@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GCNet with Knowledge Distillation</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            padding: 30px;
+        }
+        
+        h1 {
+            text-align: center;
+            color: #2d3748;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+        
+        .subtitle {
+            text-align: center;
+            color: #718096;
+            margin-bottom: 30px;
+            font-size: 1.1em;
+        }
+        
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #e2e8f0;
+        }
+        
+        .tab {
+            padding: 12px 24px;
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            color: #718096;
+            transition: all 0.3s;
+            border-bottom: 3px solid transparent;
+        }
+        
+        .tab:hover {
+            color: #667eea;
+        }
+        
+        .tab.active {
+            color: #667eea;
+            border-bottom-color: #667eea;
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+            animation: fadeIn 0.5s;
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .diagram-container {
+            background: #f7fafc;
+            border-radius: 15px;
+            padding: 30px;
+            margin-bottom: 20px;
+            overflow-x: auto;
+        }
+        
+        svg {
+            display: block;
+            margin: 0 auto;
+        }
+        
+        .block {
+            transition: all 0.3s;
+        }
+        
+        .block:hover {
+            filter: brightness(1.1);
+        }
+        
+        .legend {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-top: 30px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+        }
+        
+        .legend-color {
+            width: 30px;
+            height: 30px;
+            border-radius: 6px;
+            flex-shrink: 0;
+        }
+        
+        .legend-text {
+            font-size: 14px;
+            color: #2d3748;
+            font-weight: 500;
+        }
+        
+        .info-box {
+            background: linear-gradient(135deg, #667eea15 0%, #764ba215 100%);
+            border-left: 4px solid #667eea;
+            padding: 20px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        
+        .info-box h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.3em;
+        }
+        
+        .info-box ul {
+            list-style: none;
+            padding-left: 0;
+        }
+        
+        .info-box li {
+            padding: 8px 0;
+            color: #4a5568;
+            position: relative;
+            padding-left: 25px;
+        }
+        
+        .info-box li:before {
+            content: "✓";
+            position: absolute;
+            left: 0;
+            color: #667eea;
+            font-weight: bold;
+        }
+        
+        .loss-formula {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin: 10px 0;
+            font-family: 'Courier New', monospace;
+            border: 2px solid #e2e8f0;
+            overflow-x: auto;
+        }
+        
+        .flow-arrow {
+            stroke: #cbd5e0;
+            stroke-width: 2;
+            fill: none;
+            marker-end: url(#arrowhead);
+        }
+        
+        .distill-arrow {
+            stroke: #f56565;
+            stroke-width: 3;
+            stroke-dasharray: 5, 5;
+            fill: none;
+            marker-end: url(#distill-arrowhead);
+            animation: dash 1s linear infinite;
+        }
+        
+        @keyframes dash {
+            to {
+                stroke-dashoffset: -10;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🧠 GCNet Architecture with Knowledge Distillation</h1>
+        <p class="subtitle">Semantic Segmentation with Teacher-Student Learning</p>
+        
+        <div class="tabs">
+            <button class="tab active" onclick="showTab('architecture')">Architecture Overview</button>
+            <button class="tab" onclick="showTab('distillation')">Distillation Process</button>
+            <button class="tab" onclick="showTab('losses')">Loss Functions</button>
+        </div>
+        
+        <!-- TAB 1: Architecture -->
+        <div id="architecture" class="tab-content active">
+            <div class="diagram-container">
+                <svg width="1300" height="800" viewBox="0 0 1300 800">
+                    <defs>
+                        <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                            <polygon points="0 0, 10 3, 0 6" fill="#cbd5e0" />
+                        </marker>
+                        
+                        <linearGradient id="inputGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#4299e1;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#3182ce;stop-opacity:1" />
+                        </linearGradient>
+                        
+                        <linearGradient id="convGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#48bb78;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#38a169;stop-opacity:1" />
+                        </linearGradient>
+                        
+                        <linearGradient id="gcblockGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#ed8936;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#dd6b20;stop-opacity:1" />
+                        </linearGradient>
+                        
+                        <linearGradient id="attnGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#9f7aea;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#805ad5;stop-opacity:1" />
+                        </linearGradient>
+                        
+                        <linearGradient id="dappmGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#f687b3;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#ed64a6;stop-opacity:1" />
+                        </linearGradient>
+                        
+                        <linearGradient id="headGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#fc8181;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#f56565;stop-opacity:1" />
+                        </linearGradient>
+                    </defs>
+                    
+                    <!-- Input -->
+                    <g class="block">
+                        <rect x="20" y="380" width="80" height="60" rx="5" fill="url(#inputGrad)" />
+                        <text x="60" y="405" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Input</text>
+                        <text x="60" y="420" text-anchor="middle" fill="white" font-size="10">3×H×W</text>
+                    </g>
+                    
+                    <!-- Stage 1: H/2 -->
+                    <g class="block">
+                        <rect x="130" y="370" width="70" height="80" rx="5" fill="url(#convGrad)" />
+                        <text x="165" y="395" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 1</text>
+                        <text x="165" y="410" text-anchor="middle" fill="white" font-size="9">Conv 3×3</text>
+                        <text x="165" y="423" text-anchor="middle" fill="white" font-size="9">stride=2</text>
+                        <text x="165" y="436" text-anchor="middle" fill="white" font-size="9">32×H/2×W/2</text>
+                    </g>
+                    <line x1="100" y1="410" x2="130" y2="410" class="flow-arrow" />
+                    
+                    <!-- Stage 2: H/4 -->
+                    <g class="block">
+                        <rect x="230" y="360" width="70" height="100" rx="5" fill="url(#gcblockGrad)" />
+                        <text x="265" y="385" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 2</text>
+                        <text x="265" y="400" text-anchor="middle" fill="white" font-size="9">Conv + 4×GC</text>
+                        <text x="265" y="415" text-anchor="middle" fill="white" font-size="9">stride=2</text>
+                        <text x="265" y="430" text-anchor="middle" fill="white" font-size="9">32×H/4×W/4</text>
+                        <text x="265" y="445" text-anchor="middle" fill="white" font-size="8" font-weight="bold">→ c2</text>
+                    </g>
+                    <line x1="200" y1="410" x2="230" y2="410" class="flow-arrow" />
+                    
+                    <!-- Stage 3: H/8 (Stem) -->
+                    <g class="block">
+                        <rect x="330" y="350" width="70" height="120" rx="5" fill="url(#gcblockGrad)" />
+                        <text x="365" y="380" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 3</text>
+                        <text x="365" y="395" text-anchor="middle" fill="white" font-size="9">(Stem)</text>
+                        <text x="365" y="410" text-anchor="middle" fill="white" font-size="9">4×GCBlock</text>
+                        <text x="365" y="425" text-anchor="middle" fill="white" font-size="9">stride=2</text>
+                        <text x="365" y="440" text-anchor="middle" fill="white" font-size="9">64×H/8×W/8</text>
+                        <text x="365" y="455" text-anchor="middle" fill="white" font-size="8" font-weight="bold">→ c3</text>
+                    </g>
+                    <line x1="300" y1="410" x2="330" y2="410" class="flow-arrow" />
+                    
+                    <!-- Branch Split -->
+                    <line x1="400" y1="410" x2="450" y2="410" class="flow-arrow" />
+                    <line x1="450" y1="410" x2="450" y2="300" class="flow-arrow" />
+                    <line x1="450" y1="410" x2="450" y2="520" class="flow-arrow" />
+                    
+                    <!-- SEMANTIC BRANCH -->
+                    <text x="650" y="130" text-anchor="middle" font-size="16" font-weight="bold" fill="#805ad5">Semantic Branch (H/16 → H/32)</text>
+                    
+                    <!-- Stage 4 Semantic -->
+                    <g class="block">
+                        <rect x="480" y="150" width="90" height="140" rx="5" fill="url(#gcblockGrad)" />
+                        <text x="525" y="175" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 4-S</text>
+                        <text x="525" y="195" text-anchor="middle" fill="white" font-size="9">5×GCBlock</text>
+                        <text x="525" y="210" text-anchor="middle" fill="white" font-size="9">stride=2</text>
+                        <text x="525" y="225" text-anchor="middle" fill="white" font-size="9">128×H/16×W/16</text>
+                        <rect x="485" y="240" width="80" height="40" rx="3" fill="url(#attnGrad)" />
+                        <text x="525" y="257" text-anchor="middle" fill="white" font-size="9" font-weight="bold">FlashAttention</text>
+                        <text x="525" y="270" text-anchor="middle" fill="white" font-size="8">2 layers</text>
+                    </g>
+                    <line x1="450" y1="300" x2="480" y2="220" class="flow-arrow" />
+                    
+                    <!-- Stage 5 Semantic -->
+                    <g class="block">
+                        <rect x="600" y="150" width="90" height="140" rx="5" fill="url(#gcblockGrad)" />
+                        <text x="645" y="175" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 5-S</text>
+                        <text x="645" y="195" text-anchor="middle" fill="white" font-size="9">5×GCBlock</text>
+                        <text x="645" y="210" text-anchor="middle" fill="white" font-size="9">stride=2</text>
+                        <text x="645" y="225" text-anchor="middle" fill="white" font-size="9">128×H/32×W/32</text>
+                    </g>
+                    <line x1="570" y1="220" x2="600" y2="220" class="flow-arrow" />
+                    
+                    <!-- Stage 6 Semantic -->
+                    <g class="block">
+                        <rect x="720" y="150" width="90" height="140" rx="5" fill="url(#gcblockGrad)" />
+                        <text x="765" y="175" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 6-S</text>
+                        <text x="765" y="195" text-anchor="middle" fill="white" font-size="9">2×GCBlock</text>
+                        <text x="765" y="210" text-anchor="middle" fill="white" font-size="9">stride=2</text>
+                        <text x="765" y="225" text-anchor="middle" fill="white" font-size="9">128×H/64×W/64</text>
+                    </g>
+                    <line x1="690" y1="220" x2="720" y2="220" class="flow-arrow" />
+                    
+                    <!-- DETAIL BRANCH -->
+                    <text x="650" y="510" text-anchor="middle" font-size="16" font-weight="bold" fill="#38a169">Detail Branch (H/8)</text>
+                    
+                    <!-- Stage 4 Detail -->
+                    <g class="block">
+                        <rect x="480" y="540" width="90" height="100" rx="5" fill="url(#convGrad)" />
+                        <text x="525" y="565" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 4-D</text>
+                        <text x="525" y="585" text-anchor="middle" fill="white" font-size="9">4×GCBlock</text>
+                        <text x="525" y="600" text-anchor="middle" fill="white" font-size="9">64×H/8×W/8</text>
+                    </g>
+                    <line x1="450" y1="520" x2="480" y2="590" class="flow-arrow" />
+                    
+                    <!-- Stage 5 Detail -->
+                    <g class="block">
+                        <rect x="600" y="540" width="90" height="100" rx="5" fill="url(#convGrad)" />
+                        <text x="645" y="565" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 5-D</text>
+                        <text x="645" y="585" text-anchor="middle" fill="white" font-size="9">4×GCBlock</text>
+                        <text x="645" y="600" text-anchor="middle" fill="white" font-size="9">64×H/8×W/8</text>
+                    </g>
+                    <line x1="570" y1="590" x2="600" y2="590" class="flow-arrow" />
+                    
+                    <!-- Stage 6 Detail -->
+                    <g class="block">
+                        <rect x="720" y="540" width="90" height="100" rx="5" fill="url(#convGrad)" />
+                        <text x="765" y="565" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Stage 6-D</text>
+                        <text x="765" y="585" text-anchor="middle" fill="white" font-size="9">2×GCBlock</text>
+                        <text x="765" y="600" text-anchor="middle" fill="white" font-size="9">64×H/8×W/8</text>
+                    </g>
+                    <line x1="690" y1="590" x2="720" y2="590" class="flow-arrow" />
+                    
+                    <!-- Bilateral Fusion arrows -->
+                    <line x1="525" y1="290" x2="525" y2="540" stroke="#48bb78" stroke-width="2" stroke-dasharray="5,5" />
+                    <line x1="645" y1="290" x2="645" y2="540" stroke="#48bb78" stroke-width="2" stroke-dasharray="5,5" />
+                    <text x="530" y="420" fill="#38a169" font-size="11" font-weight="bold">Bilateral</text>
+                    <text x="530" y="435" fill="#38a169" font-size="11" font-weight="bold">Fusion</text>
+                    
+                    <!-- DAPPM + FlashAttention -->
+                    <g class="block">
+                        <rect x="840" y="180" width="100" height="80" rx="5" fill="url(#dappmGrad)" />
+                        <text x="890" y="205" text-anchor="middle" fill="white" font-size="11" font-weight="bold">DAPPM</text>
+                        <text x="890" y="220" text-anchor="middle" fill="white" font-size="9">Multi-scale</text>
+                        <text x="890" y="235" text-anchor="middle" fill="white" font-size="9">Pooling</text>
+                    </g>
+                    <line x1="810" y1="220" x2="840" y2="220" class="flow-arrow" />
+                    
+                    <g class="block">
+                        <rect x="970" y="180" width="100" height="80" rx="5" fill="url(#attnGrad)" />
+                        <text x="1020" y="205" text-anchor="middle" fill="white" font-size="11" font-weight="bold">FlashAttn</text>
+                        <text x="1020" y="220" text-anchor="middle" fill="white" font-size="9">Global</text>
+                        <text x="1020" y="235" text-anchor="middle" fill="white" font-size="9">Context</text>
+                    </g>
+                    <line x1="940" y1="220" x2="970" y2="220" class="flow-arrow" />
+                    
+                    <!-- SE Module -->
+                    <g class="block">
+                        <rect x="1100" y="195" width="80" height="50" rx="5" fill="#f6ad55" />
+                        <text x="1140" y="215" text-anchor="middle" fill="white" font-size="10" font-weight="bold">SE Module</text>
+                        <text x="1140" y="230" text-anchor="middle" fill="white" font-size="8">Channel Attn</text>
+                    </g>
+                    <line x1="1070" y1="220" x2="1100" y2="220" class="flow-arrow" />
+                    
+                    <!-- Final Fusion -->
+                    <ellipse cx="890" cy="420" rx="60" ry="40" fill="#4299e1" opacity="0.8" />
+                    <text x="890" y="415" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Final</text>
+                    <text x="890" y="430" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Fusion</text>
+                    
+                    <line x1="810" y1="590" x2="850" y2="440" class="flow-arrow" />
+                    <line x1="1140" y1="245" x2="1140" y2="400" x2="930" y2="400" class="flow-arrow" />
+                    
+                    <!-- Decoder (optional) -->
+                    <g class="block">
+                        <rect x="1000" y="390" width="120" height="120" rx="5" fill="url(#convGrad)" opacity="0.7" stroke="#38a169" stroke-width="3" stroke-dasharray="5,5" />
+                        <text x="1060" y="415" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Decoder</text>
+                        <text x="1060" y="430" text-anchor="middle" fill="white" font-size="9">(Optional)</text>
+                        <text x="1060" y="450" text-anchor="middle" fill="white" font-size="9">H/8 → H/4 → H/2 → H</text>
+                        <text x="1060" y="465" text-anchor="middle" fill="white" font-size="9">Skip: c3, c2, c1</text>
+                        <text x="1060" y="480" text-anchor="middle" fill="white" font-size="9">Gated Fusion</text>
+                        <text x="1060" y="495" text-anchor="middle" fill="white" font-size="9">16×H×W</text>
+                    </g>
+                    <line x1="950" y1="420" x2="1000" y2="450" class="flow-arrow" />
+                    
+                    <!-- Output Head -->
+                    <g class="block">
+                        <rect x="1160" y="410" width="100" height="80" rx="5" fill="url(#headGrad)" />
+                        <text x="1210" y="435" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Seg Head</text>
+                        <text x="1210" y="455" text-anchor="middle" fill="white" font-size="9">Conv 1×1</text>
+                        <text x="1210" y="470" text-anchor="middle" fill="white" font-size="9">num_classes×H×W</text>
+                    </g>
+                    <line x1="1120" y1="450" x2="1160" y2="450" class="flow-arrow" />
+                    
+                    <!-- Aux Head -->
+                    <g class="block">
+                        <rect x="525" y="50" width="80" height="60" rx="5" fill="url(#headGrad)" opacity="0.7" />
+                        <text x="565" y="75" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Aux Head</text>
+                        <text x="565" y="90" text-anchor="middle" fill="white" font-size="8">(on c4)</text>
+                    </g>
+                    <line x1="525" y1="150" x2="525" y2="110" stroke="#f56565" stroke-width="2" stroke-dasharray="3,3" />
+                    
+                    <!-- Resolution labels -->
+                    <text x="60" y="350" fill="#718096" font-size="11" font-weight="bold">H × W</text>
+                    <text x="165" y="350" fill="#718096" font-size="10">H/2</text>
+                    <text x="265" y="340" fill="#718096" font-size="10">H/4</text>
+                    <text x="365" y="330" fill="#718096" font-size="10">H/8</text>
+                    <text x="525" y="140" fill="#718096" font-size="10">H/16</text>
+                    <text x="890" y="170" fill="#718096" font-size="10">H/32→H/8</text>
+                </svg>
+            </div>
+            
+            <div class="legend">
+                <div class="legend-item">
+                    <div class="legend-color" style="background: linear-gradient(135deg, #48bb78, #38a169);"></div>
+                    <div class="legend-text">Convolution Layer</div>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: linear-gradient(135deg, #ed8936, #dd6b20);"></div>
+                    <div class="legend-text">GCBlock (Reparameterizable)</div>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: linear-gradient(135deg, #9f7aea, #805ad5);"></div>
+                    <div class="legend-text">FlashAttention</div>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: linear-gradient(135deg, #f687b3, #ed64a6);"></div>
+                    <div class="legend-text">DAPPM (Multi-scale)</div>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: linear-gradient(135deg, #fc8181, #f56565);"></div>
+                    <div class="legend-text">Segmentation Head</div>
+                </div>
+                <div class="legend-item">
+                    <div class="legend-color" style="background: #f6ad55;"></div>
+                    <div class="legend-text">SE Module</div>
+                </div>
+            </div>
+            
+            <div class="info-box">
+                <h3>🔑 Key Features</h3>
+                <ul>
+                    <li><strong>Dual-Branch Architecture:</strong> Semantic branch (H/16→H/32) captures high-level context, Detail branch (H/8) preserves spatial details</li>
+                    <li><strong>Bilateral Fusion:</strong> Information exchange between semantic and detail branches at multiple stages</li>
+                    <li><strong>FlashAttention:</strong> Efficient self-attention at Stage 4 and bottleneck for global context modeling</li>
+                    <li><strong>Reparameterizable GCBlocks:</strong> Training-time multi-path → inference-time single conv (faster inference)</li>
+                    <li><strong>DAPPM:</strong> Dense Atrous Pyramid Pooling Module for multi-scale feature aggregation</li>
+                    <li><strong>Optional Decoder:</strong> Progressive upsampling with skip connections from c1, c2, c3</li>
+                </ul>
+            </div>
+        </div>
+        
+        <!-- TAB 2: Distillation Process -->
+        <div id="distillation" class="tab-content">
+            <div class="diagram-container">
+                <svg width="1300" height="900" viewBox="0 0 1300 900">
+                    <defs>
+                        <marker id="distill-arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                            <polygon points="0 0, 10 3, 0 6" fill="#f56565" />
+                        </marker>
+                        
+                        <linearGradient id="teacherGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#f6ad55;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#ed8936;stop-opacity:1" />
+                        </linearGradient>
+                        
+                        <linearGradient id="studentGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+                            <stop offset="0%" style="stop-color:#4299e1;stop-opacity:1" />
+                            <stop offset="100%" style="stop-color:#3182ce;stop-opacity:1" />
+                        </linearGradient>
+                    </defs>
+                    
+                    <text x="650" y="40" text-anchor="middle" font-size="20" font-weight="bold" fill="#2d3748">Knowledge Distillation Pipeline</text>
+                    
+                    <!-- Teacher Network -->
+                    <g>
+                        <text x="200" y="100" text-anchor="middle" font-size="16" font-weight="bold" fill="#ed8936">👨‍🏫 Teacher (Large Model)</text>
+                        
+                        <rect x="100" y="130" width="200" height="180" rx="10" fill="url(#teacherGrad)" opacity="0.2" stroke="#ed8936" stroke-width="3" />
+                        
+                        <rect x="120" y="150" width="160" height="40" rx="5" fill="url(#teacherGrad)" />
+                        <text x="200" y="175" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Teacher Backbone</text>
+                        
+                        <rect x="120" y="210" width="160" height="80" rx="5" fill="#f6ad55" />
+                        <text x="200" y="235" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Features</text>
+                        <text x="200" y="250" text-anchor="middle" fill="white" font-size="9">c3: 128 channels</text>
+                        <text x="200" y="263" text-anchor="middle" fill="white" font-size="9">c4: 256 channels</text>
+                        <text x="200" y="276" text-anchor="middle" fill="white" font-size="9">c5: 128 channels</text>
+                        
+                        <rect x="120" y="350" width="70" height="35" rx="5" fill="#fc8181" />
+                        <text x="155" y="372" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Logits T</text>
+                        
+                        <rect x="210" y="350" width="70" height="35" rx="5" fill="#fc8181" />
+                        <text x="245" y="372" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Probs T</text>
+                    </g>
+                    
+                    <!-- Student Network -->
+                    <g>
+                        <text x="550" y="100" text-anchor="middle" font-size="16" font-weight="bold" fill="#3182ce">🎓 Student (Your Model)</text>
+                        
+                        <rect x="450" y="130" width="200" height="180" rx="10" fill="url(#studentGrad)" opacity="0.2" stroke="#3182ce" stroke-width="3" />
+                        
+                        <rect x="470" y="150" width="160" height="40" rx="5" fill="url(#studentGrad)" />
+                        <text x="550" y="175" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Student Backbone</text>
+                        
+                        <rect x="470" y="210" width="160" height="80" rx="5" fill="#4299e1" />
+                        <text x="550" y="235" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Features</text>
+                        <text x="550" y="250" text-anchor="middle" fill="white" font-size="9">c3: 64 channels</text>
+                        <text x="550" y="263" text-anchor="middle" fill="white" font-size="9">c4: 128 channels</text>
+                        <text x="550" y="276" text-anchor="middle" fill="white" font-size="9">c5: 64 channels</text>
+                        
+                        <rect x="470" y="350" width="70" height="35" rx="5" fill="#63b3ed" />
+                        <text x="505" y="372" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Logits S</text>
+                        
+                        <rect x="560" y="350" width="70" height="35" rx="5" fill="#63b3ed" />
+                        <text x="595" y="372" text-anchor="middle" fill="white" font-size="10" font-weight="bold">Probs S</text>
+                    </g>
+                    
+                    <!-- Input Image -->
+                    <rect x="330" y="20" width="60" height="60" rx="5" fill="#667eea" />
+                    <text x="360" y="45" text-anchor="middle" fill="white" font-size="11" font-weight="bold">Input</text>
+                    <text x="360" y="60" text-anchor="middle" fill="white" font-size="9">Image</text>
+                    
+                    <!-- Arrows from input -->
+                    <line x1="330" y1="50" x2="200" y2="130" stroke="#cbd5e0" stroke-width="2" marker-end="url(#arrowhead)" />
+                    <line x1="390" y1="50" x2="550" y2="130" stroke="#cbd5e0" stroke-width="2" marker-end="url(#arrowhead)" />
+                    
+                    <!-- DISTILLATION LOSSES -->
+                    <text x="900" y="100" text-anchor="middle" font-size="18" font-weight="bold" fill="#f56565">📚 Distillation Losses</text>
+                    
+                    <!-- 1. Logit Distillation -->
+                    <g>
+                        <rect x="750" y="140" width="300" height="110" rx="10" fill="#fff5f5" stroke="#fc8181" stroke-width="2" />
+                        <text x="900" y="165" text-anchor="middle" font-size="14" font-weight="bold" fill="#c53030">1️⃣ Logit Distillation (KL Div)</text>
+                        
+                        <text x="760" y="190" font-size="11" fill="#2d3748">Soft targets with temperature T=4:</text>
+                        <text x="770" y="210" font-size="10" fill="#4a5568" font-family="monospace">KL( softmax(Logits_S/T) || softmax(Logits_T/T) )</text>
+                        <text x="760" y="230" font-size="10" fill="#718096">✓ Transfers "dark knowledge"</text>
+                        
+                        <!-- Arrow from teacher/student logits -->
+                        <path d="M 190 385 Q 400 420, 750 200" class="distill-arrow" />
+                        <path d="M 505 385 Q 650 420, 750 220" class="distill-arrow" />
+                    </g>
+                    
+                    <!-- 2. Feature Distillation -->
+                    <g>
+                        <rect x="750" y="270" width="300" height="130" rx="10" fill="#f0fff4" stroke="#48bb78" stroke-width="2" />
+                        <text x="900" y="295" text-anchor="middle" font-size="14" font-weight="bold" fill="#276749">2️⃣ Feature Distillation</text>
+                        
+                        <text x="760" y="320" font-size="11" fill="#2d3748">Match intermediate features:</text>
+                        <text x="770" y="340" font-size="10" fill="#4a5568" font-family="monospace">MSE( F_S^c3, F_T^c3 )</text>
+                        <text x="770" y="355" font-size="10" fill="#4a5568" font-family="monospace">MSE( F_S^c4, F_T^c4 )</text>
+                        <text x="770" y="370" font-size="10" fill="#4a5568" font-family="monospace">MSE( F_S^c5, F_T^c5 )</text>
+                        <text x="760" y="390" font-size="10" fill="#718096">✓ Multi-stage knowledge transfer</text>
+                        
+                        <!-- Arrows from features -->
+                        <path d="M 200 250 Q 550 320, 750 320" class="distill-arrow" />
+                        <path d="M 550 250 Q 650 300, 750 350" class="distill-arrow" />
+                    </g>
+                    
+                    <!-- 3. Structural Distillation -->
+                    <g>
+                        <rect x="750" y="420" width="300" height="100" rx="10" fill="#fffaf0" stroke="#ed8936" stroke-width="2" />
+                        <text x="900" y="445" text-anchor="middle" font-size="14" font-weight="bold" fill="#9c4221">3️⃣ Structural Distillation</text>
+                        
+                        <text x="760" y="470" font-size="11" fill="#2d3748">Pixel affinity matching:</text>
+                        <text x="770" y="490" font-size="10" fill="#4a5568" font-family="monospace">MSE( Affinity_S, Affinity_T )</text>
+                        <text x="760" y="510" font-size="10" fill="#718096">✓ Preserves spatial relationships</text>
+                    </g>
+                    
+                    <!-- 4. Boundary Distillation -->
+                    <g>
+                        <rect x="750" y="540" width="300" height="100" rx="10" fill="#faf5ff" stroke="#9f7aea" stroke-width="2" />
+                        <text x="900" y="565" text-anchor="middle" font-size="14" font-weight="bold" fill="#553c9a">4️⃣ Boundary Distillation</text>
+                        
+                        <text x="760" y="590" font-size="11" fill="#2d3748">Edge-aware distillation:</text>
+                        <text x="770" y="610" font-size="10" fill="#4a5568" font-family="monospace">MSE( Sobel(Probs_S), Sobel(Probs_T) )</text>
+                        <text x="760" y="630" font-size="10" fill="#718096">✓ Improves boundary accuracy</text>
+                        
+                        <!-- Arrows from probs -->
+                        <path d="M 245 385 Q 500 600, 750 590" class="distill-arrow" />
+                        <path d="M 595 385 Q 670 550, 750 610" class="distill-arrow" />
+                    </g>
+                    
+                    <!-- FINAL LOSS -->
+                    <g>
+                        <rect x="750" y="660" width="300" height="120" rx="10" fill="linear-gradient(135deg, #667eea 0%, #764ba2 100%)" stroke="#667eea" stroke-width="3" />
+                        <text x="900" y="690" text-anchor="middle" font-size="16" font-weight="bold" fill="white">🎯 Total Loss</text>
+                        
+                        <text x="765" y="720" font-size="11" fill="white" font-family="monospace">L_total = (1-α)×L_CE + α×L_KD</text>
+                        <text x="795" y="740" font-size="11" fill="white" font-family="monospace">+ λ_feat×L_feat</text>
+                        <text x="795" y="760" font-size="11" fill="white" font-family="monospace">+ λ_struct×L_struct</text>
+                        <text x="795" y="780" font-size="11" fill="white" font-family="monospace">+ λ_bound×L_bound</text>
+                    </g>
+                    
+                    <!-- Ground Truth -->
+                    <g>
+                        <rect x="200" y="450" width="120" height="60" rx="5" fill="#68d391" />
+                        <text x="260" y="475" text-anchor="middle" fill="white" font-size="12" font-weight="bold">Ground Truth</text>
+                        <text x="260" y="492" text-anchor="middle" fill="white" font-size="10">Segmentation</text>
+                        
+                        <!-- Arrow to CE loss -->
+                        <line x1="320" y1="480" x2="470" y2="360" stroke="#48bb78" stroke-width="3" marker-end="url(#arrowhead)" />
+                        <text x="380" y="410" fill="#38a169" font-size="11" font-weight="bold">CE Loss</text>
+                    </g>
+                    
+                    <!-- Training vs Inference -->
+                    <g>
+                        <rect x="100" y="820" width="500" height="60" rx="10" fill="#edf2f7" stroke="#cbd5e0" stroke-width="2" />
+                        <text x="350" y="845" text-anchor="middle" font-size="13" font-weight="bold" fill="#2d3748">⚙️ Training: Teacher + Student (both forward)</text>
+                        <text x="350" y="865" text-anchor="middle" font-size="11" fill="#718096">Compute all distillation losses + CE loss</text>
+                    </g>
+                    
+                    <g>
+                        <rect x="650" y="820" width="500" height="60" rx="10" fill="#c6f6d5" stroke="#48bb78" stroke-width="2" />
+                        <text x="900" y="845" text-anchor="middle" font-size="13" font-weight="bold" fill="#22543d">🚀 Inference: Only Student (fast!)</text>
+                        <text x="900" y="865" text-anchor="middle" font-size="11" fill="#38a169">Teacher discarded, Student runs independently</text>
+                    </g>
+                </svg>
+            </div>
+            
+            <div class="info-box">
+                <h3>🔬 Distillation Strategy</h3>
+                <ul>
+                    <li><strong>Temperature Scaling (T=4):</strong> Softens probability distributions to reveal "dark knowledge" - relationships between classes that hard labels miss</li>
+                    <li><strong>Balanced Loss (α=0.5):</strong> Combine ground truth supervision (CE) with teacher knowledge (KD) for best results</li>
+                    <li><strong>Multi-level Distillation:</strong> Transfer knowledge at multiple abstraction levels - from low-level features to high-level semantics</li>
+                    <li><strong>Adaptive Weights:</strong> Tune λ_feat, λ_struct, λ_bound based on dataset characteristics and task requirements</li>
+                    <li><strong>Frozen Teacher:</strong> Teacher parameters are frozen (no gradients) to serve as stable knowledge source</li>
+                </ul>
+            </div>
+        </div>
+        
+        <!-- TAB 3: Loss Functions -->
+        <div id="losses" class="tab-content">
+            <div class="info-box">
+                <h3>📐 Mathematical Formulations</h3>
+            </div>
+            
+            <div class="loss-formula">
+                <h4 style="color: #c53030; margin-bottom: 10px;">1. KL Divergence Loss (Logit Distillation)</h4>
+                <pre>L_KD = T² × KL( softmax(z_s/T) || softmax(z_t/T) )
+
+where:
+  z_s, z_t = student and teacher logits
+  T = temperature (default: 4.0)
+  KL(P||Q) = Σ P(x) log(P(x)/Q(x))
+
+Higher T → softer probabilities → more information transfer</pre>
+            </div>
+            
+            <div class="loss-formula">
+                <h4 style="color: #276749; margin-bottom: 10px;">2. Feature Distillation Loss</h4>
+                <pre>L_feat = (1/N) Σ MSE( normalize(F_s^i), normalize(F_t^i) )
+       i∈{c3,c4,c5}
+
+where:
+  F_s^i, F_t^i = student and teacher features at stage i
+  normalize(F) = F / ||F||_2
+  N = number of stages
+
+Optional: Use cosine similarity or attention maps instead of MSE</pre>
+            </div>
+            
+            <div class="loss-formula">
+                <h4 style="color: #9c4221; margin-bottom: 10px;">3. Structural Distillation Loss</h4>
+                <pre>L_struct = MSE( A_s, A_t )
+
+where:
+  A = affinity matrix
+  A[i,j] = similarity between pixel i and pixel j
+  A[i,j] = normalize(F_i)^T × normalize(F_j)
+
+Captures spatial relationships and context</pre>
+            </div>
+            
+            <div class="loss-formula">
+                <h4 style="color: #553c9a; margin-bottom: 10px;">4. Boundary Distillation Loss</h4>
+                <pre>L_bound = MSE( B_s, B_t )
+
+where:
+  B = boundary map extracted using Sobel operator
+  B = sqrt( (∂P/∂x)² + (∂P/∂y)² )
+  P = probability map
+
+Critical for accurate segmentation boundaries</pre>
+            </div>
+            
+            <div class="loss-formula">
+                <h4 style="color: #667eea; margin-bottom: 10px;">5. Total Loss (Combined)</h4>
+                <pre>L_total = (1-α) × L_CE + α × L_KD 
+        + λ_feat × L_feat 
+        + λ_struct × L_struct 
+        + λ_bound × L_bound
+
+Recommended hyperparameters:
+  α = 0.5         (balance CE and KD)
+  λ_feat = 0.5    (feature distillation weight)
+  λ_struct = 0.2  (structural distillation weight)
+  λ_bound = 0.3   (boundary distillation weight)
+  T = 4.0         (temperature)
+
+Adjust based on validation performance!</pre>
+            </div>
+            
+            <div class="info-box">
+                <h3>🎛️ Hyperparameter Tuning Guide</h3>
+                <ul>
+                    <li><strong>Temperature (T):</strong> Higher T (4-6) for similar teacher-student, lower T (2-3) for very different architectures</li>
+                    <li><strong>Alpha (α):</strong> Start at 0.5, increase to 0.7 if teacher is much better, decrease to 0.3 if teacher overfits</li>
+                    <li><strong>Feature weight (λ_feat):</strong> Increase if student features diverge significantly from teacher</li>
+                    <li><strong>Boundary weight (λ_bound):</strong> Increase for datasets with complex boundaries (medical, satellite imagery)</li>
+                    <li><strong>Structural weight (λ_struct):</strong> Increase for tasks requiring strong spatial coherence</li>
+                </ul>
+            </div>
+            
+            <div class="info-box" style="border-left-color: #ed8936;">
+                <h3>⚡ Performance Impact</h3>
+                <ul>
+                    <li><strong>Training Time:</strong> ~1.5x slower (teacher forward pass + extra losses)</li>
+                    <li><strong>Inference Speed:</strong> No change (only student used)</li>
+                    <li><strong>Accuracy Gain:</strong> Typically +2-5% mIoU compared to training student alone</li>
+                    <li><strong>Model Size:</strong> No change (teacher discarded after training)</li>
+                    <li><strong>Memory Usage:</strong> ~2x during training (both models in memory)</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        function showTab(tabName) {
+            // Hide all tab contents
+            const contents = document.querySelectorAll('.tab-content');
+            contents.forEach(content => {
+                content.classList.remove('active');
+            });
+            
+            // Remove active class from all tabs
+            const tabs = document.querySelectorAll('.tab');
+            tabs.forEach(tab => {
+                tab.classList.remove('active');
+            });
+            
+            // Show selected tab content
+            document.getElementById(tabName).classList.add('active');
+            
+            // Add active class to clicked tab
+            event.target.classList.add('active');
+        }
+    </script>
+</body>
+</html>
