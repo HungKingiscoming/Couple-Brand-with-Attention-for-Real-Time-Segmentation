@@ -13,11 +13,10 @@ import wandb
 from typing import Dict, Optional
 
 # Import your modules
-from backbone import GCNetImproved
-from head import GCNetHead, GCNetAuxHead
-from dataset import CityscapesCustomDataset, create_dataloaders
-from distillation import DistillationWrapper
-
+from model.backbone.model import GCNetImproved
+from model.head.segmentation_head import GCNetHead, GCNetAuxHead
+from data.custom import CityscapesCustomDataset, create_dataloaders
+from model.distillation import DistillationWrapper
 
 # ============================================
 # METRICS
