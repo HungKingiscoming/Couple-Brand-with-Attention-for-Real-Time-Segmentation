@@ -1,88 +1,57 @@
 import os
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+import torch.nn.functional as F
 import numpy as np
-from tqdm import tqdm
+from PIL import Image
 import argparse
-import yaml
 from pathlib import Path
-import wandb
-from typing import Dict, Optional
+from typing import Dict, List, Optional
+import cv2
+from tqdm import tqdm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 # Import your modules
 from model.backbone.model import GCNetImproved
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
-from data.custom import CityscapesCustomDataset, create_dataloaders
-from model.distillation import DistillationWrapper
 
 
 # ============================================
-# METRICS
+# CITYSCAPES COLOR PALETTE
 # ============================================
 
-class SegmentationMetrics:
-    """Calculate mIoU, pixel accuracy, etc."""
-    
-    def __init__(self, num_classes: int, ignore_index: int = 255):
-        self.num_classes = num_classes
-        self.ignore_index = ignore_index
-        self.reset()
-    
-    def reset(self):
-        self.confusion_matrix = np.zeros((self.num_classes, self.num_classes))
-    
-    def update(self, pred: torch.Tensor, target: torch.Tensor):
-        """
-        Args:
-            pred: (B, H, W) predicted class indices
-            target: (B, H, W) ground truth
-        """
-        pred = pred.cpu().numpy().flatten()
-        target = target.cpu().numpy().flatten()
-        
-        # Remove ignore index
-        mask = target != self.ignore_index
-        pred = pred[mask]
-        target = target[mask]
-        
-        # Update confusion matrix
-        for t, p in zip(target, pred):
-            self.confusion_matrix[t, p] += 1
-    
-    def compute_iou(self) -> np.ndarray:
-        """Compute IoU per class"""
-        intersection = np.diag(self.confusion_matrix)
-        union = (
-            self.confusion_matrix.sum(axis=1) + 
-            self.confusion_matrix.sum(axis=0) - 
-            intersection
-        )
-        iou = intersection / (union + 1e-10)
-        return iou
-    
-    def compute_miou(self) -> float:
-        """Compute mean IoU"""
-        iou = self.compute_iou()
-        return np.nanmean(iou)
-    
-    def compute_pixel_acc(self) -> float:
-        """Compute pixel accuracy"""
-        acc = np.diag(self.confusion_matrix).sum() / (self.confusion_matrix.sum() + 1e-10)
-        return acc
-    
-    def get_results(self) -> Dict[str, float]:
-        """Get all metrics"""
-        return {
-            'mIoU': self.compute_miou(),
-            'pixel_acc': self.compute_pixel_acc()
-        }
+CITYSCAPES_PALETTE = [
+    [128, 64, 128],   # 0: road
+    [244, 35, 232],   # 1: sidewalk
+    [70, 70, 70],     # 2: building
+    [102, 102, 156],  # 3: wall
+    [190, 153, 153],  # 4: fence
+    [153, 153, 153],  # 5: pole
+    [250, 170, 30],   # 6: traffic light
+    [220, 220, 0],    # 7: traffic sign
+    [107, 142, 35],   # 8: vegetation
+    [152, 251, 152],  # 9: terrain
+    [70, 130, 180],   # 10: sky
+    [220, 20, 60],    # 11: person
+    [255, 0, 0],      # 12: rider
+    [0, 0, 142],      # 13: car
+    [0, 0, 70],       # 14: truck
+    [0, 60, 100],     # 15: bus
+    [0, 80, 100],     # 16: train
+    [0, 0, 230],      # 17: motorcycle
+    [119, 11, 32],    # 18: bicycle
+]
+
+CITYSCAPES_CLASSES = [
+    'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
+    'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
+    'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
+]
 
 
 # ============================================
-# MODEL DEFINITION
+# MODEL WRAPPER
 # ============================================
 
 class GCNetSegmentor(nn.Module):
@@ -113,7 +82,7 @@ class GCNetSegmentor(nn.Module):
             align_corners=head_cfg.get('align_corners', False)
         )
         
-        # Auxiliary head (optional, for deep supervision)
+        # Auxiliary head (optional)
         self.auxiliary_head = None
         if aux_head_cfg is not None:
             self.auxiliary_head = GCNetAuxHead(
@@ -125,363 +94,267 @@ class GCNetSegmentor(nn.Module):
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, 3, H, W)
-        Returns:
-            logits: (B, num_classes, H, W)
-        """
-        # Backbone
-        features = self.backbone(x)  # Dict: {c1, c2, c3, c4, c5}
-        
-        # Main head
-        logits = self.decode_head(features)
-        
-        return logits
-    
-    def forward_train(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Training forward with auxiliary outputs
-        
-        Returns:
-            Dict with 'main' and 'aux' logits
-        """
+        """Inference forward"""
         features = self.backbone(x)
-        
-        outputs = {}
-        outputs['main'] = self.decode_head(features)
-        
-        if self.auxiliary_head is not None:
-            outputs['aux'] = self.auxiliary_head(features)
-        
-        return outputs
+        logits = self.decode_head(features)
+        return logits
 
 
 # ============================================
-# LOSS FUNCTIONS
+# INFERENCE ENGINE
 # ============================================
 
-class SegmentationLoss(nn.Module):
-    """Combined loss for segmentation with class weighting"""
-    
-    def __init__(
-        self,
-        aux_weight: float = 0.4,
-        ignore_index: int = 255,
-        use_ohem: bool = False,
-        ohem_thresh: float = 0.7,
-        class_weights: Optional[torch.Tensor] = None
-    ):
-        super().__init__()
-        self.aux_weight = aux_weight
-        self.ignore_index = ignore_index
-        self.use_ohem = use_ohem
-        self.ohem_thresh = ohem_thresh
-        
-        # ✅ Use class weights if provided
-        self.ce_loss = nn.CrossEntropyLoss(
-            weight=class_weights,
-            ignore_index=ignore_index
-        )
-        
-        if class_weights is not None:
-            print(f"✓ Using class weights for loss computation")
-            print(f"  Weights: {class_weights.tolist()}")
-    
-    def forward(
-        self, 
-        outputs: Dict[str, torch.Tensor], 
-        target: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            outputs: Dict with 'main' and optionally 'aux'
-            target: (B, H, W)
-        
-        Returns:
-            Dict of losses
-        """
-        losses = {}
-        
-        # Main loss
-        main_logits = outputs['main']
-        
-        # Resize if needed
-        if main_logits.shape[-2:] != target.shape[-2:]:
-            main_logits = nn.functional.interpolate(
-                main_logits,
-                size=target.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-        
-        loss_main = self.ce_loss(main_logits, target)
-        losses['loss_main'] = loss_main
-        
-        # Auxiliary loss
-        if 'aux' in outputs:
-            aux_logits = outputs['aux']
-            
-            # Resize aux to target size
-            if aux_logits.shape[-2:] != target.shape[-2:]:
-                aux_logits = nn.functional.interpolate(
-                    aux_logits,
-                    size=target.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
-            
-            loss_aux = self.ce_loss(aux_logits, target)
-            losses['loss_aux'] = loss_aux * self.aux_weight
-        
-        # Total loss
-        losses['loss_total'] = sum(losses.values())
-        
-        return losses
-
-
-# ============================================
-# TRAINER
-# ============================================
-
-class Trainer:
-    """Training engine"""
+class Inferencer:
+    """Inference engine for semantic segmentation"""
     
     def __init__(
         self,
         model: nn.Module,
-        train_loader: DataLoader,
-        val_loader: DataLoader,
-        criterion: nn.Module,
-        optimizer: optim.Optimizer,
-        scheduler: Optional[object] = None,
         device: str = 'cuda',
-        num_classes: int = 19,
+        img_size: tuple = (1024, 2048),
+        mean: List[float] = [0.485, 0.456, 0.406],
+        std: List[float] = [0.229, 0.224, 0.225],
         use_amp: bool = True,
-        grad_clip: float = 1.0,
-        log_interval: int = 10,
-        save_dir: str = './checkpoints',
-        use_wandb: bool = False
+        use_sliding_window: bool = False,
+        window_size: tuple = (512, 1024),
+        window_stride: tuple = (256, 512)
     ):
-        self.model = model.to(device)
-        self.train_loader = train_loader
-        self.val_loader = val_loader
-        self.criterion = criterion
-        self.optimizer = optimizer
-        self.scheduler = scheduler
+        self.model = model.to(device).eval()
         self.device = device
-        self.num_classes = num_classes
+        self.img_size = img_size
+        self.mean = mean
+        self.std = std
         self.use_amp = use_amp
-        self.grad_clip = grad_clip
-        self.log_interval = log_interval
-        self.save_dir = Path(save_dir)
-        self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.use_wandb = use_wandb
+        self.use_sliding_window = use_sliding_window
+        self.window_size = window_size
+        self.window_stride = window_stride
         
-        # Mixed precision scaler
-        self.scaler = GradScaler() if use_amp else None
+        # Preprocessing transforms
+        self.transform = A.Compose([
+            A.Resize(height=img_size[0], width=img_size[1]),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2()
+        ])
         
-        # Metrics
-        self.metrics = SegmentationMetrics(num_classes=num_classes)
-        
-        # Best model tracking
-        self.best_miou = 0.0
-        self.current_epoch = 0
+        print(f"✓ Inferencer initialized")
+        print(f"  Device: {device}")
+        print(f"  Image size: {img_size}")
+        print(f"  Mixed precision: {use_amp}")
+        print(f"  Sliding window: {use_sliding_window}")
     
-    def train_epoch(self) -> Dict[str, float]:
-        """Train one epoch"""
-        self.model.train()
-        self.metrics.reset()
+    def preprocess(self, image_path: str) -> tuple:
+        """
+        Load and preprocess image
         
-        total_loss = 0.0
-        loss_dict_sum = {}
+        Returns:
+            (tensor, original_size, original_image)
+        """
+        # Load image
+        image = Image.open(image_path).convert('RGB')
+        original_size = image.size  # (W, H)
+        image_np = np.array(image)
         
-        pbar = tqdm(self.train_loader, desc=f'Train Epoch {self.current_epoch}')
+        # Transform
+        transformed = self.transform(image=image_np)
+        image_tensor = transformed['image'].unsqueeze(0)  # (1, 3, H, W)
         
-        for batch_idx, (images, targets) in enumerate(pbar):
-            images = images.to(self.device)
-            targets = targets.to(self.device).long()
-            
-            # Forward
-            self.optimizer.zero_grad()
-            
-            with autocast(enabled=self.use_amp):
-                outputs = self.model.forward_train(images)
-                losses = self.criterion(outputs, targets)
-                loss = losses['loss_total']
-            
-            # Backward
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-                self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                self.optimizer.step()
-            
-            # Update metrics
-            with torch.no_grad():
-                pred = outputs['main'].argmax(dim=1)
-                self.metrics.update(pred, targets)
-            
-            # Accumulate losses
-            total_loss += loss.item()
-            for k, v in losses.items():
-                loss_dict_sum[k] = loss_dict_sum.get(k, 0.0) + v.item()
-            
-            # Update progress bar
-            if (batch_idx + 1) % self.log_interval == 0:
-                avg_loss = total_loss / (batch_idx + 1)
-                pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
-        
-        # Compute epoch metrics
-        num_batches = len(self.train_loader)
-        epoch_metrics = {
-            'train_loss': total_loss / num_batches,
-            **{k: v / num_batches for k, v in loss_dict_sum.items()},
-            **{f'train_{k}': v for k, v in self.metrics.get_results().items()}
-        }
-        
-        return epoch_metrics
+        return image_tensor, original_size, image_np
     
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
-        """Validate"""
-        self.model.eval()
-        self.metrics.reset()
+    def predict_single(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Predict single image
         
-        total_loss = 0.0
+        Args:
+            image_tensor: (1, 3, H, W)
         
-        pbar = tqdm(self.val_loader, desc='Validation')
+        Returns:
+            pred: (1, H, W) class indices
+        """
+        image_tensor = image_tensor.to(self.device)
         
-        for images, targets in pbar:
-            images = images.to(self.device)
-            targets = targets.to(self.device).long()
-            
-            # Forward
-            with autocast(enabled=self.use_amp):
-                outputs = self.model.forward_train(images)
-                losses = self.criterion(outputs, targets)
-                loss = losses['loss_total']
-            
-            # Update metrics
-            pred = outputs['main'].argmax(dim=1)
-            self.metrics.update(pred, targets)
-            
-            total_loss += loss.item()
+        if self.use_amp:
+            with torch.cuda.amp.autocast():
+                logits = self.model(image_tensor)
+        else:
+            logits = self.model(image_tensor)
         
-        # Compute metrics
-        val_metrics = {
-            'val_loss': total_loss / len(self.val_loader),
-            **{f'val_{k}': v for k, v in self.metrics.get_results().items()}
+        pred = logits.argmax(dim=1)  # (1, H, W)
+        return pred
+    
+    @torch.no_grad()
+    def predict_sliding_window(self, image_tensor: torch.Tensor) -> torch.Tensor:
+        """
+        Predict with sliding window for large images
+        
+        More accurate but slower than direct prediction
+        """
+        B, C, H, W = image_tensor.shape
+        assert B == 1, "Sliding window only supports batch_size=1"
+        
+        window_h, window_w = self.window_size
+        stride_h, stride_w = self.window_stride
+        
+        # Initialize output
+        num_classes = 19
+        logits_sum = torch.zeros((1, num_classes, H, W), device=self.device)
+        count_map = torch.zeros((1, 1, H, W), device=self.device)
+        
+        # Sliding window
+        for y in range(0, H - window_h + 1, stride_h):
+            for x in range(0, W - window_w + 1, stride_w):
+                # Extract window
+                window = image_tensor[:, :, y:y+window_h, x:x+window_w]
+                
+                # Predict
+                if self.use_amp:
+                    with torch.cuda.amp.autocast():
+                        window_logits = self.model(window.to(self.device))
+                else:
+                    window_logits = self.model(window.to(self.device))
+                
+                # Accumulate
+                logits_sum[:, :, y:y+window_h, x:x+window_w] += window_logits
+                count_map[:, :, y:y+window_h, x:x+window_w] += 1
+        
+        # Average overlapping predictions
+        logits_avg = logits_sum / count_map.clamp(min=1)
+        pred = logits_avg.argmax(dim=1)
+        
+        return pred
+    
+    def predict(self, image_path: str, return_prob: bool = False) -> Dict:
+        """
+        Complete prediction pipeline
+        
+        Args:
+            image_path: Path to input image
+            return_prob: Whether to return probability map
+        
+        Returns:
+            Dict containing:
+                - 'pred': (H, W) numpy array of class indices
+                - 'prob': (num_classes, H, W) probability map (if return_prob=True)
+                - 'original_size': (W, H) original image size
+        """
+        # Preprocess
+        image_tensor, original_size, original_image = self.preprocess(image_path)
+        
+        # Predict
+        if self.use_sliding_window:
+            pred = self.predict_sliding_window(image_tensor)
+        else:
+            pred = self.predict_single(image_tensor)
+        
+        # Resize to original size
+        pred_resized = F.interpolate(
+            pred.float().unsqueeze(1),
+            size=original_size[::-1],  # (H, W)
+            mode='nearest'
+        ).squeeze().cpu().numpy().astype(np.uint8)
+        
+        result = {
+            'pred': pred_resized,
+            'original_size': original_size
         }
         
-        return val_metrics
-    
-    def train(self, num_epochs: int):
-        """Full training loop"""
-        for epoch in range(num_epochs):
-            self.current_epoch = epoch
+        # Return probability if requested
+        if return_prob:
+            if self.use_amp:
+                with torch.cuda.amp.autocast():
+                    logits = self.model(image_tensor.to(self.device))
+            else:
+                logits = self.model(image_tensor.to(self.device))
             
-            # Train
-            train_metrics = self.train_epoch()
+            prob = F.softmax(logits, dim=1)
+            prob_resized = F.interpolate(
+                prob,
+                size=original_size[::-1],
+                mode='bilinear',
+                align_corners=False
+            ).squeeze(0).cpu().numpy()
             
-            # Validate
-            val_metrics = self.validate()
-            
-            # Scheduler step
-            if self.scheduler is not None:
-                self.scheduler.step()
-            
-            # Combine metrics
-            all_metrics = {**train_metrics, **val_metrics}
-            
-            # Print
-            print(f"\nEpoch {epoch}/{num_epochs}")
-            print(f"Train Loss: {all_metrics['train_loss']:.4f} | "
-                  f"Train mIoU: {all_metrics['train_mIoU']:.4f}")
-            print(f"Val Loss: {all_metrics['val_loss']:.4f} | "
-                  f"Val mIoU: {all_metrics['val_mIoU']:.4f}")
-            
-            # Log to wandb
-            if self.use_wandb:
-                wandb.log(all_metrics, step=epoch)
-            
-            # Save best model
-            if val_metrics['val_mIoU'] > self.best_miou:
-                self.best_miou = val_metrics['val_mIoU']
-                self.save_checkpoint('best_model.pth', epoch, all_metrics)
-                print(f"✓ Saved best model with mIoU: {self.best_miou:.4f}")
-            
-            # Save latest
-            if (epoch + 1) % 5 == 0:
-                self.save_checkpoint(f'epoch_{epoch}.pth', epoch, all_metrics)
-    
-    def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
-        """Save checkpoint"""
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'metrics': metrics,
-            'best_miou': self.best_miou
-        }
+            result['prob'] = prob_resized
         
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        return result
+    
+    def predict_batch(self, image_paths: List[str], save_dir: str):
+        """
+        Batch prediction
         
-        save_path = self.save_dir / filename
-        torch.save(checkpoint, save_path)
-        print(f"Saved checkpoint to {save_path}")
+        Args:
+            image_paths: List of image paths
+            save_dir: Directory to save results
+        """
+        save_dir = Path(save_dir)
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        for image_path in tqdm(image_paths, desc='Inference'):
+            # Predict
+            result = self.predict(image_path)
+            pred = result['pred']
+            
+            # Visualize
+            vis = self.visualize(pred)
+            
+            # Save
+            filename = Path(image_path).stem
+            vis_path = save_dir / f'{filename}_pred.png'
+            Image.fromarray(vis).save(vis_path)
+            
+            # Save raw prediction (optional)
+            raw_path = save_dir / f'{filename}_pred_raw.png'
+            Image.fromarray(pred).save(raw_path)
+    
+    @staticmethod
+    def visualize(pred: np.ndarray, alpha: float = 1.0) -> np.ndarray:
+        """
+        Visualize prediction with color palette
+        
+        Args:
+            pred: (H, W) class indices
+            alpha: Transparency (not used here, for overlay)
+        
+        Returns:
+            vis: (H, W, 3) RGB visualization
+        """
+        H, W = pred.shape
+        vis = np.zeros((H, W, 3), dtype=np.uint8)
+        
+        for class_id, color in enumerate(CITYSCAPES_PALETTE):
+            mask = pred == class_id
+            vis[mask] = color
+        
+        return vis
+    
+    @staticmethod
+    def overlay(image: np.ndarray, pred: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+        """
+        Overlay prediction on original image
+        
+        Args:
+            image: (H, W, 3) original image
+            pred: (H, W) class indices
+            alpha: Overlay transparency
+        
+        Returns:
+            overlay: (H, W, 3) overlayed image
+        """
+        vis = Inferencer.visualize(pred)
+        overlay = cv2.addWeighted(image, 1-alpha, vis, alpha, 0)
+        return overlay
 
 
 # ============================================
-# MAIN TRAINING SCRIPT
+# MAIN INFERENCE SCRIPT
 # ============================================
 
-def main():
-    parser = argparse.ArgumentParser(description='Train GCNet Improved')
-    parser.add_argument('--config', type=str, default='config.yaml',
-                        help='Path to config file')
-    parser.add_argument('--train_txt', type=str, required=True,
-                        help='Path to train txt file')
-    parser.add_argument('--val_txt', type=str, required=True,
-                        help='Path to validation txt file')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--num_epochs', type=int, default=100,
-                        help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
-    parser.add_argument('--num_workers', type=int, default=4,
-                        help='Number of workers')
-    parser.add_argument('--use_class_weights', action='store_true',
-                        help='Compute and use class weights for balancing')
-    parser.add_argument('--use_wandb', action='store_true',
-                        help='Use Weights & Biases logging')
-    parser.add_argument('--wandb_project', type=str, default='gcnet-improved',
-                        help='W&B project name')
-    args = parser.parse_args()
+def load_model(checkpoint_path: str, device: str = 'cuda') -> GCNetSegmentor:
+    """Load trained model from checkpoint"""
     
-    # Device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    num_classes = 19
     
-    # Initialize wandb
-    if args.use_wandb:
-        wandb.init(project=args.wandb_project, config=vars(args))
-    
-    # ============================================
-    # MODEL CONFIG
-    # ============================================
-    
-    num_classes = 19  # Cityscapes
-    
+    # Model config (must match training)
     backbone_cfg = {
         'in_channels': 3,
         'channels': 32,
@@ -492,107 +365,148 @@ def main():
         'flash_attn_layers': 2,
         'flash_attn_heads': 8,
         'use_se': True,
-        'deploy': False
+        'deploy': False  # Set True for deployment speedup
     }
     
     head_cfg = {
-        'in_channels': 64,  # channels * 2 from backbone
+        'in_channels': 64,
         'channels': 128,
         'decode_enabled': True,
         'decoder_channels': 128,
-        'skip_channels': [64, 32, 32],  # c3, c2, c1
+        'skip_channels': [64, 32, 32],
         'use_gated_fusion': True,
         'dropout_ratio': 0.1,
         'align_corners': False
     }
     
-    aux_head_cfg = {
-        'in_channels': 128,  # channels * 4 from c4
-        'channels': 64,
-        'dropout_ratio': 0.1,
-        'align_corners': False
-    }
-    
-    # ============================================
-    # CREATE MODEL
-    # ============================================
-    
+    # Create model
     model = GCNetSegmentor(
         num_classes=num_classes,
         backbone_cfg=backbone_cfg,
         head_cfg=head_cfg,
-        aux_head_cfg=aux_head_cfg
+        aux_head_cfg=None  # Not needed for inference
     )
     
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
+    # Load checkpoint
+    print(f"Loading checkpoint from {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    # ============================================
-    # CREATE DATALOADERS
-    # ============================================
+    # Load state dict
+    if 'model_state_dict' in checkpoint:
+        model.load_state_dict(checkpoint['model_state_dict'])
+        print(f"✓ Loaded checkpoint from epoch {checkpoint.get('epoch', 'unknown')}")
+        print(f"  Best mIoU: {checkpoint.get('best_miou', 'unknown')}")
+    else:
+        model.load_state_dict(checkpoint)
     
-    train_loader, val_loader, class_weights = create_dataloaders(
-        train_txt=args.train_txt,
-        val_txt=args.val_txt,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        img_size=(512, 1024),  # Adjust as needed
-        compute_class_weights=args.use_class_weights
-    )
+    # Switch to deploy mode for speed (optional)
+    # model.backbone.switch_to_deploy()
     
-    # Move class weights to device
-    if class_weights is not None:
-        class_weights = class_weights.to(device)
+    return model
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Inference with GCNet')
     
-    # ============================================
-    # LOSS & OPTIMIZER
-    # ============================================
+    # Required arguments
+    parser.add_argument('--checkpoint', type=str, required=True,
+                        help='Path to checkpoint file')
+    parser.add_argument('--input', type=str, required=True,
+                        help='Path to input image or directory')
+    parser.add_argument('--output', type=str, default='./inference_results',
+                        help='Output directory for results')
     
-    criterion = SegmentationLoss(
-        aux_weight=0.4,
-        ignore_index=255,
-        class_weights=class_weights  # ✅ Pass class weights
-    )
+    # Optional arguments
+    parser.add_argument('--img_size', type=int, nargs=2, default=[1024, 2048],
+                        help='Target image size (H W)')
+    parser.add_argument('--device', type=str, default='cuda',
+                        help='Device (cuda or cpu)')
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Use mixed precision')
+    parser.add_argument('--sliding_window', action='store_true',
+                        help='Use sliding window for large images')
+    parser.add_argument('--window_size', type=int, nargs=2, default=[512, 1024],
+                        help='Sliding window size (H W)')
+    parser.add_argument('--overlay', action='store_true',
+                        help='Save overlay visualization')
+    parser.add_argument('--save_raw', action='store_true',
+                        help='Save raw prediction masks')
     
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=1e-4
-    )
+    args = parser.parse_args()
     
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=args.num_epochs,
-        eta_min=1e-6
-    )
+    # Check device
+    device = args.device if torch.cuda.is_available() else 'cpu'
+    print(f"Using device: {device}")
     
-    # ============================================
-    # TRAINER
-    # ============================================
+    # Load model
+    model = load_model(args.checkpoint, device=device)
     
-    trainer = Trainer(
+    # Create inferencer
+    inferencer = Inferencer(
         model=model,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        criterion=criterion,
-        optimizer=optimizer,
-        scheduler=scheduler,
         device=device,
-        num_classes=num_classes,
-        use_amp=True,
-        grad_clip=1.0,
-        log_interval=10,
-        save_dir=args.save_dir,
-        use_wandb=args.use_wandb
+        img_size=tuple(args.img_size),
+        use_amp=args.use_amp,
+        use_sliding_window=args.sliding_window,
+        window_size=tuple(args.window_size)
     )
     
-    # ============================================
-    # TRAIN
-    # ============================================
+    # Get image paths
+    input_path = Path(args.input)
     
-    trainer.train(num_epochs=args.num_epochs)
+    if input_path.is_file():
+        # Single image
+        image_paths = [str(input_path)]
+    elif input_path.is_dir():
+        # Directory of images
+        image_exts = ['.jpg', '.jpeg', '.png', '.bmp']
+        image_paths = []
+        for ext in image_exts:
+            image_paths.extend(input_path.glob(f'*{ext}'))
+            image_paths.extend(input_path.glob(f'*{ext.upper()}'))
+        image_paths = [str(p) for p in image_paths]
+    else:
+        raise ValueError(f"Input path not found: {input_path}")
     
-    print("\n✓ Training completed!")
-    print(f"Best mIoU: {trainer.best_miou:.4f}")
+    print(f"\nFound {len(image_paths)} images")
+    
+    # Create output directory
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Inference
+    for image_path in tqdm(image_paths, desc='Processing'):
+        # Predict
+        result = inferencer.predict(image_path)
+        pred = result['pred']
+        
+        # Filename
+        filename = Path(image_path).stem
+        
+        # Visualize
+        vis = inferencer.visualize(pred)
+        vis_path = output_dir / f'{filename}_seg.png'
+        Image.fromarray(vis).save(vis_path)
+        
+        # Overlay (optional)
+        if args.overlay:
+            original_image = np.array(Image.open(image_path).convert('RGB'))
+            # Resize original to match prediction
+            original_resized = cv2.resize(
+                original_image,
+                (pred.shape[1], pred.shape[0])
+            )
+            overlay = inferencer.overlay(original_resized, pred, alpha=0.5)
+            overlay_path = output_dir / f'{filename}_overlay.png'
+            Image.fromarray(overlay).save(overlay_path)
+        
+        # Save raw prediction (optional)
+        if args.save_raw:
+            raw_path = output_dir / f'{filename}_raw.png'
+            Image.fromarray(pred).save(raw_path)
+    
+    print(f"\n✓ Inference completed!")
+    print(f"Results saved to: {output_dir}")
 
 
 if __name__ == '__main__':
