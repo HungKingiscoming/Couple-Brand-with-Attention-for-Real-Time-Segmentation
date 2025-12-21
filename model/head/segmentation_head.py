@@ -44,9 +44,7 @@ class GCNetHead(BaseDecodeHead):
         use_gated_fusion: bool = True,
         **kwargs
     ):
-        # ✅ Set input_transform to handle dict inputs
-        if 'input_transform' not in kwargs:
-            kwargs['input_transform'] = None
+
         
         super().__init__(**kwargs)
         
