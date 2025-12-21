@@ -44,9 +44,7 @@ class GCNetHead(BaseDecodeHead):
         use_gated_fusion: bool = True,
         **kwargs
     ):
-        # ✅ Set input_transform to handle dict inputs
-        if 'input_transform' not in kwargs:
-            kwargs['input_transform'] = None
+
         
         super().__init__(**kwargs)
         
@@ -54,7 +52,7 @@ class GCNetHead(BaseDecodeHead):
         
         if decode_enabled:
             # ✅ Use decoder with proper skip channels
-            from decoder import LightweightDecoder
+            from model.decoder.lightweight_decoder import LightweightDecoder
             
             self.decoder = LightweightDecoder(
                 in_channels=self.in_channels,     # c5 channels (64)
