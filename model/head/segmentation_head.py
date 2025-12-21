@@ -52,7 +52,7 @@ class GCNetHead(BaseDecodeHead):
         
         if decode_enabled:
             # ✅ Use decoder with proper skip channels
-            from decoder import LightweightDecoder
+            from model.decoder.lightweight_decoder import LightweightDecoder
             
             self.decoder = LightweightDecoder(
                 in_channels=self.in_channels,     # c5 channels (64)
