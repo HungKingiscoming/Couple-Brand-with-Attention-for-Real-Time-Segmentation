@@ -4,13 +4,21 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import List, Tuple, Optional
 
-from mmcv.cnn import ConvModule
-from mmengine.model import BaseModule
+# Lưu code vào file: custom_components.py
 
-from mmseg.models.decode_heads.decode_head import BaseDecodeHead
-from mmseg.models.utils import resize
-from mmseg.registry import MODELS
-from mmseg.utils import OptConfigType, SampleList
+# Sau đó import:
+# Sau đó import:
+from components.components import (
+    ConvModule,
+    BaseModule,
+    build_norm_layer,
+    build_activation_layer,
+    resize,
+    DAPPM,
+    BaseDecodeHead,
+    OptConfigType,
+    SampleList
+)
 
 
 # ============================================

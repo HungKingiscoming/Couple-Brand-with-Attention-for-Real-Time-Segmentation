@@ -1,13 +1,11 @@
 from .base import BaseSegmentationDataset
 from .cityscapes import CityscapesDataset
-from .pascal_voc import PascalVOCDataset
 from .camvid import CamVidDataset
 from .custom import CustomDataset
 
 # Dataset registry for easy lookup
 DATASET_REGISTRY = {
     'cityscapes': CityscapesDataset,
-    'pascal_voc': PascalVOCDataset,
     'camvid': CamVidDataset,
     'custom': CustomDataset,
 }

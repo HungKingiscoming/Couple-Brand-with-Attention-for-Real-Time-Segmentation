@@ -128,7 +128,7 @@ class CityscapesCustomDataset(Dataset):
         """
         Returns:
             image: (3, H, W) normalized tensor
-            label: (H, W) long tensor with class indices
+            label: (H, W) long tensor with train_id indices (0-18, 255 for ignore)
         """
         img_path, label_path = self.samples[idx]
         
@@ -136,9 +136,13 @@ class CityscapesCustomDataset(Dataset):
         image = Image.open(img_path).convert('RGB')
         image = np.array(image)
         
-        # Load label (grayscale)
+        # Load label (grayscale) - contains original IDs
         label = Image.open(label_path)
-        label = np.array(label, dtype=np.int64)
+        label = np.array(label, dtype=np.uint8)
+        
+        # ✅ CRITICAL: Convert ID to train_id using lookup table
+        # This maps: 7->0, 8->1, ..., 33->18, others->255
+        label = self.label_map[label]
         
         # Apply transforms
         transformed = self.transforms(image=image, mask=label)
@@ -150,6 +154,28 @@ class CityscapesCustomDataset(Dataset):
             label = torch.from_numpy(label).long()
         
         return image, label
+    
+    def get_class_distribution(self) -> Dict[int, int]:
+        """
+        Compute class distribution in dataset (useful for class weights)
+        
+        Returns:
+            Dict mapping train_id -> pixel count
+        """
+        print("Computing class distribution...")
+        class_counts = {i: 0 for i in range(19)}
+        
+        for idx in tqdm(range(len(self)), desc="Scanning labels"):
+            _, label_path = self.samples[idx]
+            label = Image.open(label_path)
+            label = np.array(label, dtype=np.uint8)
+            label = self.label_map[label]
+            
+            # Count pixels per class
+            for class_id in range(19):
+                class_counts[class_id] += (label == class_id).sum()
+        
+        return class_counts
 
 
 # ============================================
@@ -242,8 +268,9 @@ def create_dataloaders(
     batch_size: int = 8,
     num_workers: int = 4,
     img_size: Tuple[int, int] = (512, 1024),  # Smaller for training speed
-    pin_memory: bool = True
-) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    pin_memory: bool = True,
+    compute_class_weights: bool = False
+) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.Tensor]]:
     """
     Create train and validation dataloaders
     
@@ -254,22 +281,49 @@ def create_dataloaders(
         num_workers: Number of worker processes
         img_size: Target image size (H, W)
         pin_memory: Whether to pin memory for faster GPU transfer
+        compute_class_weights: Whether to compute class weights for balancing
     
     Returns:
-        (train_loader, val_loader)
+        (train_loader, val_loader, class_weights)
     """
     # Create datasets
     train_dataset = CityscapesCustomDataset(
         txt_file=train_txt,
         transforms=get_train_transforms(img_size=img_size),
-        img_size=img_size
+        img_size=img_size,
+        label_mapping='train_id'  # Use train_id mapping
     )
     
     val_dataset = CityscapesCustomDataset(
         txt_file=val_txt,
         transforms=get_val_transforms(img_size=img_size),
-        img_size=img_size
+        img_size=img_size,
+        label_mapping='train_id'  # Use train_id mapping
     )
+    
+    # Compute class weights (optional)
+    class_weights = None
+    if compute_class_weights:
+        print("\n📊 Computing class weights for balanced training...")
+        class_counts = train_dataset.get_class_distribution()
+        
+        # Convert to weights: inverse frequency
+        total_pixels = sum(class_counts.values())
+        class_weights = []
+        
+        print("\nClass distribution:")
+        for class_id in range(19):
+            count = class_counts[class_id]
+            freq = count / total_pixels if total_pixels > 0 else 0
+            weight = 1.0 / (freq + 1e-8)
+            class_weights.append(weight)
+            print(f"  Class {class_id:2d}: {count:12d} pixels ({freq*100:5.2f}%) -> weight: {weight:.4f}")
+        
+        # Normalize weights
+        class_weights = torch.tensor(class_weights, dtype=torch.float32)
+        class_weights = class_weights / class_weights.sum() * 19  # Normalize to mean=1
+        
+        print(f"\n✓ Class weights computed: {class_weights.tolist()}")
     
     # Create dataloaders
     train_loader = torch.utils.data.DataLoader(
@@ -290,9 +344,9 @@ def create_dataloaders(
         drop_last=False
     )
     
-    print(f"Train batches: {len(train_loader)}")
-    print(f"Val batches: {len(val_loader)}")
+    print(f"\n✓ Train batches: {len(train_loader)}")
+    print(f"✓ Val batches: {len(val_loader)}")
     
-    return train_loader, val_loader
+    return train_loader, val_loader, class_weights
 
 

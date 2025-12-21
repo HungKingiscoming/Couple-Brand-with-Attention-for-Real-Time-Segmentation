@@ -4,9 +4,17 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Dict, List, Optional, Tuple
 
-from components.framework.engine.model import BaseModule
-from components.framework.utils.typing import OptConfigType
-
+from components.components import (
+    ConvModule,
+    BaseModule,
+    build_norm_layer,
+    build_activation_layer,
+    resize,
+    DAPPM,
+    BaseDecodeHead,
+    OptConfigType,
+    SampleList
+)
 
 # ============================================
 # DISTILLATION LOSSES

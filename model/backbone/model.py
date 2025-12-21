@@ -4,16 +4,22 @@ import torch.nn.functional as F
 from torch import Tensor
 import math
 import warnings
-from typing import List, Tuple, Union
+from typing import List, Tuple, Union, Dict
 
-from mmcv.cnn import ConvModule, build_norm_layer, build_activation_layer
-from mmengine.model import BaseModule
-from mmengine.model.utils import _BatchNormXd
 
-from mmseg.models.utils import DAPPM, resize
-from mmseg.registry import MODELS
-from mmseg.utils import OptConfigType
-
+# Sau đó import:
+from components.components import (
+    ConvModule,
+    BaseModule,
+    build_norm_layer,
+    build_activation_layer,
+    resize,
+    DAPPM,
+    BaseDecodeHead,
+    OptConfigType,
+    SampleList
+)
+from components.components import BATCH_NORM_TYPES, NORM_TYPES
 # Try to import FlashAttention
 try:
     from flash_attn import flash_attn_qkvpacked_func
@@ -461,7 +467,7 @@ class GCBlock(nn.Module):
         if conv is None:
             return 0, 0
         
-        if isinstance(conv, (nn.SyncBatchNorm, nn.BatchNorm2d, _BatchNormXd)):
+        if isinstance(conv, (nn.SyncBatchNorm, nn.BatchNorm2d, BATCH_NORM_TYPES)):
             if not hasattr(self, 'id_tensor'):
                 kernel_value = torch.zeros(
                     (self.in_channels, self.in_channels, 3, 3),
@@ -570,7 +576,7 @@ class GatedFusion(nn.Module):
 # IMPROVED GCNET BACKBONE
 # ============================================
 
-@MODELS.register_module()
+
 class GCNetImproved(BaseModule):
     """
     GCNet Improved Backbone with FlashAttention

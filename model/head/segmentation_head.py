@@ -4,15 +4,18 @@ import torch.nn as nn
 from torch import Tensor
 from typing import Dict
 
-from components.cnn import (
+# Sau đó import:
+from components.components import (
     ConvModule,
+    BaseModule,
     build_norm_layer,
-    build_activation_layer
+    build_activation_layer,
+    resize,
+    DAPPM,
+    BaseDecodeHead,
+    OptConfigType,
+    SampleList
 )
-from components.framework.models.decode_heads import BaseDecodeHead
-from components.framework.models.utils import resize
-from components.framework.utils.typing import OptConfigType, Dict
-
 
 
 class GCNetHead(BaseDecodeHead):
