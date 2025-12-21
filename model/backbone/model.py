@@ -7,7 +7,7 @@ import warnings
 from typing import List, Tuple, Union, Dict
 
 
-# Sau đó import:
+# Import components
 from components.components import (
     ConvModule,
     BaseModule,
@@ -20,24 +20,60 @@ from components.components import (
     SampleList
 )
 from components.components import BATCH_NORM_TYPES, NORM_TYPES
-# Try to import FlashAttention
+
+# ============================================
+# FLASH ATTENTION SETUP (FIXED)
+# ============================================
+
+FLASH_ATTN_AVAILABLE = False
+flash_attn_func = None
+
 try:
-    from flash_attn import flash_attn_qkvpacked_func
+    # Thử import theo cách mới (v2.x)
+    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func as _flash_attn_func
     FLASH_ATTN_AVAILABLE = True
+    flash_attn_func = _flash_attn_func
+    print("✓ FlashAttention v2 loaded successfully")
 except ImportError:
-    FLASH_ATTN_AVAILABLE = False
-    warnings.warn(
-        "FlashAttention not available. Install with: "
-        "pip install flash-attn --no-build-isolation"
-    )
+    try:
+        # Fallback: import từ interface
+        from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
+        FLASH_ATTN_AVAILABLE = True
+        print("✓ FlashAttention loaded from interface")
+    except ImportError:
+        warnings.warn(
+            "FlashAttention not available. Install with:\n"
+            "pip install flash-attn --no-build-isolation\n"
+            "Requirements: CUDA >= 12.3, H100/A100 GPU"
+        )
+
+
+def check_flash_attention_support():
+    """Kiểm tra xem FlashAttention có thể chạy không"""
+    if not FLASH_ATTN_AVAILABLE:
+        return False
+    
+    if not torch.cuda.is_available():
+        return False
+    
+    # Check GPU capability (cần compute capability >= 8.0 cho Ampere+)
+    device_capability = torch.cuda.get_device_capability()
+    if device_capability[0] < 8:
+        warnings.warn(
+            f"GPU compute capability {device_capability} < 8.0. "
+            "FlashAttention requires Ampere (A100), Ada (RTX 4090), or Hopper (H100) GPUs."
+        )
+        return False
+    
+    return True
 
 
 # ============================================
-# ATTENTION MODULES
+# ATTENTION MODULES (FIXED)
 # ============================================
 
 class FlashAttentionBlock(nn.Module):
-    """FlashAttention block with pre-norm and residual connection"""
+    """FlashAttention block với xử lý đúng chuẩn"""
     
     def __init__(
         self,
@@ -49,7 +85,7 @@ class FlashAttentionBlock(nn.Module):
         causal: bool = False
     ):
         super().__init__()
-        assert dim % num_heads == 0, f"dim {dim} should be divisible by num_heads {num_heads}"
+        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
         
         self.dim = dim
         self.num_heads = num_heads
@@ -57,13 +93,27 @@ class FlashAttentionBlock(nn.Module):
         self.scale = self.head_dim ** -0.5
         self.causal = causal
         
+        # Pre-norm cho gradient stability
         self.norm = nn.LayerNorm(dim, eps=1e-6)
+        
+        # QKV projection
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        
+        # Output projection
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         
+        # Dropout cho attention
         self.attn_drop_prob = attn_drop
         self.attn_drop = nn.Dropout(attn_drop)
+        
+        # Check FlashAttention support khi khởi tạo
+        self.can_use_flash = check_flash_attention_support()
+        if not self.can_use_flash:
+            warnings.warn(
+                f"FlashAttentionBlock initialized but FlashAttention not available. "
+                f"Will use standard attention fallback."
+            )
     
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -74,33 +124,48 @@ class FlashAttentionBlock(nn.Module):
         """
         B, N, C = x.shape
         
-        # Pre-norm for better gradient flow
+        # Pre-norm
         x_norm = self.norm(x)
         
-        # QKV projection
+        # QKV projection: (B, N, 3*C) -> (B, N, 3, num_heads, head_dim)
         qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim)
         
-        # Use FlashAttention if available and on CUDA
-        if FLASH_ATTN_AVAILABLE and x.is_cuda:
-            out = flash_attn_qkvpacked_func(
-                qkv,
-                dropout_p=self.attn_drop_prob if self.training else 0.0,
-                softmax_scale=self.scale,
-                causal=self.causal
-            )
-            out = out.reshape(B, N, C)
+        # ===== FLASHATTENTION (FIXED) =====
+        if self.can_use_flash and x.is_cuda:
+            try:
+                # Đảm bảo dtype phù hợp (fp16 hoặc bf16)
+                if qkv.dtype not in [torch.float16, torch.bfloat16]:
+                    # FlashAttention chỉ support fp16/bf16
+                    original_dtype = qkv.dtype
+                    qkv = qkv.to(torch.float16)
+                    use_fp16 = True
+                else:
+                    original_dtype = None
+                    use_fp16 = False
+                
+                # FlashAttention expects: (batch, seqlen, 3, nheads, headdim)
+                # Shape đã đúng rồi!
+                out = flash_attn_qkvpacked_func(
+                    qkv,
+                    dropout_p=self.attn_drop_prob if self.training else 0.0,
+                    softmax_scale=self.scale,
+                    causal=self.causal
+                )
+                # Output shape: (B, N, num_heads, head_dim)
+                
+                # Convert back nếu cần
+                if use_fp16:
+                    out = out.to(original_dtype)
+                
+                # Reshape: (B, N, num_heads, head_dim) -> (B, N, C)
+                out = out.reshape(B, N, C)
+                
+            except Exception as e:
+                warnings.warn(f"FlashAttention failed: {e}. Falling back to standard attention.")
+                out = self._standard_attention(qkv, B, N, C)
         else:
-            # Fallback to standard scaled dot-product attention
-            q, k, v = qkv.unbind(2)
-            q = q.transpose(1, 2)  # (B, num_heads, N, head_dim)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-            
-            out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            # Fallback to standard attention
+            out = self._standard_attention(qkv, B, N, C)
         
         # Output projection
         out = self.proj(out)
@@ -108,10 +173,42 @@ class FlashAttentionBlock(nn.Module):
         
         # Residual connection
         return x + out
+    
+    def _standard_attention(self, qkv: Tensor, B: int, N: int, C: int) -> Tensor:
+        """Standard scaled dot-product attention fallback"""
+        # qkv shape: (B, N, 3, num_heads, head_dim)
+        q, k, v = qkv.unbind(2)  # Each: (B, N, num_heads, head_dim)
+        
+        # Transpose to: (B, num_heads, N, head_dim)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        
+        # Attention scores: (B, num_heads, N, N)
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        
+        if self.causal:
+            # Causal mask
+            mask = torch.triu(
+                torch.ones(N, N, device=q.device, dtype=torch.bool),
+                diagonal=1
+            )
+            attn = attn.masked_fill(mask, float('-inf'))
+        
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+        
+        # Apply attention: (B, num_heads, N, head_dim)
+        out = attn @ v
+        
+        # Reshape: (B, num_heads, N, head_dim) -> (B, N, C)
+        out = out.transpose(1, 2).reshape(B, N, C)
+        
+        return out
 
 
 class FlashAttentionStage(nn.Module):
-    """Stacked FlashAttention blocks with FFN (Transformer block)"""
+    """Stacked FlashAttention blocks với FFN (như Transformer block)"""
     
     def __init__(
         self,
@@ -147,15 +244,15 @@ class FlashAttentionStage(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         """
         Args:
-            x: (B, N, C)
+            x: (B, N, C) - flattened spatial features
         Returns:
             out: (B, N, C)
         """
         for layer in self.layers:
-            # Attention with residual (already in FlashAttentionBlock)
+            # Attention (có residual bên trong)
             x = layer['attn'](x)
             
-            # FFN with pre-norm and residual
+            # FFN với pre-norm và residual
             x = x + layer['mlp'](layer['norm'](x))
         
         return x
@@ -182,7 +279,7 @@ class SEModule(nn.Module):
 
 
 # ============================================
-# GCBLOCK
+# GCBLOCK (Unchanged - đã đúng)
 # ============================================
 
 class Block1x1(BaseModule):
@@ -573,20 +670,19 @@ class GatedFusion(nn.Module):
 
 
 # ============================================
-# IMPROVED GCNET BACKBONE
+# IMPROVED GCNET BACKBONE (FIXED)
 # ============================================
-
 
 class GCNetImproved(BaseModule):
     """
-    GCNet Improved Backbone with FlashAttention
+    GCNet Improved Backbone với FlashAttention (FIXED)
     
     Improvements:
-    - FlashAttention in semantic branch + bottleneck
-    - SE modules for channel attention
-    - Dual-branch architecture (semantic + detail)
-    - Enhanced bottleneck with DAPPM
-    - Reparameterizable GCBlocks
+    - ✅ FlashAttention được sử dụng đúng cách với dtype checking
+    - ✅ Automatic fallback nếu hardware không support
+    - ✅ SE modules cho channel attention
+    - ✅ Dual-branch architecture
+    - ✅ Enhanced bottleneck với DAPPM
     """
     
     def __init__(
@@ -614,7 +710,7 @@ class GCNetImproved(BaseModule):
         self.channels = channels
         self.ppm_channels = ppm_channels
         self.num_blocks_per_stage = num_blocks_per_stage
-        self.use_flash_attention = use_flash_attention and FLASH_ATTN_AVAILABLE
+        self.use_flash_attention = use_flash_attention and check_flash_attention_support()
         self.flash_attn_stage = flash_attn_stage
         self.use_se = use_se
         self.align_corners = align_corners
@@ -622,13 +718,13 @@ class GCNetImproved(BaseModule):
         self.act_cfg = act_cfg
         self.deploy = deploy
         
-        if use_flash_attention and not FLASH_ATTN_AVAILABLE:
+        if use_flash_attention and not self.use_flash_attention:
             warnings.warn(
-                "FlashAttention requested but not available. "
-                "Falling back to standard attention."
+                "FlashAttention requested but not available or GPU not supported. "
+                "Using standard attention fallback."
             )
         
-        # ✅ STAGE 1: First conv (H/2)
+        # Stage 1: First conv (H/2)
         self.stage1_conv = ConvModule(
             in_channels=in_channels,
             out_channels=channels,
@@ -639,7 +735,7 @@ class GCNetImproved(BaseModule):
             act_cfg=act_cfg
         )
         
-        # ✅ STAGE 2: Second conv + blocks (H/4)
+        # Stage 2: Second conv + blocks (H/4)
         stage2_layers = [
             ConvModule(
                 in_channels=channels,
@@ -666,7 +762,7 @@ class GCNetImproved(BaseModule):
         
         self.stage2 = nn.Sequential(*stage2_layers)
         
-        # ✅ STAGE 3 (Stem): Downsample + GCBlocks (H/8)
+        # Stage 3 (Stem): Downsample + GCBlocks (H/8)
         stage3_layers = [
             GCBlock(
                 in_channels=channels,
@@ -725,7 +821,7 @@ class GCNetImproved(BaseModule):
         
         self.semantic_branch_layers.append(nn.Sequential(*stage4_sem))
         
-        # Stage 4 FlashAttention (if enabled)
+        # Stage 4 FlashAttention
         if self.use_flash_attention and flash_attn_stage == 4:
             self.stage4_attention = FlashAttentionStage(
                 dim=channels * 4,
@@ -785,7 +881,7 @@ class GCNetImproved(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    act=False,  # No activation on last block
+                    act=False,
                     deploy=deploy
                 )
             )
@@ -837,7 +933,7 @@ class GCNetImproved(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    act=False,  # No activation on last block
+                    act=False,
                     deploy=deploy
                 )
             )
@@ -883,7 +979,7 @@ class GCNetImproved(BaseModule):
         )
         
         # ======================================
-        # BOTTLENECK
+        # BOTTLENECK (FIXED)
         # ======================================
         bottleneck_modules = [
             DAPPM(
@@ -917,7 +1013,7 @@ class GCNetImproved(BaseModule):
                 SEModule(channels * 4, reduction=se_reduction)
             )
         
-        self.spp = nn.Sequential(*bottleneck_modules)
+        self.spp = nn.ModuleList(bottleneck_modules)
         
         # Initialize weights
         self.init_weights()
@@ -934,22 +1030,22 @@ class GCNetImproved(BaseModule):
     
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """
-        Forward pass with all skip connections
+        Forward pass với all skip connections
         
         Returns:
             Dict with keys: 'c1', 'c2', 'c3', 'c4', 'c5'
         """
         outputs = {}
         
-        # ✅ Stage 1 (H/2)
+        # Stage 1 (H/2)
         c1 = self.stage1_conv(x)
         outputs['c1'] = c1
         
-        # ✅ Stage 2 (H/4)
+        # Stage 2 (H/4)
         c2 = self.stage2(c1)
         outputs['c2'] = c2
         
-        # ✅ Stage 3 (H/8) - Stem output
+        # Stage 3 (H/8) - Stem output
         c3 = self.stage3(c2)
         outputs['c3'] = c3
         
@@ -957,7 +1053,7 @@ class GCNetImproved(BaseModule):
         x_s = self.semantic_branch_layers[0](c3)  # Semantic (H/16)
         x_d = self.detail_branch_layers[0](c3)     # Detail (H/8)
         
-        # Apply FlashAttention if enabled at stage 4
+        # Apply FlashAttention at stage 4 (FIXED)
         if self.stage4_attention is not None:
             B, C, H, W = x_s.shape
             x_s_flat = self._reshape_for_attention(x_s)
@@ -971,7 +1067,7 @@ class GCNetImproved(BaseModule):
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear', 
                           align_corners=self.align_corners)
         
-        # ✅ Save C4 for auxiliary head (H/16 semantic features)
+        # Save C4 cho auxiliary head
         outputs['c4'] = x_s
         
         # Stage 5
@@ -984,11 +1080,11 @@ class GCNetImproved(BaseModule):
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear',
                           align_corners=self.align_corners)
         
-        # Stage 6 + Bottleneck
+        # Stage 6
         x_d = self.detail_branch_layers[2](self.relu(x_d))
         x_s = self.semantic_branch_layers[2](self.relu(x_s))
         
-        # Apply bottleneck modules
+        # Apply bottleneck modules (FIXED)
         for module in self.spp:
             if isinstance(module, DAPPM):
                 x_s = module(x_s)
@@ -1004,14 +1100,14 @@ class GCNetImproved(BaseModule):
         x_s = resize(x_s, size=out_size, mode='bilinear',
                     align_corners=self.align_corners)
         
-        # ✅ Final fusion (H/8)
+        # Final fusion (H/8)
         c5 = x_d + x_s
         outputs['c5'] = c5
         
         return outputs
     
     def switch_to_deploy(self):
-        """Switch all GCBlocks to deploy mode for inference speedup"""
+        """Switch all GCBlocks to deploy mode"""
         for m in self.modules():
             if isinstance(m, GCBlock):
                 m.switch_to_deploy()
@@ -1038,5 +1134,3 @@ class GCNetImproved(BaseModule):
                     nn.init.trunc_normal_(m.weight, std=0.02)
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
-
-
