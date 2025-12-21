@@ -990,8 +990,7 @@ class GCNetImproved(BaseModule):
                 kernel_sizes=[5, 9, 17, 33],
                 strides=[2, 4, 8, 16],
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
-                align_corners=align_corners
+                act_cfg=act_cfg
             )
         ]
         
