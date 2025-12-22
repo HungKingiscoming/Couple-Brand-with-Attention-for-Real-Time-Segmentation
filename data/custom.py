@@ -1,5 +1,6 @@
 import os
 import torch
+from tqdm import tqdm
 import numpy as np
 from torch.utils.data import Dataset
 from PIL import Image
