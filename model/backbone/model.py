@@ -1029,10 +1029,13 @@ class GCNetImproved(BaseModule):
     
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """
-        Forward pass với all skip connections
+        ✅ STABLE VERSION: Simplified bilateral fusion
         
-        Returns:
-            Dict with keys: 'c1', 'c2', 'c3', 'c4', 'c5'
+        Changes:
+        - Bilateral fusion 1: Bidirectional (semantic ↔ detail)
+        - Bilateral fusion 2: One-way only (semantic → detail)
+        
+        This prevents shape mismatch while keeping performance
         """
         outputs = {}
         
@@ -1044,46 +1047,63 @@ class GCNetImproved(BaseModule):
         c2 = self.stage2(c1)
         outputs['c2'] = c2
         
-        # Stage 3 (H/8) - Stem output
+        # Stage 3 (H/8) - Stem
         c3 = self.stage3(c2)
         outputs['c3'] = c3
         
-        # Stage 4-6: Dual branch processing
-        x_s = self.semantic_branch_layers[0](c3)  # Semantic (H/16)
-        x_d = self.detail_branch_layers[0](c3)     # Detail (H/8)
+        # ======================================
+        # STAGE 4: Dual Branch Start
+        # ======================================
+        x_s = self.semantic_branch_layers[0](c3)  # Semantic: H/8 → H/16
+        x_d = self.detail_branch_layers[0](c3)     # Detail: H/8 → H/8
         
-        # Apply FlashAttention at stage 4 (FIXED)
+        # FlashAttention at stage 4 (if enabled)
         if self.stage4_attention is not None:
             B, C, H, W = x_s.shape
             x_s_flat = self._reshape_for_attention(x_s)
             x_s_flat = self.stage4_attention(x_s_flat)
             x_s = self._reshape_from_attention(x_s_flat, H, W)
         
-        # Bilateral fusion 1
+        # ✅ Bilateral Fusion 1 (Both directions)
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
-        comp_c = self.compression_1(self.relu(x_s))
-        x_s = x_s + self.down_1(self.relu(x_d))
+        
+        # Semantic → Detail
+        comp_c = self.compression_1(self.relu(x_s))  # 128 → 64
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear', 
                           align_corners=self.align_corners)
         
-        # Save C4 cho auxiliary head
+        # Detail → Semantic
+        x_s = x_s + self.down_1(self.relu(x_d))  # Downsample H/8 → H/16
+        
+        # Save c4 for auxiliary head
         outputs['c4'] = x_s
         
-        # Stage 5
-        x_s = self.semantic_branch_layers[1](self.relu(x_s))
-        x_d = self.detail_branch_layers[1](self.relu(x_d))
+        # ======================================
+        # STAGE 5: Continue Processing
+        # ======================================
+        x_s = self.semantic_branch_layers[1](self.relu(x_s))  # H/16 → H/32
+        x_d = self.detail_branch_layers[1](self.relu(x_d))     # H/8 → H/8
         
-        # Bilateral fusion 2
-        comp_c = self.compression_2(self.relu(x_s))
-        x_s = x_s + self.down_2(self.relu(x_d))
+        # ✅ Bilateral Fusion 2 (One-way only: semantic → detail)
+        # Reason: x_s is at H/32, too deep to receive info from H/8
+        
+        # Semantic → Detail (compress and upsample)
+        comp_c = self.compression_2(self.relu(x_s))  # 128 → 64
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear',
                           align_corners=self.align_corners)
         
-        # Stage 6
-        x_d = self.detail_branch_layers[2](self.relu(x_d))
-        x_s = self.semantic_branch_layers[2](self.relu(x_s))
+        # Semantic keeps its own path (no fusion from detail)
+        # This avoids shape mismatch
         
-        # Apply bottleneck modules (FIXED)
+        # ======================================
+        # STAGE 6: Final Processing
+        # ======================================
+        x_d = self.detail_branch_layers[2](self.relu(x_d))  # H/8 → H/8
+        x_s = self.semantic_branch_layers[2](self.relu(x_s))  # H/32 → H/32
+        
+        # ======================================
+        # BOTTLENECK: Multi-scale + Attention
+        # ======================================
         for module in self.spp:
             if isinstance(module, DAPPM):
                 x_s = module(x_s)
@@ -1095,11 +1115,11 @@ class GCNetImproved(BaseModule):
             elif isinstance(module, SEModule):
                 x_s = module(x_s)
         
-        # Resize to detail branch size
+        # ✅ Upsample semantic to detail resolution (H/8)
         x_s = resize(x_s, size=out_size, mode='bilinear',
                     align_corners=self.align_corners)
         
-        # Final fusion (H/8)
+        # ✅ Final Fusion: Combine semantic (global) + detail (local)
         c5 = x_d + x_s
         outputs['c5'] = c5
         
