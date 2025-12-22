@@ -117,9 +117,17 @@ class DecoderStage(nn.Module):
         # Upsample
         x = self.upsample(x)
         
-        # Process skip connection if provided
         if skip is not None:
             skip = self.skip_conv(skip)
+            
+            # ✅ FIXED: Resize skip to match x's spatial size
+            if skip.shape[-2:] != x.shape[-2:]:
+                skip = F.interpolate(
+                    skip,
+                    size=x.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
             
             # Fusion
             if self.fusion is not None:
