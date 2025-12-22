@@ -141,10 +141,7 @@ class GCNetAuxHead(BaseDecodeHead):
         Same as BaseDecodeHead
     """
     
-    def __init__(self, **kwargs):
-        if 'input_transform' not in kwargs:
-            kwargs['input_transform'] = None
-        
+    def __init__(self, **kwargs):       
         super().__init__(**kwargs)
         
         # Simple conv layers
