@@ -532,7 +532,8 @@ def main():
         val_txt=args.val_txt,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        img_size=(512, 1024)  # Adjust as needed
+        img_size=(512, 1024),  # Adjust as needed
+        compute_class_weights=True
     )
     
     # ============================================
