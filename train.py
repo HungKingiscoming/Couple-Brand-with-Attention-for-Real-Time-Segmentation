@@ -527,7 +527,7 @@ def main():
     # CREATE DATALOADERS
     # ============================================
     
-    train_loader, val_loader = create_dataloaders(
+    train_loader, val_loader, class_weights = create_dataloaders(
         train_txt=args.train_txt,
         val_txt=args.val_txt,
         batch_size=args.batch_size,
