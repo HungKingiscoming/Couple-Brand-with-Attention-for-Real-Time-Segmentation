@@ -57,7 +57,6 @@ class GCNetHead(BaseDecodeHead):
             self.decoder = LightweightDecoder(
                 in_channels=self.in_channels,     # c5 channels (64)
                 channels=decoder_channels,         # 128
-                skip_channels=skip_channels,       # [64, 32, 32]
                 use_gated_fusion=use_gated_fusion,
                 norm_cfg=self.norm_cfg,
                 act_cfg=self.act_cfg
