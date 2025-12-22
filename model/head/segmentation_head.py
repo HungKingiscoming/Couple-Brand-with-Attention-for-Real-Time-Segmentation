@@ -106,7 +106,7 @@ class GCNetHead(BaseDecodeHead):
         
         if self.decode_enabled and self.decoder is not None:
             # ✅ Use decoder with skip connections [c3, c2, c1]
-            skip_connections = [c3, c2, c1]
+            skip_connections = [ c2, c1, None]
             
             x = self.decoder(c5, skip_connections)  # -> (B, 16, H, W)
         else:
