@@ -1120,10 +1120,14 @@ class GCNetImproved(BaseModule):
             elif isinstance(module, SEModule):
                 x_s = module(x_s)
         
-        # ✅ Upsample semantic to detail resolution (H/8)
+        # STEP 1: Resize spatial (H/32 → H/8)
+        x_s = resize(x_s, size=out_size, mode='bilinear',
+                    align_corners=self.align_corners)
+        
+        # STEP 2: Project channels (128 → 64)
         x_s = self.final_proj(x_s)
         
-        # ✅ Final Fusion: Combine semantic (global) + detail (local)
+        # STEP 3: Final Fusion
         c5 = x_d + x_s
         outputs['c5'] = c5
         
