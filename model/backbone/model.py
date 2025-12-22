@@ -977,7 +977,13 @@ class GCNetImproved(BaseModule):
             norm_cfg=norm_cfg,
             act_cfg=None
         )
-        
+        self.final_proj = ConvModule(
+            in_channels=channels * 4,  # 128
+            out_channels=channels * 2,  # 64
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
+        )
         # ======================================
         # BOTTLENECK (FIXED)
         # ======================================
@@ -992,8 +998,7 @@ class GCNetImproved(BaseModule):
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
-        ]
-        
+        ]        
         # Global FlashAttention in bottleneck
         if self.use_flash_attention:
             bottleneck_modules.append(
@@ -1116,8 +1121,7 @@ class GCNetImproved(BaseModule):
                 x_s = module(x_s)
         
         # ✅ Upsample semantic to detail resolution (H/8)
-        x_s = resize(x_s, size=out_size, mode='bilinear',
-                    align_corners=self.align_corners)
+        x_s = self.final_proj(x_s)
         
         # ✅ Final Fusion: Combine semantic (global) + detail (local)
         c5 = x_d + x_s
