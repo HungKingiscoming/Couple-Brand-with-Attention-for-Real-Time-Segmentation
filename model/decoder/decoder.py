@@ -27,15 +27,7 @@ from components.components import (
 
 class DecoderStage(nn.Module):
     """
-    Single decoder stage with gated skip connection
-    
-    Args:
-        in_channels (int): Input channels from encoder
-        skip_channels (int): Skip connection channels
-        out_channels (int): Output channels
-        use_gated_fusion (bool): Whether to use gated fusion
-        norm_cfg (dict): Normalization config
-        act_cfg (dict): Activation config
+    Optimized decoder stage with proper channel handling
     """
     
     def __init__(
@@ -51,7 +43,7 @@ class DecoderStage(nn.Module):
         
         self.use_gated_fusion = use_gated_fusion
         
-        # Upsample
+        # Upsample decoder features
         self.upsample = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
             ConvModule(
@@ -64,19 +56,20 @@ class DecoderStage(nn.Module):
             )
         )
         
-        # Skip connection processing
+        # ✅ CRITICAL: Project skip to match decoder channels
+        # This enables gated fusion to work properly
         if skip_channels != out_channels:
-            self.skip_conv = ConvModule(
+            self.skip_proj = ConvModule(
                 in_channels=skip_channels,
-                out_channels=out_channels,
+                out_channels=out_channels,  # Match decoder output!
                 kernel_size=1,
                 norm_cfg=norm_cfg,
-                act_cfg=None
+                act_cfg=act_cfg
             )
         else:
-            self.skip_conv = nn.Identity()
+            self.skip_proj = nn.Identity()
         
-        # Gated fusion or simple addition
+        # Gated fusion (works because channels match now)
         if use_gated_fusion:
             self.fusion = GatedFusion(
                 channels=out_channels,
@@ -85,7 +78,7 @@ class DecoderStage(nn.Module):
         else:
             self.fusion = None
         
-        # Refinement
+        # Refinement convs
         self.refine = nn.Sequential(
             ConvModule(
                 in_channels=out_channels,
@@ -108,19 +101,21 @@ class DecoderStage(nn.Module):
     def forward(self, x: Tensor, skip: Optional[Tensor] = None) -> Tensor:
         """
         Args:
-            x: Input from previous decoder stage (B, C_in, H, W)
-            skip: Skip connection from encoder (B, C_skip, H*2, W*2)
+            x: Decoder features (B, C_in, H, W)
+            skip: Skip connection (B, C_skip, H_skip, W_skip)
         
         Returns:
-            out: Decoded features (B, C_out, H*2, W*2)
+            Refined features (B, C_out, H*2, W*2)
         """
-        # Upsample
+        # Upsample decoder features
         x = self.upsample(x)
         
+        # Process skip connection
         if skip is not None:
-            skip = self.skip_conv(skip)
+            # Project skip to match decoder channels
+            skip = self.skip_proj(skip)
             
-            # ✅ FIXED: Resize skip to match x's spatial size
+            # Resize skip if spatial size doesn't match
             if skip.shape[-2:] != x.shape[-2:]:
                 skip = F.interpolate(
                     skip,
@@ -129,7 +124,7 @@ class DecoderStage(nn.Module):
                     align_corners=False
                 )
             
-            # Fusion
+            # Fusion (channels now match!)
             if self.fusion is not None:
                 x = self.fusion(skip, x)
             else:
