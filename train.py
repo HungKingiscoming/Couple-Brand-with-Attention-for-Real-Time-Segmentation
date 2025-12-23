@@ -596,24 +596,24 @@ def main():
         use_wandb=args.use_wandb
     )
     if args.resume is not None:
-    print(f"Resuming from checkpoint: {args.resume}")
-    checkpoint = torch.load(args.resume, map_location=device)
-
-    model.load_state_dict(checkpoint['model_state_dict'])
-    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-
-    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-
-    if trainer.scaler is not None and 'scaler_state_dict' in checkpoint:
-        trainer.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-
-    trainer.current_epoch = checkpoint['epoch'] + 1
-    trainer.best_miou = checkpoint.get('best_miou', 0.0)
-
-    print(
-        f"✓ Resumed at epoch {trainer.current_epoch}, "
-        f"best mIoU = {trainer.best_miou:.4f}"
+        print(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=device)
+    
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+        if trainer.scaler is not None and 'scaler_state_dict' in checkpoint:
+            trainer.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+    
+        trainer.current_epoch = checkpoint['epoch'] + 1
+        trainer.best_miou = checkpoint.get('best_miou', 0.0)
+    
+        print(
+            f"✓ Resumed at epoch {trainer.current_epoch}, "
+            f"best mIoU = {trainer.best_miou:.4f}"
     )
     # ============================================
     # TRAIN
