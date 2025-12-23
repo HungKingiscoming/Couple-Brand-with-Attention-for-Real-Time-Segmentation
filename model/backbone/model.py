@@ -477,7 +477,7 @@ class GCBlock(nn.Module):
         stride: Union[int, Tuple[int]] = 1,
         padding: Union[int, Tuple[int]] = 1,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         act: bool = True,
         deploy: bool = False
     ):
@@ -700,7 +700,7 @@ class GCNetImproved(BaseModule):
         se_reduction: int = 16,
         align_corners: bool = False,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         init_cfg: OptConfigType = None,
         deploy: bool = False
     ):
