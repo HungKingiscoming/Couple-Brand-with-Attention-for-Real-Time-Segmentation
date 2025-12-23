@@ -561,7 +561,8 @@ def main():
     
     criterion = SegmentationLoss(
         aux_weight=0.4,
-        ignore_index=255
+        ignore_index=255,
+        class_weights=class_weights.to(device)
     )
     
     optimizer = optim.AdamW(
