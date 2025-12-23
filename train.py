@@ -476,7 +476,7 @@ def main():
     )
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Learning rate')
-    parser.add_argument('--num_workers', type=int, default=4,
+    parser.add_argument('--num_workers', type=int, default=6,
                         help='Number of workers')
     parser.add_argument('--use_wandb', action='store_true',
                         help='Use Weights & Biases logging')
