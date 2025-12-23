@@ -266,7 +266,7 @@ class SEModule(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.fc = nn.Sequential(
             nn.Linear(channels, max(channels // reduction, 8), bias=False),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Linear(max(channels // reduction, 8), channels, bias=False),
             nn.Sigmoid()
         )
