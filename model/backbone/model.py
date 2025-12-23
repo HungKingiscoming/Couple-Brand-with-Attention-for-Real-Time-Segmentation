@@ -1071,14 +1071,15 @@ class GCNetImproved(BaseModule):
         
         # ✅ Bilateral Fusion 1 (Both directions)
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
-        
+        x_s_relu = self.relu(x_s)
+        x_d_relu = self.relu(x_d)
         # Semantic → Detail
-        comp_c = self.compression_1(self.relu(x_s))  # 128 → 64
+        comp_c = self.compression_1(x_s_relu)  # 128 → 64
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear', 
                           align_corners=self.align_corners)
         
         # Detail → Semantic
-        x_s = x_s + self.down_1(self.relu(x_d))  # Downsample H/8 → H/16
+        x_s = x_s + self.down_1(x_d_relu)  # Downsample H/8 → H/16
         
         # Save c4 for auxiliary head
         outputs['c4'] = x_s
