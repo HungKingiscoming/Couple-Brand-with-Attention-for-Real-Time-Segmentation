@@ -76,10 +76,12 @@ class ValidationDataset(Dataset):
             for line in f:
                 line = line.strip()
                 if line:
-                    img_path, label_path = line.split(',')
-                    self.samples.append((img_path, label_path))
+                    parts = line.split(',')
+                    if len(parts) == 2:
+                        img_path, label_path = parts
+                        self.samples.append((img_path.strip(), label_path.strip()))
         
-        print(f"Loaded {len(self.samples)} validation samples from {txt_file}")
+        print(f"✓ Loaded {len(self.samples)} validation samples from {txt_file}")
         
         # Build transforms
         self.transform = A.Compose([
@@ -379,7 +381,7 @@ class Tester:
                 vis_dir = save_dir / 'visualizations'
                 vis_dir.mkdir(exist_ok=True)
         
-        print("Starting evaluation...")
+        print("\n🚀 Starting evaluation...")
         
         for batch in tqdm(dataloader, desc="Evaluating"):
             img = batch['image']  # (B, 3, H, W)
@@ -433,15 +435,15 @@ class Tester:
     def print_results(self, results: Dict):
         """Pretty print evaluation results"""
         print("\n" + "="*60)
-        print("EVALUATION RESULTS")
+        print("📊 EVALUATION RESULTS")
         print("="*60)
         
         print(f"\n{'Metric':<30} {'Value':>10}")
         print("-"*60)
-        print(f"{'mIoU (Mean IoU)':<30} {results['mIoU']:>10.4f}")
-        print(f"{'mDice (Mean Dice)':<30} {results['mDice']:>10.4f}")
-        print(f"{'Pixel Accuracy':<30} {results['Pixel_Accuracy']:>10.4f}")
-        print(f"{'Mean Class Accuracy':<30} {results['Mean_Accuracy']:>10.4f}")
+        print(f"{'mIoU (Mean IoU)':<30} {results['mIoU']*100:>9.2f}%")
+        print(f"{'mDice (Mean Dice)':<30} {results['mDice']*100:>9.2f}%")
+        print(f"{'Pixel Accuracy':<30} {results['Pixel_Accuracy']*100:>9.2f}%")
+        print(f"{'Mean Class Accuracy':<30} {results['Mean_Accuracy']*100:>9.2f}%")
         
         print("\n" + "-"*60)
         print("Per-Class IoU:")
@@ -450,7 +452,7 @@ class Tester:
         for i, (cls_name, iou) in enumerate(zip(CITYSCAPES_CLASSES, 
                                                 results['IoU_per_class'])):
             if not np.isnan(iou):
-                print(f"{cls_name:<30} {iou:>10.4f}")
+                print(f"{cls_name:<30} {iou*100:>9.2f}%")
         
         print("="*60 + "\n")
     
@@ -479,7 +481,7 @@ class Tester:
         with open(json_path, 'w') as f:
             json.dump(results_serializable, f, indent=4)
         
-        print(f"Results saved to {json_path}")
+        print(f"✅ Results saved to {json_path}")
 
 # ===================== LOAD MODEL =====================
 def load_model(ckpt_path: str, device: str) -> nn.Module:
@@ -514,21 +516,32 @@ def load_model(ckpt_path: str, device: str) -> nn.Module:
     else:
         model.load_state_dict(ckpt)
     
+    print(f"✅ Model loaded from {ckpt_path}")
+    
     return model
 
 # ===================== MAIN =====================
 def main():
-    parser = argparse.ArgumentParser(description='Validate GCNet Segmentation Model')
+    parser = argparse.ArgumentParser(
+        description='Test GCNet Segmentation Model on Validation Set',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Example:
+  python test.py \\
+      --checkpoint best_model.pth \\
+      --val_txt val.txt \\
+      --output_dir eval_results \\
+      --amp --save_vis
+        """
+    )
     
     # Model args
     parser.add_argument('--checkpoint', type=str, required=True,
                        help='Path to model checkpoint')
     
     # Data args
-    parser.add_argument('--img_dir', type=str, required=True,
-                       help='Validation images directory')
-    parser.add_argument('--gt_dir', type=str, required=True,
-                       help='Ground truth labels directory')
+    parser.add_argument('--val_txt', type=str, required=True,
+                       help='Path to validation txt file (format: img_path,label_path)')
     parser.add_argument('--img_size', type=int, nargs=2, default=[512, 1024],
                        help='Image size (H W)')
     
@@ -558,22 +571,25 @@ def main():
     
     args = parser.parse_args()
     
+    print("="*60)
+    print("🔬 GCNet Validation Testing")
+    print("="*60)
+    
     # Device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
+    print(f"Device: {device}")
     
     # Load model
-    print(f"Loading model from {args.checkpoint}...")
+    print(f"\n📦 Loading model...")
     model = load_model(args.checkpoint, device)
-    print("Model loaded successfully!")
     
     # Create dataset
-    print(f"Loading validation dataset from {args.img_dir}...")
+    print(f"\n📂 Loading validation dataset...")
     val_dataset = ValidationDataset(
-        img_dir=args.img_dir,
-        gt_dir=args.gt_dir,
+        txt_file=args.val_txt,
         img_size=tuple(args.img_size),
-        ignore_index=args.ignore_index
+        ignore_index=args.ignore_index,
+        use_label_mapping=True  # Convert Cityscapes ID to train_id
     )
     
     val_loader = DataLoader(
@@ -584,7 +600,9 @@ def main():
         pin_memory=True
     )
     
-    print(f"Found {len(val_dataset)} validation images")
+    print(f"✓ Found {len(val_dataset)} validation images")
+    print(f"✓ Batch size: {args.batch_size}")
+    print(f"✓ Total batches: {len(val_loader)}")
     
     # Create tester
     tester = Tester(
@@ -605,8 +623,8 @@ def main():
         save_visualizations=args.save_vis
     )
     
-    print("\n✓ Evaluation completed!")
-    print(f"Results saved to {args.output_dir}")
+    print("\n✅ Evaluation completed!")
+    print(f"📁 Results saved to {args.output_dir}")
 
 if __name__ == "__main__":
     main()
