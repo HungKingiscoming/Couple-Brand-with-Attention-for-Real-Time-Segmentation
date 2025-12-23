@@ -37,7 +37,7 @@ class DecoderStage(nn.Module):
         out_channels: int,
         use_gated_fusion: bool = True,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=True)
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
     ):
         super().__init__()
         
@@ -188,7 +188,7 @@ class LightweightDecoder(BaseModule):
         num_stages: int = 3,
         use_gated_fusion: bool = True,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         init_cfg: OptConfigType = None
     ):
         super().__init__(init_cfg)
