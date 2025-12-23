@@ -36,25 +36,52 @@ CITYSCAPES_CLASSES = [
 
 # ===================== DATASET =====================
 class ValidationDataset(Dataset):
-    """Dataset for validation with ground truth labels"""
+    """Dataset for validation with ground truth labels from txt file"""
+    
+    # Cityscapes ID to train_id mapping
+    ID_TO_TRAINID = {
+        7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
+        21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
+        28: 15, 31: 16, 32: 17, 33: 18, -1: 255
+    }
     
     def __init__(
         self,
-        img_dir: str,
-        gt_dir: str,
+        txt_file: str,
         img_size: Tuple[int, int] = (512, 1024),
-        ignore_index: int = 255
+        ignore_index: int = 255,
+        use_label_mapping: bool = True
     ):
-        self.img_dir = Path(img_dir)
-        self.gt_dir = Path(gt_dir)
+        """
+        Args:
+            txt_file: Path to txt file with format: image_path,label_path
+            img_size: Target image size (H, W)
+            ignore_index: Ignore index value
+            use_label_mapping: Convert Cityscapes ID to train_id (0-18)
+        """
         self.img_size = img_size
         self.ignore_index = ignore_index
+        self.use_label_mapping = use_label_mapping
         
-        # Get image list
-        self.img_paths = sorted(list(self.img_dir.glob('*.png')) + 
-                               list(self.img_dir.glob('*.jpg')))
+        # Create label mapping lookup table
+        self.label_map = np.ones(256, dtype=np.uint8) * ignore_index
+        if use_label_mapping:
+            for id_val, train_id in self.ID_TO_TRAINID.items():
+                if train_id != 255:
+                    self.label_map[id_val] = train_id
         
-        # Build transform
+        # Read txt file
+        self.samples = []
+        with open(txt_file, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    img_path, label_path = line.split(',')
+                    self.samples.append((img_path, label_path))
+        
+        print(f"Loaded {len(self.samples)} validation samples from {txt_file}")
+        
+        # Build transforms
         self.transform = A.Compose([
             A.Resize(*img_size),
             A.Normalize(mean=[0.485, 0.456, 0.406],
@@ -67,22 +94,20 @@ class ValidationDataset(Dataset):
         ])
     
     def __len__(self):
-        return len(self.img_paths)
+        return len(self.samples)
     
     def __getitem__(self, idx):
+        img_path, label_path = self.samples[idx]
+        
         # Load image
-        img_path = self.img_paths[idx]
         img = np.array(Image.open(img_path).convert('RGB'))
         
         # Load ground truth
-        gt_name = img_path.stem.replace('_leftImg8bit', '_gtFine_labelIds')
-        gt_path = self.gt_dir / f'{gt_name}.png'
+        gt = np.array(Image.open(label_path), dtype=np.uint8)
         
-        if not gt_path.exists():
-            # Try alternative naming
-            gt_path = self.gt_dir / f'{img_path.stem}.png'
-        
-        gt = np.array(Image.open(gt_path))
+        # Apply label mapping if needed
+        if self.use_label_mapping:
+            gt = self.label_map[gt]
         
         # Apply transforms
         img_transformed = self.transform(image=img)['image']
@@ -91,7 +116,7 @@ class ValidationDataset(Dataset):
         return {
             'image': img_transformed,
             'gt': torch.from_numpy(gt_transformed).long(),
-            'img_path': str(img_path),
+            'img_path': img_path,
             'original_size': img.shape[:2]
         }
 
