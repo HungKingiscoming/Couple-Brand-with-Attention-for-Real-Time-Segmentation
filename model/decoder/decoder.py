@@ -137,7 +137,12 @@ class DecoderStage(nn.Module):
 
 
 class GatedFusion(nn.Module):
-    """Gated fusion for adaptive feature selection"""
+    """
+    Gated fusion for adaptive feature selection
+    
+    Now works properly because skip and decoder features
+    have matching channels after projection
+    """
     
     def __init__(
         self,
@@ -157,12 +162,7 @@ class GatedFusion(nn.Module):
     
     def forward(self, enc_feat: Tensor, dec_feat: Tensor) -> Tensor:
         """
-        Args:
-            enc_feat: Encoder features (skip connection)
-            dec_feat: Decoder features
-        
-        Returns:
-            Fused features
+        Both features must have same channels (ensured by skip_proj)
         """
         concat = torch.cat([enc_feat, dec_feat], dim=1)
         gate = self.sigmoid(self.gate_conv(concat))
@@ -171,28 +171,21 @@ class GatedFusion(nn.Module):
 
 class LightweightDecoder(BaseModule):
     """
-    Lightweight decoder for GCNet Improved
+    ✅ OPTIMIZED: Proper channel handling + Gated fusion
     
-    Features:
-    - Progressive upsampling (4 stages)
-    - Gated skip connections
-    - Depthwise separable convolutions for efficiency
-    
-    Args:
-        in_channels (int): Input channels from backbone
-        channels (int): Base decoder channels
-        num_stages (int): Number of decoder stages (default: 4)
-        use_gated_fusion (bool): Whether to use gated fusion
-        norm_cfg (dict): Normalization config
-        act_cfg (dict): Activation config
-        init_cfg (dict): Initialization config
+    Architecture:
+    - Input: c5 (64 channels @ H/8)
+    - Stage 1: H/8 → H/4 (128 → 64) + skip c2 (32→64)
+    - Stage 2: H/4 → H/2 (64 → 32) + skip c1 (32→32)
+    - Stage 3: H/2 → H (32 → 16) + no skip
+    - Output: 16 channels @ H
     """
     
     def __init__(
         self,
-        in_channels: int = 64,  # channels * 2 from backbone
+        in_channels: int = 64,
         channels: int = 128,
-        num_stages: int = 4,
+        num_stages: int = 3,
         use_gated_fusion: bool = True,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
@@ -204,7 +197,7 @@ class LightweightDecoder(BaseModule):
         self.channels = channels
         self.num_stages = num_stages
         
-        # Input projection
+        # Input projection: 64 → 128
         self.input_proj = ConvModule(
             in_channels=in_channels,
             out_channels=channels,
@@ -216,54 +209,46 @@ class LightweightDecoder(BaseModule):
         # Decoder stages
         self.stages = nn.ModuleList()
         
-        # Stage 1: H/8 -> H/4 (channels -> channels//2)
+        # ✅ Stage 1: H/8 → H/4
+        # Input: 128, Skip: c2 (32), Output: 64
+        # Skip projection: 32 → 64 (inside DecoderStage)
         self.stages.append(
             DecoderStage(
-                in_channels=channels,
-                skip_channels=in_channels,  # Skip from backbone stage 3
-                out_channels=channels // 2,
+                in_channels=channels,           # 128
+                skip_channels=32,               # c2 will be projected to 64
+                out_channels=channels // 2,     # 64
                 use_gated_fusion=use_gated_fusion,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
         )
         
-        # Stage 2: H/4 -> H/2 (channels//2 -> channels//4)
+        # ✅ Stage 2: H/4 → H/2
+        # Input: 64, Skip: c1 (32), Output: 32
+        # Skip already matches (32 == 32), no projection needed
         self.stages.append(
             DecoderStage(
-                in_channels=channels // 2,
-                skip_channels=channels // 4,  # Skip from backbone stage 2
-                out_channels=channels // 4,
+                in_channels=channels // 2,      # 64
+                skip_channels=32,               # c1 (already 32)
+                out_channels=channels // 4,     # 32
                 use_gated_fusion=use_gated_fusion,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
         )
         
-        # Stage 3: H/2 -> H (channels//4 -> channels//8)
+        # ✅ Stage 3: H/2 → H
+        # Input: 32, Skip: None, Output: 16
         self.stages.append(
             DecoderStage(
-                in_channels=channels // 4,
-                skip_channels=channels // 8,  # Skip from backbone stage 1
-                out_channels=channels // 8,
-                use_gated_fusion=use_gated_fusion,
+                in_channels=channels // 4,      # 32
+                skip_channels=32,               # Dummy (won't be used)
+                out_channels=channels // 8,     # 16
+                use_gated_fusion=False,         # No skip, no fusion
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
         )
-        
-        # Optional Stage 4: H -> H (no skip)
-        if num_stages > 3:
-            self.stages.append(
-                DecoderStage(
-                    in_channels=channels // 8,
-                    skip_channels=0,
-                    out_channels=channels // 8,
-                    use_gated_fusion=False,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg
-                )
-            )
     
     def forward(
         self, 
@@ -272,12 +257,11 @@ class LightweightDecoder(BaseModule):
     ) -> Tensor:
         """
         Args:
-            x: Input features (B, C, H/8, W/8)
-            skip_connections: List of skip connections from encoder
-                [stage1, stage2, stage3] at resolutions [H/4, H/2, H]
+            x: c5 features (B, 64, H/8, W/8)
+            skip_connections: [c2, c1, None] at [H/4, H/2, H]
         
         Returns:
-            Decoded features (B, C//8, H, W) or (B, C//8, H/2, W/2)
+            Decoded features (B, 16, H, W)
         """
         # Input projection
         x = self.input_proj(x)
