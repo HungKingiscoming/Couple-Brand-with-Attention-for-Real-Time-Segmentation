@@ -509,7 +509,11 @@ def load_model(ckpt_path: str, device: str) -> nn.Module:
     model = GCNetSegmentor(19, backbone_cfg, head_cfg)
     
     # Load checkpoint
-    ckpt = torch.load(ckpt_path, map_location=device)
+    ckpt = torch.load(
+        ckpt_path,
+        map_location=device,
+        weights_only=False   # 🔥 quan trọng
+    )
     
     if 'model_state_dict' in ckpt:
         model.load_state_dict(ckpt['model_state_dict'])
