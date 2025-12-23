@@ -267,6 +267,8 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.criterion = criterion
+        self.last_autosave_time = time.time()
+        self.autosave_interval = 15 * 60  # 15 phút
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
@@ -336,6 +338,13 @@ class Trainer:
             if (batch_idx + 1) % self.log_interval == 0:
                 avg_loss = total_loss / (batch_idx + 1)
                 pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+            if time.time() - self.last_autosave_time > self.autosave_interval:
+                self.save_checkpoint(
+                    filename='autosave.pth',
+                    epoch=self.current_epoch,
+                    metrics={'iter': batch_idx}
+                )
+                self.last_autosave_time = time.time()
         
         # Compute epoch metrics
         num_batches = len(self.train_loader)
@@ -421,7 +430,6 @@ class Trainer:
                 self.save_checkpoint(f'epoch_{epoch}.pth', epoch, all_metrics)
     
     def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
-        """Save checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
@@ -429,13 +437,17 @@ class Trainer:
             'metrics': metrics,
             'best_miou': self.best_miou
         }
-        
+    
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-        
+    
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+    
         save_path = self.save_dir / filename
         torch.save(checkpoint, save_path)
-        print(f"Saved checkpoint to {save_path}")
+        print(f"[Checkpoint] Saved to {save_path}")
+
 
 
 # ============================================
@@ -456,6 +468,12 @@ def main():
                         help='Number of epochs')
     parser.add_argument('--batch_size', type=int, default=8,
                         help='Batch size')
+    parser.add_argument(
+        '--resume',
+        type=str,
+        default=None,
+        help='Path to checkpoint to resume from'
+    )
     parser.add_argument('--lr', type=float, default=1e-3,
                         help='Learning rate')
     parser.add_argument('--num_workers', type=int, default=4,
@@ -577,7 +595,26 @@ def main():
         save_dir=args.save_dir,
         use_wandb=args.use_wandb
     )
-    
+    if args.resume is not None:
+    print(f"Resuming from checkpoint: {args.resume}")
+    checkpoint = torch.load(args.resume, map_location=device)
+
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    if trainer.scaler is not None and 'scaler_state_dict' in checkpoint:
+        trainer.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+    trainer.current_epoch = checkpoint['epoch'] + 1
+    trainer.best_miou = checkpoint.get('best_miou', 0.0)
+
+    print(
+        f"✓ Resumed at epoch {trainer.current_epoch}, "
+        f"best mIoU = {trainer.best_miou:.4f}"
+    )
     # ============================================
     # TRAIN
     # ============================================
