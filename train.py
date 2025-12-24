@@ -424,24 +424,24 @@ class Trainer:
                 self.save_checkpoint(f'epoch_{epoch}.pth', epoch, all_metrics)
     
         
-        def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
-            checkpoint = {
-                'epoch': epoch,
-                'model_state_dict': self.model.state_dict(),
-                'optimizer_state_dict': self.optimizer.state_dict(),
-                'metrics': metrics,
-                'best_miou': self.best_miou
-            }
+    def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'metrics': metrics,
+            'best_miou': self.best_miou
+        }
         
-            if self.scheduler is not None:
-                checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-        
-            if self.scaler is not None:
-                checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-        
-            save_path = self.save_dir / filename
-            torch.save(checkpoint, save_path)
-            print(f"[Checkpoint] Saved to {save_path}")
+        if self.scheduler is not None:
+            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+    
+        if self.scaler is not None:
+            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+    
+        save_path = self.save_dir / filename
+        torch.save(checkpoint, save_path)
+        print(f"[Checkpoint] Saved to {save_path}")
 
 
 
