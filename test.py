@@ -488,7 +488,13 @@ def load_model(ckpt_path: str, device: str) -> nn.Module:
     """Load trained model from checkpoint with auto-detect deploy mode"""
     
     # Load checkpoint first to check keys
-    ckpt = torch.load(ckpt_path, map_location=device)
+    try:
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    except Exception as e:
+        print(f"⚠️  Error loading checkpoint with weights_only=False: {e}")
+        print("Trying with weights_only=True...")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
+    
     state_dict = ckpt.get('model_state_dict', ckpt)
     
     # Auto-detect deploy mode from checkpoint keys
