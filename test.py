@@ -485,7 +485,29 @@ class Tester:
 
 # ===================== LOAD MODEL =====================
 def load_model(ckpt_path: str, device: str) -> nn.Module:
-    """Load trained model from checkpoint"""
+    """Load trained model from checkpoint with auto-detect deploy mode"""
+    
+    # Load checkpoint first to check keys
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state_dict = ckpt.get('model_state_dict', ckpt)
+    
+    # Auto-detect deploy mode from checkpoint keys
+    # If checkpoint has 'reparam_3x3' only -> deploy=True
+    # If checkpoint has 'branch_3x3', 'branch_1x1' -> deploy=False
+    has_reparam = any('reparam_3x3' in k for k in state_dict.keys())
+    has_branches = any('branch_3x3' in k for k in state_dict.keys())
+    
+    if has_branches and not has_reparam:
+        deploy_mode = False
+        print("🔧 Detected training mode checkpoint (with branches)")
+    elif has_reparam and not has_branches:
+        deploy_mode = True
+        print("🚀 Detected deploy mode checkpoint (reparameterized)")
+    else:
+        # Default fallback
+        deploy_mode = False
+        print("⚠️  Could not auto-detect mode, using deploy=False")
+    
     backbone_cfg = {
         'in_channels': 3,
         'channels': 32,
@@ -496,7 +518,7 @@ def load_model(ckpt_path: str, device: str) -> nn.Module:
         'flash_attn_layers': 2,
         'flash_attn_heads': 8,
         'use_se': True,
-        'deploy': True
+        'deploy': deploy_mode
     }
 
     head_cfg = {
@@ -508,19 +530,27 @@ def load_model(ckpt_path: str, device: str) -> nn.Module:
 
     model = GCNetSegmentor(19, backbone_cfg, head_cfg)
     
-    # Load checkpoint
-    ckpt = torch.load(
-        ckpt_path,
-        map_location=device,
-        weights_only=False   # 🔥 quan trọng
-    )
-    
-    if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'])
-    else:
-        model.load_state_dict(ckpt)
-    
-    print(f"✅ Model loaded from {ckpt_path}")
+    # Load state dict
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"✅ Model loaded successfully (deploy={deploy_mode})")
+    except RuntimeError as e:
+        print(f"⚠️  Strict loading failed, trying non-strict mode...")
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        
+        if missing:
+            print(f"⚠️  Missing keys: {len(missing)}")
+            if len(missing) <= 10:
+                for k in missing:
+                    print(f"   - {k}")
+        
+        if unexpected:
+            print(f"⚠️  Unexpected keys: {len(unexpected)}")
+            if len(unexpected) <= 10:
+                for k in unexpected:
+                    print(f"   - {k}")
+        
+        print(f"✅ Model loaded with warnings")
     
     return model
 
