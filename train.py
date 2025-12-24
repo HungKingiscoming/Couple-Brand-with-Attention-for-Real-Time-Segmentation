@@ -392,6 +392,7 @@ class Trainer:
     
     def train(self, num_epochs: int):
         """Full training loop"""
+        start_epoch = self.current_epoch
         for epoch in range(num_epochs):
             self.current_epoch = epoch
             
