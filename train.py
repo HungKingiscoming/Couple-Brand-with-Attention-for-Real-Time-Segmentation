@@ -391,63 +391,57 @@ class Trainer:
         return val_metrics
     
     def train(self, num_epochs: int):
-        """Full training loop"""
-        start_epoch = self.current_epoch
-        for epoch in range(num_epochs):
+        start_epoch = self.current_epoch  # 🔥 LẤY EPOCH RESUME
+    
+        print(f"[Trainer] Start training from epoch {start_epoch}")
+    
+        for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
-            
-            # Train
+    
             train_metrics = self.train_epoch()
-            
-            # Validate
             val_metrics = self.validate()
-            
-            # Scheduler step
+    
             if self.scheduler is not None:
                 self.scheduler.step()
-            
-            # Combine metrics
+    
             all_metrics = {**train_metrics, **val_metrics}
-            
-            # Print
+    
             print(f"\nEpoch {epoch}/{num_epochs}")
             print(f"Train Loss: {all_metrics['train_loss']:.4f} | "
                   f"Train mIoU: {all_metrics['train_mIoU']:.4f}")
             print(f"Val Loss: {all_metrics['val_loss']:.4f} | "
                   f"Val mIoU: {all_metrics['val_mIoU']:.4f}")
-            
-            # Log to wandb
+    
             if self.use_wandb:
                 wandb.log(all_metrics, step=epoch)
-            
-            # Save best model
+    
             if val_metrics['val_mIoU'] > self.best_miou:
                 self.best_miou = val_metrics['val_mIoU']
                 self.save_checkpoint('best_model.pth', epoch, all_metrics)
-                print(f"✓ Saved best model with mIoU: {self.best_miou:.4f}")
-            
-            # Save latest
+                print(f"✓ Saved best model at epoch {epoch}")
+    
             if (epoch + 1) % 5 == 0:
                 self.save_checkpoint(f'epoch_{epoch}.pth', epoch, all_metrics)
     
-    def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
-        checkpoint = {
-            'epoch': epoch,
-            'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
-            'metrics': metrics,
-            'best_miou': self.best_miou
-        }
-    
-        if self.scheduler is not None:
-            checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-    
-        if self.scaler is not None:
-            checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-    
-        save_path = self.save_dir / filename
-        torch.save(checkpoint, save_path)
-        print(f"[Checkpoint] Saved to {save_path}")
+        
+        def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
+            checkpoint = {
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'metrics': metrics,
+                'best_miou': self.best_miou
+            }
+        
+            if self.scheduler is not None:
+                checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
+        
+            if self.scaler is not None:
+                checkpoint['scaler_state_dict'] = self.scaler.state_dict()
+        
+            save_path = self.save_dir / filename
+            torch.save(checkpoint, save_path)
+            print(f"[Checkpoint] Saved to {save_path}")
 
 
 
