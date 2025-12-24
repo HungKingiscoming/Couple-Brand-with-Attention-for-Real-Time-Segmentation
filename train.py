@@ -598,8 +598,12 @@ def main():
     )
     if args.resume is not None:
         print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-    
+        checkpoint = torch.load(
+            args.resume,
+            map_location=device,
+            weights_only=False   # 🔥 QUAN TRỌNG
+        )
+            
         model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
