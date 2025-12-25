@@ -11,13 +11,17 @@ import argparse
 import yaml
 from pathlib import Path
 import wandb
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # Import your modules
 from model.backbone.model import GCNetImproved
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import CityscapesCustomDataset, create_dataloaders
-from model.distillation import DistillationWrapper
+from model.distillation_complete import (
+    GCNetWithDistillation,
+    create_distillation_model,
+    get_default_configs
+)
 
 # ============================================
 # METRICS
@@ -50,7 +54,8 @@ class SegmentationMetrics:
         
         # Update confusion matrix
         for t, p in zip(target, pred):
-            self.confusion_matrix[t, p] += 1
+            if 0 <= t < self.num_classes and 0 <= p < self.num_classes:
+                self.confusion_matrix[t, p] += 1
     
     def compute_iou(self) -> np.ndarray:
         """Compute IoU per class"""
@@ -75,204 +80,55 @@ class SegmentationMetrics:
     
     def get_results(self) -> Dict[str, float]:
         """Get all metrics"""
+        iou_per_class = self.compute_iou()
         return {
             'mIoU': self.compute_miou(),
-            'pixel_acc': self.compute_pixel_acc()
+            'pixel_acc': self.compute_pixel_acc(),
+            'iou_per_class': iou_per_class
         }
 
 
 # ============================================
-# MODEL DEFINITION
+# TRAINER WITH DISTILLATION SUPPORT
 # ============================================
 
-class GCNetSegmentor(nn.Module):
-    """Complete segmentation model with backbone + head"""
+class DistillationTrainer:
+    """
+    Enhanced trainer with distillation support
     
-    def __init__(
-        self,
-        num_classes: int,
-        backbone_cfg: Dict,
-        head_cfg: Dict,
-        aux_head_cfg: Optional[Dict] = None
-    ):
-        super().__init__()
-        
-        # Backbone
-        self.backbone = GCNetImproved(**backbone_cfg)
-        
-        # Main decode head
-        self.decode_head = GCNetHead(
-            in_channels=head_cfg['in_channels'],
-            channels=head_cfg['channels'],
-            num_classes=num_classes,
-            decode_enabled=head_cfg.get('decode_enabled', True),
-            decoder_channels=head_cfg.get('decoder_channels', 128),
-            skip_channels=head_cfg.get('skip_channels', [64, 32, 32]),
-            use_gated_fusion=head_cfg.get('use_gated_fusion', True),
-            dropout_ratio=head_cfg.get('dropout_ratio', 0.1),
-            align_corners=head_cfg.get('align_corners', False)
-        )
-        
-        # Auxiliary head (optional, for deep supervision)
-        self.auxiliary_head = None
-        if aux_head_cfg is not None:
-            self.auxiliary_head = GCNetAuxHead(
-                in_channels=aux_head_cfg['in_channels'],
-                channels=aux_head_cfg['channels'],
-                num_classes=num_classes,
-                dropout_ratio=aux_head_cfg.get('dropout_ratio', 0.1),
-                align_corners=aux_head_cfg.get('align_corners', False)
-            )
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, 3, H, W)
-        Returns:
-            logits: (B, num_classes, H, W)
-        """
-        # Backbone
-        features = self.backbone(x)  # Dict: {c1, c2, c3, c4, c5}
-        
-        # Main head
-        logits = self.decode_head(features)
-        
-        return logits
-    
-    def forward_train(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Training forward with auxiliary outputs
-        
-        Returns:
-            Dict with 'main' and 'aux' logits
-        """
-        features = self.backbone(x)
-        
-        outputs = {}
-        outputs['main'] = self.decode_head(features)
-        
-        if self.auxiliary_head is not None:
-            outputs['aux'] = self.auxiliary_head(features)
-        
-        return outputs
-
-
-# ============================================
-# LOSS FUNCTIONS
-# ============================================
-
-class SegmentationLoss(nn.Module):
-    """Combined loss for segmentation with class weighting"""
-    
-    def __init__(
-        self,
-        aux_weight: float = 0.4,
-        ignore_index: int = 255,
-        use_ohem: bool = False,
-        ohem_thresh: float = 0.7,
-        class_weights: Optional[torch.Tensor] = None
-    ):
-        super().__init__()
-        self.aux_weight = aux_weight
-        self.ignore_index = ignore_index
-        self.use_ohem = use_ohem
-        self.ohem_thresh = ohem_thresh
-        
-        # ✅ Use class weights if provided
-        self.ce_loss = nn.CrossEntropyLoss(
-            weight=class_weights,
-            ignore_index=ignore_index
-        )
-        
-        if class_weights is not None:
-            print(f"✓ Using class weights for loss computation")
-            print(f"  Weights: {class_weights.tolist()}")
-    
-    def forward(
-        self, 
-        outputs: Dict[str, torch.Tensor], 
-        target: torch.Tensor
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            outputs: Dict with 'main' and optionally 'aux'
-            target: (B, H, W)
-        
-        Returns:
-            Dict of losses
-        """
-        losses = {}
-        
-        # Main loss
-        main_logits = outputs['main']
-        
-        # Resize if needed
-        if main_logits.shape[-2:] != target.shape[-2:]:
-            main_logits = nn.functional.interpolate(
-                main_logits,
-                size=target.shape[-2:],
-                mode='bilinear',
-                align_corners=False
-            )
-        
-        loss_main = self.ce_loss(main_logits, target)
-        losses['loss_main'] = loss_main
-        
-        # Auxiliary loss
-        if 'aux' in outputs:
-            aux_logits = outputs['aux']
-            
-            # Resize aux to target size
-            if aux_logits.shape[-2:] != target.shape[-2:]:
-                aux_logits = nn.functional.interpolate(
-                    aux_logits,
-                    size=target.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
-            
-            loss_aux = self.ce_loss(aux_logits, target)
-            losses['loss_aux'] = loss_aux * self.aux_weight
-        
-        # Total loss
-        losses['loss_total'] = sum(losses.values())
-        
-        return losses
-
-
-# ============================================
-# TRAINER
-# ============================================
-
-class Trainer:
-    """Training engine"""
+    Features:
+    - Standard training (no distillation)
+    - Distillation training (with teacher)
+    - Mixed precision training
+    - Auto-save & resume
+    - W&B logging
+    """
     
     def __init__(
         self,
         model: nn.Module,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        criterion: nn.Module,
         optimizer: optim.Optimizer,
         scheduler: Optional[object] = None,
         device: str = 'cuda',
         num_classes: int = 19,
+        use_distillation: bool = False,
         use_amp: bool = True,
         grad_clip: float = 1.0,
         log_interval: int = 10,
         save_dir: str = './checkpoints',
-        use_wandb: bool = False
+        use_wandb: bool = False,
+        class_weights: Optional[torch.Tensor] = None
     ):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.criterion = criterion
-        self.last_autosave_time = time.time()
-        self.autosave_interval = 15 * 60  # 15 phút
         self.optimizer = optimizer
         self.scheduler = scheduler
         self.device = device
         self.num_classes = num_classes
+        self.use_distillation = use_distillation
         self.use_amp = use_amp
         self.grad_clip = grad_clip
         self.log_interval = log_interval
@@ -280,8 +136,18 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.use_wandb = use_wandb
         
+        # Auto-save
+        self.last_autosave_time = time.time()
+        self.autosave_interval = 15 * 60  # 15 minutes
+        
         # Mixed precision scaler
         self.scaler = GradScaler() if use_amp else None
+        
+        # Loss function (for non-distillation mode)
+        self.criterion = nn.CrossEntropyLoss(
+            weight=class_weights,
+            ignore_index=255
+        ) if not use_distillation else None
         
         # Metrics
         self.metrics = SegmentationMetrics(num_classes=num_classes)
@@ -289,6 +155,15 @@ class Trainer:
         # Best model tracking
         self.best_miou = 0.0
         self.current_epoch = 0
+        
+        print(f"\n{'='*60}")
+        print(f"Trainer initialized:")
+        print(f"  Mode: {'Distillation' if use_distillation else 'Standard'}")
+        print(f"  Device: {device}")
+        print(f"  AMP: {use_amp}")
+        print(f"  Gradient clipping: {grad_clip}")
+        print(f"  Save dir: {save_dir}")
+        print(f"{'='*60}\n")
     
     def train_epoch(self) -> Dict[str, float]:
         """Train one epoch"""
@@ -296,21 +171,42 @@ class Trainer:
         self.metrics.reset()
         
         total_loss = 0.0
-        loss_dict_sum = {}
+        loss_components = {}
         
         pbar = tqdm(self.train_loader, desc=f'Train Epoch {self.current_epoch}')
         
         for batch_idx, (images, targets) in enumerate(pbar):
             images = images.to(self.device)
-            targets = targets.to(self.device).long()
+            targets = targets.to(self.device).squeeze(1).long()  # (B, H, W)
             
-            # Forward
+            # Forward & backward
             self.optimizer.zero_grad()
             
             with autocast(enabled=self.use_amp):
-                outputs = self.model.forward_train(images)
-                losses = self.criterion(outputs, targets)
-                loss = losses['loss_total']
+                if self.use_distillation:
+                    # Distillation mode
+                    losses = self.model.forward_train(images, targets.unsqueeze(1))
+                    loss = losses['loss']
+                    
+                    # Track all loss components
+                    for k, v in losses.items():
+                        if k != 'loss':
+                            loss_components[k] = loss_components.get(k, 0.0) + v.item()
+                else:
+                    # Standard mode
+                    logits = self.model(images)
+                    
+                    # Resize if needed
+                    if logits.shape[-2:] != targets.shape[-2:]:
+                        logits = nn.functional.interpolate(
+                            logits,
+                            size=targets.shape[-2:],
+                            mode='bilinear',
+                            align_corners=False
+                        )
+                    
+                    loss = self.criterion(logits, targets)
+                    losses = {'loss': loss}
             
             # Backward
             if self.use_amp:
@@ -326,18 +222,31 @@ class Trainer:
             
             # Update metrics
             with torch.no_grad():
-                pred = outputs['main'].argmax(dim=1)
+                if self.use_distillation:
+                    logits = self.model.forward_test(images)
+                else:
+                    logits = self.model(images)
+                
+                if logits.shape[-2:] != targets.shape[-2:]:
+                    logits = nn.functional.interpolate(
+                        logits,
+                        size=targets.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                
+                pred = logits.argmax(dim=1)
                 self.metrics.update(pred, targets)
             
-            # Accumulate losses
+            # Accumulate loss
             total_loss += loss.item()
-            for k, v in losses.items():
-                loss_dict_sum[k] = loss_dict_sum.get(k, 0.0) + v.item()
             
             # Update progress bar
             if (batch_idx + 1) % self.log_interval == 0:
                 avg_loss = total_loss / (batch_idx + 1)
                 pbar.set_postfix({'loss': f'{avg_loss:.4f}'})
+            
+            # Auto-save
             if time.time() - self.last_autosave_time > self.autosave_interval:
                 self.save_checkpoint(
                     filename='autosave.pth',
@@ -345,14 +254,19 @@ class Trainer:
                     metrics={'iter': batch_idx}
                 )
                 self.last_autosave_time = time.time()
+                print(f"\n✓ Auto-saved at epoch {self.current_epoch}, iter {batch_idx}")
         
         # Compute epoch metrics
         num_batches = len(self.train_loader)
         epoch_metrics = {
             'train_loss': total_loss / num_batches,
-            **{k: v / num_batches for k, v in loss_dict_sum.items()},
-            **{f'train_{k}': v for k, v in self.metrics.get_results().items()}
+            **{f'train_{k}': v for k, v in self.metrics.get_results().items() if k != 'iou_per_class'}
         }
+        
+        # Add loss components if distillation
+        if self.use_distillation and loss_components:
+            for k, v in loss_components.items():
+                epoch_metrics[f'train_{k}'] = v / num_batches
         
         return epoch_metrics
     
@@ -368,261 +282,592 @@ class Trainer:
         
         for images, targets in pbar:
             images = images.to(self.device)
-            targets = targets.to(self.device).long()
+            targets = targets.to(self.device).squeeze(1).long()
             
             # Forward
             with autocast(enabled=self.use_amp):
-                outputs = self.model.forward_train(images)
-                losses = self.criterion(outputs, targets)
-                loss = losses['loss_total']
+                if self.use_distillation:
+                    logits = self.model.forward_test(images)
+                else:
+                    logits = self.model(images)
+                
+                # Resize if needed
+                if logits.shape[-2:] != targets.shape[-2:]:
+                    logits = nn.functional.interpolate(
+                        logits,
+                        size=targets.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                
+                # Compute loss
+                loss = nn.functional.cross_entropy(
+                    logits,
+                    targets,
+                    ignore_index=255
+                )
             
             # Update metrics
-            pred = outputs['main'].argmax(dim=1)
+            pred = logits.argmax(dim=1)
             self.metrics.update(pred, targets)
             
             total_loss += loss.item()
         
         # Compute metrics
+        results = self.metrics.get_results()
         val_metrics = {
             'val_loss': total_loss / len(self.val_loader),
-            **{f'val_{k}': v for k, v in self.metrics.get_results().items()}
+            'val_mIoU': results['mIoU'],
+            'val_pixel_acc': results['pixel_acc']
         }
+        
+        # Per-class IoU (optional, for detailed logging)
+        if self.use_wandb:
+            iou_per_class = results['iou_per_class']
+            for i, iou in enumerate(iou_per_class):
+                if not np.isnan(iou):
+                    val_metrics[f'val_iou_class_{i}'] = iou
         
         return val_metrics
     
     def train(self, num_epochs: int):
-        start_epoch = self.current_epoch  # 🔥 LẤY EPOCH RESUME
-    
-        print(f"[Trainer] Start training from epoch {start_epoch}")
-    
+        """Main training loop"""
+        start_epoch = self.current_epoch
+        
+        print(f"\n{'='*60}")
+        print(f"Starting training from epoch {start_epoch} to {num_epochs}")
+        print(f"{'='*60}\n")
+        
         for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
-    
+            
+            # Train
             train_metrics = self.train_epoch()
+            
+            # Validate
             val_metrics = self.validate()
-    
+            
+            # Step scheduler
             if self.scheduler is not None:
                 self.scheduler.step()
-    
-            all_metrics = {**train_metrics, **val_metrics}
-    
-            print(f"\nEpoch {epoch}/{num_epochs}")
-            print(f"Train Loss: {all_metrics['train_loss']:.4f} | "
-                  f"Train mIoU: {all_metrics['train_mIoU']:.4f}")
-            print(f"Val Loss: {all_metrics['val_loss']:.4f} | "
-                  f"Val mIoU: {all_metrics['val_mIoU']:.4f}")
-    
+                current_lr = self.scheduler.get_last_lr()[0]
+            else:
+                current_lr = self.optimizer.param_groups[0]['lr']
+            
+            # Combine metrics
+            all_metrics = {
+                **train_metrics,
+                **val_metrics,
+                'learning_rate': current_lr
+            }
+            
+            # Print summary
+            print(f"\n{'='*60}")
+            print(f"Epoch {epoch}/{num_epochs-1}")
+            print(f"{'='*60}")
+            print(f"Train Loss: {train_metrics['train_loss']:.4f} | "
+                  f"Train mIoU: {train_metrics['train_mIoU']:.4f} | "
+                  f"Train Acc: {train_metrics['train_pixel_acc']:.4f}")
+            print(f"Val Loss:   {val_metrics['val_loss']:.4f} | "
+                  f"Val mIoU:   {val_metrics['val_mIoU']:.4f} | "
+                  f"Val Acc:   {val_metrics['val_pixel_acc']:.4f}")
+            print(f"LR: {current_lr:.6f}")
+            
+            # Print distillation loss components
+            if self.use_distillation:
+                distill_losses = [k for k in train_metrics.keys() if 'loss_' in k and k != 'train_loss']
+                if distill_losses:
+                    print("\nDistillation losses:")
+                    for k in distill_losses:
+                        print(f"  {k}: {train_metrics[k]:.4f}")
+            
+            print(f"{'='*60}\n")
+            
+            # Log to wandb
             if self.use_wandb:
                 wandb.log(all_metrics, step=epoch)
-    
+            
+            # Save best model
             if val_metrics['val_mIoU'] > self.best_miou:
                 self.best_miou = val_metrics['val_mIoU']
                 self.save_checkpoint('best_model.pth', epoch, all_metrics)
-                print(f"✓ Saved best model at epoch {epoch}")
-    
-            if (epoch + 1) % 5 == 0:
+                print(f"✓ Saved best model at epoch {epoch} (mIoU: {self.best_miou:.4f})")
+            
+            # Periodic checkpoint
+            if (epoch + 1) % 10 == 0:
                 self.save_checkpoint(f'epoch_{epoch}.pth', epoch, all_metrics)
-    
+                print(f"✓ Saved checkpoint at epoch {epoch}")
         
+        print(f"\n{'='*60}")
+        print(f"Training completed!")
+        print(f"Best mIoU: {self.best_miou:.4f}")
+        print(f"{'='*60}\n")
+    
     def save_checkpoint(self, filename: str, epoch: int, metrics: Dict):
+        """Save checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'metrics': metrics,
-            'best_miou': self.best_miou
+            'best_miou': self.best_miou,
+            'use_distillation': self.use_distillation
         }
         
         if self.scheduler is not None:
             checkpoint['scheduler_state_dict'] = self.scheduler.state_dict()
-    
+        
         if self.scaler is not None:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
-    
+        
         save_path = self.save_dir / filename
         torch.save(checkpoint, save_path)
-        print(f"[Checkpoint] Saved to {save_path}")
-
-
-
-# ============================================
-# MAIN TRAINING SCRIPT
-# ============================================
-
-def main():
-    parser = argparse.ArgumentParser(description='Train GCNet Improved')
-    parser.add_argument('--config', type=str, default='config.yaml',
-                        help='Path to config file')
-    parser.add_argument('--train_txt', type=str, required=True,
-                        help='Path to train txt file')
-    parser.add_argument('--val_txt', type=str, required=True,
-                        help='Path to validation txt file')
-    parser.add_argument('--save_dir', type=str, default='./checkpoints',
-                        help='Directory to save checkpoints')
-    parser.add_argument('--num_epochs', type=int, default=100,
-                        help='Number of epochs')
-    parser.add_argument('--batch_size', type=int, default=8,
-                        help='Batch size')
-    parser.add_argument(
-        '--resume',
-        type=str,
-        default=None,
-        help='Path to checkpoint to resume from'
-    )
-    parser.add_argument('--lr', type=float, default=1e-3,
-                        help='Learning rate')
-    parser.add_argument('--num_workers', type=int, default=6,
-                        help='Number of workers')
-    parser.add_argument('--use_wandb', action='store_true',
-                        help='Use Weights & Biases logging')
-    parser.add_argument('--wandb_project', type=str, default='gcnet-improved',
-                        help='W&B project name')
-    args = parser.parse_args()
     
-    # Device
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load checkpoint"""
+        print(f"Loading checkpoint from {checkpoint_path}...")
+        
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False
+        )
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        if self.scaler is not None and 'scaler_state_dict' in checkpoint:
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        self.current_epoch = checkpoint['epoch'] + 1
+        self.best_miou = checkpoint.get('best_miou', 0.0)
+        
+        print(f"✓ Resumed at epoch {self.current_epoch}, best mIoU = {self.best_miou:.4f}")
+
+
+# ============================================
+# CONFIGURATION HELPERS
+# ============================================
+
+def get_model_config(mode: str = 'standard') -> Tuple[Dict, Dict, Dict]:
+    """
+    Get model configurations for different modes
+    
+    Args:
+        mode: 'standard', 'small', 'large', or 'distillation'
+    
+    Returns:
+        backbone_cfg, head_cfg, aux_head_cfg
+    """
+    if mode == 'small':
+        # Small model (for student or fast training)
+        backbone_cfg = {
+            'in_channels': 3,
+            'channels': 16,
+            'ppm_channels': 64,
+            'num_blocks_per_stage': [2, 2, [3, 2], [3, 2], [2, 1]],
+            'use_flash_attention': False,
+            'use_se': True,
+            'deploy': False
+        }
+        head_cfg = {
+            'in_channels': 32,
+            'channels': 64,
+            'decode_enabled': True,
+            'decoder_channels': 64,
+            'skip_channels': [32, 16, 16],
+            'use_gated_fusion': True,
+            'dropout_ratio': 0.1,
+            'align_corners': False
+        }
+        aux_head_cfg = {
+            'in_channels': 64,
+            'channels': 32,
+            'dropout_ratio': 0.1,
+            'align_corners': False
+        }
+    
+    elif mode == 'standard':
+        # Standard model (balanced)
+        backbone_cfg = {
+            'in_channels': 3,
+            'channels': 32,
+            'ppm_channels': 128,
+            'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
+            'use_flash_attention': True,
+            'flash_attn_stage': 4,
+            'flash_attn_layers': 2,
+            'flash_attn_heads': 8,
+            'use_se': True,
+            'deploy': False
+        }
+        head_cfg = {
+            'in_channels': 64,
+            'channels': 128,
+            'decode_enabled': True,
+            'decoder_channels': 128,
+            'skip_channels': [64, 32, 32],
+            'use_gated_fusion': True,
+            'dropout_ratio': 0.1,
+            'align_corners': False
+        }
+        aux_head_cfg = {
+            'in_channels': 128,
+            'channels': 64,
+            'dropout_ratio': 0.1,
+            'align_corners': False
+        }
+    
+    elif mode == 'large':
+        # Large model (for teacher)
+        backbone_cfg = {
+            'in_channels': 3,
+            'channels': 48,
+            'ppm_channels': 192,
+            'num_blocks_per_stage': [5, 5, [6, 5], [6, 5], [3, 3]],
+            'use_flash_attention': True,
+            'flash_attn_stage': 4,
+            'flash_attn_layers': 3,
+            'flash_attn_heads': 12,
+            'use_se': True,
+            'deploy': False
+        }
+        head_cfg = {
+            'in_channels': 96,
+            'channels': 192,
+            'decode_enabled': True,
+            'decoder_channels': 192,
+            'skip_channels': [96, 48, 48],
+            'use_gated_fusion': True,
+            'dropout_ratio': 0.1,
+            'align_corners': False
+        }
+        aux_head_cfg = {
+            'in_channels': 192,
+            'channels': 96,
+            'dropout_ratio': 0.1,
+            'align_corners': False
+        }
+    
+    else:
+        raise ValueError(f"Unknown mode: {mode}")
+    
+    return backbone_cfg, head_cfg, aux_head_cfg
+
+
+# ============================================
+# MAIN TRAINING FUNCTIONS
+# ============================================
+
+def train_standard(args):
+    """Train without distillation"""
+    print("\n" + "="*60)
+    print("STANDARD TRAINING MODE")
+    print("="*60 + "\n")
+    
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
     
     # Initialize wandb
     if args.use_wandb:
-        wandb.init(project=args.wandb_project, config=vars(args))
+        wandb.init(
+            project=args.wandb_project,
+            name=f"{args.model_size}_standard",
+            config=vars(args)
+        )
     
-    # ============================================
-    # MODEL CONFIG
-    # ============================================
+    # Get model config
+    backbone_cfg, head_cfg, aux_head_cfg = get_model_config(args.model_size)
     
-    num_classes = 19  # Cityscapes
+    # Create model
+    from model.backbone.model import GCNetImproved
+    from model.head.segmentation_head import GCNetHead, GCNetAuxHead
     
-    backbone_cfg = {
-        'in_channels': 3,
-        'channels': 32,
-        'ppm_channels': 128,
-        'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
-        'use_flash_attention': True,
-        'flash_attn_stage': 4,
-        'flash_attn_layers': 2,
-        'flash_attn_heads': 8,
-        'use_se': True,
-        'deploy': False
-    }
-    
-    head_cfg = {
-        'in_channels': 64,  # channels * 2 from backbone
-        'channels': 128,
-        'decode_enabled': True,
-        'decoder_channels': 128,
-        'skip_channels': [64, 32, 32],  # c3, c2, c1
-        'use_gated_fusion': True,
-        'dropout_ratio': 0.1,
-        'align_corners': False
-    }
-    
-    aux_head_cfg = {
-        'in_channels': 128,  # channels * 4 from c4
-        'channels': 64,
-        'dropout_ratio': 0.1,
-        'align_corners': False
-    }
-    
-    # ============================================
-    # CREATE MODEL
-    # ============================================
-    
-    model = GCNetSegmentor(
-        num_classes=num_classes,
-        backbone_cfg=backbone_cfg,
-        head_cfg=head_cfg,
-        aux_head_cfg=aux_head_cfg
+    backbone = GCNetImproved(**backbone_cfg)
+    head = GCNetHead(
+        in_channels=head_cfg['in_channels'],
+        channels=head_cfg['channels'],
+        num_classes=args.num_classes,
+        **{k: v for k, v in head_cfg.items() if k not in ['in_channels', 'channels']}
     )
+    aux_head = GCNetAuxHead(
+        in_channels=aux_head_cfg['in_channels'],
+        channels=aux_head_cfg['channels'],
+        num_classes=args.num_classes,
+        **{k: v for k, v in aux_head_cfg.items() if k not in ['in_channels', 'channels']}
+    ) if args.use_aux_head else None
+    
+    # Wrap in simple container
+    class SimpleSegmentor(nn.Module):
+        def __init__(self, backbone, head, aux_head=None):
+            super().__init__()
+            self.backbone = backbone
+            self.decode_head = head
+            self.auxiliary_head = aux_head
+        
+        def forward(self, x):
+            feats = self.backbone(x)
+            return self.decode_head(feats)
+    
+    model = SimpleSegmentor(backbone, head, aux_head)
     
     print(f"Model parameters: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
     
-    # ============================================
-    # CREATE DATALOADERS
-    # ============================================
-    
+    # Create dataloaders
     train_loader, val_loader, class_weights = create_dataloaders(
         train_txt=args.train_txt,
         val_txt=args.val_txt,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        img_size=(512, 1024),  # Adjust as needed
-        compute_class_weights=True
+        img_size=tuple(args.img_size),
+        compute_class_weights=args.use_class_weights
     )
     
-    # ============================================
-    # LOSS & OPTIMIZER
-    # ============================================
-    
-    criterion = SegmentationLoss(
-        aux_weight=0.4,
-        ignore_index=255,
-        class_weights=class_weights.to(device)
-    )
-    
+    # Optimizer & scheduler
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=1e-4
+        weight_decay=args.weight_decay
     )
     
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.num_epochs,
-        eta_min=1e-6
+        eta_min=args.min_lr
     )
     
-    # ============================================
-    # TRAINER
-    # ============================================
-    
-    trainer = Trainer(
+    # Trainer
+    trainer = DistillationTrainer(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
-        criterion=criterion,
         optimizer=optimizer,
         scheduler=scheduler,
         device=device,
-        num_classes=num_classes,
-        use_amp=True,
-        grad_clip=1.0,
-        log_interval=10,
+        num_classes=args.num_classes,
+        use_distillation=False,
+        use_amp=args.use_amp,
+        grad_clip=args.grad_clip,
+        log_interval=args.log_interval,
         save_dir=args.save_dir,
-        use_wandb=args.use_wandb
+        use_wandb=args.use_wandb,
+        class_weights=class_weights.to(device) if class_weights is not None else None
     )
+    
+    # Resume if needed
     if args.resume is not None:
-        print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(
-            args.resume,
-            map_location=device,
-            weights_only=False   # 🔥 QUAN TRỌNG
-        )
-            
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        trainer.load_checkpoint(args.resume)
     
-        if scheduler is not None and 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-        if trainer.scaler is not None and 'scaler_state_dict' in checkpoint:
-            trainer.scaler.load_state_dict(checkpoint['scaler_state_dict'])
-    
-        trainer.current_epoch = checkpoint['epoch'] + 1
-        trainer.best_miou = checkpoint.get('best_miou', 0.0)
-    
-        print(
-            f"✓ Resumed at epoch {trainer.current_epoch}, "
-            f"best mIoU = {trainer.best_miou:.4f}"
-    )
-    # ============================================
-    # TRAIN
-    # ============================================
-    
+    # Train
     trainer.train(num_epochs=args.num_epochs)
     
-    print("\n✓ Training completed!")
-    print(f"Best mIoU: {trainer.best_miou:.4f}")
+    return trainer.best_miou
+
+
+def train_with_distillation(args):
+    """Train with distillation"""
+    print("\n" + "="*60)
+    print("DISTILLATION TRAINING MODE")
+    print("="*60 + "\n")
+    
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    
+    # Initialize wandb
+    if args.use_wandb:
+        wandb.init(
+            project=args.wandb_project,
+            name=f"distill_{args.student_size}_from_{args.teacher_size}",
+            config=vars(args)
+        )
+    
+    # Student config
+    student_backbone_cfg, student_head_cfg, student_aux_cfg = get_model_config(args.student_size)
+    
+    student_config = {
+        'backbone': student_backbone_cfg,
+        'head': student_head_cfg,
+        'aux_head': student_aux_cfg if args.use_aux_head else None
+    }
+    
+    # Teacher config
+    teacher_backbone_cfg, teacher_head_cfg, _ = get_model_config(args.teacher_size)
+    
+    teacher_config = {
+        'backbone': teacher_backbone_cfg,
+        'head': teacher_head_cfg,
+        'pretrained': args.teacher_checkpoint
+    }
+    
+    # Distillation config
+    distillation_config = {
+        'temperature': args.temperature,
+        'alpha': args.alpha,
+        'logit_weight': args.logit_weight,
+        'feature_weight': args.feature_weight,
+        'attention_weight': args.attention_weight,
+        'feature_stages': ['c3', 'c4', 'c5'],
+        'student_channels': {
+            'c3': student_backbone_cfg['channels'] * 2,
+            'c4': student_backbone_cfg['channels'] * 4,
+            'c5': student_backbone_cfg['channels'] * 2
+        },
+        'teacher_channels': {
+            'c3': teacher_backbone_cfg['channels'] * 2,
+            'c4': teacher_backbone_cfg['channels'] * 4,
+            'c5': teacher_backbone_cfg['channels'] * 2
+        }
+    }
+    
+    # Create model with distillation
+    model = create_distillation_model(
+        student_config=student_config,
+        teacher_config=teacher_config,
+        distillation_config=distillation_config,
+        num_classes=args.num_classes
+    )
+    
+    print(f"Student parameters: {sum(p.numel() for p in model.backbone.parameters()) / 1e6:.2f}M")
+    print(f"Teacher parameters: {sum(p.numel() for p in model.teacher_backbone.parameters()) / 1e6:.2f}M")
+    
+    # Create dataloaders
+    train_loader, val_loader, class_weights = create_dataloaders(
+        train_txt=args.train_txt,
+        val_txt=args.val_txt,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        img_size=tuple(args.img_size),
+        compute_class_weights=args.use_class_weights
+    )
+    
+    # Optimizer & scheduler (only for student)
+    optimizer = optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=args.lr,
+        weight_decay=args.weight_decay
+    )
+    
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=args.num_epochs,
+        eta_min=args.min_lr
+    )
+    
+    # Trainer
+    trainer = DistillationTrainer(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        num_classes=args.num_classes,
+        use_distillation=True,
+        use_amp=args.use_amp,
+        grad_clip=args.grad_clip,
+        log_interval=args.log_interval,
+        save_dir=args.save_dir,
+        use_wandb=args.use_wandb,
+        class_weights=class_weights.to(device) if class_weights is not None else None
+    )
+    
+    # Resume if needed
+    if args.resume is not None:
+        trainer.load_checkpoint(args.resume)
+    
+    # Train
+    trainer.train(num_epochs=args.num_epochs)
+    
+    return trainer.best_miou
+
+
+# ============================================
+# MAIN SCRIPT
+# ============================================
+
+def main():
+    parser = argparse.ArgumentParser(description='Train GCNet with optional distillation')
+    
+    # Data
+    parser.add_argument('--train_txt', type=str, required=True)
+    parser.add_argument('--val_txt', type=str, required=True)
+    parser.add_argument('--num_classes', type=int, default=19)
+    parser.add_argument('--img_size', type=int, nargs=2, default=[512, 1024])
+    
+    # Training mode
+    parser.add_argument('--mode', type=str, default='standard',
+                        choices=['standard', 'distillation'],
+                        help='Training mode')
+    
+    # Model configs
+    parser.add_argument('--model_size', type=str, default='standard',
+                        choices=['small', 'standard', 'large'],
+                        help='Model size for standard training')
+    parser.add_argument('--student_size', type=str, default='small',
+                        choices=['small', 'standard'],
+                        help='Student model size for distillation')
+    parser.add_argument('--teacher_size', type=str, default='large',
+                        choices=['standard', 'large'],
+                        help='Teacher model size for distillation')
+    parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                        help='Path to pretrained teacher checkpoint')
+    parser.add_argument('--use_aux_head', action='store_true',
+                        help='Use auxiliary head')
+    
+    # Distillation hyperparameters
+    parser.add_argument('--temperature', type=float, default=4.0,
+                        help='Distillation temperature')
+    parser.add_argument('--alpha', type=float, default=0.5,
+                        help='Balance between CE and KD loss')
+    parser.add_argument('--logit_weight', type=float, default=1.0,
+                        help='Logit distillation weight')
+    parser.add_argument('--feature_weight', type=float, default=0.5,
+                        help='Feature distillation weight')
+    parser.add_argument('--attention_weight', type=float, default=0.3,
+                        help='Attention distillation weight')
+    
+    # Training hyperparameters
+    parser.add_argument('--num_epochs', type=int, default=100)
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--min_lr', type=float, default=1e-6)
+    parser.add_argument('--weight_decay', type=float, default=1e-4)
+    parser.add_argument('--grad_clip', type=float, default=1.0)
+    parser.add_argument('--use_amp', action='store_true', default=True,
+                        help='Use mixed precision training')
+    parser.add_argument('--use_class_weights', action='store_true',
+                        help='Use class weights for imbalanced data')
+    
+    # System
+    parser.add_argument('--num_workers', type=int, default=4)
+    parser.add_argument('--save_dir', type=str, default='./checkpoints')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint to resume')
+    parser.add_argument('--log_interval', type=int, default=10)
+    
+    # Logging
+    parser.add_argument('--use_wandb', action='store_true',
+                        help='Use Weights & Biases logging')
+    parser.add_argument('--wandb_project', type=str, default='gcnet-improved',
+                        help='W&B project name')
+    
+    args = parser.parse_args()
+    
+    # Validate arguments
+    if args.mode == 'distillation' and args.teacher_checkpoint is None:
+        raise ValueError("--teacher_checkpoint is required for distillation mode")
+    
+    # Run training
+    if args.mode == 'standard':
+        best_miou = train_standard(args)
+    else:
+        best_miou = train_with_distillation(args)
+    
+    print(f"\n{'='*60}")
+    print(f"Training finished!")
+    print(f"Best mIoU: {best_miou:.4f}")
+    print(f"{'='*60}\n")
 
 
 if __name__ == '__main__':
