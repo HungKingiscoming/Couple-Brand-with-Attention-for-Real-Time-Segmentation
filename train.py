@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 from model.backbone.model import GCNetImproved
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import CityscapesCustomDataset, create_dataloaders
-from model.distillation_final import (
+from model.distillation_complete import (
     GCNetWithDistillation,
     create_distillation_model,
     get_default_configs
@@ -461,30 +461,44 @@ def get_model_config(mode: str = 'standard') -> Tuple[Dict, Dict, Dict]:
     
     Returns:
         backbone_cfg, head_cfg, aux_head_cfg
+    
+    Channel calculation from backbone:
+        channels = base_channels
+        c1 = channels      (H/2)
+        c2 = channels      (H/4)
+        c3 = channels * 2  (H/8)
+        c4 = channels * 4  (H/16)
+        c5 = channels * 2  (H/8)
     """
     if mode == 'small':
         # Small model (for student or fast training)
+        base_channels = 16
+        
         backbone_cfg = {
             'in_channels': 3,
-            'channels': 16,
+            'channels': base_channels,  # 16
             'ppm_channels': 64,
             'num_blocks_per_stage': [2, 2, [3, 2], [3, 2], [2, 1]],
             'use_flash_attention': False,
             'use_se': True,
             'deploy': False
         }
+        
+        # Skip connections: [c3, c2, c1]
+        # c3 = 16*2 = 32, c2 = 16, c1 = 16
         head_cfg = {
-            'in_channels': 32,
+            'in_channels': base_channels * 2,  # c5 = 32
             'channels': 64,
             'decode_enabled': True,
             'decoder_channels': 64,
-            'skip_channels': [32, 16, 16],
+            'skip_channels': [base_channels * 2, base_channels, base_channels],  # [32, 16, 16]
             'use_gated_fusion': True,
             'dropout_ratio': 0.1,
             'align_corners': False
         }
+        
         aux_head_cfg = {
-            'in_channels': 64,
+            'in_channels': base_channels * 4,  # c4 = 64
             'channels': 32,
             'dropout_ratio': 0.1,
             'align_corners': False
@@ -492,9 +506,11 @@ def get_model_config(mode: str = 'standard') -> Tuple[Dict, Dict, Dict]:
     
     elif mode == 'standard':
         # Standard model (balanced)
+        base_channels = 32
+        
         backbone_cfg = {
             'in_channels': 3,
-            'channels': 32,
+            'channels': base_channels,  # 32
             'ppm_channels': 128,
             'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
             'use_flash_attention': True,
@@ -504,18 +520,22 @@ def get_model_config(mode: str = 'standard') -> Tuple[Dict, Dict, Dict]:
             'use_se': True,
             'deploy': False
         }
+        
+        # Skip connections: [c3, c2, c1]
+        # c3 = 32*2 = 64, c2 = 32, c1 = 32
         head_cfg = {
-            'in_channels': 64,
+            'in_channels': base_channels * 2,  # c5 = 64
             'channels': 128,
             'decode_enabled': True,
             'decoder_channels': 128,
-            'skip_channels': [64, 32, 32],
+            'skip_channels': [base_channels * 2, base_channels, base_channels],  # [64, 32, 32]
             'use_gated_fusion': True,
             'dropout_ratio': 0.1,
             'align_corners': False
         }
+        
         aux_head_cfg = {
-            'in_channels': 128,
+            'in_channels': base_channels * 4,  # c4 = 128
             'channels': 64,
             'dropout_ratio': 0.1,
             'align_corners': False
@@ -523,9 +543,11 @@ def get_model_config(mode: str = 'standard') -> Tuple[Dict, Dict, Dict]:
     
     elif mode == 'large':
         # Large model (for teacher)
+        base_channels = 48
+        
         backbone_cfg = {
             'in_channels': 3,
-            'channels': 48,
+            'channels': base_channels,  # 48
             'ppm_channels': 192,
             'num_blocks_per_stage': [5, 5, [6, 5], [6, 5], [3, 3]],
             'use_flash_attention': True,
@@ -535,18 +557,22 @@ def get_model_config(mode: str = 'standard') -> Tuple[Dict, Dict, Dict]:
             'use_se': True,
             'deploy': False
         }
+        
+        # Skip connections: [c3, c2, c1]
+        # c3 = 48*2 = 96, c2 = 48, c1 = 48
         head_cfg = {
-            'in_channels': 96,
+            'in_channels': base_channels * 2,  # c5 = 96
             'channels': 192,
             'decode_enabled': True,
             'decoder_channels': 192,
-            'skip_channels': [96, 48, 48],
+            'skip_channels': [base_channels * 2, base_channels, base_channels],  # [96, 48, 48]
             'use_gated_fusion': True,
             'dropout_ratio': 0.1,
             'align_corners': False
         }
+        
         aux_head_cfg = {
-            'in_channels': 192,
+            'in_channels': base_channels * 4,  # c4 = 192
             'channels': 96,
             'dropout_ratio': 0.1,
             'align_corners': False
