@@ -17,7 +17,7 @@ from typing import Dict, Optional, Tuple
 from model.backbone.model import GCNetImproved
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import CityscapesCustomDataset, create_dataloaders
-from model.distillation_complete import (
+from model.distillation_final import (
     GCNetWithDistillation,
     create_distillation_model,
     get_default_configs
