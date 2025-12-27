@@ -69,7 +69,7 @@ class GCNetHead(BaseDecodeHead):
             self.decoder = None
             
             # Fuse c1, c2, c3, c5 (all resized to H/8)
-            total_channels = sum([32, 32, 64, 64])  # c1 + c2 + c3 + c5
+            total_channels = sum(skip_channels) + self.in_channels
             
             self.fusion = ConvModule(
                 in_channels=total_channels,
