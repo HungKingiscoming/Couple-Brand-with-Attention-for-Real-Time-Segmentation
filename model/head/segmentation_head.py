@@ -49,6 +49,7 @@ class GCNetHead(BaseDecodeHead):
         super().__init__(**kwargs)
         
         self.decode_enabled = decode_enabled
+        self.skip_channels = skip_channels
         
         if decode_enabled:
             # ✅ Use decoder with proper skip channels
@@ -62,12 +63,8 @@ class GCNetHead(BaseDecodeHead):
                 act_cfg=self.act_cfg
             )
             
-            # Output from decoder: channels // 8 = 16
             conv_in_channels = decoder_channels // 8
-        else:
-            # Simple fusion without decoder
-            self.decoder = None
-            
+        else:           
             # Fuse c1, c2, c3, c5 (all resized to H/8)
             total_channels = sum(skip_channels) + self.in_channels
             
