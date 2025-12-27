@@ -352,7 +352,9 @@ class TeacherTrainer:
         print("STAGE 1: TRAINING TEACHER MODEL (channels=48)")
         print("="*60 + "\n")
         
-        for epoch in range(num_epochs):
+        start_epoch = self.current_epoch  # Resume từ đây
+        
+        for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
             
             train_metrics = self.train_epoch()
@@ -377,6 +379,25 @@ class TeacherTrainer:
         
         print(f"\n✓ Teacher training completed! Best mIoU: {self.best_miou:.4f}")
         return self.best_miou
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Resume từ checkpoint"""
+        print(f"Loading teacher checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if checkpoint.get('scheduler_state_dict') and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        if checkpoint.get('scaler_state_dict'):
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        self.current_epoch = checkpoint['epoch'] + 1
+        self.best_miou = checkpoint.get('best_miou', 0.0)
+        
+        print(f"✓ Resumed at epoch {self.current_epoch}, best mIoU = {self.best_miou:.4f}")
     
     def save_checkpoint(self, filename, epoch, metrics):
         checkpoint = {
@@ -576,7 +597,9 @@ class DistillationTrainer:
         print("STAGE 2: DISTILLATION (Teacher 48 → Student 32)")
         print("="*60 + "\n")
         
-        for epoch in range(num_epochs):
+        start_epoch = self.current_epoch  # Resume từ đây
+        
+        for epoch in range(start_epoch, num_epochs):
             self.current_epoch = epoch
             
             train_metrics = self.train_epoch()
@@ -604,6 +627,25 @@ class DistillationTrainer:
         
         print(f"\n✓ Distillation completed! Best mIoU: {self.best_miou:.4f}")
         return self.best_miou
+    
+    def load_checkpoint(self, checkpoint_path):
+        """Resume từ checkpoint"""
+        print(f"Loading student checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        self.student.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        if checkpoint.get('scheduler_state_dict') and self.scheduler:
+            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        if checkpoint.get('scaler_state_dict'):
+            self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        
+        self.current_epoch = checkpoint['epoch'] + 1
+        self.best_miou = checkpoint.get('best_miou', 0.0)
+        
+        print(f"✓ Resumed at epoch {self.current_epoch}, best mIoU = {self.best_miou:.4f}")
     
     def save_checkpoint(self, filename, epoch, metrics):
         checkpoint = {
@@ -656,8 +698,16 @@ def main():
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--num_workers', type=int, default=4)
     parser.add_argument('--teacher_checkpoint', type=str, default=None,
-                        help='Path to teacher checkpoint (for distill stage)')
+                        help='Path to teacher checkpoint (for distill stage or resume)')
+    parser.add_argument('--student_checkpoint', type=str, default=None,
+                        help='Path to student checkpoint (for resume)')
     parser.add_argument('--save_dir', type=str, default='./checkpoints')
+    
+    # ✅ NEW: Resume options
+    parser.add_argument('--resume_teacher', type=str, default=None,
+                        help='Resume teacher training from checkpoint')
+    parser.add_argument('--resume_student', type=str, default=None,
+                        help='Resume student training from checkpoint')
     
     args = parser.parse_args()
     
@@ -700,15 +750,28 @@ def main():
             class_weights=class_weights.to(device) if class_weights is not None else None
         )
         
+        # ✅ RESUME TEACHER if checkpoint provided
+        if args.resume_teacher:
+            teacher_trainer.load_checkpoint(args.resume_teacher)
+            print(f"✓ Resumed teacher from epoch {teacher_trainer.current_epoch}")
+        
         teacher_miou = teacher_trainer.train(num_epochs=args.num_epochs)
         print(f"\n✓ Teacher training completed! Best mIoU: {teacher_miou:.4f}")
         
+        # Auto-set teacher checkpoint for distillation
         args.teacher_checkpoint = f'{args.save_dir}/teacher/best_teacher.pth'
     
     # ========== STAGE 2: DISTILLATION ==========
     if args.stage in ['distill', 'both']:
+        # ✅ AUTO-DETECT teacher checkpoint for "both" stage
+        if args.stage == 'both' and args.teacher_checkpoint is None:
+            args.teacher_checkpoint = f'{args.save_dir}/teacher/best_teacher.pth'
+        
         if args.teacher_checkpoint is None:
-            raise ValueError("--teacher_checkpoint is required for distillation")
+            raise ValueError("--teacher_checkpoint is required for distillation stage")
+        
+        if not os.path.exists(args.teacher_checkpoint):
+            raise FileNotFoundError(f"Teacher checkpoint not found: {args.teacher_checkpoint}")
         
         print("\n" + "="*80)
         print("STAGE 2: DISTILLATION (Teacher 48 → Student 32)")
@@ -721,7 +784,9 @@ def main():
         print(f"Loading teacher from {args.teacher_checkpoint}")
         checkpoint = torch.load(args.teacher_checkpoint, map_location='cpu', weights_only=False)
         teacher_model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"✓ Teacher loaded (mIoU: {checkpoint['metrics']['val_mIoU']:.4f})")
+        teacher_metrics = checkpoint.get('metrics', {})
+        teacher_miou = teacher_metrics.get('val_mIoU', checkpoint.get('best_miou', 0.0))
+        print(f"✓ Teacher loaded (mIoU: {teacher_miou:.4f})")
         
         # Create student
         student_config = ModelConfig.get_student_config()
@@ -751,6 +816,11 @@ def main():
             save_dir=f'{args.save_dir}/student'
         )
         
+        # ✅ RESUME STUDENT if checkpoint provided
+        if args.resume_student:
+            distill_trainer.load_checkpoint(args.resume_student)
+            print(f"✓ Resumed student from epoch {distill_trainer.current_epoch}")
+        
         student_miou = distill_trainer.train(num_epochs=args.num_epochs)
         print(f"\n✓ Distillation completed! Best mIoU: {student_miou:.4f}")
     
@@ -774,7 +844,40 @@ if __name__ == '__main__':
 # ============================================
 
 """
-# FULL WORKFLOW (Train Teacher → Distillation)
+# ============================================
+# RESUME EXAMPLES
+# ============================================
+
+# 1. RESUME TEACHER TRAINING (bị gián đoạn ở epoch 45)
+python train_distillation.py \
+    --stage teacher \
+    --train_txt data/train.txt \
+    --val_txt data/val.txt \
+    --num_epochs 100 \
+    --resume_teacher checkpoints/teacher/teacher_epoch_44.pth \
+    --save_dir checkpoints
+
+# 2. RESUME STUDENT TRAINING (bị gián đoạn ở epoch 60)
+python train_distillation.py \
+    --stage distill \
+    --teacher_checkpoint checkpoints/teacher/best_teacher.pth \
+    --train_txt data/train.txt \
+    --val_txt data/val.txt \
+    --num_epochs 100 \
+    --resume_student checkpoints/student/student_epoch_59.pth \
+    --save_dir checkpoints
+
+# 3. RESUME BOTH (Teacher xong rồi, resume Student)
+python train_distillation.py \
+    --stage both \
+    --train_txt data/train.txt \
+    --val_txt data/val.txt \
+    --num_epochs 100 \
+    --resume_teacher checkpoints/teacher/best_teacher.pth \
+    --resume_student checkpoints/student/student_epoch_40.pth \
+    --save_dir checkpoints
+
+# 4. FULL WORKFLOW WITHOUT RESUME
 python train_distillation.py \
     --stage both \
     --train_txt data/train.txt \
@@ -783,30 +886,12 @@ python train_distillation.py \
     --batch_size 8 \
     --save_dir checkpoints
 
-# OR STEP BY STEP:
-
-# Step 1: Train Teacher (channels=48)
-python train_distillation.py \
-    --stage teacher \
-    --train_txt data/train.txt \
-    --val_txt data/val.txt \
-    --num_epochs 100 \
-    --batch_size 4 \
-    --save_dir checkpoints
-
-# Step 2: Distillation (Teacher → Student)
+# 5. ONLY DISTILLATION (Teacher đã train xong)
 python train_distillation.py \
     --stage distill \
     --teacher_checkpoint checkpoints/teacher/best_teacher.pth \
     --train_txt data/train.txt \
     --val_txt data/val.txt \
     --num_epochs 100 \
-    --batch_size 8 \
     --save_dir checkpoints
-
-# Step 3: Deploy Student
-python deploy.py \
-    --checkpoint checkpoints/student/best_student.pth \
-    --input image.jpg \
-    --output result.jpg
 """
