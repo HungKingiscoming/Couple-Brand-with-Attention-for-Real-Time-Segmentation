@@ -31,10 +31,12 @@ class ModelConfig:
     @staticmethod
     def get_teacher_config():
         """Large teacher model (channels=48)"""
+        base_channels = 48
+        
         return {
             'backbone': {
                 'in_channels': 3,
-                'channels': 48,  # Large
+                'channels': base_channels,  # 48
                 'ppm_channels': 192,
                 'num_blocks_per_stage': [5, 5, [6, 5], [6, 5], [3, 3]],
                 'use_flash_attention': False,  # Auto-detect
@@ -45,14 +47,15 @@ class ModelConfig:
                 'deploy': False
             },
             'head': {
-                'in_channels': 96,  # channels * 2
+                'in_channels': base_channels * 2,  # c5 = 96
                 'channels': 192,
                 'decode_enabled': False,  # Simple fusion for stability
+                'skip_channels': [base_channels * 2, base_channels, base_channels],  # ✅ [96, 48, 48]
                 'dropout_ratio': 0.1,
                 'align_corners': False
             },
             'aux_head': {
-                'in_channels': 192,  # channels * 4
+                'in_channels': base_channels * 4,  # c4 = 192
                 'channels': 96,
                 'dropout_ratio': 0.1,
                 'align_corners': False
@@ -62,10 +65,12 @@ class ModelConfig:
     @staticmethod
     def get_student_config():
         """Standard student model (channels=32)"""
+        base_channels = 32
+        
         return {
             'backbone': {
                 'in_channels': 3,
-                'channels': 32,  # Standard
+                'channels': base_channels,  # 32
                 'ppm_channels': 128,
                 'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
                 'use_flash_attention': False,
@@ -76,14 +81,15 @@ class ModelConfig:
                 'deploy': False
             },
             'head': {
-                'in_channels': 64,  # channels * 2
+                'in_channels': base_channels * 2,  # c5 = 64
                 'channels': 128,
                 'decode_enabled': False,  # Simple fusion
+                'skip_channels': [base_channels * 2, base_channels, base_channels],  # ✅ [64, 32, 32]
                 'dropout_ratio': 0.1,
                 'align_corners': False
             },
             'aux_head': {
-                'in_channels': 128,  # channels * 4
+                'in_channels': base_channels * 4,  # c4 = 128
                 'channels': 64,
                 'dropout_ratio': 0.1,
                 'align_corners': False
