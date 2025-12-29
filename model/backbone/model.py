@@ -3,11 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 import math
-import warnings
 from typing import List, Tuple, Union, Dict
 
-
-# Import components
+# Import components (giữ nguyên)
 from components.components import (
     ConvModule,
     BaseModule,
@@ -15,105 +13,216 @@ from components.components import (
     build_activation_layer,
     resize,
     DAPPM,
-    BaseDecodeHead,
-    OptConfigType,
-    SampleList
+    OptConfigType
 )
-from components.components import BATCH_NORM_TYPES, NORM_TYPES
 
 # ============================================
-# FLASH ATTENTION SETUP (FIXED)
+# EFFICIENT ATTENTION MODULES
 # ============================================
 
-FLASH_ATTN_AVAILABLE = False
-flash_attn_func = None
-
-try:
-    # Thử import theo cách mới (v2.x)
-    from flash_attn import flash_attn_qkvpacked_func, flash_attn_func as _flash_attn_func
-    FLASH_ATTN_AVAILABLE = True
-    flash_attn_func = _flash_attn_func
-    print("✓ FlashAttention v2 loaded successfully")
-except ImportError:
-    try:
-        # Fallback: import từ interface
-        from flash_attn.flash_attn_interface import flash_attn_qkvpacked_func
-        FLASH_ATTN_AVAILABLE = True
-        print("✓ FlashAttention loaded from interface")
-    except ImportError:
-        warnings.warn(
-            "FlashAttention not available. Install with:\n"
-            "pip install flash-attn --no-build-isolation\n"
-            "Requirements: CUDA >= 12.3, H100/A100 GPU"
+class ChannelAttention(nn.Module):
+    """
+    Channel Attention Module - Lightweight và hiệu quả
+    
+    Focus: "What" channels are important
+    Complexity: O(C^2) - rất nhỏ so với spatial attention
+    """
+    
+    def __init__(self, channels: int, reduction: int = 16):
+        super().__init__()
+        
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        
+        # Shared MLP
+        self.fc = nn.Sequential(
+            nn.Linear(channels, max(channels // reduction, 8), bias=False),
+            nn.ReLU(inplace=False),
+            nn.Linear(max(channels // reduction, 8), channels, bias=False)
         )
+        
+        self.sigmoid = nn.Sigmoid()
+    
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        
+        # Global pooling
+        avg_out = self.fc(self.avg_pool(x).view(B, C))
+        max_out = self.fc(self.max_pool(x).view(B, C))
+        
+        # Channel weights
+        out = self.sigmoid(avg_out + max_out).view(B, C, 1, 1)
+        
+        return x * out.expand_as(x)
 
 
-def check_flash_attention_support():
-    """Kiểm tra xem FlashAttention có thể chạy không"""
-    if not FLASH_ATTN_AVAILABLE:
-        return False
+class SpatialAttention(nn.Module):
+    """
+    Spatial Attention Module - Tìm "where" to focus
     
-    if not torch.cuda.is_available():
-        return False
+    Complexity: O(HW) - chỉ dùng 2 channels (avg + max)
+    """
     
-    # Check GPU capability (cần compute capability >= 8.0 cho Ampere+)
-    device_capability = torch.cuda.get_device_capability()
-    if device_capability[0] < 8:
-        warnings.warn(
-            f"GPU compute capability {device_capability} < 8.0. "
-            "FlashAttention requires Ampere (A100), Ada (RTX 4090), or Hopper (H100) GPUs."
+    def __init__(self, kernel_size: int = 7):
+        super().__init__()
+        
+        self.conv = nn.Conv2d(
+            2, 1, 
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+            bias=False
         )
-        return False
+        self.sigmoid = nn.Sigmoid()
     
-    return True
+    def forward(self, x: Tensor) -> Tensor:
+        # Channel-wise pooling
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        
+        # Concatenate and convolve
+        spatial_feat = torch.cat([avg_out, max_out], dim=1)
+        spatial_weight = self.sigmoid(self.conv(spatial_feat))
+        
+        return x * spatial_weight
 
 
-# ============================================
-# ATTENTION MODULES (FIXED)
-# ============================================
+class CBAM(nn.Module):
+    """
+    Convolutional Block Attention Module
+    Reference: https://arxiv.org/abs/1807.06521
+    
+    ✅ Best choice for segmentation:
+    - Efficient (0.01M params)
+    - Proven effective
+    - Hardware agnostic
+    - Easy to integrate
+    """
+    
+    def __init__(
+        self,
+        channels: int,
+        reduction: int = 16,
+        kernel_size: int = 7
+    ):
+        super().__init__()
+        
+        self.channel_attention = ChannelAttention(channels, reduction)
+        self.spatial_attention = SpatialAttention(kernel_size)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        # Sequential: channel → spatial
+        x = self.channel_attention(x)
+        x = self.spatial_attention(x)
+        return x
 
-class FlashAttentionBlock(nn.Module):
-    """FlashAttention block với xử lý đúng chuẩn"""
+
+class AxialAttention(nn.Module):
+    """
+    Axial Attention - Efficient 2D attention
+    
+    Decompose 2D attention vào H-axis và W-axis
+    Complexity: O(HW * (H + W)) vs O(HW * HW) cho full attention
+    
+    Use case: Khi cần long-range dependencies
+    """
     
     def __init__(
         self,
         dim: int,
         num_heads: int = 8,
-        qkv_bias: bool = True,
+        qkv_bias: bool = False,
         attn_drop: float = 0.0,
-        proj_drop: float = 0.0,
-        causal: bool = False
+        proj_drop: float = 0.0
     ):
         super().__init__()
-        assert dim % num_heads == 0, f"dim {dim} must be divisible by num_heads {num_heads}"
+        assert dim % num_heads == 0
         
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.causal = causal
         
-        # Pre-norm cho gradient stability
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        # Separate projections for height and width
+        self.qkv_h = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv_w = nn.Linear(dim, dim * 3, bias=qkv_bias)
         
-        # QKV projection
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        
-        # Output projection
+        self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+    
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, C, H, W)
+        Returns:
+            out: (B, C, H, W)
+        """
+        B, C, H, W = x.shape
         
-        # Dropout cho attention
-        self.attn_drop_prob = attn_drop
+        # ===== HEIGHT ATTENTION =====
+        # Reshape: (B, C, H, W) -> (B*W, H, C)
+        x_h = x.permute(0, 3, 2, 1).reshape(B * W, H, C)
+        
+        qkv_h = self.qkv_h(x_h).reshape(B * W, H, 3, self.num_heads, self.head_dim)
+        q_h, k_h, v_h = qkv_h.unbind(2)
+        
+        # Attention
+        attn_h = (q_h @ k_h.transpose(-2, -1)) * self.scale
+        attn_h = attn_h.softmax(dim=-1)
+        attn_h = self.attn_drop(attn_h)
+        
+        out_h = (attn_h @ v_h).reshape(B * W, H, C)
+        out_h = out_h.reshape(B, W, H, C).permute(0, 3, 2, 1)  # -> (B, C, H, W)
+        
+        # ===== WIDTH ATTENTION =====
+        # Reshape: (B, C, H, W) -> (B*H, W, C)
+        x_w = out_h.permute(0, 2, 3, 1).reshape(B * H, W, C)
+        
+        qkv_w = self.qkv_w(x_w).reshape(B * H, W, 3, self.num_heads, self.head_dim)
+        q_w, k_w, v_w = qkv_w.unbind(2)
+        
+        # Attention
+        attn_w = (q_w @ k_w.transpose(-2, -1)) * self.scale
+        attn_w = attn_w.softmax(dim=-1)
+        attn_w = self.attn_drop(attn_w)
+        
+        out_w = (attn_w @ v_w).reshape(B * H, W, C)
+        out_w = out_w.reshape(B, H, W, C).permute(0, 3, 1, 2)  # -> (B, C, H, W)
+        
+        # Final projection
+        out = self.proj(out_w.flatten(2).transpose(1, 2))  # (B, H*W, C)
+        out = self.proj_drop(out)
+        out = out.transpose(1, 2).reshape(B, C, H, W)
+        
+        return out + x  # Residual
+
+
+class EfficientMultiHeadAttention(nn.Module):
+    """
+    Simplified Multi-Head Attention cho small spatial size
+    
+    Use case: Bottleneck features (H/32, W/32)
+    """
+    
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int = 8,
+        qkv_bias: bool = False,
+        attn_drop: float = 0.0,
+        proj_drop: float = 0.0
+    ):
+        super().__init__()
+        assert dim % num_heads == 0
+        
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        
-        # Check FlashAttention support khi khởi tạo
-        self.can_use_flash = check_flash_attention_support()
-        if not self.can_use_flash:
-            warnings.warn(
-                f"FlashAttentionBlock initialized but FlashAttention not available. "
-                f"Will use standard attention fallback."
-            )
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
     
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -124,142 +233,30 @@ class FlashAttentionBlock(nn.Module):
         """
         B, N, C = x.shape
         
-        # Pre-norm
-        x_norm = self.norm(x)
-        
-        # QKV projection: (B, N, 3*C) -> (B, N, 3, num_heads, head_dim)
-        qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim)
-        
-        # ===== FLASHATTENTION (FIXED) =====
-        if self.can_use_flash and x.is_cuda:
-            try:
-                # Đảm bảo dtype phù hợp (fp16 hoặc bf16)
-                if qkv.dtype not in [torch.float16, torch.bfloat16]:
-                    # FlashAttention chỉ support fp16/bf16
-                    original_dtype = qkv.dtype
-                    qkv = qkv.to(torch.float16)
-                    use_fp16 = True
-                else:
-                    original_dtype = None
-                    use_fp16 = False
-                
-                # FlashAttention expects: (batch, seqlen, 3, nheads, headdim)
-                # Shape đã đúng rồi!
-                out = flash_attn_qkvpacked_func(
-                    qkv,
-                    dropout_p=self.attn_drop_prob if self.training else 0.0,
-                    softmax_scale=self.scale,
-                    causal=self.causal
-                )
-                # Output shape: (B, N, num_heads, head_dim)
-                
-                # Convert back nếu cần
-                if use_fp16:
-                    out = out.to(original_dtype)
-                
-                # Reshape: (B, N, num_heads, head_dim) -> (B, N, C)
-                out = out.reshape(B, N, C)
-                
-            except Exception as e:
-                warnings.warn(f"FlashAttention failed: {e}. Falling back to standard attention.")
-                out = self._standard_attention(qkv, B, N, C)
-        else:
-            # Fallback to standard attention
-            out = self._standard_attention(qkv, B, N, C)
-        
-        # Output projection
-        out = self.proj(out)
-        out = self.proj_drop(out)
-        
-        # Residual connection
-        return x + out
-    
-    def _standard_attention(self, qkv: Tensor, B: int, N: int, C: int) -> Tensor:
-        """Standard scaled dot-product attention fallback"""
-        # qkv shape: (B, N, 3, num_heads, head_dim)
+        # QKV projection
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
         q, k, v = qkv.unbind(2)  # Each: (B, N, num_heads, head_dim)
         
-        # Transpose to: (B, num_heads, N, head_dim)
-        q = q.transpose(1, 2)
+        # Transpose for attention
+        q = q.transpose(1, 2)  # (B, num_heads, N, head_dim)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Attention scores: (B, num_heads, N, N)
+        # Scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        
-        if self.causal:
-            # Causal mask
-            mask = torch.triu(
-                torch.ones(N, N, device=q.device, dtype=torch.bool),
-                diagonal=1
-            )
-            attn = attn.masked_fill(mask, float('-inf'))
-        
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         
-        # Apply attention: (B, num_heads, N, head_dim)
-        out = attn @ v
-        
-        # Reshape: (B, num_heads, N, head_dim) -> (B, N, C)
-        out = out.transpose(1, 2).reshape(B, N, C)
+        # Apply attention
+        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        out = self.proj(out)
+        out = self.proj_drop(out)
         
         return out
 
 
-class FlashAttentionStage(nn.Module):
-    """Stacked FlashAttention blocks với FFN (như Transformer block)"""
-    
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        num_layers: int = 2,
-        mlp_ratio: float = 4.0,
-        drop: float = 0.0,
-        attn_drop: float = 0.0
-    ):
-        super().__init__()
-        
-        self.layers = nn.ModuleList([
-            nn.ModuleDict({
-                'attn': FlashAttentionBlock(
-                    dim=dim,
-                    num_heads=num_heads,
-                    attn_drop=attn_drop,
-                    proj_drop=drop
-                ),
-                'norm': nn.LayerNorm(dim, eps=1e-6),
-                'mlp': nn.Sequential(
-                    nn.Linear(dim, int(dim * mlp_ratio)),
-                    nn.GELU(),
-                    nn.Dropout(drop),
-                    nn.Linear(int(dim * mlp_ratio), dim),
-                    nn.Dropout(drop)
-                )
-            })
-            for _ in range(num_layers)
-        ])
-    
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, N, C) - flattened spatial features
-        Returns:
-            out: (B, N, C)
-        """
-        for layer in self.layers:
-            # Attention (có residual bên trong)
-            x = layer['attn'](x)
-            
-            # FFN với pre-norm và residual
-            x = x + layer['mlp'](layer['norm'](x))
-        
-        return x
-
-
 class SEModule(nn.Module):
-    """Squeeze-and-Excitation module"""
+    """Squeeze-and-Excitation - Simplest channel attention"""
     
     def __init__(self, channels: int, reduction: int = 16):
         super().__init__()
@@ -279,7 +276,7 @@ class SEModule(nn.Module):
 
 
 # ============================================
-# GCBLOCK (Unchanged - đã đúng)
+# GCBLOCK (Giữ nguyên - đã tốt)
 # ============================================
 
 class Block1x1(BaseModule):
@@ -469,6 +466,8 @@ class Block3x3(BaseModule):
 
 
 class GCBlock(nn.Module):  
+    """GCBlock with optional attention"""
+    
     def __init__(
         self,
         in_channels: int,
@@ -479,7 +478,9 @@ class GCBlock(nn.Module):
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         act: bool = True,
-        deploy: bool = False
+        deploy: bool = False,
+        use_attention: bool = False,
+        attention_type: str = 'se'  # 'se', 'cbam', or None
     ):
         super().__init__()
         
@@ -489,6 +490,7 @@ class GCBlock(nn.Module):
         self.stride = stride
         self.padding = padding
         self.deploy = deploy
+        self.use_attention = use_attention
         
         assert kernel_size == 3 and padding == 1
         
@@ -540,19 +542,35 @@ class GCBlock(nn.Module):
                 bias=False,
                 norm_cfg=norm_cfg
             )
+        
+        # ✅ Add attention module
+        if use_attention and not deploy:
+            if attention_type == 'se':
+                self.attention = SEModule(out_channels)
+            elif attention_type == 'cbam':
+                self.attention = CBAM(out_channels)
+            else:
+                self.attention = None
+        else:
+            self.attention = None
     
     def forward(self, x: Tensor) -> Tensor:
         if hasattr(self, 'reparam_3x3'):
-            return self.relu(self.reparam_3x3(x))
+            out = self.relu(self.reparam_3x3(x))
+        else:
+            id_out = 0 if self.path_residual is None else self.path_residual(x)
+            out = self.relu(
+                self.path_3x3_1(x) + 
+                self.path_3x3_2(x) + 
+                self.path_1x1(x) + 
+                id_out
+            )
         
-        id_out = 0 if self.path_residual is None else self.path_residual(x)
+        # Apply attention if available
+        if self.attention is not None:
+            out = self.attention(out)
         
-        return self.relu(
-            self.path_3x3_1(x) + 
-            self.path_3x3_2(x) + 
-            self.path_1x1(x) + 
-            id_out
-        )
+        return out
     
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
@@ -564,7 +582,7 @@ class GCBlock(nn.Module):
         if conv is None:
             return 0, 0
         
-        if isinstance(conv, (nn.SyncBatchNorm, nn.BatchNorm2d, BATCH_NORM_TYPES)):
+        if isinstance(conv, (nn.SyncBatchNorm, nn.BatchNorm2d)):
             if not hasattr(self, 'id_tensor'):
                 kernel_value = torch.zeros(
                     (self.in_channels, self.in_channels, 3, 3),
@@ -641,48 +659,22 @@ class GCBlock(nn.Module):
 
 
 # ============================================
-# GATED FUSION MODULE
-# ============================================
-
-class GatedFusion(nn.Module):
-    """Gated fusion for adaptive feature selection"""
-    
-    def __init__(
-        self,
-        channels: int,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-    ):
-        super().__init__()
-        
-        self.gate_conv = ConvModule(
-            in_channels=channels * 2,
-            out_channels=1,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        )
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, enc_feat: Tensor, dec_feat: Tensor) -> Tensor:
-        concat = torch.cat([enc_feat, dec_feat], dim=1)
-        gate = self.sigmoid(self.gate_conv(concat))
-        return gate * enc_feat + (1 - gate) * dec_feat
-
-
-# ============================================
-# IMPROVED GCNET BACKBONE (FIXED)
+# IMPROVED GCNET BACKBONE
 # ============================================
 
 class GCNetImproved(BaseModule):
     """
-    GCNet Improved Backbone với FlashAttention (FIXED)
+    ✅ GCNet với Efficient Attention Strategy
     
-    Improvements:
-    - ✅ FlashAttention được sử dụng đúng cách với dtype checking
-    - ✅ Automatic fallback nếu hardware không support
-    - ✅ SE modules cho channel attention
-    - ✅ Dual-branch architecture
-    - ✅ Enhanced bottleneck với DAPPM
+    Attention placement:
+    - Stage 2-3: SE module (lightweight, local)
+    - Stage 4: CBAM (channel + spatial)
+    - Bottleneck: Axial Attention (long-range) + CBAM
+    
+    Rationale:
+    - Early stages: Local features → lightweight attention
+    - Mid stages: Richer features → full attention
+    - Bottleneck: Small spatial → efficient global attention
     """
     
     def __init__(
@@ -691,12 +683,12 @@ class GCNetImproved(BaseModule):
         channels: int = 32,
         ppm_channels: int = 128,
         num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
-        use_flash_attention: bool = True,
-        flash_attn_stage: int = 4,
-        flash_attn_layers: int = 2,
-        flash_attn_heads: int = 8,
-        flash_attn_drop: float = 0.0,
-        use_se: bool = True,
+        attention_config: Dict = {
+            'stage2': 'se',      # Lightweight
+            'stage3': 'se',      # Lightweight
+            'stage4': 'cbam',    # Full attention
+            'bottleneck': 'axial+cbam'  # Long-range + channel/spatial
+        },
         se_reduction: int = 16,
         align_corners: bool = False,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
@@ -710,19 +702,11 @@ class GCNetImproved(BaseModule):
         self.channels = channels
         self.ppm_channels = ppm_channels
         self.num_blocks_per_stage = num_blocks_per_stage
-        self.use_flash_attention = use_flash_attention and check_flash_attention_support()
-        self.flash_attn_stage = flash_attn_stage
-        self.use_se = use_se
+        self.attention_config = attention_config
         self.align_corners = align_corners
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
         self.deploy = deploy
-        
-        if use_flash_attention and not self.use_flash_attention:
-            warnings.warn(
-                "FlashAttention requested but not available or GPU not supported. "
-                "Using standard attention fallback."
-            )
         
         # Stage 1: First conv (H/2)
         self.stage1_conv = ConvModule(
@@ -735,7 +719,7 @@ class GCNetImproved(BaseModule):
             act_cfg=act_cfg
         )
         
-        # Stage 2: Second conv + blocks (H/4)
+        # Stage 2: Second conv + blocks (H/4) với SE
         stage2_layers = [
             ConvModule(
                 in_channels=channels,
@@ -748,7 +732,9 @@ class GCNetImproved(BaseModule):
             )
         ]
         
-        for _ in range(num_blocks_per_stage[0]):
+        for i in range(num_blocks_per_stage[0]):
+            # ✅ Add SE to last block
+            use_attn = (i == num_blocks_per_stage[0] - 1) and (attention_config.get('stage2') == 'se')
             stage2_layers.append(
                 GCBlock(
                     in_channels=channels,
@@ -756,13 +742,15 @@ class GCNetImproved(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    deploy=deploy
+                    deploy=deploy,
+                    use_attention=use_attn,
+                    attention_type='se'
                 )
             )
         
         self.stage2 = nn.Sequential(*stage2_layers)
         
-        # Stage 3 (Stem): Downsample + GCBlocks (H/8)
+        # Stage 3 (Stem): Downsample + GCBlocks (H/8) với SE
         stage3_layers = [
             GCBlock(
                 in_channels=channels,
@@ -774,7 +762,9 @@ class GCNetImproved(BaseModule):
             )
         ]
         
-        for _ in range(num_blocks_per_stage[1] - 1):
+        for i in range(num_blocks_per_stage[1] - 1):
+            # ✅ Add SE to last block
+            use_attn = (i == num_blocks_per_stage[1] - 2) and (attention_config.get('stage3') == 'se')
             stage3_layers.append(
                 GCBlock(
                     in_channels=channels * 2,
@@ -782,7 +772,9 @@ class GCNetImproved(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    deploy=deploy
+                    deploy=deploy,
+                    use_attention=use_attn,
+                    attention_type='se'
                 )
             )
         
@@ -794,7 +786,7 @@ class GCNetImproved(BaseModule):
         # ======================================
         self.semantic_branch_layers = nn.ModuleList()
         
-        # Stage 4 Semantic
+        # Stage 4 Semantic với CBAM
         stage4_sem = []
         stage4_sem.append(
             GCBlock(
@@ -807,7 +799,9 @@ class GCNetImproved(BaseModule):
             )
         )
         
-        for _ in range(num_blocks_per_stage[2][0] - 1):
+        for i in range(num_blocks_per_stage[2][0] - 1):
+            # ✅ Add CBAM to last block
+            use_attn = (i == num_blocks_per_stage[2][0] - 2) and (attention_config.get('stage4') == 'cbam')
             stage4_sem.append(
                 GCBlock(
                     in_channels=channels * 4,
@@ -815,23 +809,13 @@ class GCNetImproved(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    deploy=deploy
+                    deploy=deploy,
+                    use_attention=use_attn,
+                    attention_type='cbam'
                 )
             )
         
         self.semantic_branch_layers.append(nn.Sequential(*stage4_sem))
-        
-        # Stage 4 FlashAttention
-        if self.use_flash_attention and flash_attn_stage == 4:
-            self.stage4_attention = FlashAttentionStage(
-                dim=channels * 4,
-                num_heads=flash_attn_heads,
-                num_layers=flash_attn_layers,
-                drop=flash_attn_drop,
-                attn_drop=flash_attn_drop
-            )
-        else:
-            self.stage4_attention = None
         
         # Stage 5 Semantic
         stage5_sem = []
@@ -846,7 +830,7 @@ class GCNetImproved(BaseModule):
             )
         )
         
-        for _ in range(num_blocks_per_stage[3][0] - 1):
+        for i in range(num_blocks_per_stage[3][0] - 1):
             stage5_sem.append(
                 GCBlock(
                     in_channels=channels * 4,
@@ -873,7 +857,7 @@ class GCNetImproved(BaseModule):
             )
         )
         
-        for _ in range(num_blocks_per_stage[4][0] - 1):
+        for i in range(num_blocks_per_stage[4][0] - 1):
             stage6_sem.append(
                 GCBlock(
                     in_channels=channels * 4,
@@ -895,7 +879,7 @@ class GCNetImproved(BaseModule):
         
         # Stage 4 Detail
         detail_stage4 = []
-        for _ in range(num_blocks_per_stage[2][1]):
+        for i in range(num_blocks_per_stage[2][1]):
             detail_stage4.append(
                 GCBlock(
                     in_channels=channels * 2,
@@ -910,7 +894,7 @@ class GCNetImproved(BaseModule):
         
         # Stage 5 Detail
         detail_stage5 = []
-        for _ in range(num_blocks_per_stage[3][1]):
+        for i in range(num_blocks_per_stage[3][1]):
             detail_stage5.append(
                 GCBlock(
                     in_channels=channels * 2,
@@ -925,7 +909,7 @@ class GCNetImproved(BaseModule):
         
         # Stage 6 Detail
         detail_stage6 = []
-        for _ in range(num_blocks_per_stage[4][1]):
+        for i in range(num_blocks_per_stage[4][1]):
             detail_stage6.append(
                 GCBlock(
                     in_channels=channels * 2,
@@ -977,15 +961,17 @@ class GCNetImproved(BaseModule):
             norm_cfg=norm_cfg,
             act_cfg=None
         )
+        
         self.final_proj = ConvModule(
-            in_channels=channels * 4,  # 128
-            out_channels=channels * 2,  # 64
+            in_channels=channels * 4,
+            out_channels=channels * 2,
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg
         )
+        
         # ======================================
-        # BOTTLENECK (FIXED)
+        # BOTTLENECK với Attention
         # ======================================
         bottleneck_modules = [
             DAPPM(
@@ -998,23 +984,26 @@ class GCNetImproved(BaseModule):
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
-        ]        
-        # Global FlashAttention in bottleneck
-        if self.use_flash_attention:
-            bottleneck_modules.append(
-                FlashAttentionStage(
-                    dim=channels * 4,
-                    num_heads=flash_attn_heads,
-                    num_layers=flash_attn_layers,
-                    drop=flash_attn_drop,
-                    attn_drop=flash_attn_drop
-                )
-            )
+        ]
         
-        # SE Module in bottleneck
-        if self.use_se:
+        # ✅ Bottleneck attention strategy
+        bottleneck_type = attention_config.get('bottleneck', 'cbam')
+        
+        if 'axial' in bottleneck_type:
+            # Axial attention cho long-range dependencies
+            self.bottleneck_axial = AxialAttention(
+                dim=channels * 4,
+                num_heads=8,
+                attn_drop=0.0,
+                proj_drop=0.0
+            )
+        else:
+            self.bottleneck_axial = None
+        
+        if 'cbam' in bottleneck_type:
+            # CBAM cho channel + spatial attention
             bottleneck_modules.append(
-                SEModule(channels * 4, reduction=se_reduction)
+                CBAM(channels * 4, reduction=se_reduction)
             )
         
         self.spp = nn.ModuleList(bottleneck_modules)
@@ -1022,25 +1011,9 @@ class GCNetImproved(BaseModule):
         # Initialize weights
         self.init_weights()
     
-    def _reshape_for_attention(self, x: Tensor) -> Tensor:
-        """(B, C, H, W) -> (B, H*W, C)"""
-        B, C, H, W = x.shape
-        return x.flatten(2).transpose(1, 2)
-    
-    def _reshape_from_attention(self, x: Tensor, H: int, W: int) -> Tensor:
-        """(B, H*W, C) -> (B, C, H, W)"""
-        B, N, C = x.shape
-        return x.transpose(1, 2).reshape(B, C, H, W)
-    
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """
-        ✅ STABLE VERSION: Simplified bilateral fusion
-        
-        Changes:
-        - Bilateral fusion 1: Bidirectional (semantic ↔ detail)
-        - Bilateral fusion 2: One-way only (semantic → detail)
-        
-        This prevents shape mismatch while keeping performance
+        Forward pass với efficient attention placement
         """
         outputs = {}
         
@@ -1048,64 +1021,51 @@ class GCNetImproved(BaseModule):
         c1 = self.stage1_conv(x)
         outputs['c1'] = c1
         
-        # Stage 2 (H/4)
+        # Stage 2 (H/4) - có SE attention
         c2 = self.stage2(c1)
         outputs['c2'] = c2
         
-        # Stage 3 (H/8) - Stem
+        # Stage 3 (H/8) - Stem với SE attention
         c3 = self.stage3(c2)
         outputs['c3'] = c3
         
         # ======================================
-        # STAGE 4: Dual Branch Start
+        # STAGE 4: Dual Branch với CBAM
         # ======================================
-        x_s = self.semantic_branch_layers[0](c3)  # Semantic: H/8 → H/16
-        x_d = self.detail_branch_layers[0](c3)     # Detail: H/8 → H/8
+        x_s = self.semantic_branch_layers[0](c3)  # H/8 → H/16
+        x_d = self.detail_branch_layers[0](c3)     # H/8 → H/8
         
-        # FlashAttention at stage 4 (if enabled)
-        if self.stage4_attention is not None:
-            B, C, H, W = x_s.shape
-            x_s_flat = self._reshape_for_attention(x_s)
-            x_s_flat = self.stage4_attention(x_s_flat)
-            x_s = self._reshape_from_attention(x_s_flat, H, W)
-        
-        # ✅ Bilateral Fusion 1 (Both directions)
+        # Bilateral Fusion 1
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         x_s_relu = self.relu(x_s)
         x_d_relu = self.relu(x_d)
+        
         # Semantic → Detail
-        comp_c = self.compression_1(x_s_relu)  # 128 → 64
+        comp_c = self.compression_1(x_s_relu)
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear', 
                           align_corners=self.align_corners)
         
         # Detail → Semantic
-        x_s = x_s + self.down_1(x_d_relu)  # Downsample H/8 → H/16
+        x_s = x_s + self.down_1(x_d_relu)
         
-        # Save c4 for auxiliary head
         outputs['c4'] = x_s
         
         # ======================================
         # STAGE 5: Continue Processing
         # ======================================
-        x_s = self.semantic_branch_layers[1](self.relu(x_s))  # H/16 → H/32
-        x_d = self.detail_branch_layers[1](self.relu(x_d))     # H/8 → H/8
+        x_s = self.semantic_branch_layers[1](self.relu(x_s))
+        x_d = self.detail_branch_layers[1](self.relu(x_d))
         
-        # ✅ Bilateral Fusion 2 (One-way only: semantic → detail)
-        # Reason: x_s is at H/32, too deep to receive info from H/8
-        
-        # Semantic → Detail (compress and upsample)
-        comp_c = self.compression_2(self.relu(x_s))  # 128 → 64
+        # Bilateral Fusion 2
+        comp_c = self.compression_2(self.relu(x_s))
         x_d = x_d + resize(comp_c, size=out_size, mode='bilinear',
                           align_corners=self.align_corners)
-        
-        # Semantic keeps its own path (no fusion from detail)
-        # This avoids shape mismatch
         
         # ======================================
         # STAGE 6: Final Processing
         # ======================================
-        x_d = self.detail_branch_layers[2](self.relu(x_d))  # H/8 → H/8
-        x_s = self.semantic_branch_layers[2](self.relu(x_s))  # H/32 → H/32
+        x_d = self.detail_branch_layers[2](self.relu(x_d))
+        x_s = self.semantic_branch_layers[2](self.relu(x_s))
         
         # ======================================
         # BOTTLENECK: Multi-scale + Attention
@@ -1113,22 +1073,19 @@ class GCNetImproved(BaseModule):
         for module in self.spp:
             if isinstance(module, DAPPM):
                 x_s = module(x_s)
-            elif isinstance(module, FlashAttentionStage):
-                B, C, H, W = x_s.shape
-                x_s_flat = self._reshape_for_attention(x_s)
-                x_s_flat = module(x_s_flat)
-                x_s = self._reshape_from_attention(x_s_flat, H, W)
-            elif isinstance(module, SEModule):
+            elif isinstance(module, CBAM):
                 x_s = module(x_s)
         
-        # STEP 1: Resize spatial (H/32 → H/8)
+        # ✅ Apply axial attention if enabled
+        if self.bottleneck_axial is not None:
+            x_s = self.bottleneck_axial(x_s)
+        
+        # Resize and project
         x_s = resize(x_s, size=out_size, mode='bilinear',
                     align_corners=self.align_corners)
-        
-        # STEP 2: Project channels (128 → 64)
         x_s = self.final_proj(x_s)
         
-        # STEP 3: Final Fusion
+        # Final fusion
         c5 = x_d + x_s
         outputs['c5'] = c5
         
@@ -1162,3 +1119,50 @@ class GCNetImproved(BaseModule):
                     nn.init.trunc_normal_(m.weight, std=0.02)
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
+
+
+# ============================================
+# USAGE EXAMPLES
+# ============================================
+
+def create_gcnet_variants():
+    """Factory function cho các variants khác nhau"""
+    
+    # ✅ Lightweight variant (mobile/edge devices)
+    gcnet_lite = GCNetImproved(
+        channels=24,
+        attention_config={
+            'stage2': 'se',
+            'stage3': 'se',
+            'stage4': None,  # No attention
+            'bottleneck': 'cbam'  # Only CBAM
+        }
+    )
+    
+    # ✅ Standard variant (balanced)
+    gcnet_std = GCNetImproved(
+        channels=32,
+        attention_config={
+            'stage2': 'se',
+            'stage3': 'se',
+            'stage4': 'cbam',
+            'bottleneck': 'cbam'
+        }
+    )
+    
+    # ✅ Performance variant (maximum accuracy)
+    gcnet_perf = GCNetImproved(
+        channels=48,
+        attention_config={
+            'stage2': 'se',
+            'stage3': 'se',
+            'stage4': 'cbam',
+            'bottleneck': 'axial+cbam'  # Full attention
+        }
+    )
+    
+    return {
+        'lite': gcnet_lite,
+        'standard': gcnet_std,
+        'performance': gcnet_perf
+    }
