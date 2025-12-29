@@ -188,102 +188,69 @@ class CityscapesDataset(Dataset):
 # ============================================
 
 def get_train_transforms(
-    img_size: Tuple[int, int] = (1024, 2048),
+    img_size: Tuple[int, int] = (512, 1024),
     mean: List[float] = [0.485, 0.456, 0.406],
     std: List[float] = [0.229, 0.224, 0.225],
-    dataset_type: str = 'normal'
+    dataset_type: str = "normal"
 ) -> A.Compose:
     """
-    Training augmentation pipeline
-    
-    Args:
-        img_size: Target size (H, W)
-        mean: Normalization mean
-        std: Normalization std
-        dataset_type: 'normal' or 'foggy' - affects augmentation strategy
+    Cityscapes training augmentation (industry standard)
     """
-    
-    # Base geometric augmentations (common for both)
-    base_transforms = [
-        A.Resize(height=img_size[0], width=img_size[1]),
-        A.HorizontalFlip(p=0.5),
-        A.ShiftScaleRotate(
-            shift_limit=0.1,
-            scale_limit=0.2,
-            rotate_limit=15,
-            border_mode=0,
-            p=0.5
+
+    # 1. Geometric transforms (MOST IMPORTANT)
+    transforms = [
+        # Random scale (multi-scale training)
+        A.RandomScale(
+            scale_limit=(0.75, 1.25) if dataset_type == "normal" else (0.5, 1.5),
+            interpolation=cv2.INTER_LINEAR,
+            p=1.0
         ),
+
+        # Random crop to training size
+        A.RandomCrop(
+            height=img_size[0],
+            width=img_size[1],
+            p=1.0
+        ),
+
+        # Horizontal flip
+        A.HorizontalFlip(p=0.5),
     ]
-    
-    # Color augmentations - different strategies for normal vs foggy
-    if dataset_type == 'normal':
-        # NORMAL CITYSCAPES: Standard color augmentations
-        color_transforms = [
-            A.OneOf([
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.2,
-                    contrast_limit=0.2,
-                    p=1.0
-                ),
-                A.HueSaturationValue(
-                    hue_shift_limit=15,
-                    sat_shift_limit=25,
-                    val_shift_limit=15,
-                    p=1.0
-                ),
-                A.RGBShift(
-                    r_shift_limit=20,
-                    g_shift_limit=20,
-                    b_shift_limit=20,
-                    p=1.0
-                ),
-            ], p=0.6),
-            
-            # Light blur/noise for robustness
-            A.OneOf([
-                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-                A.GaussNoise(var_limit=(10.0, 30.0), p=1.0),
-            ], p=0.2),
+
+    # 2. Color augmentations (LIGHT & CONTROLLED)
+    if dataset_type == "normal":
+        transforms += [
+            A.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.05,
+                p=0.3
+            ),
         ]
     else:
-        # FOGGY CITYSCAPES: Stronger augmentations to handle fog variations
-        color_transforms = [
-            A.OneOf([
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.3,
-                    contrast_limit=0.3,
-                    p=1.0
-                ),
-                A.HueSaturationValue(
-                    hue_shift_limit=20,
-                    sat_shift_limit=30,
-                    val_shift_limit=20,
-                    p=1.0
-                ),
-                A.RGBShift(
-                    r_shift_limit=25,
-                    g_shift_limit=25,
-                    b_shift_limit=25,
-                    p=1.0
-                ),
-            ], p=0.7),
-            
-            # Stronger blur/noise to simulate fog variations
-            A.OneOf([
-                A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-                A.MedianBlur(blur_limit=5, p=1.0),
-                A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
-            ], p=0.3),
+        # Foggy dataset: stronger color + blur
+        transforms += [
+            A.ColorJitter(
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.3,
+                hue=0.1,
+                p=0.5
+            ),
+            A.GaussianBlur(
+                blur_limit=(3, 5),
+                p=0.2
+            ),
         ]
-    
-    # Combine all transforms
-    all_transforms = base_transforms + color_transforms + [
+
+    # 3. Normalize & tensor
+    transforms += [
         A.Normalize(mean=mean, std=std),
         ToTensorV2()
     ]
-    
-    return A.Compose(all_transforms)
+
+    return A.Compose(transforms)
 
 
 def get_val_transforms(
@@ -292,13 +259,18 @@ def get_val_transforms(
     std: List[float] = [0.229, 0.224, 0.225]
 ) -> A.Compose:
     """
-    Validation/Test augmentation pipeline (no augmentation)
+    Validation/Test transforms (NO augmentation)
     """
     return A.Compose([
-        A.Resize(height=img_size[0], width=img_size[1]),
+        A.Resize(
+            height=img_size[0],
+            width=img_size[1],
+            interpolation=cv2.INTER_LINEAR
+        ),
         A.Normalize(mean=mean, std=std),
         ToTensorV2()
     ])
+
 
 
 # ============================================
