@@ -22,7 +22,7 @@ from datetime import datetime
 # IMPORTS
 # ============================================
 
-from model.backbone.model import GCNetImproved
+from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import create_dataloaders
 
