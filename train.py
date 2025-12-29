@@ -587,7 +587,7 @@ def main():
     
     cfg = ModelConfig.get_config(base_channels=args.base_channels)
     model = Segmentor(
-        backbone=GCNetImproved(**cfg["backbone"]),
+        backbone=GCNetWithDWSA(**cfg["backbone"]),
         head=GCNetHead(num_classes=args.num_classes, **cfg["head"]),
         aux_head=GCNetAuxHead(num_classes=args.num_classes, **cfg["aux_head"])
     )
