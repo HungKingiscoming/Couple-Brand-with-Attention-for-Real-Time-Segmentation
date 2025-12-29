@@ -48,7 +48,6 @@ class ModelConfig:
                 "channels": base_channels,
                 "ppm_channels": min(128, base_channels * 4),
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
-                "use_flash_attention": False,
                 "use_se": True,
                 "deploy": False
             },
