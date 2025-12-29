@@ -5,7 +5,6 @@ from torch import Tensor
 import math
 from typing import List, Tuple, Union, Dict
 
-# Import components (giữ nguyên)
 from components.components import (
     ConvModule,
     BaseModule,
@@ -17,8 +16,9 @@ from components.components import (
 )
 
 # ============================================
-# EFFICIENT ATTENTION MODULES
+# DEPTHWISE SEPARABLE ATTENTION
 # ============================================
+
 class DepthWiseSeparableAttention(nn.Module):
     """
     ✅ KHUYẾN NGHỊ #1 cho Segmentation
@@ -41,7 +41,7 @@ class DepthWiseSeparableAttention(nn.Module):
         qkv_bias: bool = True,
         attn_drop: float = 0.0,
         proj_drop: float = 0.0,
-        spatial_kernel: int = 7  # Local spatial window
+        spatial_kernel: int = 7
     ):
         super().__init__()
         assert dim % num_heads == 0
@@ -82,6 +82,13 @@ class DepthWiseSeparableAttention(nn.Module):
         Returns:
             out: same shape as input
         """
+        # Handle 4D input (B, C, H, W)
+        is_4d = False
+        if x.dim() == 4:
+            is_4d = True
+            B, C, H, W = x.shape
+            x = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        
         B, N, C = x.shape
         
         # Pre-norm
@@ -104,11 +111,11 @@ class DepthWiseSeparableAttention(nn.Module):
         # 2. Apply local spatial bias (for segmentation)
         if N == int(math.sqrt(N)) ** 2:  # If square feature map
             H_feat = W_feat = int(math.sqrt(N))
-            attn_2d = attn.reshape(B, self.num_heads, H_feat, W_feat, H_feat, W_feat)
+            attn_2d = attn.view(B, self.num_heads, H_feat, W_feat, N)
             
             # Local attention bias
             local_bias = self.local_attn(
-                attn_2d.mean(dim=(4, 5))  # Average over target positions
+                attn_2d.mean(dim=-1)  # Average over target positions
             )
             attn = attn + local_bias.flatten(2).unsqueeze(-1)
         
@@ -126,137 +133,56 @@ class DepthWiseSeparableAttention(nn.Module):
         out = self.proj(out)
         out = self.proj_drop(out)
         
-        return x + out
-
-class ChannelAttention(nn.Module):
-    """
-    Channel Attention Module - Lightweight và hiệu quả
-    
-    Focus: "What" channels are important
-    Complexity: O(C^2) - rất nhỏ so với spatial attention
-    """
-    
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
+        # Residual
+        out = x + out
         
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
+        # Restore 4D shape if needed
+        if is_4d:
+            out = out.transpose(1, 2).reshape(B, C, H, W)
         
-        # Shared MLP
-        self.fc = nn.Sequential(
-            nn.Linear(channels, max(channels // reduction, 8), bias=False),
-            nn.ReLU(inplace=False),
-            nn.Linear(max(channels // reduction, 8), channels, bias=False)
-        )
-        
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x: Tensor) -> Tensor:
-        B, C, H, W = x.shape
-        
-        # Global pooling
-        avg_out = self.fc(self.avg_pool(x).view(B, C))
-        max_out = self.fc(self.max_pool(x).view(B, C))
-        
-        # Channel weights
-        out = self.sigmoid(avg_out + max_out).view(B, C, 1, 1)
-        
-        return x * out.expand_as(x)
+        return out
 
 
-class SpatialAttention(nn.Module):
+class DWSABlock(nn.Module):
     """
-    Spatial Attention Module - Tìm "where" to focus
-    
-    Complexity: O(HW) - chỉ dùng 2 channels (avg + max)
-    """
-    
-    def __init__(self, kernel_size: int = 7):
-        super().__init__()
-        
-        self.conv = nn.Conv2d(
-            2, 1, 
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            bias=False
-        )
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x: Tensor) -> Tensor:
-        # Channel-wise pooling
-        avg_out = torch.mean(x, dim=1, keepdim=True)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)
-        
-        # Concatenate and convolve
-        spatial_feat = torch.cat([avg_out, max_out], dim=1)
-        spatial_weight = self.sigmoid(self.conv(spatial_feat))
-        
-        return x * spatial_weight
-
-
-class CBAM(nn.Module):
-    """
-    Convolutional Block Attention Module
-    Reference: https://arxiv.org/abs/1807.06521
-    
-    ✅ Best choice for segmentation:
-    - Efficient (0.01M params)
-    - Proven effective
-    - Hardware agnostic
-    - Easy to integrate
+    Wrapper block cho DepthWiseSeparableAttention
+    Dễ dàng thay thế vào backbone
     """
     
     def __init__(
         self,
         channels: int,
-        reduction: int = 16,
-        kernel_size: int = 7
-    ):
-        super().__init__()
-        
-        self.channel_attention = ChannelAttention(channels, reduction)
-        self.spatial_attention = SpatialAttention(kernel_size)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        # Sequential: channel → spatial
-        x = self.channel_attention(x)
-        x = self.spatial_attention(x)
-        return x
-
-
-class AxialAttention(nn.Module):
-    """
-    Axial Attention - Efficient 2D attention
-    
-    Decompose 2D attention vào H-axis và W-axis
-    Complexity: O(HW * (H + W)) vs O(HW * HW) cho full attention
-    
-    Use case: Khi cần long-range dependencies
-    """
-    
-    def __init__(
-        self,
-        dim: int,
         num_heads: int = 8,
-        qkv_bias: bool = False,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0
+        spatial_kernel: int = 7,
+        mlp_ratio: float = 2.0,
+        drop: float = 0.0,
+        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
     ):
         super().__init__()
-        assert dim % num_heads == 0
         
-        self.dim = dim
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
+        # Attention
+        self.attn = DepthWiseSeparableAttention(
+            dim=channels,
+            num_heads=num_heads,
+            spatial_kernel=spatial_kernel,
+            attn_drop=drop,
+            proj_drop=drop
+        )
         
-        # Separate projections for height and width
-        self.qkv_h = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.qkv_w = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        # FFN (Feed-Forward Network)
+        mlp_hidden = int(channels * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(channels, mlp_hidden),
+            build_activation_layer(act_cfg),
+            nn.Dropout(drop),
+            nn.Linear(mlp_hidden, channels),
+            nn.Dropout(drop)
+        )
         
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
+        # Norms
+        self.norm1 = nn.LayerNorm(channels)
+        self.norm2 = nn.LayerNorm(channels)
     
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -267,128 +193,26 @@ class AxialAttention(nn.Module):
         """
         B, C, H, W = x.shape
         
-        # ===== HEIGHT ATTENTION =====
-        # Reshape: (B, C, H, W) -> (B*W, H, C)
-        x_h = x.permute(0, 3, 2, 1).reshape(B * W, H, C)
+        # Attention block (handles 4D internally)
+        x = self.attn(x)
         
-        qkv_h = self.qkv_h(x_h).reshape(B * W, H, 3, self.num_heads, self.head_dim)
-        q_h, k_h, v_h = qkv_h.unbind(2)
+        # FFN block (need to reshape to 3D)
+        identity = x
+        x = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        x = self.norm2(x)
+        x = self.mlp(x)
+        x = x.transpose(1, 2).reshape(B, C, H, W)
+        x = identity + x
         
-        # Attention
-        attn_h = (q_h @ k_h.transpose(-2, -1)) * self.scale
-        attn_h = attn_h.softmax(dim=-1)
-        attn_h = self.attn_drop(attn_h)
-        
-        out_h = (attn_h @ v_h).reshape(B * W, H, C)
-        out_h = out_h.reshape(B, W, H, C).permute(0, 3, 2, 1)  # -> (B, C, H, W)
-        
-        # ===== WIDTH ATTENTION =====
-        # Reshape: (B, C, H, W) -> (B*H, W, C)
-        x_w = out_h.permute(0, 2, 3, 1).reshape(B * H, W, C)
-        
-        qkv_w = self.qkv_w(x_w).reshape(B * H, W, 3, self.num_heads, self.head_dim)
-        q_w, k_w, v_w = qkv_w.unbind(2)
-        
-        # Attention
-        attn_w = (q_w @ k_w.transpose(-2, -1)) * self.scale
-        attn_w = attn_w.softmax(dim=-1)
-        attn_w = self.attn_drop(attn_w)
-        
-        out_w = (attn_w @ v_w).reshape(B * H, W, C)
-        out_w = out_w.reshape(B, H, W, C).permute(0, 3, 1, 2)  # -> (B, C, H, W)
-        
-        # Final projection
-        out = self.proj(out_w.flatten(2).transpose(1, 2))  # (B, H*W, C)
-        out = self.proj_drop(out)
-        out = out.transpose(1, 2).reshape(B, C, H, W)
-        
-        return out + x  # Residual
-
-
-class EfficientMultiHeadAttention(nn.Module):
-    """
-    Simplified Multi-Head Attention cho small spatial size
-    
-    Use case: Bottleneck features (H/32, W/32)
-    """
-    
-    def __init__(
-        self,
-        dim: int,
-        num_heads: int = 8,
-        qkv_bias: bool = False,
-        attn_drop: float = 0.0,
-        proj_drop: float = 0.0
-    ):
-        super().__init__()
-        assert dim % num_heads == 0
-        
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.scale = self.head_dim ** -0.5
-        
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        Args:
-            x: (B, N, C) where N = H*W
-        Returns:
-            out: (B, N, C)
-        """
-        B, N, C = x.shape
-        
-        # QKV projection
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)  # Each: (B, N, num_heads, head_dim)
-        
-        # Transpose for attention
-        q = q.transpose(1, 2)  # (B, num_heads, N, head_dim)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        
-        # Scaled dot-product attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        
-        # Apply attention
-        out = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
-        out = self.proj_drop(out)
-        
-        return out
-
-
-class SEModule(nn.Module):
-    """Squeeze-and-Excitation - Simplest channel attention"""
-    
-    def __init__(self, channels: int, reduction: int = 16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Sequential(
-            nn.Linear(channels, max(channels // reduction, 8), bias=False),
-            nn.ReLU(inplace=False),
-            nn.Linear(max(channels // reduction, 8), channels, bias=False),
-            nn.Sigmoid()
-        )
-    
-    def forward(self, x: Tensor) -> Tensor:
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+        return x
 
 
 # ============================================
-# GCBLOCK (Giữ nguyên - đã tốt)
+# GCBLOCK với DWSA Support
 # ============================================
 
 class Block1x1(BaseModule):
-    """1x1_1x1 path of GCBlock"""
+    """1x1_1x1 path của GCBlock"""
     
     def __init__(
         self,
@@ -481,7 +305,7 @@ class Block1x1(BaseModule):
 
 
 class Block3x3(BaseModule):
-    """3x3_1x1 path of GCBlock"""
+    """3x3_1x1 path của GCBlock"""
     
     def __init__(
         self,
@@ -573,8 +397,8 @@ class Block3x3(BaseModule):
         self.deploy = True
 
 
-class GCBlock(nn.Module):  
-    """GCBlock with optional attention"""
+class GCBlock(nn.Module):
+    """GCBlock với optional DWSA"""
     
     def __init__(
         self,
@@ -587,8 +411,8 @@ class GCBlock(nn.Module):
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         act: bool = True,
         deploy: bool = False,
-        use_attention: bool = False,
-        attention_type: str = 'se'  # 'se', 'cbam', or None
+        use_dwsa: bool = False,  # ✅ NEW
+        dwsa_num_heads: int = 8
     ):
         super().__init__()
         
@@ -598,7 +422,7 @@ class GCBlock(nn.Module):
         self.stride = stride
         self.padding = padding
         self.deploy = deploy
-        self.use_attention = use_attention
+        self.use_dwsa = use_dwsa
         
         assert kernel_size == 3 and padding == 1
         
@@ -651,16 +475,16 @@ class GCBlock(nn.Module):
                 norm_cfg=norm_cfg
             )
         
-        # ✅ Add attention module
-        if use_attention and not deploy:
-            if attention_type == 'se':
-                self.attention = SEModule(out_channels)
-            elif attention_type == 'cbam':
-                self.attention = CBAM(out_channels)
-            else:
-                self.attention = None
+        # ✅ Add DWSA module
+        if use_dwsa and not deploy:
+            self.dwsa = DWSABlock(
+                channels=out_channels,
+                num_heads=dwsa_num_heads,
+                spatial_kernel=7,
+                drop=0.0
+            )
         else:
-            self.attention = None
+            self.dwsa = None
     
     def forward(self, x: Tensor) -> Tensor:
         if hasattr(self, 'reparam_3x3'):
@@ -674,9 +498,9 @@ class GCBlock(nn.Module):
                 id_out
             )
         
-        # Apply attention if available
-        if self.attention is not None:
-            out = self.attention(out)
+        # ✅ Apply DWSA if available
+        if self.dwsa is not None:
+            out = self.dwsa(out)
         
         return out
     
@@ -762,27 +586,29 @@ class GCBlock(nn.Module):
             self.__delattr__('path_residual')
         if hasattr(self, 'id_tensor'):
             self.__delattr__('id_tensor')
+        if hasattr(self, 'dwsa'):
+            self.__delattr__('dwsa')
         
         self.deploy = True
 
 
 # ============================================
-# IMPROVED GCNET BACKBONE
+# GCNET với DWSA
 # ============================================
 
-class GCNetImproved(BaseModule):
+class GCNetWithDWSA(BaseModule):
     """
-    ✅ GCNet với Efficient Attention Strategy
+    ✅ GCNet với DepthWiseSeparableAttention
     
-    Attention placement:
-    - Stage 2-3: SE module (lightweight, local)
-    - Stage 4: CBAM (channel + spatial)
-    - Bottleneck: Axial Attention (long-range) + CBAM
+    DWSA Placement Strategy:
+    - Stage 3 (H/8): Last block → Capture spatial context
+    - Stage 4 (H/16): Last 2 blocks → Rich features
+    - Bottleneck: DAPPM + DWSA → Global context
     
     Rationale:
-    - Early stages: Local features → lightweight attention
-    - Mid stages: Richer features → full attention
-    - Bottleneck: Small spatial → efficient global attention
+    - Early stages (H/2, H/4): Pure convs (local features)
+    - Mid stages (H/8, H/16): DWSA (multi-scale context)
+    - Bottleneck: Full attention (global understanding)
     """
     
     def __init__(
@@ -791,13 +617,8 @@ class GCNetImproved(BaseModule):
         channels: int = 32,
         ppm_channels: int = 128,
         num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
-        attention_config: Dict = {
-            'stage2': 'se',      # Lightweight
-            'stage3': 'se',      # Lightweight
-            'stage4': 'cbam',    # Full attention
-            'bottleneck': 'axial+cbam'  # Long-range + channel/spatial
-        },
-        se_reduction: int = 16,
+        dwsa_stages: List[str] = ['stage3', 'stage4', 'bottleneck'],  # ✅ Config
+        dwsa_num_heads: int = 8,
         align_corners: bool = False,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
@@ -810,7 +631,7 @@ class GCNetImproved(BaseModule):
         self.channels = channels
         self.ppm_channels = ppm_channels
         self.num_blocks_per_stage = num_blocks_per_stage
-        self.attention_config = attention_config
+        self.dwsa_stages = dwsa_stages
         self.align_corners = align_corners
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
@@ -827,7 +648,7 @@ class GCNetImproved(BaseModule):
             act_cfg=act_cfg
         )
         
-        # Stage 2: Second conv + blocks (H/4) với SE
+        # Stage 2: Second conv + blocks (H/4)
         stage2_layers = [
             ConvModule(
                 in_channels=channels,
@@ -841,8 +662,6 @@ class GCNetImproved(BaseModule):
         ]
         
         for i in range(num_blocks_per_stage[0]):
-            # ✅ Add SE to last block
-            use_attn = (i == num_blocks_per_stage[0] - 1) and (attention_config.get('stage2') == 'se')
             stage2_layers.append(
                 GCBlock(
                     in_channels=channels,
@@ -850,15 +669,13 @@ class GCNetImproved(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
-                    deploy=deploy,
-                    use_attention=use_attn,
-                    attention_type='se'
+                    deploy=deploy
                 )
             )
         
         self.stage2 = nn.Sequential(*stage2_layers)
         
-        # Stage 3 (Stem): Downsample + GCBlocks (H/8) với SE
+        # Stage 3 (Stem): Downsample + GCBlocks (H/8) ✅ với DWSA
         stage3_layers = [
             GCBlock(
                 in_channels=channels,
@@ -871,8 +688,8 @@ class GCNetImproved(BaseModule):
         ]
         
         for i in range(num_blocks_per_stage[1] - 1):
-            # ✅ Add SE to last block
-            use_attn = (i == num_blocks_per_stage[1] - 2) and (attention_config.get('stage3') == 'se')
+            # ✅ Add DWSA to last block
+            use_dwsa = (i == num_blocks_per_stage[1] - 2) and ('stage3' in dwsa_stages)
             stage3_layers.append(
                 GCBlock(
                     in_channels=channels * 2,
@@ -881,8 +698,8 @@ class GCNetImproved(BaseModule):
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
                     deploy=deploy,
-                    use_attention=use_attn,
-                    attention_type='se'
+                    use_dwsa=use_dwsa,
+                    dwsa_num_heads=dwsa_num_heads
                 )
             )
         
@@ -894,7 +711,7 @@ class GCNetImproved(BaseModule):
         # ======================================
         self.semantic_branch_layers = nn.ModuleList()
         
-        # Stage 4 Semantic với CBAM
+        # Stage 4 Semantic ✅ với DWSA
         stage4_sem = []
         stage4_sem.append(
             GCBlock(
@@ -908,8 +725,8 @@ class GCNetImproved(BaseModule):
         )
         
         for i in range(num_blocks_per_stage[2][0] - 1):
-            # ✅ Add CBAM to last block
-            use_attn = (i == num_blocks_per_stage[2][0] - 2) and (attention_config.get('stage4') == 'cbam')
+            # ✅ Add DWSA to last 2 blocks
+            use_dwsa = (i >= num_blocks_per_stage[2][0] - 3) and ('stage4' in dwsa_stages)
             stage4_sem.append(
                 GCBlock(
                     in_channels=channels * 4,
@@ -918,8 +735,8 @@ class GCNetImproved(BaseModule):
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
                     deploy=deploy,
-                    use_attention=use_attn,
-                    attention_type='cbam'
+                    use_dwsa=use_dwsa,
+                    dwsa_num_heads=dwsa_num_heads
                 )
             )
         
@@ -1079,66 +896,51 @@ class GCNetImproved(BaseModule):
         )
         
         # ======================================
-        # BOTTLENECK với Attention
+        # BOTTLENECK với DWSA
         # ======================================
-        bottleneck_modules = [
-            DAPPM(
-                in_channels=channels * 4,
-                branch_channels=ppm_channels,
-                out_channels=channels * 4,
-                num_scales=5,
-                kernel_sizes=[5, 9, 17, 33],
-                strides=[2, 4, 8, 16],
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
-        ]
+        self.spp = DAPPM(
+            in_channels=channels * 4,
+            branch_channels=ppm_channels,
+            out_channels=channels * 4,
+            num_scales=5,
+            kernel_sizes=[5, 9, 17, 33],
+            strides=[2, 4, 8, 16],
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
+        )
         
-        # ✅ Bottleneck attention strategy
-        bottleneck_type = attention_config.get('bottleneck', 'cbam')
-        
-        if 'axial' in bottleneck_type:
-            # Axial attention cho long-range dependencies
-            self.bottleneck_axial = AxialAttention(
-                dim=channels * 4,
-                num_heads=8,
-                attn_drop=0.0,
-                proj_drop=0.0
+        # ✅ Bottleneck DWSA
+        if 'bottleneck' in dwsa_stages:
+            self.bottleneck_dwsa = DWSABlock(
+                channels=channels * 4,
+                num_heads=dwsa_num_heads,
+                spatial_kernel=7,
+                drop=0.0
             )
         else:
-            self.bottleneck_axial = None
-        
-        if 'cbam' in bottleneck_type:
-            # CBAM cho channel + spatial attention
-            bottleneck_modules.append(
-                CBAM(channels * 4, reduction=se_reduction)
-            )
-        
-        self.spp = nn.ModuleList(bottleneck_modules)
+            self.bottleneck_dwsa = None
         
         # Initialize weights
         self.init_weights()
     
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """
-        Forward pass với efficient attention placement
-        """
+        """Forward pass với DWSA"""
         outputs = {}
         
         # Stage 1 (H/2)
         c1 = self.stage1_conv(x)
         outputs['c1'] = c1
         
-        # Stage 2 (H/4) - có SE attention
+        # Stage 2 (H/4)
         c2 = self.stage2(c1)
         outputs['c2'] = c2
         
-        # Stage 3 (H/8) - Stem với SE attention
+        # Stage 3 (H/8) - ✅ có DWSA
         c3 = self.stage3(c2)
         outputs['c3'] = c3
         
         # ======================================
-        # STAGE 4: Dual Branch với CBAM
+        # STAGE 4: Dual Branch - ✅ có DWSA
         # ======================================
         x_s = self.semantic_branch_layers[0](c3)  # H/8 → H/16
         x_d = self.detail_branch_layers[0](c3)     # H/8 → H/8
@@ -1176,17 +978,13 @@ class GCNetImproved(BaseModule):
         x_s = self.semantic_branch_layers[2](self.relu(x_s))
         
         # ======================================
-        # BOTTLENECK: Multi-scale + Attention
+        # BOTTLENECK: DAPPM + DWSA
         # ======================================
-        for module in self.spp:
-            if isinstance(module, DAPPM):
-                x_s = module(x_s)
-            elif isinstance(module, CBAM):
-                x_s = module(x_s)
+        x_s = self.spp(x_s)
         
-        # ✅ Apply axial attention if enabled
-        if self.bottleneck_axial is not None:
-            x_s = self.bottleneck_axial(x_s)
+        # ✅ Apply DWSA at bottleneck
+        if self.bottleneck_dwsa is not None:
+            x_s = self.bottleneck_dwsa(x_s)
         
         # Resize and project
         x_s = resize(x_s, size=out_size, mode='bilinear',
@@ -1230,47 +1028,61 @@ class GCNetImproved(BaseModule):
 
 
 # ============================================
-# USAGE EXAMPLES
+# FACTORY FUNCTIONS
 # ============================================
 
-def create_gcnet_variants():
-    """Factory function cho các variants khác nhau"""
+def create_gcnet_dwsa_variants():
+    """
+    Tạo các variants khác nhau của GCNet với DWSA
+    """
     
-    # ✅ Lightweight variant (mobile/edge devices)
-    gcnet_lite = GCNetImproved(
+    # ✅ Lightweight variant (mobile)
+    gcnet_dwsa_lite = GCNetWithDWSA(
         channels=24,
-        attention_config={
-            'stage2': 'se',
-            'stage3': 'se',
-            'stage4': None,  # No attention
-            'bottleneck': 'cbam'  # Only CBAM
-        }
+        dwsa_stages=['bottleneck'],  # Only at bottleneck
+        dwsa_num_heads=4
     )
     
     # ✅ Standard variant (balanced)
-    gcnet_std = GCNetImproved(
+    gcnet_dwsa_std = GCNetWithDWSA(
         channels=32,
-        attention_config={
-            'stage2': 'se',
-            'stage3': 'se',
-            'stage4': 'cbam',
-            'bottleneck': 'cbam'
-        }
+        dwsa_stages=['stage3', 'bottleneck'],  # Mid + bottleneck
+        dwsa_num_heads=8
     )
     
     # ✅ Performance variant (maximum accuracy)
-    gcnet_perf = GCNetImproved(
+    gcnet_dwsa_perf = GCNetWithDWSA(
         channels=48,
-        attention_config={
-            'stage2': 'se',
-            'stage3': 'se',
-            'stage4': 'cbam',
-            'bottleneck': 'axial+cbam'  # Full attention
-        }
+        dwsa_stages=['stage3', 'stage4', 'bottleneck'],  # Full attention
+        dwsa_num_heads=8
     )
     
     return {
-        'lite': gcnet_lite,
-        'standard': gcnet_std,
-        'performance': gcnet_perf
+        'lite': gcnet_dwsa_lite,
+        'standard': gcnet_dwsa_std,
+        'performance': gcnet_dwsa_perf
     }
+
+
+# ============================================
+# USAGE EXAMPLE
+# ============================================
+
+if __name__ == '__main__':
+    # Test model
+    model = GCNetWithDWSA(
+        channels=32,
+        dwsa_stages=['stage3', 'stage4', 'bottleneck'],
+        dwsa_num_heads=8
+    )
+    
+    # Dummy input
+    x = torch.randn(2, 3, 512, 1024)
+    
+    # Forward
+    outputs = model(x)
+    
+    print("✅ GCNet với DWSA outputs:")
+    for k, v in outputs.items():
+        print(f"  {k}: {v.shape}")
+        detail_stage5
