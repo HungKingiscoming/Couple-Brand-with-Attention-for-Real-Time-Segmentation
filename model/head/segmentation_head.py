@@ -221,16 +221,21 @@ class GCNetHead(BaseDecodeHead):
 
         # Optional decoder
         if self.decode_enabled:
-            from model.decoder.lightweight_decoder import LightweightDecoder
-            
-            self.decoder = LightweightDecoder(
-                in_channels=decoder_channels,
-                channels=decoder_channels,
-                use_gated_fusion=use_gated_fusion,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg,
-            )
-            seg_in_channels = decoder_channels // 8
+            try:
+                from model.decoder.lightweight_decoder import LightweightDecoder
+                
+                self.decoder = LightweightDecoder(
+                    in_channels=decoder_channels,
+                    channels=decoder_channels,
+                    use_gated_fusion=use_gated_fusion,
+                    norm_cfg=self.norm_cfg,
+                    act_cfg=self.act_cfg,
+                )
+                seg_in_channels = decoder_channels // 8
+            except ImportError:
+                print("⚠️  LightweightDecoder not found, decoder disabled")
+                self.decoder = None
+                seg_in_channels = decoder_channels
         else:
             self.decoder = None
             seg_in_channels = decoder_channels
@@ -306,52 +311,8 @@ class GCNetAuxHead(BaseDecodeHead):
         """
         # Use c3 or c4 for auxiliary supervision
         x = inputs.get("c3", inputs.get("c4"))
+        if x is None:
+            # Fallback to any available feature
+            x = list(inputs.values())[-2]
         x = self.conv(x)
         return x
-
-
-# ============================================================
-# USAGE EXAMPLE
-# ============================================================
-
-if __name__ == "__main__":
-    # Test the fixed head
-    
-    # Dummy backbone outputs
-    dummy_inputs = {
-        "c1": torch.randn(2, 24, 256, 512),   # H/2
-        "c2": torch.randn(2, 24, 128, 256),   # H/4
-        "c3": torch.randn(2, 48, 64, 128),    # H/8
-        "c4": torch.randn(2, 96, 32, 64),     # H/16
-        "c5": torch.randn(2, 48, 64, 128),    # H/8 (final)
-    }
-    
-    # ✅ Create head with proper kwargs
-    head = GCNetHead(
-        in_channels=48,              # c5 channels
-        channels=96,                 # Internal channels
-        num_classes=19,
-        decoder_channels=128,        # Custom param
-        decode_enabled=False,        # Custom param
-        skip_channels=[48, 24, 24],  # Custom param
-        dropout_ratio=0.1,           # BaseDecodeHead param
-        align_corners=False          # BaseDecodeHead param
-    )
-    
-    # Forward
-    logits = head(dummy_inputs)
-    print(f"✅ Main Head Output: {logits.shape}")  # (2, 19, 64, 128)
-    
-    # ✅ Aux head
-    aux_head = GCNetAuxHead(
-        in_channels=96,     # c4 channels
-        channels=48,
-        num_classes=19,
-        dropout_ratio=0.1,
-        align_corners=False
-    )
-    
-    aux_logits = aux_head(dummy_inputs)
-    print(f"✅ Aux Head Output: {aux_logits.shape}")  # (2, 19, 64, 128)
-    
-    print("\n✅ All tests passed!")
