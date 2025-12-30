@@ -81,43 +81,43 @@ class LovaszSoftmaxLoss(nn.Module):
 
 class BoundaryLoss(nn.Module):
     """
-    Boundary-aware loss using Laplacian edge detection
-    
-    Helps with sharp object boundaries (poles, signs, etc.)
+    Boundary-aware loss using Laplacian edge
+    AMP-safe
     """
-    
+
     def __init__(self):
         super().__init__()
-        
-        # Laplacian kernel for edge detection
+
         kernel = torch.tensor(
-            [[-1, -1, -1],
-             [-1,  8, -1],
-             [-1, -1, -1]],
+            [[1, 1, 1],
+             [1, -8, 1],
+             [1, 1, 1]],
             dtype=torch.float32
         ).view(1, 1, 3, 3)
-        
+
+        # 🔥 QUAN TRỌNG: register_buffer để:
+        # - tự move theo model.to(device)
+        # - không bị optimizer update
+        # - tương thích AMP
         self.register_buffer("kernel", kernel)
-    
+
     def forward(self, logits, targets):
-        """
-        Args:
-            logits: (B, C, H, W) - predictions
-            targets: (B, H, W) - ground truth
-        """
-        # Get predicted segmentation
         probs = F.softmax(logits, dim=1)
+    
         pred = probs.argmax(dim=1, keepdim=True).float()
-        
-        # Ground truth as float
         gt = targets.unsqueeze(1).float()
-        
-        # Detect edges using Laplacian
-        pred_edge = F.conv2d(pred, self.kernel, padding=1)
-        gt_edge = F.conv2d(gt, self.kernel, padding=1)
-        
-        # L1 loss on edges
+    
+        # mask ignore pixels
+        valid_mask = (targets != 255).unsqueeze(1)
+    
+        kernel = self.kernel.to(dtype=pred.dtype, device=pred.device)
+    
+        kernel = self.kernel.to(dtype=pred.dtype, device=pred.device)
+        pred_edge = F.conv2d(pred, kernel, padding=1)
+        gt_edge = F.conv2d(gt * valid_mask, kernel, padding=1)
+    
         return F.l1_loss(pred_edge, gt_edge)
+
 
 
 # ============================================================
