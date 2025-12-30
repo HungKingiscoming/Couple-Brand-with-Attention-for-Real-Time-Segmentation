@@ -134,7 +134,8 @@ class ModelConfig:
                 "use_gated_fusion": True,
             },
             "aux_head": {
-                "in_channels": 128,             # c4 channels (32 * 4)
+                # ✅ FIXED: Use c3 channels for medium (c4 might not exist)
+                "in_channels": 64,              # c3 channels (32 * 2)
                 "channels": 64,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -168,7 +169,8 @@ class ModelConfig:
                 "use_gated_fusion": True,
             },
             "aux_head": {
-                "in_channels": 192,             # c4 channels (48 * 4)
+                # ✅ Use c3 channels (safest approach)
+                "in_channels": 96,              # c3 channels (48 * 2)
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
