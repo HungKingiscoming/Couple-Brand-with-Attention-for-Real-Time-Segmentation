@@ -26,6 +26,7 @@ import gc
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import create_dataloaders
+from model.losses.composite_loss import CompositeSegLoss
 
 # ============================================
 # MEMORY OPTIMIZATION UTILITIES
@@ -202,9 +203,13 @@ class MemoryEfficientTrainer:
         self.args = args
         
         # Loss function
-        self.criterion = MemoryEfficientLoss(
+        self.criterion = CompositeSegLoss(
+            num_classes=args.num_classes,
             ignore_index=args.ignore_index,
-            class_weights=class_weights.to(device) if class_weights is not None else None
+            class_weights=class_weights.to(device) if class_weights is not None else None,
+            w_ce=1.0,
+            w_lovasz=1.0,
+            w_boundary=0.5
         )
         
         # Mixed precision
@@ -268,7 +273,8 @@ class MemoryEfficientTrainer:
                 )
                 
                 # Main loss
-                loss = self.criterion(logits, masks)
+                loss_dict = self.criterion(logits, masks)
+                loss = loss_dict["loss"]
                 
                 # Auxiliary loss (if enabled)
                 if "aux" in outputs and self.args.aux_weight > 0:
@@ -278,8 +284,8 @@ class MemoryEfficientTrainer:
                         mode="bilinear",
                         align_corners=False
                     )
-                    aux_loss = self.criterion(aux_logits, masks)
-                    loss = loss + self.args.aux_weight * aux_loss
+                    aux_loss_dict = self.criterion(aux_logits, masks)
+                    loss = loss + self.args.aux_weight * aux_loss_dict["loss"]
                 
                 # ✅ Scale loss for gradient accumulation
                 loss = loss / self.args.accumulation_steps
@@ -367,7 +373,7 @@ class MemoryEfficientTrainer:
                     align_corners=False
                 )
                 
-                loss = self.criterion(logits, masks)
+                loss = self.criterion.ce(logits, masks)
             
             total_loss += loss.item()
             
