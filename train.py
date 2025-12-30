@@ -66,6 +66,8 @@ class ModelConfig:
     @staticmethod
     def get_lightweight_config():
         """
+        ✅ FIXED: Properly separate custom kwargs from BaseDecodeHead kwargs
+        
         Ultra-lightweight config for 16GB GPU
         
         Memory Budget:
@@ -78,33 +80,41 @@ class ModelConfig:
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 24,  # ✅ Reduced from 32
-                "ppm_channels": 96,  # ✅ Reduced from 128
-                "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],  # ✅ Fewer blocks
-                "dwsa_stages": ['bottleneck'],  # ✅ Only bottleneck (lowest resolution)
-                "dwsa_num_heads": 4,  # ✅ Fewer heads
+                "channels": 24,
+                "ppm_channels": 96,
+                "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
+                "dwsa_stages": ['bottleneck'],
+                "dwsa_num_heads": 4,
                 "deploy": False
             },
             "head": {
-                "in_channels": 48,  # 24 * 2
-                "channels": 96,  # ✅ Reduced
-                "decode_enabled": False,  # ✅ Disable decoder to save memory
-                "skip_channels": [48, 24, 24],
+                # ✅ BaseDecodeHead parameters
+                "in_channels": 48,              # c5 channels (24 * 2)
+                "channels": 96,                 # Internal channels
+                "num_classes": None,            # Will be set at runtime
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
+                
+                # ✅ Custom GCNetHead parameters
+                "decoder_channels": 128,
+                "decode_enabled": False,        # Disable decoder for memory
+                "skip_channels": [48, 24, 24],
+                "use_gated_fusion": True,
             },
             "aux_head": {
-                "in_channels": 96,  # 24 * 4
-                "channels": 48,  # ✅ Reduced
+                # ✅ BaseDecodeHead parameters only
+                "in_channels": 96,              # c4 channels (24 * 4)
+                "channels": 48,
+                "num_classes": None,            # Will be set at runtime
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
             }
         }
     
     @staticmethod
     def get_medium_config():
         """
-        Balanced config for 24GB+ GPU
+        ✅ FIXED: Balanced config for 24GB+ GPU
         """
         return {
             "backbone": {
@@ -112,26 +122,97 @@ class ModelConfig:
                 "channels": 32,
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
-                "dwsa_stages": ['stage4', 'bottleneck'],  # ✅ Avoid H/8
+                "dwsa_stages": ['stage4', 'bottleneck'],
                 "dwsa_num_heads": 8,
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,
+                # BaseDecodeHead parameters
+                "in_channels": 64,              # c5 channels (32 * 2)
                 "channels": 128,
-                "decode_enabled": False,
-                "skip_channels": [64, 32, 32],
+                "num_classes": None,
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
+                
+                # Custom GCNetHead parameters
+                "decoder_channels": 256,
+                "decode_enabled": True,         # Enable decoder
+                "skip_channels": [64, 32, 32],
+                "use_gated_fusion": True,
             },
             "aux_head": {
-                "in_channels": 128,
+                "in_channels": 128,             # c4 channels (32 * 4)
                 "channels": 64,
+                "num_classes": None,
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
             }
         }
-
+    
+    @staticmethod
+    def get_performance_config():
+        """
+        ✅ NEW: Maximum performance for 32GB+ GPU
+        """
+        return {
+            "backbone": {
+                "in_channels": 3,
+                "channels": 48,
+                "ppm_channels": 192,
+                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
+                "dwsa_stages": ['stage3', 'stage4', 'bottleneck'],
+                "dwsa_num_heads": 8,
+                "deploy": False
+            },
+            "head": {
+                "in_channels": 96,              # c5 channels (48 * 2)
+                "channels": 192,
+                "num_classes": None,
+                "dropout_ratio": 0.1,
+                "align_corners": False,
+                
+                "decoder_channels": 384,
+                "decode_enabled": True,
+                "skip_channels": [96, 48, 48],
+                "use_gated_fusion": True,
+            },
+            "aux_head": {
+                "in_channels": 192,             # c4 channels (48 * 4)
+                "channels": 96,
+                "num_classes": None,
+                "dropout_ratio": 0.1,
+                "align_corners": False,
+            }
+        }
+def create_model_from_config(config: dict, num_classes: int):
+    """
+    ✅ Helper function to create model from config
+    
+    Args:
+        config: Config dict from ModelConfig
+        num_classes: Number of segmentation classes
+    
+    Returns:
+        Segmentor model
+    """
+    from model.backbone.model import GCNetWithDWSA
+    from model.head.segmentation_head import GCNetHead, GCNetAuxHead
+    
+    # Add num_classes to head configs
+    head_cfg = config["head"].copy()
+    head_cfg["num_classes"] = num_classes
+    
+    aux_head_cfg = config["aux_head"].copy()
+    aux_head_cfg["num_classes"] = num_classes
+    
+    # Create model
+    model = Segmentor(
+        backbone=GCNetWithDWSA(**config["backbone"]),
+        head=GCNetHead(**head_cfg),
+        aux_head=GCNetAuxHead(**aux_head_cfg)
+    )
+    
+    return model
 # ============================================
 # SEGMENTOR
 # ============================================
