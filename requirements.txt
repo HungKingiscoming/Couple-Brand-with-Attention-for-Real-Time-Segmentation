@@ -1,6 +1,5 @@
 torch>=2.2.0
 torchvision>=0.17.0
-flash-attn>=2.5.5
 packaging>=23.0
 ninja>=1.11.0
 numpy>=1.23.0
