@@ -173,7 +173,7 @@ class ClassAwareContext(nn.Module):
 # 3️⃣ GCNet HEAD V2 (DROP-IN REPLACEMENT)
 # ============================================================
 
-class GCNetHeadV2(BaseDecodeHead):
+class GCNetHead(BaseDecodeHead):
     """
     ✅ GCNet Head V2:
     - ASPP-Lite
