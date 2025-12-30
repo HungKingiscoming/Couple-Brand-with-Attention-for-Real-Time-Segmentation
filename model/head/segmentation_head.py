@@ -126,6 +126,36 @@ class ASPPLite(nn.Module):
         x = torch.cat(feats, dim=1)
         return self.project(x)
 
+class GCNetAuxHead(BaseDecodeHead):
+    """
+    Auxiliary head for deep supervision (nhẹ)
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+
+        self.conv = nn.Sequential(
+            ConvModule(
+                self.in_channels,
+                self.channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg,
+            ),
+            nn.Conv2d(self.channels, self.num_classes, kernel_size=1)
+        )
+
+    def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
+        # thường dùng c3 hoặc c4
+        x = inputs.get("c3", list(inputs.values())[-2])
+        x = self.conv(x)
+        return resize(
+            x,
+            size=inputs["c1"].shape[2:],
+            mode="bilinear",
+            align_corners=self.align_corners,
+        )
 
 # ============================================================
 # 2️⃣ CLASS-AWARE CONTEXT MODULE (NHẸ – RẤT QUAN TRỌNG)
