@@ -24,7 +24,7 @@ import gc
 # ============================================
 
 from model.backbone.model import GCNetWithDWSA
-from model.head.segmentation_head import GCNetHead, GCNetAuxHead
+from model.head.segmentation_head import GCNetHead
 from data.custom import create_dataloaders
 from model.losses.composite_loss import CompositeSegLoss
 
