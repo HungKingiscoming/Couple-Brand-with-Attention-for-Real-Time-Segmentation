@@ -32,35 +32,64 @@ class ASPPLite(nn.Module):
         super().__init__()
 
         self.branches = nn.ModuleList([
-            ConvModule(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                padding=1,
-                dilation=1,
-                groups=in_channels,      # depthwise
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
+            nn.Sequential(
+                # Depthwise
+                ConvModule(
+                    in_channels,
+                    in_channels,
+                    kernel_size=3,
+                    padding=1,
+                    dilation=1,
+                    groups=in_channels,
+                    norm_cfg=norm_cfg,
+                    act_cfg=act_cfg,
+                ),
+                # Pointwise
+                ConvModule(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    norm_cfg=norm_cfg,
+                    act_cfg=act_cfg,
+                ),
             ),
-            ConvModule(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                padding=2,
-                dilation=2,
-                groups=in_channels,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
+            nn.Sequential(
+                ConvModule(
+                    in_channels,
+                    in_channels,
+                    kernel_size=3,
+                    padding=2,
+                    dilation=2,
+                    groups=in_channels,
+                    norm_cfg=norm_cfg,
+                    act_cfg=act_cfg,
+                ),
+                ConvModule(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    norm_cfg=norm_cfg,
+                    act_cfg=act_cfg,
+                ),
             ),
-            ConvModule(
-                in_channels,
-                out_channels,
-                kernel_size=3,
-                padding=3,
-                dilation=3,
-                groups=in_channels,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
+            nn.Sequential(
+                ConvModule(
+                    in_channels,
+                    in_channels,
+                    kernel_size=3,
+                    padding=3,
+                    dilation=3,
+                    groups=in_channels,
+                    norm_cfg=norm_cfg,
+                    act_cfg=act_cfg,
+                ),
+                ConvModule(
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    norm_cfg=norm_cfg,
+                    act_cfg=act_cfg,
+                ),
             ),
         ])
 
