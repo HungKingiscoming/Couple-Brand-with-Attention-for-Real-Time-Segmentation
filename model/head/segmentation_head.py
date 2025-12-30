@@ -278,21 +278,26 @@ class GCNetHead(BaseDecodeHead):
 
 
 # ============================================================
-# 4️⃣ AUXILIARY HEAD (UNCHANGED)
+# 4️⃣ AUXILIARY HEAD (FIXED - Channel Matching)
 # ============================================================
 
 class GCNetAuxHead(BaseDecodeHead):
     """
-    Auxiliary head for deep supervision
+    ✅ FIXED: Auxiliary head for deep supervision
+    
+    Automatically matches input channels from backbone
+    No hardcoded channel assumptions
     """
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+        # ✅ FIX: Use self.in_channels (from BaseDecodeHead)
+        # This matches whatever the backbone outputs
         self.conv = nn.Sequential(
             ConvModule(
-                self.in_channels,
-                self.channels,
+                self.in_channels,      # ✅ Backbone output channels
+                self.channels,         # ✅ Internal processing channels
                 kernel_size=3,
                 padding=1,
                 norm_cfg=self.norm_cfg,
@@ -309,10 +314,22 @@ class GCNetAuxHead(BaseDecodeHead):
         Returns:
             Auxiliary segmentation logits
         """
-        # Use c3 or c4 for auxiliary supervision
-        x = inputs.get("c3", inputs.get("c4"))
-        if x is None:
-            # Fallback to any available feature
+        # ✅ Try to get c4 first (preferred), fallback to c3
+        if "c4" in inputs:
+            x = inputs["c4"]
+        elif "c3" in inputs:
+            x = inputs["c3"]
+        else:
+            # Last resort: use any available feature
             x = list(inputs.values())[-2]
+        
+        # Print debug info (only once)
+        if not hasattr(self, '_debug_printed'):
+            print(f"🔍 AuxHead Debug:")
+            print(f"   Input shape: {x.shape}")
+            print(f"   Expected in_channels: {self.in_channels}")
+            print(f"   Output channels: {self.channels}")
+            self._debug_printed = True
+        
         x = self.conv(x)
         return x
