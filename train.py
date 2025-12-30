@@ -154,29 +154,6 @@ class Segmentor(nn.Module):
             outputs["aux"] = self.aux_head(feats)
         return outputs
 
-# ============================================
-# MEMORY-EFFICIENT LOSS
-# ============================================
-
-class MemoryEfficientLoss(nn.Module):
-    """
-    Loss with gradient checkpointing and efficient computation
-    """
-    
-    def __init__(self, ignore_index=255, class_weights=None):
-        super().__init__()
-        self.ce = nn.CrossEntropyLoss(
-            ignore_index=ignore_index,
-            weight=class_weights,
-            reduction='mean'  # ✅ Reduce memory vs 'none'
-        )
-        self.ignore_index = ignore_index
-
-    def forward(self, logits, targets):
-        """
-        Simple CE loss (Dice too expensive for large images)
-        """
-        return self.ce(logits, targets)
 
 # ============================================
 # GRADIENT ACCUMULATION TRAINER
