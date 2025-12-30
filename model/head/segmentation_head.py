@@ -1,191 +1,210 @@
-# head.py - FIXED VERSION
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
-from typing import Dict
+from typing import Dict, List
 
-# Sau đó import:
 from components.components import (
     ConvModule,
-    BaseModule,
-    build_norm_layer,
-    build_activation_layer,
-    resize,
-    DAPPM,
     BaseDecodeHead,
+    resize,
     OptConfigType,
-    SampleList
 )
 
+# ============================================================
+# 1️⃣ ASPP-LITE (Depthwise, rất nhẹ)
+# ============================================================
 
-class GCNetHead(BaseDecodeHead):
+class ASPPLite(nn.Module):
     """
-    ✅ FIXED: Main segmentation head khớp với sơ đồ
-    
-    Input from backbone:
-        - c1: H/2
-        - c2: H/4
-        - c3: H/8
-        - c4: H/16 (for aux head only)
-        - c5: H/8 (main features)
-    
-    Args:
-        decode_enabled (bool): Use decoder or simple fusion
-        decoder_channels (int): Base decoder channels
-        skip_channels (List[int]): Skip connection channels [c3, c2, c1]
-        use_gated_fusion (bool): Use gated fusion in decoder
+    ASPP-Lite:
+    - 3x3 DW conv (rate 1, 2, 3)
+    - Global pooling branch
     """
-    
+
     def __init__(
         self,
-        decode_enabled: bool = True,
+        in_channels: int,
+        out_channels: int,
+        norm_cfg: OptConfigType,
+        act_cfg: OptConfigType,
+    ):
+        super().__init__()
+
+        self.branches = nn.ModuleList([
+            ConvModule(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=1,
+                dilation=1,
+                groups=in_channels,      # depthwise
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+            ),
+            ConvModule(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=2,
+                dilation=2,
+                groups=in_channels,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+            ),
+            ConvModule(
+                in_channels,
+                out_channels,
+                kernel_size=3,
+                padding=3,
+                dilation=3,
+                groups=in_channels,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+            ),
+        ])
+
+        # Global context
+        self.global_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            ConvModule(
+                in_channels,
+                out_channels,
+                kernel_size=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+            )
+        )
+
+        self.project = ConvModule(
+            out_channels * 4,
+            out_channels,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+        )
+
+    def forward(self, x: Tensor) -> Tensor:
+        size = x.shape[2:]
+
+        feats = [branch(x) for branch in self.branches]
+
+        gp = self.global_pool(x)
+        gp = F.interpolate(gp, size=size, mode="bilinear", align_corners=False)
+
+        feats.append(gp)
+
+        x = torch.cat(feats, dim=1)
+        return self.project(x)
+
+
+# ============================================================
+# 2️⃣ CLASS-AWARE CONTEXT MODULE (NHẸ – RẤT QUAN TRỌNG)
+# ============================================================
+
+class ClassAwareContext(nn.Module):
+    """
+    Learn per-class importance and reweight features
+    """
+
+    def __init__(self, channels: int, num_classes: int):
+        super().__init__()
+
+        self.pool = nn.AdaptiveAvgPool2d(1)
+
+        self.fc = nn.Sequential(
+            nn.Conv2d(channels, channels // 4, kernel_size=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, num_classes, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+        self.class_embed = nn.Embedding(num_classes, channels)
+
+    def forward(self, x: Tensor) -> Tensor:
+        """
+        x: (B, C, H, W)
+        """
+        B, C, _, _ = x.shape
+
+        pooled = self.pool(x)                 # (B, C, 1, 1)
+        gates = self.fc(pooled)               # (B, num_classes, 1, 1)
+
+        class_weights = self.class_embed.weight   # (num_classes, C)
+        class_weights = class_weights.unsqueeze(0)  # (1, num_classes, C)
+
+        # Weighted sum over classes
+        weights = (gates.view(B, -1, 1) * class_weights).sum(dim=1)
+        weights = weights.view(B, C, 1, 1)
+
+        return x * weights
+
+
+# ============================================================
+# 3️⃣ GCNet HEAD V2 (DROP-IN REPLACEMENT)
+# ============================================================
+
+class GCNetHeadV2(BaseDecodeHead):
+    """
+    ✅ GCNet Head V2:
+    - ASPP-Lite
+    - Class-Aware Context
+    - Lightweight Decoder (giữ nguyên)
+    """
+
+    def __init__(
+        self,
         decoder_channels: int = 128,
-        skip_channels: list = [64, 32, 32],  # [c3, c2, c1] from backbone
         use_gated_fusion: bool = True,
         **kwargs
     ):
-
-        
         super().__init__(**kwargs)
-        
-        self.decode_enabled = decode_enabled
-        self.skip_channels = skip_channels
-        
-        if decode_enabled:
-            # ✅ Use decoder with proper skip channels
-            from model.decoder import LightweightDecoder
-            
-            self.decoder = LightweightDecoder(
-                in_channels=self.in_channels,     # c5 channels (64)
-                channels=decoder_channels,         # 128
-                use_gated_fusion=use_gated_fusion,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg
-            )
-            
-            conv_in_channels = decoder_channels // 8
-        else:           
-            # Fuse c1, c2, c3, c5 (all resized to H/8)
-            total_channels = sum(skip_channels) + self.in_channels
-            
-            self.fusion = ConvModule(
-                in_channels=total_channels,
-                out_channels=self.channels,
-                kernel_size=1,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg
-            )
-            
-            conv_in_channels = self.channels
-        
-        # Segmentation conv
+
+        from model.decoder.lightweight_decoder import LightweightDecoder
+
+        # ASPP-Lite
+        self.aspp = ASPPLite(
+            in_channels=self.in_channels,      # c5
+            out_channels=decoder_channels,
+            norm_cfg=self.norm_cfg,
+            act_cfg=self.act_cfg,
+        )
+
+        # Class-aware context
+        self.class_aware = ClassAwareContext(
+            channels=decoder_channels,
+            num_classes=self.num_classes,
+        )
+
+        # Decoder (giữ nguyên kiến trúc bạn đã làm)
+        self.decoder = LightweightDecoder(
+            in_channels=decoder_channels,
+            channels=decoder_channels,
+            use_gated_fusion=use_gated_fusion,
+        )
+
         self.conv_seg = nn.Conv2d(
-            conv_in_channels,
+            decoder_channels // 8,
             self.num_classes,
             kernel_size=1
         )
-    
+
     def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
         """
-        ✅ FIXED: Handle dict inputs from backbone
-        
-        Args:
-            inputs: Dict with keys ['c1', 'c2', 'c3', 'c4', 'c5']
-        
-        Returns:
-            Segmentation logits (B, num_classes, H/8 or H, W/8 or W)
+        inputs: dict {c1, c2, c3, c4, c5}
         """
-        # Extract features
-        c1 = inputs['c1']  # H/2
-        c2 = inputs['c2']  # H/4
-        c3 = inputs['c3']  # H/8
-        c5 = inputs['c5']  # H/8 (main output)
-        
-        if self.decode_enabled and self.decoder is not None:
-            # ✅ Use decoder with skip connections [c3, c2, c1]
-            skip_connections = [ c2, c1, None]
-            
-            x = self.decoder(c5, skip_connections)  # -> (B, 16, H, W)
-        else:
-            # Simple multi-scale fusion at H/8 resolution
-            target_size = c5.shape[2:]  # H/8, W/8
-            
-            # Resize c1, c2 to H/8
-            c1_resized = resize(c1, size=target_size, mode='bilinear',
-                               align_corners=self.align_corners)
-            c2_resized = resize(c2, size=target_size, mode='bilinear',
-                               align_corners=self.align_corners)
-            
-            # Concatenate [c1, c2, c3, c5]
-            x = torch.cat([c1_resized, c2_resized, c3, c5], dim=1)
-            x = self.fusion(x)
-        
-        # Apply dropout
+        c1 = inputs["c1"]
+        c2 = inputs["c2"]
+        c5 = inputs["c5"]
+
+        # 1️⃣ ASPP-Lite
+        x = self.aspp(c5)
+
+        # 2️⃣ Class-aware reweighting
+        x = self.class_aware(x)
+
+        # 3️⃣ Decoder
+        x = self.decoder(x, [c2, c1, None])
+
         x = self.dropout(x)
-        
-        # Segmentation
-        output = self.conv_seg(x)
-        
-        return output
-
-
-
-class GCNetAuxHead(BaseDecodeHead):
-    """
-    ✅ Auxiliary head for deep supervision on c4 (H/16)
-    
-    Args:
-        Same as BaseDecodeHead
-    """
-    
-    def __init__(self, **kwargs):       
-        super().__init__(**kwargs)
-        
-        # Simple conv layers
-        self.conv = nn.Sequential(
-            ConvModule(
-                in_channels=self.in_channels,
-                out_channels=self.channels,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg
-            ),
-            ConvModule(
-                in_channels=self.channels,
-                out_channels=self.channels,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg
-            )
-        )
-        
-        # Segmentation conv
-        self.conv_seg = nn.Conv2d(
-            self.channels,
-            self.num_classes,
-            kernel_size=1
-        )
-    
-    def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
-        """
-        ✅ FIXED: Extract c4 from dict
-        
-        Args:
-            inputs: Dict with key 'c4' (B, C, H/16, W/16)
-        
-        Returns:
-            Segmentation logits (B, num_classes, H/16, W/16)
-        """
-        # Extract c4 (stage 4 semantic features)
-        x = inputs['c4']
-        
-        # Convolutions
-        x = self.conv(x)
-        x = self.dropout(x)
-        
-        # Segmentation
-        output = self.conv_seg(x)
-        
-        return output
+        return self.conv_seg(x)
