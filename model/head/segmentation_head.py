@@ -1,335 +1,191 @@
+# head.py - FIXED VERSION
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
-from typing import Dict, List, Optional
+from typing import Dict
 
+# Sau đó import:
 from components.components import (
     ConvModule,
-    BaseDecodeHead,
+    BaseModule,
+    build_norm_layer,
+    build_activation_layer,
     resize,
+    DAPPM,
+    BaseDecodeHead,
     OptConfigType,
+    SampleList
 )
 
-# ============================================================
-# 1️⃣ ASPP-LITE (Depthwise, rất nhẹ)
-# ============================================================
-
-class ASPPLite(nn.Module):
-    """
-    ASPP-Lite:
-    - 3x3 DW conv (rate 1, 2, 3)
-    - Global pooling branch
-    """
-
-    def __init__(
-        self,
-        in_channels: int,
-        out_channels: int,
-        norm_cfg: OptConfigType,
-        act_cfg: OptConfigType,
-    ):
-        super().__init__()
-
-        self.branches = nn.ModuleList([
-            nn.Sequential(
-                # Depthwise
-                ConvModule(
-                    in_channels,
-                    in_channels,
-                    kernel_size=3,
-                    padding=1,
-                    dilation=1,
-                    groups=in_channels,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                ),
-                # Pointwise
-                ConvModule(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                ),
-            ),
-            nn.Sequential(
-                ConvModule(
-                    in_channels,
-                    in_channels,
-                    kernel_size=3,
-                    padding=2,
-                    dilation=2,
-                    groups=in_channels,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                ),
-                ConvModule(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                ),
-            ),
-            nn.Sequential(
-                ConvModule(
-                    in_channels,
-                    in_channels,
-                    kernel_size=3,
-                    padding=3,
-                    dilation=3,
-                    groups=in_channels,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                ),
-                ConvModule(
-                    in_channels,
-                    out_channels,
-                    kernel_size=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                ),
-            ),
-        ])
-
-        # Global context
-        self.global_pool = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            ConvModule(
-                in_channels,
-                out_channels,
-                kernel_size=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
-            )
-        )
-
-        self.project = ConvModule(
-            out_channels * 4,
-            out_channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        size = x.shape[2:]
-
-        feats = [branch(x) for branch in self.branches]
-
-        gp = self.global_pool(x)
-        gp = F.interpolate(gp, size=size, mode="bilinear", align_corners=False)
-
-        feats.append(gp)
-
-        x = torch.cat(feats, dim=1)
-        return self.project(x)
-
-
-# ============================================================
-# 2️⃣ CLASS-AWARE CONTEXT MODULE (NHẸ – RẤT QUAN TRỌNG)
-# ============================================================
-
-class ClassAwareContext(nn.Module):
-    """
-    Learn per-class importance and reweight features
-    """
-
-    def __init__(self, channels: int, num_classes: int):
-        super().__init__()
-
-        self.pool = nn.AdaptiveAvgPool2d(1)
-
-        self.fc = nn.Sequential(
-            nn.Conv2d(channels, channels // 4, kernel_size=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(channels // 4, num_classes, kernel_size=1),
-            nn.Sigmoid(),
-        )
-
-        self.class_embed = nn.Embedding(num_classes, channels)
-
-    def forward(self, x: Tensor) -> Tensor:
-        """
-        x: (B, C, H, W)
-        """
-        B, C, _, _ = x.shape
-
-        pooled = self.pool(x)                 # (B, C, 1, 1)
-        gates = self.fc(pooled)               # (B, num_classes, 1, 1)
-
-        class_weights = self.class_embed.weight   # (num_classes, C)
-        class_weights = class_weights.unsqueeze(0)  # (1, num_classes, C)
-
-        # Weighted sum over classes
-        weights = (gates.view(B, -1, 1) * class_weights).sum(dim=1)
-        weights = weights.view(B, C, 1, 1)
-
-        return x * weights
-
-
-# ============================================================
-# 3️⃣ GCNet HEAD V2 (FIXED VERSION)
-# ============================================================
 
 class GCNetHead(BaseDecodeHead):
     """
-    ✅ GCNet Head V2 - FIXED:
-    - Properly filter kwargs before passing to BaseDecodeHead
-    - ASPP-Lite for multi-scale context
-    - Class-Aware Context for handling imbalanced classes
-    - Optional lightweight decoder
+    ✅ FIXED: Main segmentation head khớp với sơ đồ
+    
+    Input from backbone:
+        - c1: H/2
+        - c2: H/4
+        - c3: H/8
+        - c4: H/16 (for aux head only)
+        - c5: H/8 (main features)
+    
+    Args:
+        decode_enabled (bool): Use decoder or simple fusion
+        decoder_channels (int): Base decoder channels
+        skip_channels (List[int]): Skip connection channels [c3, c2, c1]
+        use_gated_fusion (bool): Use gated fusion in decoder
     """
-
+    
     def __init__(
         self,
-        # Custom parameters (not for BaseDecodeHead)
+        decode_enabled: bool = True,
         decoder_channels: int = 128,
-        decode_enabled: bool = False,
-        skip_channels: Optional[List[int]] = None,
+        skip_channels: list = [64, 32, 32],  # [c3, c2, c1] from backbone
         use_gated_fusion: bool = True,
-        # BaseDecodeHead parameters
         **kwargs
     ):
-        # ✅ Filter out custom kwargs before passing to super().__init__()
-        # BaseDecodeHead only accepts: in_channels, channels, num_classes, 
-        # dropout_ratio, conv_cfg, norm_cfg, act_cfg, in_index, input_transform,
-        # loss_decode, ignore_index, sampler, align_corners, init_cfg
+
         
         super().__init__(**kwargs)
         
-        # Store custom parameters
-        self.decoder_channels = decoder_channels
         self.decode_enabled = decode_enabled
-        self.skip_channels = skip_channels or [64, 32, 32]
-        self.use_gated_fusion = use_gated_fusion
-
-        # ASPP-Lite for multi-scale context
-        self.aspp = ASPPLite(
-            in_channels=self.in_channels,      # c5 channels
-            out_channels=decoder_channels,
-            norm_cfg=self.norm_cfg,
-            act_cfg=self.act_cfg,
-        )
-
-        # Class-aware context module
-        self.class_aware = ClassAwareContext(
-            channels=decoder_channels,
-            num_classes=self.num_classes,
-        )
-
-        # Optional decoder
-        if self.decode_enabled:
-            try:
-                from model.decoder.lightweight_decoder import LightweightDecoder
-                
-                self.decoder = LightweightDecoder(
-                    in_channels=decoder_channels,
-                    channels=decoder_channels,
-                    use_gated_fusion=use_gated_fusion,
-                    norm_cfg=self.norm_cfg,
-                    act_cfg=self.act_cfg,
-                )
-                seg_in_channels = decoder_channels // 8
-            except ImportError:
-                print("⚠️  LightweightDecoder not found, decoder disabled")
-                self.decoder = None
-                seg_in_channels = decoder_channels
-        else:
-            self.decoder = None
-            seg_in_channels = decoder_channels
-
-        # Segmentation head
+        self.skip_channels = skip_channels
+        
+        if decode_enabled:
+            # ✅ Use decoder with proper skip channels
+            from model.decoder import LightweightDecoder
+            
+            self.decoder = LightweightDecoder(
+                in_channels=self.in_channels,     # c5 channels (64)
+                channels=decoder_channels,         # 128
+                use_gated_fusion=use_gated_fusion,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg
+            )
+            
+            conv_in_channels = decoder_channels // 8
+        else:           
+            # Fuse c1, c2, c3, c5 (all resized to H/8)
+            total_channels = sum(skip_channels) + self.in_channels
+            
+            self.fusion = ConvModule(
+                in_channels=total_channels,
+                out_channels=self.channels,
+                kernel_size=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg
+            )
+            
+            conv_in_channels = self.channels
+        
+        # Segmentation conv
         self.conv_seg = nn.Conv2d(
-            seg_in_channels,
+            conv_in_channels,
             self.num_classes,
             kernel_size=1
         )
-
+    
     def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
         """
+        ✅ FIXED: Handle dict inputs from backbone
+        
         Args:
             inputs: Dict with keys ['c1', 'c2', 'c3', 'c4', 'c5']
         
         Returns:
-            Segmentation logits
+            Segmentation logits (B, num_classes, H/8 or H, W/8 or W)
         """
-        c5 = inputs["c5"]
-
-        # 1️⃣ ASPP-Lite for multi-scale context
-        x = self.aspp(c5)
-
-        # 2️⃣ Class-aware reweighting
-        x = self.class_aware(x)
-
-        # 3️⃣ Optional decoder
-        if self.decoder is not None and self.decode_enabled:
-            c1 = inputs.get("c1")
-            c2 = inputs.get("c2")
-            skip_connections = [c2, c1, None]
-            x = self.decoder(x, skip_connections)
-
-        # 4️⃣ Dropout and segmentation
-        x = self.dropout(x)
-        logits = self.conv_seg(x)
+        # Extract features
+        c1 = inputs['c1']  # H/2
+        c2 = inputs['c2']  # H/4
+        c3 = inputs['c3']  # H/8
+        c5 = inputs['c5']  # H/8 (main output)
         
-        return logits
+        if self.decode_enabled and self.decoder is not None:
+            # ✅ Use decoder with skip connections [c3, c2, c1]
+            skip_connections = [ c2, c1, None]
+            
+            x = self.decoder(c5, skip_connections)  # -> (B, 16, H, W)
+        else:
+            # Simple multi-scale fusion at H/8 resolution
+            target_size = c5.shape[2:]  # H/8, W/8
+            
+            # Resize c1, c2 to H/8
+            c1_resized = resize(c1, size=target_size, mode='bilinear',
+                               align_corners=self.align_corners)
+            c2_resized = resize(c2, size=target_size, mode='bilinear',
+                               align_corners=self.align_corners)
+            
+            # Concatenate [c1, c2, c3, c5]
+            x = torch.cat([c1_resized, c2_resized, c3, c5], dim=1)
+            x = self.fusion(x)
+        
+        # Apply dropout
+        x = self.dropout(x)
+        
+        # Segmentation
+        output = self.conv_seg(x)
+        
+        return output
 
 
-# ============================================================
-# 4️⃣ AUXILIARY HEAD (FIXED - Channel Matching)
-# ============================================================
 
 class GCNetAuxHead(BaseDecodeHead):
     """
-    ✅ FIXED: Auxiliary head for deep supervision
+    ✅ Auxiliary head for deep supervision on c4 (H/16)
     
-    Automatically matches input channels from backbone
-    No hardcoded channel assumptions
+    Args:
+        Same as BaseDecodeHead
     """
-
-    def __init__(self, **kwargs):
+    
+    def __init__(self, **kwargs):       
         super().__init__(**kwargs)
-
-        # ✅ FIX: Use self.in_channels (from BaseDecodeHead)
-        # This matches whatever the backbone outputs
+        
+        # Simple conv layers
         self.conv = nn.Sequential(
             ConvModule(
-                self.in_channels,      # ✅ Backbone output channels
-                self.channels,         # ✅ Internal processing channels
+                in_channels=self.in_channels,
+                out_channels=self.channels,
                 kernel_size=3,
                 padding=1,
                 norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg,
+                act_cfg=self.act_cfg
             ),
-            nn.Conv2d(self.channels, self.num_classes, kernel_size=1)
+            ConvModule(
+                in_channels=self.channels,
+                out_channels=self.channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg
+            )
         )
-
+        
+        # Segmentation conv
+        self.conv_seg = nn.Conv2d(
+            self.channels,
+            self.num_classes,
+            kernel_size=1
+        )
+    
     def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
         """
+        ✅ FIXED: Extract c4 from dict
+        
         Args:
-            inputs: Dict with backbone features
+            inputs: Dict with key 'c4' (B, C, H/16, W/16)
         
         Returns:
-            Auxiliary segmentation logits
+            Segmentation logits (B, num_classes, H/16, W/16)
         """
-        # ✅ Try to get c4 first (preferred), fallback to c3
-        if "c4" in inputs:
-            x = inputs["c4"]
-        elif "c3" in inputs:
-            x = inputs["c3"]
-        else:
-            # Last resort: use any available feature
-            x = list(inputs.values())[-2]
+        # Extract c4 (stage 4 semantic features)
+        x = inputs['c4']
         
-        # Print debug info (only once)
-        if not hasattr(self, '_debug_printed'):
-            print(f"🔍 AuxHead Debug:")
-            print(f"   Input shape: {x.shape}")
-            print(f"   Expected in_channels: {self.in_channels}")
-            print(f"   Output channels: {self.channels}")
-            self._debug_printed = True
-        
+        # Convolutions
         x = self.conv(x)
-        return x
+        x = self.dropout(x)
+        
+        # Segmentation
+        output = self.conv_seg(x)
+        
+        return output
