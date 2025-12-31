@@ -732,7 +732,8 @@ def main():
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--img_size", type=int, nargs=2, default=[512, 1024])
     parser.add_argument("--compute_class_weights", action="store_true")
-    
+    parser.add_argument('--img_h', type=int, default=512, help='Input image height')
+    parser.add_argument('--img_w', type=int, default=1024, help='Input image width')
     # Model
     parser.add_argument("--model_size", default="lightweight",
                         choices=["lightweight", "standard"])
