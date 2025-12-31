@@ -345,7 +345,6 @@ class ModelConfig:
                 "ppm_channels": 96,
                 "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
                 "dwsa_num_heads": 8,
-                "dwsa_drop": 0.0,
                 "deploy": False
             },
             "head": {
