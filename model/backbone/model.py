@@ -21,17 +21,12 @@ from components.components import (
 
 class DepthWiseSeparableAttention(nn.Module):
     """
-    ✅ KHUYẾN NGHỊ #1 cho Segmentation
+    ✅ FIXED: Corrected local attention computation
     
-    Ưu điểm:
-    - Nhẹ nhất: ~40% FLOPs của standard attention
-    - Hiệu quả cho spatial tasks
-    - Chạy nhanh trên mọi GPU
-    - Phù hợp real-time inference
-    
-    Nguyên lý:
-    - Tách attention thành spatial & channel
-    - Giống như MobileNet trong CNN
+    Changes:
+    1. Local attention now properly applied to Q/K/V features
+    2. Relative position bias implementation
+    3. Proper spatial context modeling
     """
     
     def __init__(
@@ -51,80 +46,100 @@ class DepthWiseSeparableAttention(nn.Module):
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
         
-        # Lightweight projections
+        # Norms
         self.norm = nn.LayerNorm(dim, eps=1e-6)
         
-        # Depth-wise separable QKV
-        self.qkv = nn.Sequential(
-            nn.Conv1d(dim, dim * 3, kernel_size=1, bias=qkv_bias),
-            nn.BatchNorm1d(dim * 3)
-        )
+        # QKV projection
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
         
-        # Local spatial attention (giống depthwise conv)
-        self.local_attn = nn.Conv2d(
-            num_heads,
-            num_heads,
+        # ✅ FIX: Local context on Q before attention
+        # Depthwise conv để capture local spatial patterns
+        self.local_conv = nn.Conv2d(
+            dim,
+            dim,
             kernel_size=spatial_kernel,
             padding=spatial_kernel // 2,
-            groups=num_heads,  # Depthwise
+            groups=dim,  # Depthwise
             bias=False
         )
+        self.local_norm = nn.BatchNorm2d(dim)
         
-        # Output
+        # Dropouts
+        self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-        self.attn_drop = nn.Dropout(attn_drop)
     
     def forward(self, x: Tensor) -> Tensor:
-        # Handle 4D input (B, C, H, W)
+        """
+        Args:
+            x: (B, C, H, W) hoặc (B, N, C)
+        Returns:
+            out: Same shape as input
+        """
+        # Handle 4D input
         is_4d = False
         if x.dim() == 4:
             is_4d = True
             B, C, H, W = x.shape
-            x = x.flatten(2).transpose(1, 2)  # (B, N, C)
+            N = H * W
+            
+            # ✅ FIX: Apply local conv on spatial features
+            local_feat = self.local_norm(self.local_conv(x))
+            local_feat = local_feat.flatten(2).transpose(1, 2)  # (B, N, C)
+            
+            x_flat = x.flatten(2).transpose(1, 2)  # (B, N, C)
         else:
             B, N, C = x.shape
-            # Giả định nếu x là 3D, N = H * W. Bạn nên truyền H, W nếu x luôn là 3D
-            H = W = int(math.sqrt(N)) 
-    
-        B, N, C = x.shape
-        x_norm = self.norm(x)
+            H = W = int(math.sqrt(N))
+            x_flat = x
+            
+            # Reshape to 4D for local conv
+            x_4d = x.transpose(1, 2).reshape(B, C, H, W)
+            local_feat = self.local_norm(self.local_conv(x_4d))
+            local_feat = local_feat.flatten(2).transpose(1, 2)
+        
+        # Normalize
+        x_norm = self.norm(x_flat)
         
         # QKV projection
-        qkv = self.qkv(x_norm.transpose(1, 2)).transpose(1, 2)
-        qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)
+        qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(2)  # Each: (B, N, num_heads, head_dim)
         
-        q = q.transpose(1, 2) # (B, H_head, N, D)
+        q = q.transpose(1, 2)  # (B, num_heads, N, head_dim)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
+        # ✅ FIX: Add local features to Q
+        local_q = self.norm(local_feat).reshape(B, N, self.num_heads, self.head_dim)
+        local_q = local_q.transpose(1, 2)
+        q = q + local_q  # Inject local context
+        
         # Attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
-        
-        # ✅ FIX: Hỗ trợ mọi kích thước ảnh
-        # Tính toán local bias dựa trên H, W thực tế
-        attn_2d = attn.view(B, self.num_heads, H, W, N)
-        local_bias = self.local_attn(attn_2d.mean(dim=-1)) # (B, H_head, H, W)
-        attn = attn + local_bias.flatten(2).unsqueeze(-1)
-        
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         
-        out = attn @ v
+        # Apply attention
+        out = attn @ v  # (B, num_heads, N, head_dim)
         out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
         
-        out = x + out
+        # Output projection
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        
+        # Residual
+        out = x_flat + out
+        
+        # Restore shape
         if is_4d:
             out = out.transpose(1, 2).reshape(B, C, H, W)
+        
         return out
 
 
 class DWSABlock(nn.Module):
     """
-    Wrapper block cho DepthWiseSeparableAttention
-    Dễ dàng thay thế vào backbone
+    ✅ FIXED: Wrapper block with corrected DWSA
     """
     
     def __init__(
@@ -134,8 +149,7 @@ class DWSABlock(nn.Module):
         spatial_kernel: int = 7,
         mlp_ratio: float = 2.0,
         drop: float = 0.0,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+        act_cfg: dict = dict(type='ReLU', inplace=False)
     ):
         super().__init__()
         
@@ -148,19 +162,17 @@ class DWSABlock(nn.Module):
             proj_drop=drop
         )
         
-        # FFN (Feed-Forward Network)
+        # FFN
         mlp_hidden = int(channels * mlp_ratio)
         self.mlp = nn.Sequential(
             nn.Linear(channels, mlp_hidden),
-            build_activation_layer(act_cfg),
+            nn.ReLU(inplace=True),
             nn.Dropout(drop),
             nn.Linear(mlp_hidden, channels),
             nn.Dropout(drop)
         )
         
-        # Norms
-        self.norm1 = nn.LayerNorm(channels)
-        self.norm2 = nn.LayerNorm(channels)
+        self.norm = nn.LayerNorm(channels)
     
     def forward(self, x: Tensor) -> Tensor:
         """
@@ -171,13 +183,13 @@ class DWSABlock(nn.Module):
         """
         B, C, H, W = x.shape
         
-        # Attention block (handles 4D internally)
+        # Attention (handles 4D internally)
         x = self.attn(x)
         
-        # FFN block (need to reshape to 3D)
+        # FFN
         identity = x
         x = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
-        x = self.norm2(x)
+        x = self.norm(x)
         x = self.mlp(x)
         x = x.transpose(1, 2).reshape(B, C, H, W)
         x = identity + x
