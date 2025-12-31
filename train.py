@@ -34,11 +34,271 @@ import gc
 # IMPORTS (use fixed modules)
 # ============================================
 
-from hybrid_loss import HybridLoss
+
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import create_dataloaders
 
+
+
+# ============================================
+# HYBRID LOSS (inline)
+# ============================================
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        probs = F.softmax(logits, dim=1)
+        B, C, H, W = probs.shape
+        
+        targets_one_hot = F.one_hot(
+            targets.clamp(0, C - 1),
+            num_classes=C
+        ).permute(0, 3, 1, 2).float()
+        
+        mask = (targets != self.ignore_index).float().unsqueeze(1)
+        probs = probs * mask
+        targets_one_hot = targets_one_hot * mask
+        
+        probs = probs.reshape(B, C, -1)
+        targets_one_hot = targets_one_hot.reshape(B, C, -1)
+        
+        intersection = (probs * targets_one_hot).sum(dim=2)
+        union = probs.sum(dim=2) + targets_one_hot.sum(dim=2)
+        
+        dice_per_class = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss_per_class = 1.0 - dice_per_class
+        
+        return dice_loss_per_class.mean() if self.reduction == 'mean' else dice_loss_per_class
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        B, C, H, W = logits.shape
+        
+        log_probs = log_probs.permute(0, 2, 3, 1).reshape(-1, C)
+        targets_flat = targets.reshape(-1)
+        
+        valid_mask = targets_flat != self.ignore_index
+        log_probs = log_probs[valid_mask]
+        targets_flat = targets_flat[valid_mask]
+        
+        if targets_flat.numel() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        probs = log_probs.exp()
+        targets_probs = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        focal_weight = (1 - targets_probs) ** self.gamma
+        focal_loss = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss
+
+
+class HybridLoss(nn.Module):
+    def __init__(
+        self,
+        ce_weight=1.0,
+        dice_weight=0.5,
+        focal_weight=0.0,
+        ignore_index=255,
+        class_weights=None,
+        focal_alpha=0.25,
+        focal_gamma=2.0,
+        dice_smooth=1.0
+    ):
+        super().__init__()
+        
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.ignore_index = ignore_index
+        
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights,
+            ignore_index=ignore_index,
+            reduction='mean'
+        )
+        
+        self.dice_loss = DiceLoss(
+            smooth=dice_smooth,
+            ignore_index=ignore_index,
+            reduction='mean'
+        )
+        
+        self.focal_loss = FocalLoss(
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+            ignore_index=ignore_index,
+            reduction='mean'
+        )
+    
+    def forward(self, logits, targets):
+        losses = {}
+        
+        if self.ce_weight > 0:
+            losses['ce'] = self.ce_loss(logits, targets)
+        else:
+            losses['ce'] = torch.tensor(0.0, device=logits.device)
+        
+        if self.dice_weight > 0:
+            losses['dice'] = self.dice_loss(logits, targets)
+        else:
+            losses['dice'] = torch.tensor(0.0, device=logits.device)
+        
+        if self.focal_weight > 0:
+            losses['focal'] = self.focal_loss(logits, targets)
+        else:
+            losses['focal'] = torch.tensor(0.0, device=logits.device)
+        
+        losses['total'] = (
+            self.ce_weight * losses['ce'] +
+            self.dice_weight * losses['dice'] +
+            self.focal_weight * losses['focal']
+        )
+        
+        return losses
+# ============================================
+# HYBRID LOSS (inline)
+# ============================================
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1.0, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        probs = F.softmax(logits, dim=1)
+        B, C, H, W = probs.shape
+        
+        targets_one_hot = F.one_hot(
+            targets.clamp(0, C - 1),
+            num_classes=C
+        ).permute(0, 3, 1, 2).float()
+        
+        mask = (targets != self.ignore_index).float().unsqueeze(1)
+        probs = probs * mask
+        targets_one_hot = targets_one_hot * mask
+        
+        probs = probs.reshape(B, C, -1)
+        targets_one_hot = targets_one_hot.reshape(B, C, -1)
+        
+        intersection = (probs * targets_one_hot).sum(dim=2)
+        union = probs.sum(dim=2) + targets_one_hot.sum(dim=2)
+        
+        dice_per_class = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss_per_class = 1.0 - dice_per_class
+        
+        return dice_loss_per_class.mean() if self.reduction == 'mean' else dice_loss_per_class
+
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        B, C, H, W = logits.shape
+        
+        log_probs = log_probs.permute(0, 2, 3, 1).reshape(-1, C)
+        targets_flat = targets.reshape(-1)
+        
+        valid_mask = targets_flat != self.ignore_index
+        log_probs = log_probs[valid_mask]
+        targets_flat = targets_flat[valid_mask]
+        
+        if targets_flat.numel() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        probs = log_probs.exp()
+        targets_probs = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        focal_weight = (1 - targets_probs) ** self.gamma
+        focal_loss = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss
+
+
+class HybridLoss(nn.Module):
+    def __init__(
+        self,
+        ce_weight=1.0,
+        dice_weight=0.5,
+        focal_weight=0.0,
+        ignore_index=255,
+        class_weights=None,
+        focal_alpha=0.25,
+        focal_gamma=2.0,
+        dice_smooth=1.0
+    ):
+        super().__init__()
+        
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.ignore_index = ignore_index
+        
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights,
+            ignore_index=ignore_index,
+            reduction='mean'
+        )
+        
+        self.dice_loss = DiceLoss(
+            smooth=dice_smooth,
+            ignore_index=ignore_index,
+            reduction='mean'
+        )
+        
+        self.focal_loss = FocalLoss(
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+            ignore_index=ignore_index,
+            reduction='mean'
+        )
+    
+    def forward(self, logits, targets):
+        losses = {}
+        
+        if self.ce_weight > 0:
+            losses['ce'] = self.ce_loss(logits, targets)
+        else:
+            losses['ce'] = torch.tensor(0.0, device=logits.device)
+        
+        if self.dice_weight > 0:
+            losses['dice'] = self.dice_loss(logits, targets)
+        else:
+            losses['dice'] = torch.tensor(0.0, device=logits.device)
+        
+        if self.focal_weight > 0:
+            losses['focal'] = self.focal_loss(logits, targets)
+        else:
+            losses['focal'] = torch.tensor(0.0, device=logits.device)
+        
+        losses['total'] = (
+            self.ce_weight * losses['ce'] +
+            self.dice_weight * losses['dice'] +
+            self.focal_weight * losses['focal']
+        )
+        
+        return losses
 # ============================================
 # MEMORY UTILITIES (unchanged)
 # ============================================
