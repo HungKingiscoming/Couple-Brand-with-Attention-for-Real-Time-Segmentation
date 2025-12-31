@@ -785,7 +785,16 @@ def main():
     print_memory_usage("Initial")
     
     # Dataloaders (assuming implemented)
-    # train_loader, val_loader, class_weights = create_dataloaders(...)
+    train_loader, val_loader, class_weights = create_dataloaders(
+        train_txt=args.train_txt,      # ví dụ: data/cityscapes_train.txt
+        val_txt=args.val_txt,          # ví dụ: data/cityscapes_val.txt
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        img_size=(args.img_h, args.img_w),
+        pin_memory=True,
+        compute_class_weights=False,   # bật nếu cần
+        dataset_type=args.dataset_type # 'normal' hoặc 'foggy'
+    )
     
     # ✅ Create model with fixed config
     print(f"\n{'='*70}")
