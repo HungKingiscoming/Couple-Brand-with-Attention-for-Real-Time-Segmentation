@@ -76,48 +76,70 @@ class DepthWiseSeparableAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
     
     def forward(self, x: Tensor) -> Tensor:
+        """
+        Args:
+            x: (B, N, C) hoặc (B, C, H, W)
+        Returns:
+            out: same shape as input
+        """
         # Handle 4D input (B, C, H, W)
         is_4d = False
         if x.dim() == 4:
             is_4d = True
             B, C, H, W = x.shape
-            x = x.flatten(2).transpose(1, 2)  # (B, N, C)
-        else:
-            B, N, C = x.shape
-            # Giả định nếu x là 3D, N = H * W. Bạn nên truyền H, W nếu x luôn là 3D
-            H = W = int(math.sqrt(N)) 
-    
+            x = x.flatten(2).transpose(1, 2)  # (B, H*W, C)
+        
         B, N, C = x.shape
+        
+        # Pre-norm
         x_norm = self.norm(x)
         
         # QKV projection
         qkv = self.qkv(x_norm.transpose(1, 2)).transpose(1, 2)
         qkv = qkv.reshape(B, N, 3, self.num_heads, self.head_dim)
-        q, k, v = qkv.unbind(2)
+        q, k, v = qkv.unbind(2)  # (B, N, H, D)
         
-        q = q.transpose(1, 2) # (B, H_head, N, D)
+        # Reshape for efficient computation
+        q = q.transpose(1, 2)  # (B, H, N, D)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         
-        # Attention
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # ===== LIGHTWEIGHT ATTENTION =====
+        # 1. Reduced attention matrix
+        attn = (q @ k.transpose(-2, -1)) * self.scale  # (B, H, N, N)
         
-        # ✅ FIX: Hỗ trợ mọi kích thước ảnh
-        # Tính toán local bias dựa trên H, W thực tế
-        attn_2d = attn.view(B, self.num_heads, H, W, N)
-        local_bias = self.local_attn(attn_2d.mean(dim=-1)) # (B, H_head, H, W)
-        attn = attn + local_bias.flatten(2).unsqueeze(-1)
+        # 2. Apply local spatial bias (for segmentation)
+        if N == int(math.sqrt(N)) ** 2:  # If square feature map
+            H_feat = W_feat = int(math.sqrt(N))
+            attn_2d = attn.view(B, self.num_heads, H_feat, W_feat, N)
+            
+            # Local attention bias
+            local_bias = self.local_attn(
+                attn_2d.mean(dim=-1)  # Average over target positions
+            )
+            attn = attn + local_bias.flatten(2).unsqueeze(-1)
         
+        # 3. Efficient softmax
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         
-        out = attn @ v
-        out = out.transpose(1, 2).reshape(B, N, C)
-        out = self.proj(out)
+        # 4. Apply attention
+        out = attn @ v  # (B, H, N, D)
         
+        # Reshape back
+        out = out.transpose(1, 2).reshape(B, N, C)
+        
+        # Output projection
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        
+        # Residual
         out = x + out
+        
+        # Restore 4D shape if needed
         if is_4d:
             out = out.transpose(1, 2).reshape(B, C, H, W)
+        
         return out
 
 
@@ -258,31 +280,27 @@ class Block1x1(BaseModule):
         return kernel * t, beta + (bias - running_mean) * gamma / std
     
     def switch_to_deploy(self):
-        if hasattr(self, 'reparam_3x3'):
+        if self.deploy:
             return
+            
+        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
+        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
         
-        kernel, bias = self.get_equivalent_kernel_bias()
-        
-        self.reparam_3x3 = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            kernel_size=self.kernel_size,
-            stride=self.stride,
-            padding=self.padding,
-            bias=True
+        self.conv = nn.Conv2d(
+            self.in_channels, self.out_channels,
+            kernel_size=1, stride=self.stride,
+            padding=self.padding, bias=True
         )
         
-        self.reparam_3x3.weight.data = kernel
-        self.reparam_3x3.bias.data = bias
+        self.conv.weight.data = torch.einsum(
+            'oi,icjk->ocjk',
+            kernel2.squeeze(3).squeeze(2),
+            kernel1
+        )
+        self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
         
-        # Xóa các nhánh Reparam nhưng GIỮ LẠI dwsa
-        self.__delattr__('path_3x3_1')
-        self.__delattr__('path_3x3_2')
-        self.__delattr__('path_1x1')
-        if hasattr(self, 'path_residual'):
-            self.__delattr__('path_residual')
-        
-        # ✅ KHÔNG xóa self.dwsa ở đây
+        self.__delattr__('conv1')
+        self.__delattr__('conv2')
         self.deploy = True
 
 
