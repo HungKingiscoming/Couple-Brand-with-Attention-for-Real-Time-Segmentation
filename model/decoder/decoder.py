@@ -169,109 +169,128 @@ class GatedFusion(nn.Module):
         return gate * enc_feat + (1 - gate) * dec_feat
 
 
-class LightweightDecoder(BaseModule):
+class LightweightDecoder(nn.Module):
     """
-    ✅ OPTIMIZED: Proper channel handling + Gated fusion
+    ✅ NEW: Lightweight decoder for memory efficiency
     
     Architecture:
-    - Input: c5 (64 channels @ H/8)
-    - Stage 1: H/8 → H/4 (128 → 64) + skip c2 (32→64)
-    - Stage 2: H/4 → H/2 (64 → 32) + skip c1 (32→32)
-    - Stage 3: H/2 → H (32 → 16) + no skip
-    - Output: 16 channels @ H
+        Input (H/8) → H/4 → H/2 → H (output)
+        
+    Features:
+    - Progressive upsampling
+    - Thin channels: 128 → 64 → 32 → 16
+    - Simple skip fusion (concat + 1x1)
+    - Low memory overhead (~1.5GB additional)
     """
     
     def __init__(
         self,
-        in_channels: int = 64,
-        channels: int = 128,
-        num_stages: int = 3,
-        use_gated_fusion: bool = True,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
-        init_cfg: OptConfigType = None
+        in_channels: int = 64,      # c5 channels
+        channels: int = 128,         # Base decoder channels
+        use_gated_fusion: bool = False,  # Simplified: always False
+        norm_cfg: dict = dict(type='BN', requires_grad=True),
+        act_cfg: dict = dict(type='ReLU', inplace=False)
     ):
-        super().__init__(init_cfg)
+        super().__init__()
         
-        self.in_channels = in_channels
-        self.channels = channels
-        self.num_stages = num_stages
+        from components.components import ConvModule
         
-        # Input projection: 64 → 128
-        self.input_proj = ConvModule(
-            in_channels=in_channels,
-            out_channels=channels,
+        # Stage 1: H/8 → H/4 (128 channels)
+        self.up1 = nn.Sequential(
+            ConvModule(
+                in_channels=in_channels,
+                out_channels=channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg
+            ),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        
+        # Fusion with c2 (skip from H/4)
+        self.fusion1 = ConvModule(
+            in_channels=channels + 32,  # 128 + c2_channels
+            out_channels=channels // 2,  # 64
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg
         )
         
-        # Decoder stages
-        self.stages = nn.ModuleList()
-        
-        # ✅ Stage 1: H/8 → H/4
-        # Input: 128, Skip: c2 (32), Output: 64
-        # Skip projection: 32 → 64 (inside DecoderStage)
-        self.stages.append(
-            DecoderStage(
-                in_channels=channels,           # 128
-                skip_channels=32,               # c2 will be projected to 64
-                out_channels=channels // 2,     # 64
-                use_gated_fusion=use_gated_fusion,
+        # Stage 2: H/4 → H/2 (64 channels)
+        self.up2 = nn.Sequential(
+            ConvModule(
+                in_channels=channels // 2,
+                out_channels=channels // 2,
+                kernel_size=3,
+                padding=1,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
-            )
+            ),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
         
-        # ✅ Stage 2: H/4 → H/2
-        # Input: 64, Skip: c1 (32), Output: 32
-        # Skip already matches (32 == 32), no projection needed
-        self.stages.append(
-            DecoderStage(
-                in_channels=channels // 2,      # 64
-                skip_channels=32,               # c1 (already 32)
-                out_channels=channels // 4,     # 32
-                use_gated_fusion=use_gated_fusion,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
+        # Fusion with c1 (skip from H/2)
+        self.fusion2 = ConvModule(
+            in_channels=channels // 2 + 32,  # 64 + c1_channels
+            out_channels=channels // 4,  # 32
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
         )
         
-        # ✅ Stage 3: H/2 → H
-        # Input: 32, Skip: None, Output: 16
-        self.stages.append(
-            DecoderStage(
-                in_channels=channels // 4,      # 32
-                skip_channels=32,               # Dummy (won't be used)
-                out_channels=channels // 8,     # 16
-                use_gated_fusion=False,         # No skip, no fusion
+        # Stage 3: H/2 → H (32 channels)
+        self.up3 = nn.Sequential(
+            ConvModule(
+                in_channels=channels // 4,
+                out_channels=channels // 4,
+                kernel_size=3,
+                padding=1,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
-            )
+            ),
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        )
+        
+        # Final refinement
+        self.final = ConvModule(
+            in_channels=channels // 4,
+            out_channels=channels // 8,  # 16
+            kernel_size=3,
+            padding=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
         )
     
-    def forward(
-        self, 
-        x: Tensor, 
-        skip_connections: Optional[List[Tensor]] = None
-    ) -> Tensor:
+    def forward(self, x: Tensor, skip_connections: List[Tensor]) -> Tensor:
         """
         Args:
-            x: c5 features (B, 64, H/8, W/8)
-            skip_connections: [c2, c1, None] at [H/4, H/2, H]
+            x: (B, 64, H/8, W/8) - c5 from backbone
+            skip_connections: [c2, c1, None]
+                - c2: (B, 32, H/4, W/4)
+                - c1: (B, 32, H/2, W/2)
         
         Returns:
-            Decoded features (B, 16, H, W)
+            out: (B, 16, H, W)
         """
-        # Input projection
-        x = self.input_proj(x)
+        c2, c1, _ = skip_connections
         
-        # Progressive decoding
-        for i, stage in enumerate(self.stages):
-            skip = None
-            if skip_connections is not None and i < len(skip_connections):
-                skip = skip_connections[i]
-            
-            x = stage(x, skip)
+        # Stage 1: H/8 → H/4
+        x = self.up1(x)  # (B, 128, H/4, W/4)
+        
+        if c2 is not None:
+            x = torch.cat([x, c2], dim=1)  # (B, 160, H/4, W/4)
+        x = self.fusion1(x)  # (B, 64, H/4, W/4)
+        
+        # Stage 2: H/4 → H/2
+        x = self.up2(x)  # (B, 64, H/2, W/2)
+        
+        if c1 is not None:
+            x = torch.cat([x, c1], dim=1)  # (B, 96, H/2, W/2)
+        x = self.fusion2(x)  # (B, 32, H/2, W/2)
+        
+        # Stage 3: H/2 → H
+        x = self.up3(x)  # (B, 32, H, W)
+        x = self.final(x)  # (B, 16, H, W)
         
         return x
