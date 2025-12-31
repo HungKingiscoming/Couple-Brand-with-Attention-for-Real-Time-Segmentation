@@ -34,10 +34,10 @@ import gc
 # IMPORTS (use fixed modules)
 # ============================================
 
-# from fixed_backbone import GCNetWithDWSA
-# from fixed_dwsa import GCNetHead, GCNetAuxHead, LightweightDecoder
-# from hybrid_loss import HybridLoss
-# from data.custom import create_dataloaders
+from fixed_backbone import GCNetWithDWSA
+from fixed_dwsa import GCNetHead, GCNetAuxHead, LightweightDecoder
+from hybrid_loss import HybridLoss
+from data.custom import create_dataloaders
 
 
 # ============================================
