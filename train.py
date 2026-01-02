@@ -24,7 +24,7 @@ warnings.filterwarnings('ignore')
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import create_dataloaders
-
+from model_utils import replace_bn_with_gn, init_weights
 
 # ============================================
 # LOSS FUNCTIONS
