@@ -93,64 +93,64 @@ class DepthWiseSeparableAttention(nn.Module):
         
         return torch.cat(attn_chunks, dim=2)
     def forward(self, x: Tensor) -> Tensor:
-    """
-    ✅ FIXED: No duplicates, proper shapes, Kaggle-ready
-    """
-    # ✅ CORRECT shape inference
-    if x.dim() == 4:
-        B, C, H, W = x.shape
-        is_4d = True
-        x_4d = x
-        x_flat = x.flatten(2).transpose(1, 2)  # (B, N, C)
-    else:  # 3D: (B, N, C)
-        B, N, C = x.shape
-        is_4d = False
-        x_flat = x
-        # Infer H,W from N (handles non-square)
-        H = int(math.sqrt(N))
-        W = N // H
-        x_4d = x.transpose(1, 2).reshape(B, C, H, W)
-    
-    N = x_flat.shape[1]  # ✅ Define N properly
-    
-    # Local context (always 4D)
-    local_feat = self.local_norm(self.local_conv(x_4d))
-    local_feat_flat = local_feat.flatten(2).transpose(1, 2)  # (B, N, C)
-    
-    # Normalize
-    x_norm = self.norm(x_flat)
-    
-    # QKV: (B, N, 3*heads*head_dim) -> (3, B, heads, N, head_dim)
-    qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-    q, k, v = qkv.unbind(0)  # Each: (B, heads, N, head_dim)
-    
-    # Inject local context into Q
-    local_q = self.norm(local_feat_flat).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
-    q = q + local_q
-    
-    # ✅ SINGLE ATTENTION BLOCK - Kaggle optimized
-    if hasattr(self, 'use_memory_efficient') and self.use_memory_efficient and N > 4096:
-        out = self._memory_efficient_attention(q, k, v)
-    else:
-        # Standard attention (works everywhere)
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        out = attn @ v  # (B, heads, N, head_dim)
-    
-    # Reshape output
-    out = out.transpose(1, 2).reshape(B, N, self.dim)  # (B, N, C)
-    
-    # Final projection + residual
-    out = self.proj(out)
-    out = self.proj_drop(out)
-    out = x_flat + out
-    
-    # Restore shape
-    if is_4d:
-        out = out.transpose(1, 2).reshape(B, C, H, W)
-    
-    return out
+        """
+        ✅ FIXED: No duplicates, proper shapes, Kaggle-ready
+        """
+        # ✅ CORRECT shape inference
+        if x.dim() == 4:
+            B, C, H, W = x.shape
+            is_4d = True
+            x_4d = x
+            x_flat = x.flatten(2).transpose(1, 2)  # (B, N, C)
+        else:  # 3D: (B, N, C)
+            B, N, C = x.shape
+            is_4d = False
+            x_flat = x
+            # Infer H,W from N (handles non-square)
+            H = int(math.sqrt(N))
+            W = N // H
+            x_4d = x.transpose(1, 2).reshape(B, C, H, W)
+        
+        N = x_flat.shape[1]  # ✅ Define N properly
+        
+        # Local context (always 4D)
+        local_feat = self.local_norm(self.local_conv(x_4d))
+        local_feat_flat = local_feat.flatten(2).transpose(1, 2)  # (B, N, C)
+        
+        # Normalize
+        x_norm = self.norm(x_flat)
+        
+        # QKV: (B, N, 3*heads*head_dim) -> (3, B, heads, N, head_dim)
+        qkv = self.qkv(x_norm).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)  # Each: (B, heads, N, head_dim)
+        
+        # Inject local context into Q
+        local_q = self.norm(local_feat_flat).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        q = q + local_q
+        
+        # ✅ SINGLE ATTENTION BLOCK - Kaggle optimized
+        if hasattr(self, 'use_memory_efficient') and self.use_memory_efficient and N > 4096:
+            out = self._memory_efficient_attention(q, k, v)
+        else:
+            # Standard attention (works everywhere)
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            out = attn @ v  # (B, heads, N, head_dim)
+        
+        # Reshape output
+        out = out.transpose(1, 2).reshape(B, N, self.dim)  # (B, N, C)
+        
+        # Final projection + residual
+        out = self.proj(out)
+        out = self.proj_drop(out)
+        out = x_flat + out
+        
+        # Restore shape
+        if is_4d:
+            out = out.transpose(1, 2).reshape(B, C, H, W)
+        
+        return out
 
 
 
