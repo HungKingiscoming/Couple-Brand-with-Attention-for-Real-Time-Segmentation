@@ -426,7 +426,7 @@ class Segmentor(nn.Module):
 # ✅ UPDATED TRAINER
 # ============================================
 
-class :
+class:
     """
     ✅ Updated with hybrid loss
     """
