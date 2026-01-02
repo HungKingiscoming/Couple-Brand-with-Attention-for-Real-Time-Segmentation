@@ -190,87 +190,58 @@ class CityscapesDataset(Dataset):
 def get_train_transforms(
     img_size: Tuple[int, int] = (512, 1024),
     mean: List[float] = [0.485, 0.456, 0.406],
-    std: List[float] = [0.229, 0.224, 0.225],
-    dataset_type: str = "normal"
-) -> A.Compose:
-    """
-    Cityscapes training augmentation (industry standard)
-    """
-
-    # 1. Geometric transforms (MOST IMPORTANT)
-    transforms = [
-        # Random scale (multi-scale training)
-        A.RandomScale(
-            scale_limit=(0.75, 1.25) if dataset_type == "normal" else (0.5, 1.5),
-            interpolation=cv2.INTER_LINEAR,
-            p=1.0
-        ),
-
-        # Random crop to training size
-        A.RandomCrop(
-            height=img_size[0],
-            width=img_size[1],
-            p=1.0
-        ),
-
-        # Horizontal flip
-        A.HorizontalFlip(p=0.5),
-    ]
-
-    # 2. Color augmentations (LIGHT & CONTROLLED)
-    if dataset_type == "normal":
-        transforms += [
-            A.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.05,
-                p=0.3
-            ),
-        ]
-    else:
-        # Foggy dataset: stronger color + blur
-        transforms += [
-            A.ColorJitter(
-                brightness=0.3,
-                contrast=0.3,
-                saturation=0.3,
-                hue=0.1,
-                p=0.5
-            ),
-            A.GaussianBlur(
-                blur_limit=(3, 5),
-                p=0.2
-            ),
-        ]
-
-    # 3. Normalize & tensor
-    transforms += [
-        A.Normalize(mean=mean, std=std),
-        ToTensorV2()
-    ]
-
-    return A.Compose(transforms)
-
-
-def get_val_transforms(
-    img_size: Tuple[int, int] = (1024, 2048),
-    mean: List[float] = [0.485, 0.456, 0.406],
     std: List[float] = [0.229, 0.224, 0.225]
 ) -> A.Compose:
     """
-    Validation/Test transforms (NO augmentation)
+    Chiến thuật Augmentation tối ưu để đạt mIoU cao trên Cityscapes thường
     """
     return A.Compose([
-        A.Resize(
-            height=img_size[0],
-            width=img_size[1],
-            interpolation=cv2.INTER_LINEAR
+        # 1. Resize ban đầu về kích thước chuẩn để tính toán scale đồng nhất
+        A.Resize(height=img_size[0], width=img_size[1], p=1.0),
+
+        # 2. Thu hẹp scale_limit (0.75 - 1.25)
+        # Giúp vật thể không bị quá nhỏ (biến mất) hoặc quá to (mất context)
+        A.RandomScale(
+            scale_limit=0.25, # Kết quả là [1-0.25, 1+0.25] = [0.75, 1.25]
+            interpolation=cv2.INTER_LINEAR,
+            p=0.5
         ),
+
+        # 3. RandomCrop giữ nguyên kích thước đích
+        # Đảm bảo sau khi scale, ảnh vẫn quay về đúng (512, 1024)
+        A.PadIfNeeded(
+            min_height=img_size[0], 
+            min_width=img_size[1], 
+            border_mode=cv2.BORDER_CONSTANT, 
+            value=0, 
+            mask_value=255 # Quan trọng: Pad label bằng ignore_index
+        ),
+        A.RandomCrop(height=img_size[0], width=img_size[1], p=1.0),
+
+        # 4. Horizontal Flip (Kỹ thuật cơ bản nhưng cực kỳ hiệu quả cho giao thông)
+        A.HorizontalFlip(p=0.5),
+
+        # 5. Color Jitter nhẹ nhàng (Không làm sai lệch màu sắc quá mức)
+        A.OneOf([
+            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=1.0),
+            A.RandomGamma(gamma_limit=(80, 120), p=1.0),
+        ], p=0.3),
+
+        # 6. Normalize & Tensor
         A.Normalize(mean=mean, std=std),
         ToTensorV2()
     ])
 
+def get_val_transforms(
+    img_size: Tuple[int, int] = (512, 1024),
+    mean: List[float] = [0.485, 0.456, 0.406],
+    std: List[float] = [0.229, 0.224, 0.225]
+) -> A.Compose:
+    return A.Compose([
+        A.Resize(height=img_size[0], width=img_size[1], interpolation=cv2.INTER_LINEAR),
+        A.Normalize(mean=mean, std=std),
+        ToTensorV2()
+    ])
 
 
 # ============================================
