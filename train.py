@@ -333,42 +333,48 @@ class ModelConfig:
     @staticmethod
     def get_lightweight_config():
         """
-        ✅ FIXED: Lightweight config with decoder enabled
+        ✅ FIXED: Proper channel alignment
         
-        Changes:
-        - Removed decode_enabled (always True now)
-        - DWSA @ Stage3 + Bottleneck (was only Bottleneck)
+        Backbone output channels:
+        - c1: 32 (H/2)
+        - c2: 32 (H/4)  
+        - c3: 64 (H/8)
+        - c4: 128 (H/16) ← Used by aux_head
+        - c5: 64 (H/8)   ← Used by main head
         """
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 32,  # Increased from 24
+                "channels": 32,  # Base channels
                 "ppm_channels": 96,
                 "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
-                "dwsa_stages": ['stage3', 'bottleneck'],
+                "dwsa_stages": ['bottleneck'],  # ✅ Only bottleneck initially
                 "dwsa_num_heads": 8,
+                "align_corners": False,
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,  # 32 * 2
+                # ✅ FIX: Match backbone c5 output
+                "in_channels": 64,  # channels * 2 = 32 * 2 = 64
                 "channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False
-                # Note: decode_enabled removed - decoder always enabled
             },
             "aux_head": {
-                "in_channels": 64,  # 32 * 4
-                "channels": 128,
+                # ✅ FIX: Match backbone c4 output  
+                "in_channels": 128,  # channels * 4 = 32 * 4 = 128
+                "channels": 64,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "loss": {
+                # ✅ FIX: Optimized for Cityscapes
                 "ce_weight": 1.0,
-                "dice_weight": 0.5,
-                "focal_weight": 0.3,  # Can increase to 0.3 for imbalanced datasets
+                "dice_weight": 1.0,      # ✅ Increased from 0.5
+                "focal_weight": 0.0,     # ✅ Disabled initially
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
                 "dice_smooth": 1.0
@@ -378,27 +384,32 @@ class ModelConfig:
     @staticmethod
     def get_standard_config():
         """
-        Standard config for 24GB+ GPU
+        ✅ Standard config with proper channels
+        
+        Backbone output:
+        - c5: 96 (channels=48 → 48*2=96)
+        - c4: 192 (48*4=192)
         """
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 48,  # Increased from 24
+                "channels": 48,  # Increased capacity
                 "ppm_channels": 112,
                 "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
+                "dwsa_stages": ['bottleneck'],
                 "dwsa_num_heads": 8,
+                "align_corners": False,
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,  # 32 * 2
+                "in_channels": 96,   # 48 * 2
                 "channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False
-                # Note: decode_enabled removed - decoder always enabled
             },
             "aux_head": {
-                "in_channels": 192,  # 32 * 4
+                "in_channels": 192,  # 48 * 4
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -408,7 +419,7 @@ class ModelConfig:
             "loss": {
                 "ce_weight": 1.0,
                 "dice_weight": 1.0,
-                "focal_weight": 0.3,  # Can increase to 0.3 for imbalanced datasets
+                "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
                 "dice_smooth": 1.0
