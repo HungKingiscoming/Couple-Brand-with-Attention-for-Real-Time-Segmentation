@@ -182,7 +182,52 @@ def setup_memory_efficient_training():
     torch.backends.cudnn.allow_tf32 = True
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
-
+class TrainingSchedule:
+    """
+    Multi-stage training schedule for from-scratch training
+    """
+    
+    @staticmethod
+    def get_schedule_from_scratch(total_epochs=200):
+        """
+        Progressive training strategy:
+        
+        Stage 1 (0-50): High LR, learn basic features
+        Stage 2 (50-150): Stable training
+        Stage 3 (150-200): Fine-tuning
+        """
+        return {
+            # Stage 1: Warm-up and initial learning
+            "stage1": {
+                "epochs": (0, 50),
+                "lr": 1e-3,
+                "weight_decay": 1e-4,
+                "aux_weight": 0.4,
+                "img_size": (384, 768),  # Smaller for faster iteration
+                "batch_size": 8,
+                "accumulation": 2
+            },
+            # Stage 2: Main training
+            "stage2": {
+                "epochs": (50, 150),
+                "lr": 5e-4,
+                "weight_decay": 5e-5,
+                "aux_weight": 0.3,
+                "img_size": (512, 1024),  # Full resolution
+                "batch_size": 4,
+                "accumulation": 4
+            },
+            # Stage 3: Fine-tuning
+            "stage3": {
+                "epochs": (150, 200),
+                "lr": 1e-4,
+                "weight_decay": 1e-5,
+                "aux_weight": 0.2,
+                "img_size": (512, 1024),
+                "batch_size": 4,
+                "accumulation": 4
+            }
+        }
 # ============================================
 # ✅ UPDATED MODEL CONFIG
 # ============================================
@@ -400,7 +445,7 @@ class Segmentor(nn.Module):
 # ✅ UPDATED TRAINER
 # ============================================
 
-class MemoryEfficientTrainer:
+class :
     """
     ✅ Updated with hybrid loss
     """
@@ -826,8 +871,6 @@ def main():
     )
     
     # Training imports
-    from train_fixed import MemoryEfficientTrainer
-    
     trainer = MemoryEfficientTrainer(
         model=model,
         optimizer=optimizer,
