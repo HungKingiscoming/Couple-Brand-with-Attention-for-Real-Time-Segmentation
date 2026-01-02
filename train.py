@@ -24,7 +24,8 @@ warnings.filterwarnings('ignore')
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import create_dataloaders
-from model_utils import replace_bn_with_gn, init_weights
+from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
+
 
 # ============================================
 # LOSS FUNCTIONS
@@ -693,7 +694,11 @@ def main():
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
-    
+    if args.batch_size < 16:
+        model = replace_bn_with_gn(model)
+    if args.from_scratch:
+        model.apply(init_weights)
+    check_model_health(model)
     # Test forward pass
     model = model.to(device)
     with torch.no_grad():
