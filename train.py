@@ -1,20 +1,3 @@
-"""
-============================================
-✅ FULLY FIXED GCNET TRAINING PIPELINE
-============================================
-
-Fixes Applied:
-1. ✅ Fixed DWSA local attention
-2. ✅ Fixed skip connections in decoder
-3. ✅ Enabled lightweight decoder
-4. ✅ Added DWSA @ H/8 (Stage 3)
-5. ✅ Hybrid loss (CE + Dice + Focal)
-
-Expected Performance:
-- Lightweight config: 76-78% mIoU @ Cityscapes
-- Memory usage: ~12-14GB @ batch_size=4, 512x1024
-"""
-
 import os
 import torch
 import torch.nn as nn
