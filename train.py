@@ -345,11 +345,12 @@ class ModelConfig:
                 "channels": 32,  # Increased from 24
                 "ppm_channels": 96,
                 "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
+                "dwsa_stages": ['stage3', 'bottleneck'],
                 "dwsa_num_heads": 8,
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,  # 32 * 2
+                "in_channels": 96,  # 32 * 2
                 "channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
@@ -357,15 +358,17 @@ class ModelConfig:
                 # Note: decode_enabled removed - decoder always enabled
             },
             "aux_head": {
-                "in_channels": 128,  # 32 * 4
-                "channels": 64,
+                "in_channels": 64,  # 32 * 4
+                "channels": 128,
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "loss": {
                 "ce_weight": 1.0,
                 "dice_weight": 0.5,
-                "focal_weight": 0.0,  # Can increase to 0.3 for imbalanced datasets
+                "focal_weight": 0.3,  # Can increase to 0.3 for imbalanced datasets
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
                 "dice_smooth": 1.0
@@ -380,15 +383,14 @@ class ModelConfig:
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 32,
-                "ppm_channels": 128,
-                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
+                "channels": 48,  # Increased from 24
+                "ppm_channels": 112,
+                "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
                 "dwsa_num_heads": 8,
-                "dwsa_drop": 0.0,
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,
+                "in_channels": 96,  # 32 * 2
                 "channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
@@ -396,15 +398,17 @@ class ModelConfig:
                 # Note: decode_enabled removed - decoder always enabled
             },
             "aux_head": {
-                "in_channels": 128,
-                "channels": 64,
+                "in_channels": 192,  # 32 * 4
+                "channels": 96,
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "loss": {
                 "ce_weight": 1.0,
-                "dice_weight": 0.5,
-                "focal_weight": 0.0,
+                "dice_weight": 1.0,
+                "focal_weight": 0.3,  # Can increase to 0.3 for imbalanced datasets
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
                 "dice_smooth": 1.0
