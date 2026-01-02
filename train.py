@@ -763,10 +763,10 @@ def main():
     
     # ✅ Load FIXED config
     if args.from_scratch:
-        cfg = OptimizedConfig.get_config_from_scratch()
+        cfg = ModelConfig.get_config_from_scratch()
         print("✅ Using FROM-SCRATCH config with FIXED channels")
     else:
-        cfg = OptimizedConfig.get_config_standard()
+        cfg = ModelConfig.get_config_standard()
         print("✅ Using STANDARD config with FIXED channels")
     
     # Verify channels
