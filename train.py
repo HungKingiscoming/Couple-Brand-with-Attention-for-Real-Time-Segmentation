@@ -692,8 +692,23 @@ def main():
         aux_head=GCNetAuxHead(num_classes=args.num_classes, **cfg["aux_head"])
     )
     
+    # ====================================================
+    # ✅ CRITICAL: Apply model optimizations
+    # ====================================================    
+    print("\n🔧 Applying Model Optimizations...")
+    print("   ├─ Converting BatchNorm → GroupNorm")
+    model = replace_bn_with_gn(model)
+    
+    print("   └─ Applying Kaiming Initialization")
+    model.apply(init_weights)
+    
+    check_model_health(model)
+    print()
+    # ====================================================
+    
     total_params = sum(p.numel() for p in model.parameters())
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+
     if args.batch_size < 16:
         model = replace_bn_with_gn(model)
     if args.from_scratch:
