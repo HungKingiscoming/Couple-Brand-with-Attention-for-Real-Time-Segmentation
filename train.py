@@ -203,7 +203,6 @@ class ModelConfig:
             },
             "head": {
                 "in_channels": 64,  # c5 = channels * 2 = 32 * 2
-                "channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.15,
                 "align_corners": False
@@ -237,7 +236,7 @@ class ModelConfig:
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 48,
+                "decoder_channels": 48,
                 "ppm_channels": 112,
                 "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
                 "dwsa_stages": ['stage3', 'bottleneck'],
@@ -247,7 +246,6 @@ class ModelConfig:
             },
             "head": {
                 "in_channels": 96,   # 48 * 2
-                "channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False
@@ -709,11 +707,6 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
 
-    if args.batch_size < 16:
-        model = replace_bn_with_gn(model)
-    if args.from_scratch:
-        model.apply(init_weights)
-    check_model_health(model)
     # Test forward pass
     model = model.to(device)
     with torch.no_grad():
