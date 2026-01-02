@@ -236,12 +236,11 @@ class FocalLoss(nn.Module):
         
         return focal_loss.mean() if self.reduction == 'mean' else focal_loss
 
-
 class HybridLoss(nn.Module):
     def __init__(
         self,
         ce_weight=1.0,
-        dice_weight=0.5,
+        dice_weight=1.0,
         focal_weight=0.0,
         ignore_index=255,
         class_weights=None,
@@ -262,6 +261,8 @@ class HybridLoss(nn.Module):
             reduction='mean'
         )
         
+        from train_fixed import DiceLoss, FocalLoss
+        
         self.dice_loss = DiceLoss(
             smooth=dice_smooth,
             ignore_index=ignore_index,
@@ -278,20 +279,9 @@ class HybridLoss(nn.Module):
     def forward(self, logits, targets):
         losses = {}
         
-        if self.ce_weight > 0:
-            losses['ce'] = self.ce_loss(logits, targets)
-        else:
-            losses['ce'] = torch.tensor(0.0, device=logits.device)
-        
-        if self.dice_weight > 0:
-            losses['dice'] = self.dice_loss(logits, targets)
-        else:
-            losses['dice'] = torch.tensor(0.0, device=logits.device)
-        
-        if self.focal_weight > 0:
-            losses['focal'] = self.focal_loss(logits, targets)
-        else:
-            losses['focal'] = torch.tensor(0.0, device=logits.device)
+        losses['ce'] = self.ce_loss(logits, targets) if self.ce_weight > 0 else 0
+        losses['dice'] = self.dice_loss(logits, targets) if self.dice_weight > 0 else 0
+        losses['focal'] = self.focal_loss(logits, targets) if self.focal_weight > 0 else 0
         
         losses['total'] = (
             self.ce_weight * losses['ce'] +
@@ -300,6 +290,7 @@ class HybridLoss(nn.Module):
         )
         
         return losses
+
 # ============================================
 # MEMORY UTILITIES (unchanged)
 # ============================================
@@ -330,6 +321,54 @@ def setup_memory_efficient_training():
 # ============================================
 
 class ModelConfig:
+    @staticmethod
+    def get_config_from_scratch():
+        """
+        ✅ Config cho training từ scratch
+        
+        Key changes:
+        - Simpler architecture (avoid overfitting)
+        - Higher regularization
+        - Conservative DWSA usage
+        """
+        return {
+            "backbone": {
+                "in_channels": 3,
+                "channels": 32,  # Base channels
+                "ppm_channels": 96,
+                "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
+                "dwsa_stages": ['bottleneck'],  # ✅ ONLY bottleneck for stability
+                "dwsa_num_heads": 8,
+                "align_corners": False,
+                "deploy": False
+            },
+            "head": {
+                # ✅ CRITICAL FIX: Match backbone output!
+                "in_channels": 64,  # c5 = channels * 2 = 32 * 2 = 64
+                "channels": 128,
+                "decoder_channels": 128,
+                "dropout_ratio": 0.15,  # ✅ Increased from 0.1 for regularization
+                "align_corners": False
+            },
+            "aux_head": {
+                # ✅ CRITICAL FIX: Match backbone output!
+                "in_channels": 128,  # c4 = channels * 4 = 32 * 4 = 128
+                "channels": 64,
+                "dropout_ratio": 0.15,
+                "align_corners": False,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
+            },
+            "loss": {
+                # ✅ Optimized for scratch training
+                "ce_weight": 1.0,
+                "dice_weight": 1.0,  # Equal weight helps convergence
+                "focal_weight": 0.0,  # Disabled - adds instability
+                "focal_alpha": 0.25,
+                "focal_gamma": 2.0,
+                "dice_smooth": 1.0
+            }
+        }
     @staticmethod
     def get_lightweight_config():
         """
@@ -382,21 +421,17 @@ class ModelConfig:
         }
     
     @staticmethod
-    def get_standard_config():
+    def get_config_standard():
         """
-        ✅ Standard config with proper channels
-        
-        Backbone output:
-        - c5: 96 (channels=48 → 48*2=96)
-        - c4: 192 (48*4=192)
+        ✅ Standard config (if you get pretrained weights later)
         """
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 48,  # Increased capacity
+                "channels": 48,
                 "ppm_channels": 112,
                 "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
-                "dwsa_stages": ['bottleneck'],
+                "dwsa_stages": ['stage3', 'bottleneck'],  # More DWSA when pretrained
                 "dwsa_num_heads": 8,
                 "align_corners": False,
                 "deploy": False
@@ -426,7 +461,52 @@ class ModelConfig:
             }
         }
 
-
+class TrainingSchedule:
+    """
+    Multi-stage training schedule for from-scratch training
+    """
+    
+    @staticmethod
+    def get_schedule_from_scratch(total_epochs=200):
+        """
+        Progressive training strategy:
+        
+        Stage 1 (0-50): High LR, learn basic features
+        Stage 2 (50-150): Stable training
+        Stage 3 (150-200): Fine-tuning
+        """
+        return {
+            # Stage 1: Warm-up and initial learning
+            "stage1": {
+                "epochs": (0, 50),
+                "lr": 1e-3,
+                "weight_decay": 1e-4,
+                "aux_weight": 0.4,
+                "img_size": (384, 768),  # Smaller for faster iteration
+                "batch_size": 8,
+                "accumulation": 2
+            },
+            # Stage 2: Main training
+            "stage2": {
+                "epochs": (50, 150),
+                "lr": 5e-4,
+                "weight_decay": 5e-5,
+                "aux_weight": 0.3,
+                "img_size": (512, 1024),  # Full resolution
+                "batch_size": 4,
+                "accumulation": 4
+            },
+            # Stage 3: Fine-tuning
+            "stage3": {
+                "epochs": (150, 200),
+                "lr": 1e-4,
+                "weight_decay": 1e-5,
+                "aux_weight": 0.2,
+                "img_size": (512, 1024),
+                "batch_size": 4,
+                "accumulation": 4
+            }
+        }
 # ============================================
 # SEGMENTOR (unchanged)
 # ============================================
@@ -448,7 +528,6 @@ class Segmentor(nn.Module):
         if self.aux_head is not None:
             outputs["aux"] = self.aux_head(feats)
         return outputs
-
 
 # ============================================
 # ✅ UPDATED TRAINER
@@ -732,12 +811,8 @@ class MemoryEfficientTrainer:
         print(f"   Best mIoU: {self.best_miou:.4f}")
 
 
-# ============================================
-# MAIN
-# ============================================
-
 def main():
-    parser = argparse.ArgumentParser(description="Fixed GCNet Training")
+    parser = argparse.ArgumentParser(description="Optimized GCNet Training")
     
     # Dataset
     parser.add_argument("--train_txt", required=True)
@@ -745,89 +820,92 @@ def main():
     parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
-    parser.add_argument("--img_size", type=int, nargs=2, default=[512, 1024])
-    parser.add_argument("--compute_class_weights", action="store_true")
-    parser.add_argument('--img_h', type=int, default=512, help='Input image height')
-    parser.add_argument('--img_w', type=int, default=1024, help='Input image width')
+    
+    # Training strategy
+    parser.add_argument("--from_scratch", action="store_true", default=True,
+                        help="Training from scratch (no pretrained weights)")
+    parser.add_argument("--epochs", type=int, default=200,
+                        help="Total epochs (200 recommended for scratch)")
+    
     # Model
     parser.add_argument("--model_size", default="lightweight",
                         choices=["lightweight", "standard"])
-    parser.add_argument("--aux_weight", type=float, default=0.4)
     
-    # Training
-    parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--batch_size", type=int, default=4)
+    # Optimization
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=0.4)
     
-    # Scheduler
-    parser.add_argument("--scheduler_type", default="cosine")
-    parser.add_argument("--warmup_epochs", type=int, default=10)  # Increased from 5
-    
-    # Optimization
-    parser.add_argument("--use_amp", action="store_true", default=True)
-    
-    # Logging
-    parser.add_argument("--save_dir", default="./checkpoints_fixed")
-    parser.add_argument("--log_interval", type=int, default=10)
-    parser.add_argument("--save_interval", type=int, default=10)
-    parser.add_argument("--resume", type=str, default=None)
+    # Image size (will be adjusted by stage)
+    parser.add_argument("--img_h", type=int, default=512)
+    parser.add_argument("--img_w", type=int, default=1024)
     
     # System
+    parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--save_dir", default="./checkpoints_optimized")
+    parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--seed", type=int, default=42)
     
     args = parser.parse_args()
     
-    # Seed
+    # Setup
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
-    
-    setup_memory_efficient_training()
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"🚀 Fixed GCNet Training Pipeline")
+    print(f"🚀 Optimized GCNet Training")
     print(f"{'='*70}")
     print(f"📱 Device: {device}")
-    print(f"🎯 Dataset: {args.dataset_type.upper()} Cityscapes")
-    print(f"📐 Image size: {args.img_size[0]}x{args.img_size[1]}")
-    print(f"🏗️  Model size: {args.model_size}")
+    print(f"🎯 Training: {'FROM SCRATCH' if args.from_scratch else 'WITH PRETRAINED'}")
+    print(f"📐 Initial image size: {args.img_h}x{args.img_w}")
+    print(f"📊 Epochs: {args.epochs}")
+    print(f"⚠️  Expected mIoU: {'65-70%' if args.from_scratch else '76-78%'}")
     print(f"{'='*70}\n")
     
-    print_memory_usage("Initial")
-    
-    # Dataloaders (assuming implemented)
-    train_loader, val_loader, class_weights = create_dataloaders(
-        train_txt=args.train_txt,      # ví dụ: data/cityscapes_train.txt
-        val_txt=args.val_txt,          # ví dụ: data/cityscapes_val.txt
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        img_size=(args.img_h, args.img_w),
-        pin_memory=True,
-        compute_class_weights=False,   # bật nếu cần
-        dataset_type=args.dataset_type # 'normal' hoặc 'foggy'
-    )
-    
-    # ✅ Create model with fixed config
-    print(f"\n{'='*70}")
-    print("🏗️  Building Fixed Model...")
-    print(f"{'='*70}\n")
-    
-    if args.model_size == "lightweight":
-        cfg = ModelConfig.get_lightweight_config()
+    # ✅ Load FIXED config
+    if args.from_scratch:
+        cfg = OptimizedConfig.get_config_from_scratch()
+        print("✅ Using FROM-SCRATCH config with FIXED channels")
     else:
-        cfg = ModelConfig.get_standard_config()
+        cfg = OptimizedConfig.get_config_standard()
+        print("✅ Using STANDARD config with FIXED channels")
+    
+    # Verify channels
+    print(f"\n{'='*70}")
+    print("🔍 Channel Verification")
+    print(f"{'='*70}")
+    print(f"Backbone base channels: {cfg['backbone']['channels']}")
+    print(f"Expected c5 (main): {cfg['backbone']['channels'] * 2}")
+    print(f"Expected c4 (aux):  {cfg['backbone']['channels'] * 4}")
+    print(f"Head expects:       {cfg['head']['in_channels']} ✅")
+    print(f"Aux expects:        {cfg['aux_head']['in_channels']} ✅")
+    print(f"{'='*70}\n")
     
     # Store loss config
     args.loss_config = cfg["loss"]
     
-    # Import fixed modules
-    # from fixed_backbone import GCNetWithDWSA
-    # from fixed_dwsa import GCNetHead, GCNetAuxHead
+    # Create dataloaders
+    train_loader, val_loader, class_weights = create_dataloaders(
+        train_txt=args.train_txt,
+        val_txt=args.val_txt,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        img_size=(args.img_h, args.img_w),
+        pin_memory=True,
+        compute_class_weights=False,
+        dataset_type=args.dataset_type
+    )
+    
+    # Create model
+    print(f"\n{'='*70}")
+    print("🏗️  Building Model with FIXED Channels...")
+    print(f"{'='*70}\n")
     
     model = Segmentor(
         backbone=GCNetWithDWSA(**cfg["backbone"]),
@@ -838,7 +916,24 @@ def main():
     total_params = sum(p.numel() for p in model.parameters())
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     
-    print_memory_usage("After model creation")
+    # Test forward pass
+    model = model.to(device)
+    with torch.no_grad():
+        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+        try:
+            outputs = model.forward_train(sample)
+            print(f"✅ Forward pass successful!")
+            print(f"   Main output: {outputs['main'].shape}")
+            if 'aux' in outputs:
+                print(f"   Aux output:  {outputs['aux'].shape}")
+        except Exception as e:
+            print(f"❌ Forward pass FAILED: {e}")
+            print(f"⚠️  FIX CHANNELS BEFORE TRAINING!")
+            return
+    
+    print(f"\n{'='*70}")
+    print("✅ Model verification passed! Ready to train.")
+    print(f"{'='*70}\n")
     
     # Optimizer
     optimizer = optim.AdamW(
@@ -848,26 +943,24 @@ def main():
         betas=(0.9, 0.999)
     )
     
-    # Scheduler
-    total_steps = len(train_loader) * args.epochs // args.accumulation_steps
+    # Scheduler - Polynomial (better for segmentation)
+    def poly_lr_lambda(epoch):
+        return (1 - epoch / args.epochs) ** 0.9
     
-    if args.scheduler_type == "cosine":
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=args.epochs,
-            eta_min=args.lr * 0.01
-        )
-    elif args.scheduler_type == "onecycle":
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=args.lr,
-            total_steps=total_steps,
-            pct_start=0.1,  # 10% warmup
-            div_factor=25,
-            final_div_factor=1e4
-        )
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
     
-    # Trainer
+    # Criterion
+    criterion = HybridLoss(
+        ce_weight=cfg["loss"]["ce_weight"],
+        dice_weight=cfg["loss"]["dice_weight"],
+        focal_weight=cfg["loss"]["focal_weight"],
+        ignore_index=args.ignore_index,
+        class_weights=class_weights.to(device) if class_weights is not None else None
+    )
+    
+    # Training imports
+    from train_fixed import MemoryEfficientTrainer
+    
     trainer = MemoryEfficientTrainer(
         model=model,
         optimizer=optimizer,
@@ -880,70 +973,44 @@ def main():
     if args.resume:
         trainer.load_checkpoint(args.resume)
     
-    print_memory_usage("Before training")
-    
     # Training loop
     print(f"\n{'='*70}")
-    print("🚀 Starting Training with All Fixes Applied!")
+    print("🚀 Starting Optimized Training!")
     print(f"{'='*70}\n")
     
-    start_time = time.time()
-    
     for epoch in range(trainer.start_epoch, args.epochs):
-        epoch_start = time.time()
-        
         # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
-        
-        clear_gpu_memory()
         
         # Validate
         val_metrics = trainer.validate(val_loader, epoch)
         
-        if scheduler and args.scheduler_type != 'onecycle':
-            scheduler.step()
+        # Step scheduler
+        scheduler.step()
         
         # Logging
-        epoch_time = time.time() - epoch_start
         print(f"\n{'='*70}")
-        print(f"📊 Epoch {epoch+1}/{args.epochs} (Time: {epoch_time:.2f}s)")
+        print(f"📊 Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
-        print(f"Train Loss: {train_metrics['loss']:.4f} "
-              f"(CE: {train_metrics['ce']:.4f}, Dice: {train_metrics['dice']:.4f})")
-        print(f"Val   Loss: {val_metrics['loss']:.4f} | "
+        print(f"Train - Loss: {train_metrics['loss']:.4f} | "
+              f"CE: {train_metrics['ce']:.4f} | "
+              f"Dice: {train_metrics['dice']:.4f}")
+        print(f"Val   - Loss: {val_metrics['loss']:.4f} | "
               f"mIoU: {val_metrics['miou']:.4f} | "
               f"Acc: {val_metrics['accuracy']:.4f}")
         print(f"{'='*70}\n")
         
-        print_memory_usage(f"After epoch {epoch+1}")
-        
-        # TensorBoard
-        trainer.writer.add_scalars('Loss', {
-            'train': train_metrics['loss'],
-            'val': val_metrics['loss']
-        }, epoch)
-        trainer.writer.add_scalar('mIoU', val_metrics['miou'], epoch)
-        
-        # Save
+        # Save checkpoint
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
             trainer.best_miou = val_metrics['miou']
         
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
-        
-        clear_gpu_memory()
     
-    total_time = time.time() - start_time
     print(f"\n{'='*70}")
     print("✅ Training Completed!")
-    print(f"{'='*70}")
-    print(f"⏱️  Total time: {total_time/3600:.2f} hours")
     print(f"🏆 Best mIoU: {trainer.best_miou:.4f}")
-    print(f"📈 Expected improvement: +4-6% over original")
-    print(f"💾 Checkpoints: {args.save_dir}")
     print(f"{'='*70}\n")
-    
-    trainer.writer.close()
 
 if __name__ == "__main__":
     main()
