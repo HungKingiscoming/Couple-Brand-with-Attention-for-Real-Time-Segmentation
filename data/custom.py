@@ -190,7 +190,8 @@ class CityscapesDataset(Dataset):
 def get_train_transforms(
     img_size: Tuple[int, int] = (512, 1024),
     mean: List[float] = [0.485, 0.456, 0.406],
-    std: List[float] = [0.229, 0.224, 0.225]
+    std: List[float] = [0.229, 0.224, 0.225],
+    dataset_type='normal'
 ) -> A.Compose:
     """
     Chiến thuật Augmentation tối ưu để đạt mIoU cao trên Cityscapes thường
