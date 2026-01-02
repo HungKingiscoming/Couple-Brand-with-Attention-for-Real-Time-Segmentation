@@ -128,8 +128,6 @@ class HybridLoss(nn.Module):
             reduction='mean'
         )
         
-        from train_fixed import DiceLoss, FocalLoss
-        
         self.dice_loss = DiceLoss(
             smooth=dice_smooth,
             ignore_index=ignore_index,
