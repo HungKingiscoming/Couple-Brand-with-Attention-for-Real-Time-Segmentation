@@ -32,37 +32,32 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # ============================================
 
 class DiceLoss(nn.Module):
-    """Dice Loss for semantic segmentation"""
-    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
-        super().__init__()
-        self.smooth = smooth
-        self.ignore_index = ignore_index
-        self.reduction = reduction
-    
     def forward(self, logits, targets):
-        probs = F.softmax(logits, dim=1)
-        B, C, H, W = probs.shape
+        B, C, H, W = logits.shape
         
+        # ✅ Step 1: Create mask FIRST
+        valid_mask = (targets != self.ignore_index).float()
+        
+        # ✅ Step 2: One-hot with mask applied
         targets_one_hot = F.one_hot(
-            targets.clamp(0, C - 1),
-            num_classes=C
+            targets.clamp(0, C - 1), num_classes=C
         ).permute(0, 3, 1, 2).float()
+        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1)
         
-        mask = (targets != self.ignore_index).float().unsqueeze(1)
-        probs = probs * mask
-        targets_one_hot = targets_one_hot * mask
+        # ✅ Step 3: Softmax with mask
+        probs = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1)
         
-        probs = probs.reshape(B, C, -1)
-        targets_one_hot = targets_one_hot.reshape(B, C, -1)
+        # ✅ Step 4: THEN reshape
+        probs_flat = probs.reshape(B, C, -1)
+        targets_flat = targets_one_hot.reshape(B, C, -1)
         
-        intersection = (probs * targets_one_hot).sum(dim=2)
-        union = probs.sum(dim=2) + targets_one_hot.sum(dim=2)
+        intersection = (probs_flat * targets_flat).sum(dim=2)
+        union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
         
-        dice_per_class = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss_per_class = 1.0 - dice_per_class
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = 1.0 - dice.mean(dim=1)
         
-        return dice_loss_per_class.mean() if self.reduction == 'mean' else dice_loss_per_class
-
+        return dice_loss.mean()
 
 class FocalLoss(nn.Module):
     """Focal Loss for hard example mining"""
@@ -413,8 +408,9 @@ class Trainer:
                         align_corners=False
                     )
                     aux_loss_dict = self.criterion(aux_logits, masks)
-                    loss = loss + self.args.aux_weight * aux_loss_dict['total']
-                
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    loss = loss + aux_weight * aux_loss_dict['total']
+                    
                 # Scale for gradient accumulation
                 loss = loss / self.args.accumulation_steps
 
