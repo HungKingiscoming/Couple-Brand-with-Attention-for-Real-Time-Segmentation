@@ -928,11 +928,13 @@ class GCNetWithDWSA(BaseModule):
         self.init_weights()
     
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """Forward pass với DWSA"""
-        if self.training:
-        for m in self.modules():
-            if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
-                m.train()
+    """Forward pass với DWSA"""
+    # ✅ REMOVE this empty if block - it's causing the error
+    # if self.training:
+    #     for m in self.modules():
+    #         if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+    #             m.train()
+    
         outputs = {}
         
         # Stage 1 (H/2)
