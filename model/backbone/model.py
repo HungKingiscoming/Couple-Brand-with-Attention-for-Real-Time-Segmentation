@@ -672,7 +672,7 @@ class GCNetWithDWSA(BaseModule):
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
                     use_dwsa=use_dwsa,
-                    dwsa_num_heads=dwsa_num_heads
+                    dwsa_num_heads=dwsa_num_heads,
                     deploy=deploy
                 )
             )
