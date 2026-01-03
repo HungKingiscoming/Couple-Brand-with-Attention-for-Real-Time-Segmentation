@@ -199,7 +199,7 @@ def get_train_transforms(
         A.Resize(height=img_size[0], width=img_size[1], p=1.0),
         
         # More aggressive scaling [0.5, 1.5]
-        A.RandomScale(scale_limit=0.5, p=0.6),
+        A.RandomScale(scale_limit=0.25, p=0.5),
         
         # Pad and crop
         A.PadIfNeeded(
@@ -227,16 +227,15 @@ def get_train_transforms(
         A.OneOf([
             A.GaussianBlur(blur_limit=(3, 7), p=1.0),
             A.MedianBlur(blur_limit=5, p=1.0),
-        ], p=0.2),
+        ], p=0.1),
         
         # Color augmentations (more aggressive)
         A.OneOf([
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1, p=1.0),
-            A.RandomGamma(gamma_limit=(70, 130), p=1.0),
+            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=1.0),
+            A.RandomGamma(gamma_limit=(85, 115), p=1.0),
             A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
         ], p=0.5),
         
-        A.GaussNoise(p=0.1),
         
         # Normalize
         A.Normalize(mean=mean, std=std),
