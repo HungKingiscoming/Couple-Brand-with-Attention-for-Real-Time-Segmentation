@@ -43,123 +43,77 @@ class GatedFusion(nn.Module):
         gate = self.gate_conv(concat)
         return gate * enc_feat + (1 - gate) * dec_feat
 
-# ============================================
-# LIGHTWEIGHT DECODER (BẢN SỬA ĐỔI MẠNH MẼ)
-# ============================================
 
-class LightweightDecoder(nn.Module):
-    """
-    FIXED VERSION:
-    1. Tăng channels ở đầu ra cuối (16 -> 64) để chứa đủ thông tin 19 classes.
-    2. Thêm Dropout nội bộ để tránh overfitting.
-    3. Cấu trúc channels: 128 -> 128 -> 64 -> 64
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 64,      # c5 channels
-        channels: int = 128,         # Base decoder channels
-        use_gated_fusion: bool = False,
-        norm_cfg: dict = dict(type='BN', requires_grad=True),
-        act_cfg: dict = dict(type='ReLU', inplace=False)
-    ):
+class LightweightDecoder(nn.Module):    
+    def __init__(self, in_channels: int = 64, channels: int = 128,
+                 norm_cfg: dict = dict(type='BN', requires_grad=True),
+                 act_cfg: dict = dict(type='ReLU', inplace=False)):
         super().__init__()
         
-        # Tầng 1: H/8 -> H/4 (Giữ nguyên 128 channels để học feature sâu)
+        # ✅ Project c2: 32 -> 64 channels
+        self.c2_proj = ConvModule(
+            in_channels=32, out_channels=64, kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=act_cfg
+        )
+        
         self.up1 = nn.Sequential(
-            ConvModule(
-                in_channels=in_channels,
-                out_channels=channels,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            ),
+            ConvModule(in_channels, channels, kernel_size=3, padding=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
         
-        # Fusion 1 (c2: H/4)
+        # ✅ Fusion1: 128 + 64 = 192 -> 128
         self.fusion1 = ConvModule(
-            in_channels=channels + 32,  # 128 + 32
-            out_channels=channels,      # Giữ 128 channels ở scale H/4
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+            in_channels=channels + 64,  # Changed from 32
+            out_channels=channels, kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=act_cfg
         )
         
-        # Tầng 2: H/4 -> H/2 (Hạ xuống 64 channels)
         self.up2 = nn.Sequential(
-            ConvModule(
-                in_channels=channels,
-                out_channels=channels // 2, # 64
-                kernel_size=3,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            ),
+            ConvModule(channels, channels // 2, kernel_size=3, padding=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
         
-        # Fusion 2 (c1: H/2)
         self.fusion2 = ConvModule(
-            in_channels=(channels // 2) + 32,  # 64 + 32
-            out_channels=channels // 2,        # 64
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+            in_channels=(channels // 2) + 32, out_channels=channels // 2,
+            kernel_size=1, norm_cfg=norm_cfg, act_cfg=act_cfg
         )
         
-        # Tầng 3: H/2 -> H (Scale ảnh về gốc)
         self.up3 = nn.Sequential(
-            ConvModule(
-                in_channels=channels // 2,
-                out_channels=channels // 2, # Giữ 64 channels thay vì nén xuống 32
-                kernel_size=3,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            ),
+            ConvModule(channels // 2, channels // 2, kernel_size=3, padding=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg),
             nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         )
         
-        # ✅ FINAL REFINEMENT: Nâng từ 16 lên 64 channels
-        # Điều này cực kỳ quan trọng để mô hình phân biệt được 19 classes phức tạp
-        self.final = nn.Sequential(
-            ConvModule(
-                in_channels=channels // 2,
-                out_channels=channels // 2, # 64 channels
-                kernel_size=3,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            ),
-            nn.Dropout2d(0.1) # Thêm dropout nhẹ để bền bỉ hơn
+        self.final = ConvModule(
+            channels // 2, channels // 2, kernel_size=3, padding=1,
+            norm_cfg=norm_cfg, act_cfg=act_cfg
         )
+        
+        # ✅ Dropout only during training
+        self.dropout = nn.Dropout2d(0.1)
     
     def forward(self, x: Tensor, skip_connections: List[Tensor]) -> Tensor:
-        """
-        x: c5 (H/8)
-        skip_connections: [c2 (H/4), c1 (H/2), None]
-        """
         c2, c1, _ = skip_connections
         
-        # Stage 1: H/8 -> H/4
         x = self.up1(x)
         if c2 is not None:
+            c2 = self.c2_proj(c2)  # ✅ 32 -> 64
             x = torch.cat([x, c2], dim=1)
             x = self.fusion1(x)
         
-        # Stage 2: H/4 -> H/2
         x = self.up2(x)
         if c1 is not None:
             x = torch.cat([x, c1], dim=1)
             x = self.fusion2(x)
-            
-        # Stage 3: H/2 -> H
+        
         x = self.up3(x)
-        x = self.final(x) # Output: (B, 64, H, W)
+        x = self.final(x)
+        x = self.dropout(x) if self.training else x  # ✅ Training only
         
         return x
+
 
 # ============================================
 # CẬP NHẬT HEAD ĐỂ TƯƠNG THÍCH VỚI CHANNELS MỚI
