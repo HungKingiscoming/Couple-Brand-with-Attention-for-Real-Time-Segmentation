@@ -672,7 +672,7 @@ def main():
         num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w),
         pin_memory=True,
-        compute_class_weights=False,
+        compute_class_weights=True,
         dataset_type=args.dataset_type
     )
     print(f"✅ Dataloaders created\n")
