@@ -664,6 +664,7 @@ class GCNetWithDWSA(BaseModule):
         ]
         
         for i in range(num_blocks_per_stage[0]):
+            use_dwsa = ('stage2' in dwsa_stages)
             stage2_layers.append(
                 GCBlock(
                     in_channels=channels,
