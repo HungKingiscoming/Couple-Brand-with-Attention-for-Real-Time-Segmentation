@@ -578,7 +578,11 @@ class Trainer:
 
     def load_checkpoint(self, checkpoint_path):
         """Load checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        checkpoint = torch.load(
+            checkpoint_path,
+            map_location=self.device,
+            weights_only=False  # ✅ allow full pickle for your own file
+        )
         
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
