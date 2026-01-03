@@ -671,6 +671,8 @@ class GCNetWithDWSA(BaseModule):
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
+                    use_dwsa=use_dwsa,
+                    dwsa_num_heads=dwsa_num_heads
                     deploy=deploy
                 )
             )
@@ -927,6 +929,10 @@ class GCNetWithDWSA(BaseModule):
     
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """Forward pass với DWSA"""
+        if self.training:
+        for m in self.modules():
+            if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                m.train()
         outputs = {}
         
         # Stage 1 (H/2)
@@ -1049,14 +1055,14 @@ def create_gcnet_dwsa_variants():
     gcnet_dwsa_std = GCNetWithDWSA(
         channels=32,
         dwsa_stages=['stage3', 'bottleneck'],  # Mid + bottleneck
-        dwsa_num_heads=8
+        dwsa_num_heads=16
     )
     
     # ✅ Performance variant (maximum accuracy)
     gcnet_dwsa_perf = GCNetWithDWSA(
         channels=48,
         dwsa_stages=['stage3', 'stage4', 'bottleneck'],  # Full attention
-        dwsa_num_heads=8
+        dwsa_num_heads=16
     )
     
     return {
