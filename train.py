@@ -577,28 +577,19 @@ class Trainer:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
 
     def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint"""
-        checkpoint = torch.load(
-            checkpoint_path,
-            map_location=self.device,
-            weights_only=False  # ✅ allow full pickle for your own file
-        )
+        """Load checkpoint - reset epoch for new phase"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         
-        if self.scheduler and checkpoint['scheduler']:
-            self.scheduler.load_state_dict(checkpoint['scheduler'])
+        # ✅ RESET FOR NEW PHASE
+        self.start_epoch = 0  # Start from epoch 0
+        self.best_miou = 0.0  # Reset best metric
+        self.global_step = 0  # Reset step counter
         
-        if self.args.use_amp:
-            self.scaler.load_state_dict(checkpoint['scaler'])
-        
-        self.start_epoch = checkpoint['epoch'] + 1
-        self.best_miou = checkpoint['best_miou']
-        self.global_step = checkpoint.get('global_step', 0)
-        
-        print(f"✅ Checkpoint loaded from epoch {checkpoint['epoch']}")
-        print(f"   Best mIoU: {self.best_miou:.4f}")
+        print(f"✅ Weights loaded from epoch {checkpoint['epoch']}")
+        print(f"   Starting new phase from epoch 0 (scheduler will be rebuilt)")
 
 
 # ============================================
