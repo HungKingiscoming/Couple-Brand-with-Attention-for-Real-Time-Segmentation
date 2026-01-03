@@ -224,7 +224,7 @@ def get_train_transforms(
         
         # Blur (helps with generalization)
         A.OneOf([
-            A.GaussBlur(blur_limit=(3, 7), p=1.0),
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
             A.MedianBlur(blur_limit=5, p=1.0),
         ], p=0.2),
         
