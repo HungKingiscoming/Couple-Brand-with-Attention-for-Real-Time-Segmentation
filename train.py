@@ -33,7 +33,7 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 
 class DiceLoss(nn.Module):
     """Dice Loss for semantic segmentation"""
-    def __init__(self, smooth=1.0, ignore_index=255, reduction='mean'):
+    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
         super().__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
@@ -733,15 +733,18 @@ def main():
     
     # Scheduler
     if args.scheduler == 'onecycle':
-        print(f"✅ Using OneCycleLR (best for training from scratch)")
+        total_steps = len(train_loader) * args.epochs  # Total training iterations
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=args.lr,
-            epochs=args.epochs,
-            steps_per_epoch=len(train_loader) // args.accumulation_steps,
-            pct_start=0.3,  # Spend first 30% warming up
+            total_steps=total_steps,  # ✅ Use total_steps instead
+            pct_start=0.05,  # 5% warmup (standard for segmentation)
+            anneal_strategy='cos',
+            cycle_momentum=True,
+            base_momentum=0.85,
+            max_momentum=0.95,
             div_factor=25,
-            final_div_factor=1000,
+            final_div_factor=100000,
         )
     elif args.scheduler == 'poly':
         print(f"✅ Using Polynomial LR decay")
