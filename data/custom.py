@@ -205,16 +205,17 @@ def get_train_transforms(
         A.PadIfNeeded(
             min_height=img_size[0], 
             min_width=img_size[1], 
-            border_mode=cv2.BORDER_REFLECT_101,  # Better than CONSTANT
+            border_mode=cv2.BORDER_REFLECT_101,
             value=0, 
-            mask_value=255
+            mask_value=255,
+            p=1.0
         ),
         A.RandomCrop(height=img_size[0], width=img_size[1], p=1.0),
         
         # Geometric augmentations
         A.ShiftScaleRotate(
             shift_limit=0.1, 
-            scale_limit=0.2, 
+            scale_limit=0.0,  # ✅ Disable scaling (already done by RandomScale)
             rotate_limit=10,
             border_mode=cv2.BORDER_REFLECT_101,
             p=0.5
