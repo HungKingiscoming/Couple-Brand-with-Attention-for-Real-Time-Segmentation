@@ -266,7 +266,7 @@ def create_dataloaders(
     num_workers: int = 4,
     img_size: Tuple[int, int] = (512, 1024),  # Smaller for training speed
     pin_memory: bool = True,
-    compute_class_weights: bool = True,
+    compute_class_weights: bool = False,
     dataset_type: str = 'normal'  # 'normal' or 'foggy'
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.Tensor]]:
     """
