@@ -423,8 +423,10 @@ class Trainer:
             
             # Update weights
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
+                # ✅ CORRECT ORDER: unscale → clip → step → update
+                self.scaler.unscale_(self.optimizer)
+                
                 if self.args.grad_clip > 0:
-                    self.scaler.unscale_(self.optimizer)
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         self.args.grad_clip
@@ -434,11 +436,11 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 
-                # Step OneCycleLR every accumulation step
-                if self.scheduler and self.args.scheduler == 'onecycle':
-                    self.scheduler.step()
-                
                 self.global_step += 1
+            
+            # ✅ Step scheduler EVERY iteration (not just after accumulation)
+            if self.scheduler and self.args.scheduler == 'onecycle':
+                self.scheduler.step()
             
             # Track loss components
             total_loss += loss.item() * self.args.accumulation_steps
