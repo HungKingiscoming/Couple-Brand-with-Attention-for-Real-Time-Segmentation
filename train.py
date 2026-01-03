@@ -32,6 +32,11 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # ============================================
 
 class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):  # ✅ Added 'smooth'
+        super().__init__()
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.reduction = reduction
     def forward(self, logits, targets):
         B, C, H, W = logits.shape
         
