@@ -334,9 +334,10 @@ def create_dataloaders(
         
         # Normalize weights
         class_weights = torch.tensor(class_weights, dtype=torch.float32)
-        class_weights = class_weights / class_weights.sum() * 19  # Normalize to mean=1
+        class_weights = torch.clamp(class_weights, min=0.1, max=50.0)
+        class_weights = class_weights / class_weights.sum() * 19
         
-        print(f"\n✅ Class weights normalized (mean=1.0)")
+        print(f"\n✅ Class weights normalized (mean=1.0, max clipped to 50x)")
     
     # Create dataloaders
     train_loader = torch.utils.data.DataLoader(
