@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================
-# IMPORTS - ENHANCED BACKBONE ONLY
+# IMPORTS - ENHANCED BACKBONE + UPGRADED HEAD
 # ============================================
 
 from model.backbone.model import GCNetWithDWSA
@@ -168,15 +168,15 @@ def setup_memory_efficient_training():
 
 
 # ============================================
-# MODEL CONFIG - ENHANCED BACKBONE ONLY
+# MODEL CONFIG - ENHANCED BACKBONE WITH UPGRADED HEAD
 # ============================================
 
 class ModelConfig:
-    """Enhanced Backbone: channels=48 + DCN + multi-scale context"""
+    """Enhanced Backbone: channels=48 + Upgraded Head with Gated Fusion"""
     
     @staticmethod
     def get_config():
-        """Optimized config for best mIoU (0.65-0.68 target)"""
+        """Optimized config for best mIoU (0.68-0.72 target with upgrades)"""
         return {
             "backbone": {
                 "in_channels": 3,
@@ -191,14 +191,19 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,
+                "in_channels": 96,  # c5 = channels * 2 = 48 * 2
+                "num_classes": 19,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
-                "align_corners": False
+                "align_corners": False,
+                "use_gated_fusion": True,  # ✅ UPGRADED: Enable gated fusion
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 192,
+                "in_channels": 192,  # c4 = channels * 4 = 48 * 4
                 "channels": 96,
+                "num_classes": 19,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
@@ -220,7 +225,7 @@ class ModelConfig:
 # ============================================
 
 class Segmentor(nn.Module):
-    """Segmentation model with backbone + head + auxiliary head"""
+    """Segmentation model with backbone + upgraded head + auxiliary head"""
     
     def __init__(self, backbone, head, aux_head=None):
         super().__init__()
@@ -295,6 +300,7 @@ class Trainer:
         print(f"⚡ Mixed precision: {self.args.use_amp}")
         print(f"✂️  Gradient clipping: {self.args.grad_clip}")
         print(f"📉 Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Focal({loss_cfg['focal_weight']})")
+        print(f"🔀 Gated Fusion: ENABLED (upgraded head)")
         print(f"💾 Save dir: {self.args.save_dir}")
         print(f"{'='*70}\n")
 
@@ -332,8 +338,11 @@ class Trainer:
                 loss = loss_dict['total']
                 
                 if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = F.interpolate(outputs["aux"], size=masks.shape[-2:], mode="bilinear", align_corners=False)
+                    aux_logits = outputs["aux"]
+                    # Aux output is at H/16, resize to original mask size
+                    aux_logits = F.interpolate(aux_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                     aux_loss_dict = self.criterion(aux_logits, masks)
+                    # Decay aux weight as training progresses
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_loss_dict['total']
                     
@@ -491,7 +500,7 @@ class Trainer:
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone")
+    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
     
     # Dataset
     parser.add_argument("--train_txt", required=True, help="Path to training list")
@@ -509,7 +518,7 @@ def main():
     parser.add_argument("--lr", type=float, default=5e-4, help="Max LR")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--aux_weight", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=1.0, help="Auxiliary head weight (decays over epochs)")
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
     # Data
@@ -536,12 +545,13 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"🚀 GCNet Training - Enhanced Backbone (channels=48)")
+    print(f"🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
     print(f"{'='*70}")
     print(f"📱 Device: {device}")
     print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
     print(f"📊 Epochs: {args.epochs}")
     print(f"⚡ Scheduler: {args.scheduler}")
+    print(f"🔀 Gated Fusion: ENABLED")
     print(f"{'='*70}\n")
     
     # Config
@@ -564,7 +574,7 @@ def main():
     
     # Model
     print(f"{'='*70}")
-    print("🏗️  BUILDING ENHANCED BACKBONE MODEL")
+    print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
     print(f"{'='*70}\n")
     
     model = Segmentor(
@@ -577,9 +587,10 @@ def main():
     print("   ├─ Converting BatchNorm → GroupNorm")
     model = replace_bn_with_gn(model)
     
-    print("   └─ Applying Kaiming Initialization")
+    print("   ├─ Applying Kaiming Initialization")
     model.apply(init_weights)
     
+    print("   └─ Checking Model Health")
     check_model_health(model)
     print()
     
@@ -593,9 +604,9 @@ def main():
         try:
             outputs = model.forward_train(sample)
             print(f"✅ Forward pass successful!")
-            print(f"   Main output: {outputs['main'].shape}")
+            print(f"   Main head output:  {outputs['main'].shape}")
             if 'aux' in outputs:
-                print(f"   Aux output:  {outputs['aux'].shape}")
+                print(f"   Aux head output:   {outputs['aux'].shape}")
         except Exception as e:
             print(f"❌ Forward pass FAILED: {e}")
             return
@@ -652,7 +663,7 @@ def main():
     
     # Training loop
     print(f"\n{'='*70}")
-    print("🚀 STARTING TRAINING")
+    print("🚀 STARTING TRAINING WITH UPGRADED HEAD")
     print(f"{'='*70}\n")
     
     for epoch in range(trainer.start_epoch, args.epochs):
@@ -686,6 +697,7 @@ def main():
     print("✅ TRAINING COMPLETED!")
     print(f"🏆 Best mIoU: {trainer.best_miou:.4f}")
     print(f"💾 Checkpoints saved to: {args.save_dir}")
+    print(f"📊 Tensorboard logs at: {args.save_dir}/tensorboard")
     print(f"{'='*70}\n")
 
 
