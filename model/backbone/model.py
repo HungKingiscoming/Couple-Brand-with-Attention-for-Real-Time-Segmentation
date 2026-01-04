@@ -1038,22 +1038,7 @@ class GCNetWithDWSA(BaseModule):
 def create_gcnet_dwsa_variants():
     """
     Tạo các variants khác nhau của GCNet với DWSA
-    """
-    
-    # ✅ Lightweight variant (mobile)
-    gcnet_dwsa_lite = GCNetWithDWSA(
-        channels=24,
-        dwsa_stages=['bottleneck'],  # Only at bottleneck
-        dwsa_num_heads=4
-    )
-    
-    # ✅ Standard variant (balanced)
-    gcnet_dwsa_std = GCNetWithDWSA(
-        channels=32,
-        dwsa_stages=['stage3', 'bottleneck'],  # Mid + bottleneck
-        dwsa_num_heads=16
-    )
-    
+    """    
     # ✅ Performance variant (maximum accuracy)
     gcnet_dwsa_perf = GCNetWithDWSA(
         channels=48,
@@ -1062,7 +1047,5 @@ def create_gcnet_dwsa_variants():
     )
     
     return {
-        'lite': gcnet_dwsa_lite,
-        'standard': gcnet_dwsa_std,
         'performance': gcnet_dwsa_perf
     }
