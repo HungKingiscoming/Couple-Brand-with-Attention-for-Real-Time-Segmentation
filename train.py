@@ -18,7 +18,7 @@ import warnings
 warnings.filterwarnings('ignore')
 
 # ============================================
-# IMPORTS
+# IMPORTS - ENHANCED BACKBONE ONLY
 # ============================================
 
 from model.backbone.model import GCNetWithDWSA
@@ -32,27 +32,23 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # ============================================
 
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):  # ✅ Added 'smooth'
+    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
         super().__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
         self.reduction = reduction
+    
     def forward(self, logits, targets):
         B, C, H, W = logits.shape
         
-        # ✅ Step 1: Create mask FIRST
         valid_mask = (targets != self.ignore_index).float()
-        
-        # ✅ Step 2: One-hot with mask applied
         targets_one_hot = F.one_hot(
             targets.clamp(0, C - 1), num_classes=C
         ).permute(0, 3, 1, 2).float()
         targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1)
         
-        # ✅ Step 3: Softmax with mask
         probs = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1)
         
-        # ✅ Step 4: THEN reshape
         probs_flat = probs.reshape(B, C, -1)
         targets_flat = targets_one_hot.reshape(B, C, -1)
         
@@ -63,6 +59,7 @@ class DiceLoss(nn.Module):
         dice_loss = 1.0 - dice.mean(dim=1)
         
         return dice_loss.mean()
+
 
 class FocalLoss(nn.Module):
     """Focal Loss for hard example mining"""
@@ -106,7 +103,7 @@ class HybridLoss(nn.Module):
         class_weights=None,
         focal_alpha=0.25,
         focal_gamma=2.0,
-        dice_smooth=1.0
+        dice_smooth=1e-5
     ):
         super().__init__()
         
@@ -151,7 +148,7 @@ class HybridLoss(nn.Module):
 
 
 # ============================================
-# MEMORY UTILITIES
+# UTILITIES
 # ============================================
 
 def clear_gpu_memory():
@@ -160,16 +157,6 @@ def clear_gpu_memory():
     torch.cuda.empty_cache()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
-
-
-def print_memory_usage(prefix=""):
-    """Print GPU memory statistics"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3
-        reserved = torch.cuda.memory_reserved() / 1024**3
-        max_allocated = torch.cuda.max_memory_allocated() / 1024**3
-        print(f"{prefix} GPU Memory - Allocated: {allocated:.2f}GB, "
-              f"Reserved: {reserved:.2f}GB, Peak: {max_allocated:.2f}GB")
 
 
 def setup_memory_efficient_training():
@@ -181,77 +168,36 @@ def setup_memory_efficient_training():
 
 
 # ============================================
-# MODEL CONFIG
+# MODEL CONFIG - ENHANCED BACKBONE ONLY
 # ============================================
 
 class ModelConfig:
-    """Model configuration for different training scenarios"""
+    """Enhanced Backbone: channels=48 + DCN + multi-scale context"""
     
     @staticmethod
-    def get_config_from_scratch():
-        """Config for training from scratch (lightweight, conservative)"""
+    def get_config():
+        """Optimized config for best mIoU (0.65-0.68 target)"""
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 32,
-                "ppm_channels": 96,
-                "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
-                "dwsa_stages": ['bottleneck'],  # Only bottleneck for stability
+                "channels": 48,
+                "ppm_channels": 128,
+                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
+                "dwsa_stages": ['stage3', 'stage4', 'bottleneck'],
                 "dwsa_num_heads": 8,
+                "use_dcn_in_stage4": True,
+                "use_multi_scale_context": True,
                 "align_corners": False,
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,  # c5 = channels * 2 = 32 * 2
-                "decoder_channels": 128,
-                "dropout_ratio": 0.15,
-                "align_corners": False
-            },
-            "aux_head": {
-                "in_channels": 128,  # c4 = channels * 4 = 32 * 4
-                "channels": 64,
-                "dropout_ratio": 0.15,
-                "align_corners": False,
-                "norm_cfg": {'type': 'BN', 'requires_grad': True},
-                "act_cfg": {'type': 'ReLU', 'inplace': False}
-            },
-            "loss": {
-                "ce_weight": 1.0,
-                "dice_weight": 1.0,
-                "focal_weight": 0.0,
-                "focal_alpha": 0.25,
-                "focal_gamma": 2.0,
-                "dice_smooth": 1.0
-            }
-        }
-    
-    @staticmethod
-    def get_config_lightweight():
-        """Lightweight config for fast training"""
-        return ModelConfig.get_config_from_scratch()
-    
-    @staticmethod
-    def get_config_standard():
-        """Standard config (when pretrained weights available)"""
-        return {
-            "backbone": {
-                "in_channels": 3,
-                "decoder_channels": 48,
-                "ppm_channels": 112,
-                "num_blocks_per_stage": [3, 3, [4, 3], [4, 3], [2, 2]],
-                "dwsa_stages": ['stage3', 'bottleneck'],
-                "dwsa_num_heads": 8,
-                "align_corners": False,
-                "deploy": False
-            },
-            "head": {
-                "in_channels": 96,   # 48 * 2
+                "in_channels": 96,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False
             },
             "aux_head": {
-                "in_channels": 192,  # 48 * 4
+                "in_channels": 192,
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -264,7 +210,7 @@ class ModelConfig:
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
-                "dice_smooth": 1.0
+                "dice_smooth": 1e-5
             }
         }
 
@@ -274,7 +220,7 @@ class ModelConfig:
 # ============================================
 
 class Segmentor(nn.Module):
-    """Segmentation model with backbone + head + optional auxiliary head"""
+    """Segmentation model with backbone + head + auxiliary head"""
     
     def __init__(self, backbone, head, aux_head=None):
         super().__init__()
@@ -283,12 +229,12 @@ class Segmentor(nn.Module):
         self.aux_head = aux_head
 
     def forward(self, x):
-        """Inference mode (no aux head)"""
+        """Inference mode"""
         feats = self.backbone(x)
         return self.decode_head(feats)
 
     def forward_train(self, x):
-        """Training mode (with aux head)"""
+        """Training mode with auxiliary head"""
         feats = self.backbone(x)
         outputs = {"main": self.decode_head(feats)}
         if self.aux_head is not None:
@@ -301,17 +247,9 @@ class Segmentor(nn.Module):
 # ============================================
 
 class Trainer:
-    """Main training class with logging and checkpointing"""
+    """Training class with logging and checkpointing"""
     
-    def __init__(
-        self,
-        model,
-        optimizer,
-        scheduler,
-        device,
-        args,
-        class_weights=None
-    ):
+    def __init__(self, model, optimizer, scheduler, device, args, class_weights=None):
         self.model = model.to(device)
         self.optimizer = optimizer
         self.scheduler = scheduler
@@ -343,10 +281,7 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         
-        # Save config
         self.save_config()
-        
-        # Print config
         self._print_config(loss_cfg)
 
     def _print_config(self, loss_cfg):
@@ -364,10 +299,10 @@ class Trainer:
         print(f"{'='*70}\n")
 
     def save_config(self):
-        """Save training config to JSON"""
+        """Save training config"""
         config = vars(self.args)
         with open(self.save_dir / "config.json", "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(config, f, indent=2, default=str)
 
     def train_epoch(self, loader, epoch):
         """Train one epoch"""
@@ -387,63 +322,39 @@ class Trainer:
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
 
-            # Forward with AMP
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
                 logits = outputs["main"]
                 
-                # Interpolate to mask size
-                logits = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False
-                )
+                logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                 
-                # Main loss
                 loss_dict = self.criterion(logits, masks)
                 loss = loss_dict['total']
                 
-                # Auxiliary loss
                 if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = F.interpolate(
-                        outputs["aux"],
-                        size=masks.shape[-2:],
-                        mode="bilinear",
-                        align_corners=False
-                    )
+                    aux_logits = F.interpolate(outputs["aux"], size=masks.shape[-2:], mode="bilinear", align_corners=False)
                     aux_loss_dict = self.criterion(aux_logits, masks)
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_loss_dict['total']
                     
-                # Scale for gradient accumulation
                 loss = loss / self.args.accumulation_steps
 
-            # Backward
             self.scaler.scale(loss).backward()
             
-            # Update weights
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
-                # ✅ CORRECT ORDER: unscale → clip → step → update
                 self.scaler.unscale_(self.optimizer)
                 
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(),
-                        self.args.grad_clip
-                    )
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
-                
                 self.global_step += 1
             
-            # ✅ Step scheduler EVERY iteration (not just after accumulation)
             if self.scheduler and self.args.scheduler == 'onecycle':
                 self.scheduler.step()
             
-            # Track loss components
             total_loss += loss.item() * self.args.accumulation_steps
             
             ce_val = loss_dict['ce'].item() if isinstance(loss_dict['ce'], torch.Tensor) else loss_dict['ce']
@@ -454,7 +365,6 @@ class Trainer:
             total_dice += dice_val
             total_focal += focal_val
             
-            # Update progress
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
@@ -463,11 +373,9 @@ class Trainer:
                 'lr': f'{current_lr:.6f}'
             })
             
-            # Clear cache
             if batch_idx % 50 == 0:
                 clear_gpu_memory()
             
-            # TensorBoard logging
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
                 self.writer.add_scalar('train/ce_loss', ce_val, self.global_step)
@@ -475,7 +383,6 @@ class Trainer:
                 self.writer.add_scalar('train/focal_loss', focal_val, self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
 
-        # Step other schedulers
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
 
@@ -484,12 +391,7 @@ class Trainer:
         avg_dice = total_dice / len(loader)
         avg_focal = total_focal / len(loader)
         
-        return {
-            'loss': avg_loss,
-            'ce': avg_ce,
-            'dice': avg_dice,
-            'focal': avg_focal
-        }
+        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': avg_focal}
 
     @torch.no_grad()
     def validate(self, loader, epoch):
@@ -511,19 +413,13 @@ class Trainer:
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 logits = self.model(imgs)
-                logits = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False
-                )
+                logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                 
                 loss_dict = self.criterion(logits, masks)
                 loss = loss_dict['total']
             
             total_loss += loss.item()
             
-            # Metrics
             pred = logits.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             
@@ -537,22 +433,15 @@ class Trainer:
             if batch_idx % 20 == 0:
                 clear_gpu_memory()
 
-        # Compute mIoU
         intersection = np.diag(confusion_matrix)
         union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
         iou = intersection / (union + 1e-10)
         miou = np.nanmean(iou)
         
         acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
-        
         avg_loss = total_loss / len(loader)
         
-        return {
-            'loss': avg_loss,
-            'miou': miou,
-            'accuracy': acc,
-            'per_class_iou': iou
-        }
+        return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
         """Save checkpoint"""
@@ -576,20 +465,25 @@ class Trainer:
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
 
-    def load_checkpoint(self, checkpoint_path):
-        """Load checkpoint - reset epoch for new phase"""
+    def load_checkpoint(self, checkpoint_path, reset_epoch=True):
+        """Load checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
         
-        # ✅ RESET FOR NEW PHASE
-        self.start_epoch = 0  # Start from epoch 0
-        self.best_miou = 0.0  # Reset best metric
-        self.global_step = 0  # Reset step counter
-        
-        print(f"✅ Weights loaded from epoch {checkpoint['epoch']}")
-        print(f"   Starting new phase from epoch 0 (scheduler will be rebuilt)")
+        if reset_epoch:
+            self.start_epoch = 0
+            self.best_miou = 0.0
+            self.global_step = 0
+            print(f"✅ Weights loaded from epoch {checkpoint['epoch']}, starting new phase from epoch 0")
+        else:
+            self.start_epoch = checkpoint['epoch'] + 1
+            self.best_miou = checkpoint.get('best_miou', 0.0)
+            self.global_step = checkpoint.get('global_step', 0)
+            if self.scheduler and checkpoint.get('scheduler'):
+                self.scheduler.load_state_dict(checkpoint['scheduler'])
+            print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
 # ============================================
@@ -597,7 +491,7 @@ class Trainer:
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="🚀 Optimized GCNet Training from Scratch")
+    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone")
     
     # Dataset
     parser.add_argument("--train_txt", required=True, help="Path to training list")
@@ -607,28 +501,27 @@ def main():
     parser.add_argument("--ignore_index", type=int, default=255)
     
     # Training
-    parser.add_argument("--epochs", type=int, default=200, help="Total epochs (200 for scratch)")
-    parser.add_argument("--model_size", default="lightweight", choices=["lightweight", "standard"])
-    parser.add_argument("--from_scratch", action="store_true", default=True)
+    parser.add_argument("--epochs", type=int, default=100, help="Total epochs")
     
     # Optimization
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=2e-3, help="Max LR for OneCycleLR")
+    parser.add_argument("--lr", type=float, default=5e-4, help="Max LR")
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--aux_weight", type=float, default=1.0, help="Increased for faster learning")
+    parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
     # Data
-    parser.add_argument("--img_h", type=int, default=256, help="Start with small images for fast learning")
-    parser.add_argument("--img_w", type=int, default=512)
+    parser.add_argument("--img_h", type=int, default=512)
+    parser.add_argument("--img_w", type=int, default=1024)
     
     # System
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume_reset", action="store_true", default=True)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=10)
@@ -642,28 +535,20 @@ def main():
     
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # Print header
     print(f"\n{'='*70}")
-    print(f"🚀 OPTIMIZED GCNET TRAINING - CURRICULUM LEARNING")
+    print(f"🚀 GCNet Training - Enhanced Backbone (channels=48)")
     print(f"{'='*70}")
     print(f"📱 Device: {device}")
-    print(f"🎯 Training: FROM SCRATCH")
-    print(f"🖼️  Initial image size: {args.img_h}x{args.img_w} (start small for fast learning)")
+    print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
     print(f"📊 Epochs: {args.epochs}")
     print(f"⚡ Scheduler: {args.scheduler}")
-    print(f"💡 Auxiliary weight: {args.aux_weight} (increased for faster backbone learning)")
     print(f"{'='*70}\n")
     
-    # Load config
-    if args.model_size == "lightweight":
-        cfg = ModelConfig.get_config_lightweight()
-    else:
-        cfg = ModelConfig.get_config_standard()
-    
-    # Store loss config
+    # Config
+    cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
     
-    # Create dataloaders
+    # Dataloaders
     print(f"📂 Creating dataloaders...")
     train_loader, val_loader, class_weights = create_dataloaders(
         train_txt=args.train_txt,
@@ -677,9 +562,9 @@ def main():
     )
     print(f"✅ Dataloaders created\n")
     
-    # Create model
+    # Model
     print(f"{'='*70}")
-    print("🏗️  BUILDING MODEL")
+    print("🏗️  BUILDING ENHANCED BACKBONE MODEL")
     print(f"{'='*70}\n")
     
     model = Segmentor(
@@ -688,9 +573,6 @@ def main():
         aux_head=GCNetAuxHead(num_classes=args.num_classes, **cfg["aux_head"])
     )
     
-    # ====================================================
-    # ✅ CRITICAL: Apply model optimizations
-    # ====================================================    
     print("\n🔧 Applying Model Optimizations...")
     print("   ├─ Converting BatchNorm → GroupNorm")
     model = replace_bn_with_gn(model)
@@ -700,10 +582,9 @@ def main():
     
     check_model_health(model)
     print()
-    # ====================================================
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
 
     # Test forward pass
     model = model.to(device)
@@ -731,12 +612,12 @@ def main():
     
     # Scheduler
     if args.scheduler == 'onecycle':
-        total_steps = len(train_loader) * args.epochs  # Total training iterations
+        total_steps = len(train_loader) * args.epochs
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=args.lr,
-            total_steps=total_steps,  # ✅ Use total_steps instead
-            pct_start=0.05,  # 5% warmup (standard for segmentation)
+            total_steps=total_steps,
+            pct_start=0.05,
             anneal_strategy='cos',
             cycle_momentum=True,
             base_momentum=0.85,
@@ -744,6 +625,7 @@ def main():
             div_factor=25,
             final_div_factor=100000,
         )
+        print(f"✅ Using OneCycleLR scheduler (total_steps={total_steps})")
     elif args.scheduler == 'poly':
         print(f"✅ Using Polynomial LR decay")
         def poly_lr_lambda(epoch):
@@ -766,7 +648,7 @@ def main():
     )
     
     if args.resume:
-        trainer.load_checkpoint(args.resume)
+        trainer.load_checkpoint(args.resume, reset_epoch=args.resume_reset)
     
     # Training loop
     print(f"\n{'='*70}")
@@ -774,13 +656,9 @@ def main():
     print(f"{'='*70}\n")
     
     for epoch in range(trainer.start_epoch, args.epochs):
-        # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
-        
-        # Validate
         val_metrics = trainer.validate(val_loader, epoch)
         
-        # Logging
         print(f"\n{'='*70}")
         print(f"📊 Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
@@ -792,12 +670,10 @@ def main():
               f"Acc: {val_metrics['accuracy']:.4f}")
         print(f"{'='*70}\n")
         
-        # TensorBoard logging
         trainer.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
         trainer.writer.add_scalar('val/miou', val_metrics['miou'], epoch)
         trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
         
-        # Save checkpoint
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
             trainer.best_miou = val_metrics['miou']
