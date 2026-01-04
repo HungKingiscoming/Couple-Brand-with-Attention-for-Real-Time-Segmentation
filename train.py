@@ -192,7 +192,6 @@ class ModelConfig:
             },
             "head": {
                 "in_channels": 96,  # c5 = channels * 2 = 48 * 2
-                "num_classes": 19,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -203,7 +202,6 @@ class ModelConfig:
             "aux_head": {
                 "in_channels": 192,  # c4 = channels * 4 = 48 * 4
                 "channels": 96,
-                "num_classes": 19,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
