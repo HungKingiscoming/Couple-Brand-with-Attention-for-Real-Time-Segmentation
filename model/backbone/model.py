@@ -26,16 +26,17 @@ class MultiScaleContextModule(nn.Module):
         super().__init__()
         
         # 5 parallel paths with different dilations
-        self.path_1x1 = nn.Conv2d(in_channels, out_channels//5, 1)
-        self.path_3x3_d1 = nn.Conv2d(in_channels, out_channels//5, 3, padding=1, dilation=1)
-        self.path_3x3_d3 = nn.Conv2d(in_channels, out_channels//5, 3, padding=3, dilation=3)
-        self.path_3x3_d6 = nn.Conv2d(in_channels, out_channels//5, 3, padding=6, dilation=6)
+        branch_channels = in_channels // 5
+        self.path_1x1 = nn.Conv2d(in_channels, branch_channels, 1)
+        self.path_3x3_d1 = nn.Conv2d(in_channels, branch_channels, 3, padding=1, dilation=1)
+        self.path_3x3_d3 = nn.Conv2d(in_channels, branch_channels, 3, padding=3, dilation=3)
+        self.path_3x3_d6 = nn.Conv2d(in_channels, branch_channels, 3, padding=6, dilation=6)
         self.path_pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, out_channels//5, 1)
+            nn.Conv2d(in_channels, branch_channels, 1)
         )
         
-        self.fusion = nn.Conv2d(out_channels, out_channels, 1)
+        self.fusion = nn.Conv2d(branch_channels * 5, out_channels, 1)
     
     def forward(self, x):
         H, W = x.shape[2:]
