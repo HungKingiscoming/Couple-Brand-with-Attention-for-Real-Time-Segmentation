@@ -575,10 +575,13 @@ def main():
     print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
     print(f"{'='*70}\n")
     
+    head_cfg = {**cfg["head"], "num_classes": args.num_classes}
+    aux_head_cfg = {**cfg["aux_head"], "num_classes": args.num_classes}
+
     model = Segmentor(
         backbone=GCNetWithDWSA(**cfg["backbone"]),
-        head=GCNetHead(num_classes=args.num_classes, **cfg["head"]),
-        aux_head=GCNetAuxHead(num_classes=args.num_classes, **cfg["aux_head"])
+        head=GCNetHead(**head_cfg),
+        aux_head=GCNetAuxHead(**aux_head_cfg)
     )
     
     print("\n🔧 Applying Model Optimizations...")
