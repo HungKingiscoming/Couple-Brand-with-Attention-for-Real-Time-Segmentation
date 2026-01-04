@@ -22,7 +22,7 @@ warnings.filterwarnings('ignore')
 # ============================================
 
 from model.backbone.model import GCNetWithDWSA
-from model.head.segmentation_head import GCNetHead, GCNetAuxHead
+from model.head.segmentation_head import GCNetHead, GCNetAuxHead, EnhancedDecoder, GatedFusion, DWConvModule, ResidualBlock
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
