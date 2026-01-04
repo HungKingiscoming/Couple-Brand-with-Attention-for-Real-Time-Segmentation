@@ -608,7 +608,9 @@ def main():
     # Build configs with detected channels
     head_cfg = {
         **cfg["head"],
-        "in_channels": detected_channels['c5'],
+        "in_channels": detected_channels['c5'],      # 96
+        "c1_channels": detected_channels['c1'],      # 48 ✅
+        "c2_channels": detected_channels['c2'],      # 48 ✅
         "num_classes": args.num_classes
     }
     
