@@ -493,6 +493,29 @@ class Trainer:
             print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
+def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
+    """Automatically detect backbone output channels"""
+    backbone.eval()
+    with torch.no_grad():
+        sample = torch.randn(1, 3, *img_size).to(device)
+        feats = backbone(sample)
+        
+        channels = {}
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in feats:
+                channels[key] = feats[key].shape[1]
+        
+        print(f"\n{'='*70}")
+        print("🔍 BACKBONE CHANNEL DETECTION")
+        print(f"{'='*70}")
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in channels:
+                print(f"   {key}: {channels[key]} channels")
+        print(f"{'='*70}\n")
+        
+        return channels
+
+
 # ============================================
 # MAIN
 # ============================================
@@ -575,11 +598,29 @@ def main():
     print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
     print(f"{'='*70}\n")
     
-    head_cfg = {**cfg["head"], "num_classes": args.num_classes}
-    aux_head_cfg = {**cfg["aux_head"], "num_classes": args.num_classes}
-
+    # ✅ NEW CODE
+    # Build backbone first
+    backbone = GCNetWithDWSA(**cfg["backbone"]).to(device)
+    
+    # Auto-detect channels
+    detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
+    
+    # Build configs with detected channels
+    head_cfg = {
+        **cfg["head"],
+        "in_channels": detected_channels['c5'],
+        "num_classes": args.num_classes
+    }
+    
+    aux_head_cfg = {
+        **cfg["aux_head"],
+        "in_channels": detected_channels['c4'],  # Will be 190
+        "num_classes": args.num_classes
+    }
+    
+    # Build model
     model = Segmentor(
-        backbone=GCNetWithDWSA(**cfg["backbone"]),
+        backbone=backbone,
         head=GCNetHead(**head_cfg),
         aux_head=GCNetAuxHead(**aux_head_cfg)
     )
