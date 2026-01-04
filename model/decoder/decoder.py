@@ -156,27 +156,14 @@ class ResidualBlock(nn.Module):
 # ============================================
 
 class EnhancedDecoder(nn.Module):
-    """
-    ✅ UPGRADED: Decoder optimized for channels=48 backbone
-    
-    Design:
-    - c5: 96 channels (48*2) → 128 (decoder)
-    - c2: 96 channels (48*2) → project to 96 for skip fusion
-    - c1: 48 channels → project to 48 for skip fusion
-    
-    Features:
-    - Gated fusion for adaptive feature selection
-    - Residual blocks for better gradient flow
-    - Depthwise separable convolutions for efficiency
-    - Progressive upsampling with channel reduction
-    """
-    
     def __init__(
         self,
-        in_channels: int = 96,  # c5 = channels * 2 = 48 * 2
+        in_channels: int = 96,        # c5 channels
+        c2_channels: int = 48,        # ✅ NEW: c2 from backbone
+        c1_channels: int = 48,        # ✅ NEW: c1 from backbone
         decoder_channels: int = 128,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
+        norm_cfg: dict = dict(type='BN', requires_grad=True),
+        act_cfg: dict = dict(type='ReLU', inplace=False),
         dropout_ratio: float = 0.1,
         use_gated_fusion: bool = True
     ):
@@ -185,11 +172,8 @@ class EnhancedDecoder(nn.Module):
         self.use_gated_fusion = use_gated_fusion
         self.decoder_channels = decoder_channels
         
-        # ======================================
-        # STAGE 1: c5 (H/16) → H/8
-        # ======================================
+        # Stage 1
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
         self.refine1 = nn.Sequential(
             ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(
@@ -202,23 +186,28 @@ class EnhancedDecoder(nn.Module):
             )
         )
         
-        # Skip fusion: c2 (96 channels)
+        # ✅ NEW: Project c2 to decoder_channels
+        self.c2_proj = ConvModule(
+            in_channels=c2_channels,
+            out_channels=decoder_channels,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=None
+        ) if c2_channels != decoder_channels else nn.Identity()
+        
         if use_gated_fusion:
             self.fusion1_gate = GatedFusion(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion1 = ConvModule(
-                in_channels=decoder_channels + 96,  # decoder + c2
+                in_channels=decoder_channels + decoder_channels,
                 out_channels=decoder_channels,
                 kernel_size=1,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
         
-        # ======================================
-        # STAGE 2: H/8 → H/4
-        # ======================================
+        # Stage 2
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
         self.refine2 = nn.Sequential(
             ResidualBlock(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(
@@ -231,31 +220,33 @@ class EnhancedDecoder(nn.Module):
             )
         )
         
-        # Skip fusion: c1 (48 channels)
+        # ✅ NEW: Project c1 to decoder_channels//2
+        self.c1_proj = ConvModule(
+            in_channels=c1_channels,
+            out_channels=decoder_channels // 2,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=None
+        ) if c1_channels != (decoder_channels // 2) else nn.Identity()
+        
         if use_gated_fusion:
             self.fusion2_gate = GatedFusion(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion2 = ConvModule(
-                in_channels=(decoder_channels // 2) + 48,  # decoder + c1
+                in_channels=(decoder_channels // 2) + (decoder_channels // 2),
                 out_channels=decoder_channels // 2,
                 kernel_size=1,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg
             )
         
-        # ======================================
-        # STAGE 3: H/4 → H/2
-        # ======================================
+        # Stage 3 & Final (same as before)
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
         self.refine3 = nn.Sequential(
             DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
             DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg)
         )
         
-        # ======================================
-        # FINAL: Output projection
-        # ======================================
         self.final_proj = ConvModule(
             in_channels=decoder_channels // 2,
             out_channels=decoder_channels // 2,
@@ -266,46 +257,36 @@ class EnhancedDecoder(nn.Module):
         
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
     
-    def forward(
-        self,
-        c5: Tensor,
-        c2: Tensor,
-        c1: Tensor
-    ) -> Tensor:
-        """
-        Args:
-            c5: (B, 96, H/16, W/16) - bottleneck features
-            c2: (B, 96, H/4, W/4) - skip connection from stage2
-            c1: (B, 48, H/2, W/2) - skip connection from stage1
-        Returns:
-            (B, 64, H/2, W/2) - decoder output
-        """
+    def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
+        # Stage 1
+        x = self.up1(c5)
+        x = self.refine1(x)
         
-        # Stage 1: H/16 → H/8
-        x = self.up1(c5)  # (B, 96, H/8, W/8)
-        x = self.refine1(x)  # (B, 128, H/8, W/8)
+        # ✅ Project c2 before fusion
+        c2_proj = self.c2_proj(c2)
         
         if self.use_gated_fusion:
-            x = self.fusion1_gate(c2, x)
+            x = self.fusion1_gate(c2_proj, x)
         else:
-            x = torch.cat([x, c2], dim=1)
+            x = torch.cat([x, c2_proj], dim=1)
             x = self.fusion1(x)
         
-        # Stage 2: H/8 → H/4
-        x = self.up2(x)  # (B, 128, H/4, W/4)
-        x = self.refine2(x)  # (B, 64, H/4, W/4)
+        # Stage 2
+        x = self.up2(x)
+        x = self.refine2(x)
+        
+        # ✅ Project c1 before fusion
+        c1_proj = self.c1_proj(c1)
         
         if self.use_gated_fusion:
-            x = self.fusion2_gate(c1, x)
+            x = self.fusion2_gate(c1_proj, x)
         else:
-            x = torch.cat([x, c1], dim=1)
+            x = torch.cat([x, c1_proj], dim=1)
             x = self.fusion2(x)
         
-        # Stage 3: H/4 → H/2
-        x = self.up3(x)  # (B, 64, H/2, W/2)
-        x = self.refine3(x)  # (B, 64, H/2, W/2)
-        
-        # Final projection
+        # Stage 3 & Final
+        x = self.up3(x)
+        x = self.refine3(x)
         x = self.final_proj(x)
         x = self.dropout(x)
         
