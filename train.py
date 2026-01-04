@@ -200,7 +200,7 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 192,  # c4 = channels * 4 = 48 * 4
+                "in_channels": 190,  # c4 = channels * 4 = 48 * 4
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
