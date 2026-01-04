@@ -375,6 +375,10 @@ class GCNetAuxHead(nn.Module):
         )
     
     def forward(self, x: Tensor) -> Tensor:
+        """Handle both dict and tensor input"""
+        if isinstance(x, dict):
+            x = x['c4']
+        
         x = self.conv1(x)
         return self.conv_seg(x)
 
@@ -437,21 +441,21 @@ class GCNetHead(nn.Module):
     def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
         """
         Args:
-            inputs: Dictionary containing:
-                c1: (B, c1_channels, H/2, W/2)
-                c2: (B, c2_channels, H/4, W/4)
-                c5: (B, in_channels, H/16, W/16)
+            inputs: Dictionary containing c1, c2, c5 tensors
         Returns:
-            Segmentation logits (B, num_classes, H/2, W/2)
+            Segmentation logits
         """
-        c1 = inputs['c1']
-        c2 = inputs['c2']
-        c5 = inputs['c5']
+        # ✅ CRITICAL: Extract tensors from dict FIRST
+        if isinstance(inputs, dict):
+            c1 = inputs['c1']
+            c2 = inputs['c2']
+            c5 = inputs['c5']
+        else:
+            # Fallback for tuple input
+            c1, c2, c5 = inputs[0], inputs[1], inputs[2]
         
-        # Decode
-        x = self.decoder(c5, c2, c1)  # (B, 64, H/2, W/2)
-        
-        # Segment
-        x = self.conv_seg(x)  # (B, num_classes, H/2, W/2)
+        # Now pass individual tensors (NOT dict!)
+        x = self.decoder(c5, c2, c1)
+        x = self.conv_seg(x)
         
         return x
