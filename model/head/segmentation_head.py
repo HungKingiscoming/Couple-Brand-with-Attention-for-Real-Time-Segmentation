@@ -81,7 +81,9 @@ class GCNetHead(nn.Module):
         align_corners: bool = False,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
-        use_gated_fusion: bool = True
+        use_gated_fusion: bool = True,
+        c1_channels: int = 48,
+        c2_channels: int = 48
     ):
         super().__init__()
         
@@ -89,6 +91,21 @@ class GCNetHead(nn.Module):
         self.num_classes = num_classes
         self.decoder_channels = decoder_channels
         self.align_corners = align_corners
+        self.decoder = EnhancedDecoder(
+            in_channels=in_channels,
+            c2_channels=c2_channels,
+            c1_channels=c1_channels,
+            decoder_channels=decoder_channels,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+            dropout_ratio=dropout_ratio,
+            use_gated_fusion=use_gated_fusion
+        )
+        output_channels = decoder_channels // 2
+        self.conv_seg = nn.Sequential(
+            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
+            nn.Conv2d(output_channels, num_classes, kernel_size=1)
+        )
         self.use_gated_fusion = use_gated_fusion
         
         # ======================================
