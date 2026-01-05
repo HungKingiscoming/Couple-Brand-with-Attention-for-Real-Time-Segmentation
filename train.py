@@ -552,7 +552,9 @@ def main():
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--resume_reset", action="store_true", default=True)
+    parser.add_argument("--resume_mode", type=str, default="transfer", 
+                    choices=["transfer", "continue"],
+                    help="transfer: start from epoch 0, continue: resume from saved epoch")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=10)
@@ -704,7 +706,8 @@ def main():
     )
     
     if args.resume:
-        trainer.load_checkpoint(args.resume, reset_epoch=args.resume_reset)
+        reset_epoch = (args.resume_mode == "transfer")
+        trainer.load_checkpoint(args.resume, reset_epoch=reset_epoch)
     
     # Training loop
     print(f"\n{'='*70}")
