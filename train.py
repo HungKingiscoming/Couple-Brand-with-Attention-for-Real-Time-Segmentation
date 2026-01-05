@@ -478,7 +478,8 @@ class Trainer:
         
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
-        
+        if 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+            self.scaler.load_state_dict(checkpoint['scaler'])
         if reset_epoch:
             self.start_epoch = 0
             self.best_miou = 0.0
