@@ -22,7 +22,14 @@ warnings.filterwarnings('ignore')
 # ============================================
 
 from model.backbone.model import GCNetWithDWSA
-from model.head.segmentation_head import GCNetHead, GCNetAuxHead, EnhancedDecoder, GatedFusion, DWConvModule, ResidualBlock
+from model.head.segmentation_head import (
+    GCNetHead,
+    GCNetAuxHead,
+    EnhancedDecoder,
+    GatedFusion,
+    DWConvModule,
+    ResidualBlock,
+)
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
@@ -176,7 +183,7 @@ class ModelConfig:
     
     @staticmethod
     def get_config():
-        """Optimized config for best mIoU (0.68-0.72 target with upgrades)"""
+        """Optimized config for best mIoU"""
         return {
             "backbone": {
                 "in_channels": 3,
@@ -191,16 +198,16 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,  # c5 = channels * 2 = 48 * 2
+                "in_channels": 96,  # c5 = channels * 2 = 48 * 2 (sẽ override bằng detect_backbone_channels)
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
-                "use_gated_fusion": True,  # ✅ UPGRADED: Enable gated fusion
+                "use_gated_fusion": True,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 190,  # c4 = channels * 4 = 48 * 4
+                "in_channels": 192,  # c4 = channels * 4 = 48 * 4 (sẽ override bằng detect_backbone_channels)
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -337,7 +344,7 @@ class Trainer:
                 
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = outputs["aux"]
-                    # Aux output is at H/16, resize to original mask size
+                    # Aux output is at lower resolution, resize to mask size
                     aux_logits = F.interpolate(aux_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                     aux_loss_dict = self.criterion(aux_logits, masks)
                     # Decay aux weight as training progresses
@@ -601,33 +608,32 @@ def main():
     print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
     print(f"{'='*70}\n")
     
-    # ✅ NEW CODE
-    # Build backbone first
+    # Build backbone
     backbone = GCNetWithDWSA(**cfg["backbone"]).to(device)
     
-    # Auto-detect channels
+    # Auto-detect backbone channels
     detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
     
-    # Build configs with detected channels
+    # Build head config with detected channels
     head_cfg = {
         **cfg["head"],
-        "in_channels": detected_channels['c5'],      # 96
-        "c1_channels": detected_channels['c1'],      # 48 ✅
-        "c2_channels": detected_channels['c2'],      # 48 ✅
-        "num_classes": args.num_classes
+        "in_channels": detected_channels['c5'],
+        "c1_channels": detected_channels['c1'],
+        "c2_channels": detected_channels['c2'],
+        "num_classes": args.num_classes,
     }
     
     aux_head_cfg = {
         **cfg["aux_head"],
-        "in_channels": detected_channels['c4'],  # Will be 190
-        "num_classes": args.num_classes
+        "in_channels": detected_channels['c4'],
+        "num_classes": args.num_classes,
     }
     
-    # Build model
+    # Build Segmentor
     model = Segmentor(
         backbone=backbone,
         head=GCNetHead(**head_cfg),
-        aux_head=GCNetAuxHead(**aux_head_cfg)
+        aux_head=GCNetAuxHead(**aux_head_cfg),
     )
     
     print("\n🔧 Applying Model Optimizations...")
