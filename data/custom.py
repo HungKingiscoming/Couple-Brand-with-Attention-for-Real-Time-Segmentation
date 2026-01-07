@@ -191,56 +191,91 @@ def get_train_transforms(
     img_size: Tuple[int, int] = (512, 1024),
     mean: List[float] = [0.485, 0.456, 0.406],
     std: List[float] = [0.229, 0.224, 0.225],
-    dataset_type='normal'
+    dataset_type: str = 'normal'
 ) -> A.Compose:
-    """Enhanced augmentation for Cityscapes (0.75+ mIoU)"""
-    return A.Compose([
-        # Initial resize
+    # Phần chung: resize + hình học
+    base_list = [
         A.Resize(height=img_size[0], width=img_size[1], p=1.0),
-        
-        # More aggressive scaling [0.5, 1.5]
         A.RandomScale(scale_limit=0.25, p=0.5),
-        
-        # Pad and crop
         A.PadIfNeeded(
-            min_height=img_size[0], 
-            min_width=img_size[1], 
+            min_height=img_size[0],
+            min_width=img_size[1],
             border_mode=cv2.BORDER_REFLECT_101,
-            value=0, 
+            value=0,
             mask_value=255,
             p=1.0
         ),
         A.RandomCrop(height=img_size[0], width=img_size[1], p=1.0),
-        
-        # Geometric augmentations
         A.ShiftScaleRotate(
-            shift_limit=0.1, 
-            scale_limit=0.0,  # ✅ Disable scaling (already done by RandomScale)
+            shift_limit=0.1,
+            scale_limit=0.0,  # đã scale ở RandomScale
             rotate_limit=10,
             border_mode=cv2.BORDER_REFLECT_101,
             p=0.5
         ),
-        
         A.HorizontalFlip(p=0.5),
-        
-        # Blur (helps with generalization)
-        A.OneOf([
-            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-            A.MedianBlur(blur_limit=5, p=1.0),
-        ], p=0.1),
-        
-        # Color augmentations (more aggressive)
-        A.OneOf([
-            A.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05, p=1.0),
-            A.RandomGamma(gamma_limit=(85, 115), p=1.0),
-            A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=1.0),
-        ], p=0.5),
-        
-        
-        # Normalize
-        A.Normalize(mean=mean, std=std),
-        ToTensorV2()
-    ])
+    ]
+
+    if dataset_type == 'foggy':
+        # Augment dành cho foggy
+        foggy_specific = [
+            # Blur nhẹ nhưng thường xuyên hơn
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                A.MotionBlur(blur_limit=5, p=1.0),
+            ], p=0.3),
+
+            # Điều chỉnh độ dày sương: brightness + contrast + gamma yếu
+            A.OneOf([
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.1,  # nhỏ hơn normal
+                    contrast_limit=0.1,
+                    p=1.0
+                ),
+                A.RandomGamma(gamma_limit=(90, 110), p=1.0),
+            ], p=0.5),
+
+            # Optional: thêm haze nhẹ
+            A.RandomFog(
+                fog_coef_lower=0.1,
+                fog_coef_upper=0.3,
+                alpha_coef=0.08,
+                p=0.3
+            ),
+        ]
+    else:
+        # Augment dành cho normal (giữ gần như như cũ)
+        foggy_specific = [
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+                A.MedianBlur(blur_limit=5, p=1.0),
+            ], p=0.1),
+            A.OneOf([
+                A.ColorJitter(
+                    brightness=0.1,
+                    contrast=0.1,
+                    saturation=0.1,
+                    hue=0.05,
+                    p=1.0
+                ),
+                A.RandomGamma(gamma_limit=(85, 115), p=1.0),
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.2,
+                    contrast_limit=0.2,
+                    p=1.0
+                ),
+            ], p=0.5),
+        ]
+
+    return A.Compose(
+        base_list
+        + foggy_specific
+        + [
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2()
+        ]
+    )
+
 
 
 def get_val_transforms(
