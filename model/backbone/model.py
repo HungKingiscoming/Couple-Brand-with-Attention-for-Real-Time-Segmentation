@@ -16,9 +16,6 @@ from components.components import (
     OptConfigType
 )
 
-# ============================================
-# MULTI-SCALE CONTEXT MODULE
-# ============================================
 
 class MultiScaleContextModule(nn.Module):
     """ASPP-style multi-scale context - adds +2-3% mIoU"""
