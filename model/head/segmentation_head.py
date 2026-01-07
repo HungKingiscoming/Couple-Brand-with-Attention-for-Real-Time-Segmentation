@@ -1,11 +1,4 @@
-# ============================================
-# COMPLETE segmentation_head.py FILE
-# ============================================
 
-"""
-This is your COMPLETE segmentation_head.py file.
-Copy this entire file to replace your current one.
-"""
 
 import torch
 import torch.nn as nn
@@ -23,9 +16,7 @@ from components.components import (
     OptConfigType
 )
 
-# ============================================
-# ENHANCED FUSION MODULES
-# ============================================
+
 
 class GatedFusion(nn.Module):
     """
