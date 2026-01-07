@@ -17,9 +17,7 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# ============================================
-# IMPORTS - ENHANCED BACKBONE + UPGRADED HEAD
-# ============================================
+
 
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import (
