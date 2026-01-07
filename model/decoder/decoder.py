@@ -14,9 +14,7 @@ from components.components import (
     OptConfigType
 )
 
-# ============================================
-# ENHANCED FUSION MODULES
-# ============================================
+
 
 class GatedFusion(nn.Module):
     """
