@@ -356,14 +356,16 @@ class GCNetHead(nn.Module):
     
     def __init__(
         self,
-        in_channels: int = 96,  # c5 = channels * 2 = 48 * 2
+        in_channels: int,  # c5 = channels * 2 = 48 * 2
         num_classes: int = 19,
         decoder_channels: int = 128,
         dropout_ratio: float = 0.1,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         align_corners: bool = False,
-        use_gated_fusion: bool = True
+        use_gated_fusion: bool = True,
+        c1_channels: int = 32,
+        c2_channels: int = 64,
     ):
         super().__init__()
         
@@ -372,6 +374,8 @@ class GCNetHead(nn.Module):
         # Decoder: c5 → output features
         self.decoder = EnhancedDecoder(
             in_channels=in_channels,
+            c2_channels=c2_channels,       # 64
+            c1_channels=c1_channels,
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
@@ -396,14 +400,10 @@ class GCNetHead(nn.Module):
         Returns:
             Segmentation logits (B, num_classes, H/2, W/2)
         """
-        c1 = inputs['c1']
-        c2 = inputs['c2']
-        c5 = inputs['c5']
-        
-        # Decode
-        x = self.decoder(c5, c2, c1)  # (B, 64, H/2, W/2)
-        
-        # Segment
-        x = self.conv_seg(x)  # (B, num_classes, H/2, W/2)
-        
+        c1 = inputs['c1']   # (B, 32, H/2, W/2)
+        c2 = inputs['c2']   # (B, 64, H/4, W/4)
+        c5 = inputs['c5']   # (B, 128, H/16, W/16)
+
+        x = self.decoder(c5, c2, c1)
+        x = self.conv_seg(x)
         return x
