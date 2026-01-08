@@ -165,9 +165,9 @@ class EnhancedDecoder(nn.Module):
     
     def __init__(
         self,
-        in_channels: int = 96,        # c5 channels
-        c2_channels: int = 48,        # ✅ NEW: c2 from backbone
-        c1_channels: int = 48,        # ✅ NEW: c1 from backbone
+        in_channels: int = 128,        # c5 channels
+        c2_channels: int = 64,        # ✅ NEW: c2 from backbone
+        c1_channels: int = 32,        # ✅ NEW: c1 from backbone
         decoder_channels: int = 128,
         norm_cfg: dict = dict(type='BN', requires_grad=True),
         act_cfg: dict = dict(type='ReLU', inplace=False),
@@ -394,7 +394,7 @@ class GCNetHead(nn.Module):
     
     def __init__(
         self,
-        in_channels: int = 96,  # c5
+        in_channels: int = 128,  # c5
         num_classes: int = 19,
         decoder_channels: int = 128,
         dropout_ratio: float = 0.1,
@@ -403,8 +403,8 @@ class GCNetHead(nn.Module):
         align_corners: bool = False,
         use_gated_fusion: bool = True,
         # ✅ NEW: Accept flexible c1, c2 channels from backbone
-        c1_channels: int = 48,
-        c2_channels: int = 48
+        c1_channels: int = 32,
+        c2_channels: int = 64
     ):
         super().__init__()
         
