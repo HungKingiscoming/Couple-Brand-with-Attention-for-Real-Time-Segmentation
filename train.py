@@ -17,8 +17,6 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-
-
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import (
     GCNetHead,
@@ -30,6 +28,7 @@ from model.head.segmentation_head import (
 )
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
+
 
 # ============================================
 # FREEZE/UNFREEZE UTILITIES
@@ -177,6 +176,7 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
     
     return optimizer
 
+
 # ============================================
 # LOSS FUNCTIONS
 # ============================================
@@ -317,6 +317,29 @@ def setup_memory_efficient_training():
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
+def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
+    """Automatically detect backbone output channels"""
+    backbone.eval()
+    with torch.no_grad():
+        sample = torch.randn(1, 3, *img_size).to(device)
+        feats = backbone(sample)
+        
+        channels = {}
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in feats:
+                channels[key] = feats[key].shape[1]
+        
+        print(f"\n{'='*70}")
+        print("🔍 BACKBONE CHANNEL DETECTION")
+        print(f"{'='*70}")
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in channels:
+                print(f"   {key}: {channels[key]} channels")
+        print(f"{'='*70}\n")
+        
+        return channels
+
+
 # ============================================
 # MODEL CONFIG - ENHANCED BACKBONE WITH UPGRADED HEAD
 # ============================================
@@ -341,7 +364,7 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,  # c5 = channels * 2 = 48 * 2 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 96,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -350,7 +373,7 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 192,  # c4 = channels * 4 = 48 * 4 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 192,
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -398,6 +421,7 @@ class Segmentor(nn.Module):
 # ============================================
 # TRAINER
 # ============================================
+
 class Trainer:
     """Training class with progressive unfreezing, logging và checkpointing"""
     
@@ -531,7 +555,7 @@ class Trainer:
         if epoch in self.unfreeze_epochs:
             self._handle_unfreezing(epoch)
         
-        # ====== EXISTING TRAINING CODE ======
+        # ====== TRAINING CODE ======
         
         self.model.train()
         
@@ -727,14 +751,14 @@ class Trainer:
             print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
-
-
 # ============================================
 # MAIN
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
+    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Progressive Unfreezing")
+    
+    # ========== TRANSFER LEARNING ARGUMENTS ==========
     parser.add_argument("--pretrained_weights", type=str, default=None,
                        help="Path to pretrained GCNet weights")
     parser.add_argument("--freeze_backbone", action="store_true", default=False,
@@ -748,17 +772,18 @@ def main():
                        help="Dùng LR khác nhau cho backbone vs head")
     parser.add_argument("--backbone_lr_factor", type=float, default=0.1,
                        help="Backbone LR = head_lr * factor")
-    # Dataset
+    
+    # ========== DATASET ARGUMENTS ==========
     parser.add_argument("--train_txt", required=True, help="Path to training list")
     parser.add_argument("--val_txt", required=True, help="Path to validation list")
     parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
     
-    # Training
+    # ========== TRAINING ARGUMENTS ==========
     parser.add_argument("--epochs", type=int, default=100, help="Total epochs")
     
-    # Optimization
+    # ========== OPTIMIZATION ARGUMENTS ==========
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4, help="Max LR")
@@ -767,11 +792,11 @@ def main():
     parser.add_argument("--aux_weight", type=float, default=1.0, help="Auxiliary head weight (decays over epochs)")
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
-    # Data
+    # ========== DATA ARGUMENTS ==========
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
     
-    # System
+    # ========== SYSTEM ARGUMENTS ==========
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", default="./checkpoints")
@@ -793,13 +818,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
+    print(f"🚀 GCNet Training - Progressive Unfreezing & Transfer Learning")
     print(f"{'='*70}")
     print(f"📱 Device: {device}")
     print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
     print(f"📊 Epochs: {args.epochs}")
     print(f"⚡ Scheduler: {args.scheduler}")
-    print(f"🔀 Gated Fusion: ENABLED")
+    print(f"❄️  Freeze backbone: {args.freeze_backbone}")
+    print(f"📅 Unfreeze schedule: {args.unfreeze_schedule}")
     print(f"{'='*70}\n")
     
     # Config
@@ -863,8 +889,7 @@ def main():
     print("   └─ Checking Model Health")
     check_model_health(model)
     print()
-
-
+    
     # ===================== TRANSFER LEARNING SETUP =====================
     print(f"{'='*70}")
     print("🔄 TRANSFER LEARNING SETUP")
@@ -896,16 +921,17 @@ def main():
             missing, unexpected = model.backbone.load_state_dict(backbone_state, strict=False)
             if missing:
                 print(f"   ⚠️  Missing keys in backbone: {len(missing)} keys")
-                print(f"      Sample: {missing[:3]}")
+                if len(missing) <= 5:
+                    print(f"      Keys: {missing}")
             if unexpected:
                 print(f"   ⚠️  Unexpected keys: {len(unexpected)} keys")
-                print(f"      Sample: {unexpected[:3]}")
             
             print(f"✅ Weights loaded successfully!\n")
             
         except Exception as e:
             print(f"❌ Failed to load weights: {e}\n")
             return
+    
     # Freeze backbone if requested
     if args.freeze_backbone:
         print(f"❄️  Freezing backbone...")
@@ -915,9 +941,8 @@ def main():
     # Print status
     count_trainable_params(model)
     print_freeze_status(model)
-
-    # ===================== END TRANSFER LEARNING SETUP =====================
     
+    # ===================== END TRANSFER LEARNING SETUP =====================
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
@@ -997,7 +1022,7 @@ def main():
     
     # Training loop
     print(f"\n{'='*70}")
-    print("🚀 STARTING TRAINING WITH UPGRADED HEAD")
+    print("🚀 STARTING TRAINING")
     print(f"{'='*70}\n")
     
     for epoch in range(trainer.start_epoch, args.epochs):
