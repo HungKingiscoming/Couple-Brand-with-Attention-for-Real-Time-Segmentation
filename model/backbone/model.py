@@ -669,7 +669,7 @@ class GCNetWithDWSA(BaseModule):
     def __init__(
         self,
         in_channels: int = 3,
-        channels: int = 48,  # ✅ Increased from 32
+        channels: int = 32,  # ✅ Increased from 32
         ppm_channels: int = 128,
         num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
         dwsa_stages: List[str] = ['stage3', 'stage4', 'bottleneck'],
@@ -1115,7 +1115,7 @@ def create_gcnet_dwsa_variants():
     
     # ✅ Enhanced Performance Variant
     gcnet_dwsa_enhanced = GCNetWithDWSA(
-        channels=48,  # Increased from 32
+        channels=32,  # Increased from 32
         dwsa_stages=['stage3', 'stage4', 'bottleneck'],
         dwsa_num_heads=8,
         use_dcn_in_stage4=True,  # ✅ NEW
