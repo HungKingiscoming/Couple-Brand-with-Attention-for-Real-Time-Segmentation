@@ -156,9 +156,9 @@ class ResidualBlock(nn.Module):
 class EnhancedDecoder(nn.Module):
     def __init__(
         self,
-        in_channels: int = 96,        # c5 channels
-        c2_channels: int = 48,        # ✅ NEW: c2 from backbone
-        c1_channels: int = 48,        # ✅ NEW: c1 from backbone
+        in_channels: int = 128,        
+        c2_channels: int = 64,       
+        c1_channels: int = 32,      
         decoder_channels: int = 128,
         norm_cfg: dict = dict(type='BN', requires_grad=True),
         act_cfg: dict = dict(type='ReLU', inplace=False),
@@ -218,7 +218,6 @@ class EnhancedDecoder(nn.Module):
             )
         )
         
-        # ✅ NEW: Project c1 to decoder_channels//2
         self.c1_proj = ConvModule(
             in_channels=c1_channels,
             out_channels=decoder_channels // 2,
