@@ -353,7 +353,7 @@ class ModelConfig:
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 48,
+                "channels": 32,
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
                 "dwsa_stages": ['stage3', 'stage4', 'bottleneck'],
@@ -364,7 +364,7 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,
+                "in_channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -373,7 +373,7 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 192,
+                "in_channels": 256,
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
