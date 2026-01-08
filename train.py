@@ -31,6 +31,151 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
+# ============================================
+# FREEZE/UNFREEZE UTILITIES
+# ============================================
+
+def freeze_backbone(model):
+    """Freeze toàn bộ backbone"""
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    print("🔒 Backbone FROZEN - chỉ head được train")
+
+
+def unfreeze_backbone(model):
+    """Unfreeze toàn bộ backbone"""
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+    print("🔓 Backbone UNFROZEN - tất cả layers trainable")
+
+
+def unfreeze_backbone_progressive(model, stage_name):
+    """
+    Unfreeze một stage cụ thể của backbone
+    stage_name: 'stem', 'stage1', 'stage2', 'stage3', 'stage4', 'bottleneck', 'ppm'
+    """
+    unfrozen_count = 0
+    for name, module in model.backbone.named_modules():
+        if stage_name in name:
+            for param in module.parameters():
+                param.requires_grad = True
+                unfrozen_count += 1
+    
+    print(f"🔓 Unfrozen stage: {stage_name} ({unfrozen_count} parameters)")
+
+
+def get_backbone_stages(model):
+    """Lấy danh sách các stages trong backbone theo thứ tự từ input đến output"""
+    stages = []
+    
+    # Thứ tự từ thấp đến cao (càng gần input càng tổng quát)
+    if hasattr(model.backbone, 'stem'):
+        stages.append('stem')
+    
+    for i in range(1, 6):  # stage1 đến stage5
+        stage_name = f'stage{i}'
+        if hasattr(model.backbone, stage_name):
+            stages.append(stage_name)
+    
+    if hasattr(model.backbone, 'bottleneck'):
+        stages.append('bottleneck')
+    
+    if hasattr(model.backbone, 'ppm'):
+        stages.append('ppm')
+    
+    return stages
+
+
+def count_trainable_params(model):
+    """Đếm và hiển thị số parameters trainable/frozen"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    
+    backbone_total = sum(p.numel() for p in model.backbone.parameters())
+    backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    
+    head_total = sum(p.numel() for p in model.decode_head.parameters())
+    head_trainable = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
+    
+    if hasattr(model, 'aux_head') and model.aux_head is not None:
+        aux_total = sum(p.numel() for p in model.aux_head.parameters())
+        aux_trainable = sum(p.numel() for p in model.aux_head.parameters() if p.requires_grad)
+    else:
+        aux_total = aux_trainable = 0
+    
+    print(f"\n{'='*70}")
+    print("📊 PARAMETER STATISTICS")
+    print(f"{'='*70}")
+    print(f"Total:        {total:>15,} | 100%")
+    print(f"Trainable:    {trainable:>15,} | {100*trainable/total:.1f}%")
+    print(f"Frozen:       {frozen:>15,} | {100*frozen/total:.1f}%")
+    print(f"{'-'*70}")
+    print(f"Backbone:     {backbone_trainable:>15,} / {backbone_total:,} | {100*backbone_trainable/backbone_total:.1f}%")
+    print(f"Head:         {head_trainable:>15,} / {head_total:,} | {100*head_trainable/head_total:.1f}%")
+    if aux_total > 0:
+        print(f"Aux Head:     {aux_trainable:>15,} / {aux_total:,} | {100*aux_trainable/aux_total:.1f}%")
+    print(f"{'='*70}\n")
+    
+    return trainable, frozen
+
+
+def print_freeze_status(model):
+    """Hiển thị trạng thái freeze chi tiết từng stage"""
+    print(f"\n{'='*70}")
+    print("🔍 FREEZE STATUS")
+    print(f"{'='*70}")
+    
+    stages = get_backbone_stages(model)
+    for stage in stages:
+        stage_params = [p for n, p in model.backbone.named_parameters() if stage in n]
+        if stage_params:
+            trainable = sum(1 for p in stage_params if p.requires_grad)
+            total = len(stage_params)
+            status = "🟢" if trainable == total else "🔴" if trainable == 0 else "🟡"
+            print(f"{status} {stage:12s}: {trainable:>3}/{total:>3} trainable")
+    
+    # Heads
+    head_trainable = sum(1 for p in model.decode_head.parameters() if p.requires_grad)
+    head_total = sum(1 for p in model.decode_head.parameters())
+    print(f"🟢 {'head':12s}: {head_trainable:>3}/{head_total:>3} trainable")
+    
+    if hasattr(model, 'aux_head') and model.aux_head is not None:
+        aux_trainable = sum(1 for p in model.aux_head.parameters() if p.requires_grad)
+        aux_total = sum(1 for p in model.aux_head.parameters())
+        print(f"🟢 {'aux_head':12s}: {aux_trainable:>3}/{aux_total:>3} trainable")
+    
+    print(f"{'='*70}\n")
+
+
+def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
+    """
+    Tạo optimizer với LR khác nhau cho backbone vs head
+    backbone_lr = base_lr * backbone_lr_factor
+    head_lr = base_lr
+    """
+    backbone_params = [p for n, p in model.named_parameters() 
+                      if 'backbone' in n and p.requires_grad]
+    head_params = [p for n, p in model.named_parameters() 
+                  if 'backbone' not in n and p.requires_grad]
+    
+    if len(backbone_params) == 0:
+        # Backbone fully frozen
+        optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
+        print(f"⚙️  Optimizer: AdamW (lr={base_lr}) - chỉ head")
+    else:
+        backbone_lr = base_lr * backbone_lr_factor
+        param_groups = [
+            {'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
+            {'params': head_params, 'lr': base_lr, 'name': 'head'}
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        
+        print(f"⚙️  Optimizer: AdamW")
+        print(f"   ├─ Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
+        print(f"   └─ Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
+    
+    return optimizer
 
 # ============================================
 # LOSS FUNCTIONS
@@ -253,9 +398,8 @@ class Segmentor(nn.Module):
 # ============================================
 # TRAINER
 # ============================================
-
 class Trainer:
-    """Training class with logging and checkpointing"""
+    """Training class with progressive unfreezing, logging và checkpointing"""
     
     def __init__(self, model, optimizer, scheduler, device, args, class_weights=None):
         self.model = model.to(device)
@@ -289,9 +433,23 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         
+        # ====== PROGRESSIVE UNFREEZING SETUP ======
+        self.unfreeze_epochs = [int(x) for x in args.unfreeze_schedule.split(',')] if args.unfreeze_schedule else []
+        self.unfreeze_mode = args.unfreeze_mode
+        self.current_unfreeze_idx = 0
+        
+        # Get backbone stages
+        self.backbone_stages = get_backbone_stages(model)
+        print(f"\n📋 Backbone stages: {self.backbone_stages}")
+        
+        # Setup discriminative LR tracking
+        self.base_lr = args.lr
+        self.backbone_lr_factor = args.backbone_lr_factor
+        
+        # Save config
         self.save_config()
         self._print_config(loss_cfg)
-
+    
     def _print_config(self, loss_cfg):
         """Print training configuration"""
         print(f"\n{'='*70}")
@@ -305,16 +463,76 @@ class Trainer:
         print(f"📉 Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Focal({loss_cfg['focal_weight']})")
         print(f"🔀 Gated Fusion: ENABLED (upgraded head)")
         print(f"💾 Save dir: {self.args.save_dir}")
+        print(f"❄️  Freeze backbone: {self.args.freeze_backbone}")
+        print(f"📅 Unfreeze schedule: {self.unfreeze_epochs}")
+        print(f"🔄 Unfreeze mode: {self.unfreeze_mode}")
         print(f"{'='*70}\n")
-
+    
     def save_config(self):
         """Save training config"""
         config = vars(self.args)
         with open(self.save_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2, default=str)
-
+    
+    def _handle_unfreezing(self, epoch):
+        """Xử lý unfreezing tại epoch"""
+        print(f"\n{'='*70}")
+        print(f"🔓 UNFREEZING AT EPOCH {epoch}")
+        print(f"{'='*70}\n")
+        
+        if self.unfreeze_mode == 'all_at_once':
+            # Unfreeze toàn bộ backbone ngay lập tức
+            unfreeze_backbone(self.model)
+            self.current_unfreeze_idx = len(self.backbone_stages)
+            print("✅ Unfrozen toàn bộ backbone!")
+            
+        else:  # progressive
+            # Unfreeze từng stage một
+            if self.current_unfreeze_idx < len(self.backbone_stages):
+                stage_to_unfreeze = self.backbone_stages[self.current_unfreeze_idx]
+                unfreeze_backbone_progressive(self.model, stage_to_unfreeze)
+                self.current_unfreeze_idx += 1
+                print(f"✅ Unfrozen stage: {stage_to_unfreeze}")
+            else:
+                print("⚠️  Tất cả stages đã được unfreeze!")
+        
+        # Update optimizer sau khi unfreeze
+        self._update_optimizer_after_unfreeze()
+        
+        # Print status
+        print_freeze_status(self.model)
+        count_trainable_params(self.model)
+        
+        print(f"{'='*70}\n")
+    
+    def _update_optimizer_after_unfreeze(self):
+        """Cập nhật optimizer sau khi unfreeze layers mới"""
+        # Giảm LR cho backbone khi unfreeze thêm
+        new_backbone_lr = self.base_lr * self.backbone_lr_factor * (0.5 ** self.current_unfreeze_idx)
+        new_head_lr = self.base_lr * (0.5 ** self.current_unfreeze_idx)
+        
+        # Tạo optimizer mới với params mới
+        self.optimizer = setup_discriminative_lr(
+            self.model,
+            base_lr=new_head_lr,
+            backbone_lr_factor=self.backbone_lr_factor * (0.5 ** self.current_unfreeze_idx),
+            weight_decay=self.args.weight_decay
+        )
+        
+        # Reset scaler để tránh numerical issues
+        self.scaler = GradScaler(enabled=self.args.use_amp)
+        
+        print(f"📉 LR updated: Backbone={new_backbone_lr:.2e}, Head={new_head_lr:.2e}")
+    
     def train_epoch(self, loader, epoch):
-        """Train one epoch"""
+        """Train one epoch với progressive unfreezing"""
+        
+        # ====== PROGRESSIVE UNFREEZING LOGIC ======
+        if epoch in self.unfreeze_epochs:
+            self._handle_unfreezing(epoch)
+        
+        # ====== EXISTING TRAINING CODE ======
+        
         self.model.train()
         
         total_loss = 0.0
@@ -342,7 +560,6 @@ class Trainer:
                 
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = outputs["aux"]
-                    # Aux output is at lower resolution, resize to mask size
                     aux_logits = F.interpolate(aux_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                     aux_loss_dict = self.criterion(aux_logits, masks)
                     # Decay aux weight as training progresses
@@ -404,7 +621,7 @@ class Trainer:
         avg_focal = total_focal / len(loader)
         
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': avg_focal}
-
+    
     @torch.no_grad()
     def validate(self, loader, epoch):
         """Validate one epoch"""
@@ -454,7 +671,7 @@ class Trainer:
         avg_loss = total_loss / len(loader)
         
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
-
+    
     def save_checkpoint(self, epoch, metrics, is_best=False):
         """Save checkpoint"""
         checkpoint = {
@@ -465,7 +682,10 @@ class Trainer:
             'scaler': self.scaler.state_dict(),
             'best_miou': self.best_miou,
             'metrics': metrics,
-            'global_step': self.global_step
+            'global_step': self.global_step,
+            'unfreeze_epochs': self.unfreeze_epochs,
+            'current_unfreeze_idx': self.current_unfreeze_idx,
+            'backbone_stages': self.backbone_stages
         }
         
         torch.save(checkpoint, self.save_dir / "last.pth")
@@ -476,15 +696,17 @@ class Trainer:
         
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
-
+    
     def load_checkpoint(self, checkpoint_path, reset_epoch=True):
         """Load checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
+        
         if 'scaler' in checkpoint and checkpoint['scaler'] is not None:
             self.scaler.load_state_dict(checkpoint['scaler'])
+        
         if reset_epoch:
             self.start_epoch = 0
             self.best_miou = 0.0
@@ -494,32 +716,17 @@ class Trainer:
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_miou = checkpoint.get('best_miou', 0.0)
             self.global_step = checkpoint.get('global_step', 0)
+            
+            # Restore unfreezing state
+            self.unfreeze_epochs = checkpoint.get('unfreeze_epochs', [])
+            self.current_unfreeze_idx = checkpoint.get('current_unfreeze_idx', 0)
+            
             if self.scheduler and checkpoint.get('scheduler'):
                 self.scheduler.load_state_dict(checkpoint['scheduler'])
+            
             print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
-def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
-    """Automatically detect backbone output channels"""
-    backbone.eval()
-    with torch.no_grad():
-        sample = torch.randn(1, 3, *img_size).to(device)
-        feats = backbone(sample)
-        
-        channels = {}
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in feats:
-                channels[key] = feats[key].shape[1]
-        
-        print(f"\n{'='*70}")
-        print("🔍 BACKBONE CHANNEL DETECTION")
-        print(f"{'='*70}")
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in channels:
-                print(f"   {key}: {channels[key]} channels")
-        print(f"{'='*70}\n")
-        
-        return channels
 
 
 # ============================================
@@ -528,7 +735,19 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
 
 def main():
     parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
-    
+    parser.add_argument("--pretrained_weights", type=str, default=None,
+                       help="Path to pretrained GCNet weights")
+    parser.add_argument("--freeze_backbone", action="store_true", default=False,
+                       help="Freeze toàn bộ backbone từ epoch 0")
+    parser.add_argument("--unfreeze_schedule", type=str, default="10,20,30,40",
+                       help="Các epoch sẽ unfreeze (VD: '10,20,30,40')")
+    parser.add_argument("--unfreeze_mode", type=str, default="progressive",
+                       choices=["progressive", "all_at_once"],
+                       help="Cách unfreeze: progressive (từng stage) hoặc all_at_once")
+    parser.add_argument("--use_discriminative_lr", action="store_true", default=True,
+                       help="Dùng LR khác nhau cho backbone vs head")
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.1,
+                       help="Backbone LR = head_lr * factor")
     # Dataset
     parser.add_argument("--train_txt", required=True, help="Path to training list")
     parser.add_argument("--val_txt", required=True, help="Path to validation list")
@@ -603,7 +822,7 @@ def main():
     
     # Model
     print(f"{'='*70}")
-    print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
+    print("🏗️  BUILDING MODEL WITH PROGRESSIVE UNFREEZING")
     print(f"{'='*70}\n")
     
     # Build backbone
@@ -644,6 +863,61 @@ def main():
     print("   └─ Checking Model Health")
     check_model_health(model)
     print()
+
+
+    # ===================== TRANSFER LEARNING SETUP =====================
+    print(f"{'='*70}")
+    print("🔄 TRANSFER LEARNING SETUP")
+    print(f"{'='*70}\n")
+    
+    # Load pre-trained weights
+    if args.pretrained_weights:
+        print(f"📥 Loading pretrained weights from: {args.pretrained_weights}")
+        
+        try:
+            checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
+            
+            # Handle different checkpoint formats
+            if isinstance(checkpoint, dict):
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                    # Remove 'backbone.' prefix if loading from MMSegmentation
+                    state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items() if k.startswith('backbone.')}
+                elif 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint
+            else:
+                state_dict = checkpoint
+            
+            # Load backbone
+            backbone_state = {k: v for k, v in state_dict.items() if not k.startswith('decode_head') and not k.startswith('aux_head')}
+            
+            missing, unexpected = model.backbone.load_state_dict(backbone_state, strict=False)
+            if missing:
+                print(f"   ⚠️  Missing keys in backbone: {len(missing)} keys")
+                print(f"      Sample: {missing[:3]}")
+            if unexpected:
+                print(f"   ⚠️  Unexpected keys: {len(unexpected)} keys")
+                print(f"      Sample: {unexpected[:3]}")
+            
+            print(f"✅ Weights loaded successfully!\n")
+            
+        except Exception as e:
+            print(f"❌ Failed to load weights: {e}\n")
+            return
+    # Freeze backbone if requested
+    if args.freeze_backbone:
+        print(f"❄️  Freezing backbone...")
+        freeze_backbone(model)
+        print()
+    
+    # Print status
+    count_trainable_params(model)
+    print_freeze_status(model)
+
+    # ===================== END TRANSFER LEARNING SETUP =====================
+    
     
     total_params = sum(p.numel() for p in model.parameters())
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
@@ -663,14 +937,22 @@ def main():
             return
     
     print(f"{'='*70}\n")
-    
-    # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999)
-    )
+
+    # ===================== OPTIMIZER SETUP =====================
+    if args.use_discriminative_lr:
+        optimizer = setup_discriminative_lr(
+            model,
+            base_lr=args.lr,
+            backbone_lr_factor=args.backbone_lr_factor,
+            weight_decay=args.weight_decay
+        )
+    else:
+        optimizer = optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.999)
+        )
     
     # Scheduler
     if args.scheduler == 'onecycle':
