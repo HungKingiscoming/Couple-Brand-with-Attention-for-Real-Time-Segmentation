@@ -518,19 +518,40 @@ class GCNetWithDWSA_v2(BaseModule):
         self.detail_branch_layers.append(nn.Sequential(*detail_stage5))
         
         # Stage 6 Detail
+        # ======================================
+        # Stage 6 Detail - PERFECT MATCH with GCNet
+        # ======================================
         detail_stage6 = []
-        for i in range(num_blocks_per_stage[4][1]):
+        
+        # ✅ FIRST block: 64→128 upsample (channels * 2 → channels * 4)
+        detail_stage6.append(
+            GCBlock(
+                in_channels=channels * 2,      # 64 ✅ CHANGED!
+                out_channels=channels * 4,     # 128
+                stride=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg,
+                deploy=deploy
+            )
+        )
+        
+        # ✅ REMAINING blocks: 128→128 (num_blocks_per_stage[4][1] - 1 blocks)
+        for i in range(num_blocks_per_stage[4][1] - 1):
+            # Last block has act=False, others have act=True
+            is_last_block = (i == num_blocks_per_stage[4][1] - 2)
+            
             detail_stage6.append(
                 GCBlock(
-                    in_channels=channels * 4,
-                    out_channels=channels * 4,
+                    in_channels=channels * 4,   # 128
+                    out_channels=channels * 4,  # 128
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
                     deploy=deploy,
-                    act=(i < num_blocks_per_stage[4][1] - 1)
+                    act=not is_last_block  # ✅ Last block: act=False
                 )
             )
+        
         self.detail_branch_layers.append(nn.Sequential(*detail_stage6))
         
         # ======================================
