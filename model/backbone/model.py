@@ -346,22 +346,37 @@ class GCBlock(nn.Module):
 # ===========================
 
 class DWSABlock(nn.Module):
-    def __init__(self, channels, num_heads=4, spatial_kernel=7, drop=0.0, reduction: int = 4):
+    def __init__(
+        self,
+        channels: int,
+        num_heads: int = 4,
+        drop: float = 0.0,
+        reduction: int = 4,
+    ):
+        """
+        Lightweight DWSA:
+        - Giảm kênh: C -> C' = C//reduction (ví dụ 512 -> 128).
+        - Attention chạy trên C', rồi project ngược lại C.
+        """
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
-        self.spatial_kernel = spatial_kernel
-        self.scale = (channels // num_heads) ** -0.5
-        reduced = channels // reduction  
-        self.reduced_dim = reduced
-        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1)
-        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1)
-        
-        self.to_q = nn.Linear(channels, channels, bias=True)
-        self.to_k = nn.Linear(channels, channels, bias=True)
-        self.to_v = nn.Linear(channels, channels, bias=True)
 
-        self.out_proj = nn.Linear(channels, channels, bias=True)
+        assert channels % reduction == 0, "channels phải chia hết reduction"
+        reduced = channels // reduction      # C' (vd: 512//4 = 128)
+        self.reduced_dim = reduced
+
+        # C -> C'
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1)
+        # C' -> C
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1)
+
+        # Linear Q,K,V,O trên C'
+        self.to_q = nn.Linear(reduced, reduced, bias=True)
+        self.to_k = nn.Linear(reduced, reduced, bias=True)
+        self.to_v = nn.Linear(reduced, reduced, bias=True)
+        self.proj_o = nn.Linear(reduced, reduced, bias=True)
+
         self.drop = nn.Dropout(drop)
         self.scale = (reduced // num_heads) ** -0.5
 
@@ -370,7 +385,7 @@ class DWSABlock(nn.Module):
 
         # B, C, H, W -> B, C', H, W
         x_red = self.in_proj(x)
-        B, C2, H, W = x_red.shape
+        B, C2, H, W = x_red.shape  # C2 = reduced
 
         # B, HW, C'
         x_flat = x_red.view(B, C2, -1).transpose(1, 2)
@@ -379,8 +394,8 @@ class DWSABlock(nn.Module):
         k = self.to_k(x_flat)
         v = self.to_v(x_flat)
 
-        # (B, heads, HW, C'/heads)
-        q = q.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
+        # reshape cho multi-head
+        q = q.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)  # B, heads, HW, C'/heads
         k = k.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
         v = v.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
 
@@ -391,11 +406,12 @@ class DWSABlock(nn.Module):
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(B, -1, C2)
         out = self.proj_o(out)
-        out = out.view(B, H, W, C2).permute(0, 3, 1, 2)
+        out = out.view(B, H, W, C2).permute(0, 3, 1, 2)  # B, C', H, W
 
-        out = self.out_proj(out)   # B, C, H, W
+        out = self.out_proj(out)  # B, C, H, W
 
         return out + x
+
 
 
 class MultiScaleContextModule(nn.Module):
