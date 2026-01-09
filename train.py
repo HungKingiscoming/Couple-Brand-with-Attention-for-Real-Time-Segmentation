@@ -31,7 +31,7 @@ warnings.filterwarnings('ignore')
 # IMPORTS
 # ============================================
 
-from model.model import (
+from model.backbone.model import (
     GCNetWithEnhance,
     GCNetCore,      # nếu cần
     GCBlock,
