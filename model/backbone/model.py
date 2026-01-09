@@ -729,48 +729,56 @@ class GCNetWithEnhance(BaseModule):
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         feats = self.backbone(x)
-        c4 = feats['c4']
+    
+        # lấy các feature cần cho head
+        c1 = feats['c1']      # H/2, 32 ch (ví dụ)
+        c2 = feats['c2']      # H/4, 64 ch
+        c4 = feats['c4']      # H/8, 64 ch
+        x_d6 = feats['x_d6']  # H/8, 128 ch (detail stage6)
         s4, s5, s6 = feats['s4'], feats['s5'], feats['s6']
-
-        # DWSA
+    
+        # ===== DWSA =====
         if self.dwsa4 is not None:
             s4 = self.dwsa4(s4)
         if self.dwsa5 is not None:
             s5 = self.dwsa5(s5)
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
-
-        # DCN trên s5, s6
+    
+        # ===== DCN trên s5, s6 =====
         if self.dcn5 is not None:
             offset5 = torch.zeros(
                 x.size(0), 2 * 3 * 3, s5.size(2), s5.size(3),
                 device=s5.device, dtype=s5.dtype)
             s5 = self.dcn5(s5, offset5)
+    
         if self.dcn6 is not None:
             offset6 = torch.zeros(
                 x.size(0), 2 * 3 * 3, s6.size(2), s6.size(3),
                 device=s6.device, dtype=s6.dtype)
             s6 = self.dcn6(s6, offset6)
-
-        # SPP + MultiScale
-        x_spp = self.backbone.spp(s6)
+    
+        # ===== SPP + MultiScale trên semantic deep (s6) =====
+        x_spp = self.backbone.spp(s6)  # (B, 128, H/8, W/8)
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         x_spp = resize(
             x_spp, size=out_size,
             mode='bilinear',
             align_corners=self.align_corners)
-
+    
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
-
-        x_spp = self.final_proj(x_spp)
-
-        c5 = feats['out']  # GCNet nguyên bản: x_d6 + spp(s6)
-        # nếu muốn dùng phiên bản enhanced:
-        c5_enh = c4 + x_spp
-
+    
+        x_spp = self.final_proj(x_spp)  # vẫn 128 ch
+    
+        # ===== C5: enhanced version của GCNet gốc =====
+        # GCNet gốc: out = x_d6 + spp(s6)
+        c5_gcnet = feats['out']       # nếu backbone đã trả out = x_d6 + spp
+        c5_enh = x_d6 + x_spp         # thay spp(s6) bằng phiên bản DWSA/DCN/MultiScale
+    
         return dict(
-            c4=c4,          # H/8 detail
-            c5_gcnet=c5,    # output GCNet gốc
-            c5_enh=c5_enh,  # output đã thêm DWSA/DCN/MultiScale
+            c1=c1,          # H/2, cho head
+            c2=c2,          # H/4, cho head
+            c4=c4,          # H/8, cho aux head
+            c5=c5_enh,      # H/8, 128 ch, cho main head
         )
