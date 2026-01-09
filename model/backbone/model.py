@@ -312,7 +312,8 @@ class GCNetWithDWSA_v2(BaseModule):
         # ======================================
         # STAGE 1-3: Stem (giống GCNet 100%)
         # ======================================
-        self.stage1_conv = ConvModule(
+        stem_dict = nn.ModuleDict()
+        stem_dict['stage1_conv'] = ConvModule(
             in_channels=in_channels,
             out_channels=channels,
             kernel_size=3,
@@ -346,7 +347,7 @@ class GCNetWithDWSA_v2(BaseModule):
                 )
             )
         
-        self.stage2 = nn.Sequential(*stage2_layers)
+        stem_dict['stage2'] = nn.Sequential(*stage2_layers)
         
         # Stage 3
         stage3_layers = [
@@ -372,7 +373,7 @@ class GCNetWithDWSA_v2(BaseModule):
                 )
             )
         
-        self.stage3 = nn.Sequential(*stage3_layers)
+        stem_dict['stage3'] = nn.Sequential(*stage3_layers)
         self.relu = build_activation_layer(act_cfg)
         
         # ======================================
@@ -634,13 +635,13 @@ class GCNetWithDWSA_v2(BaseModule):
         outputs = {}
         
         # Stage 1-3 (giống GCNet)
-        c1 = self.stage1_conv(x)
+        c1 = self.stem['stage1_conv'](x)
         outputs['c1'] = c1
         
-        c2 = self.stage2(c1)
+        c2 = self.stem['stage2'](c1)
         outputs['c2'] = c2
         
-        c3 = self.stage3(c2)
+        c3 = self.stem['stage3'](c2)
         outputs['c3'] = c3
         
         # ======================================
