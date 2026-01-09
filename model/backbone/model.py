@@ -312,8 +312,11 @@ class GCNetWithDWSA_v2(BaseModule):
         # ======================================
         # STAGE 1-3: Stem (giống GCNet 100%)
         # ======================================
-        stem_dict = nn.ModuleDict()
-        stem_dict['stage1_conv'] = ConvModule(
+        # Use Sequential with numeric indices to match checkpoint format
+        stem_layers = nn.ModuleList()
+        
+        # Stage 0 (was stage1_conv)
+        stem_layers.append(ConvModule(
             in_channels=in_channels,
             out_channels=channels,
             kernel_size=3,
@@ -321,8 +324,9 @@ class GCNetWithDWSA_v2(BaseModule):
             padding=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg
-        )
+        ))
         
+        # Stage 1 (was stage2)
         stage2_layers = [
             ConvModule(
                 in_channels=channels,
@@ -334,7 +338,6 @@ class GCNetWithDWSA_v2(BaseModule):
                 act_cfg=act_cfg
             )
         ]
-        
         for i in range(num_blocks_per_stage[0]):
             stage2_layers.append(
                 GCBlock(
@@ -346,10 +349,9 @@ class GCNetWithDWSA_v2(BaseModule):
                     deploy=deploy
                 )
             )
+        stem_layers.append(nn.Sequential(*stage2_layers))
         
-        stem_dict['stage2'] = nn.Sequential(*stage2_layers)
-        
-        # Stage 3
+        # Stage 2 (was stage3)
         stage3_layers = [
             GCBlock(
                 in_channels=channels,
@@ -360,7 +362,6 @@ class GCNetWithDWSA_v2(BaseModule):
                 deploy=deploy
             )
         ]
-        
         for i in range(num_blocks_per_stage[1] - 1):
             stage3_layers.append(
                 GCBlock(
@@ -372,9 +373,9 @@ class GCNetWithDWSA_v2(BaseModule):
                     deploy=deploy
                 )
             )
+        stem_layers.append(nn.Sequential(*stage3_layers))
         
-        stem_dict['stage3'] = nn.Sequential(*stage3_layers)
-        self.stem = stem_dict
+        self.stem = nn.ModuleList(stem_layers)
         self.relu = build_activation_layer(act_cfg)
         
         # ======================================
