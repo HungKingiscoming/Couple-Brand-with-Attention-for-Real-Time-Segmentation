@@ -23,7 +23,164 @@ from components.components import (
 )
 
 # Import GCBlock, DWSABlock, MultiScaleContextModule từ file cũ của bạn
+class GCBlock(nn.Module):
+    """Global Context Block"""
+    def __init__(self, in_channels, out_channels, stride=1, norm_cfg=None, 
+                 act_cfg=None, deploy=False, use_dwsa=False, dwsa_num_heads=8,
+                 use_dcn=False, act=True):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.deploy = deploy
+        
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
+                               stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        
+        if use_dcn:
+            from torchvision.ops import DeformConv2d
+            self.conv2 = DeformConv2d(out_channels, out_channels, 
+                                      kernel_size=3, padding=1, bias=False)
+        else:
+            self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
+                                   padding=1, bias=False)
+        
+        self.bn2 = nn.BatchNorm2d(out_channels)
+        
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, 
+                         stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+        else:
+            self.shortcut = nn.Identity()
+        
+        self.global_context = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(out_channels, out_channels // 16, kernel_size=1, bias=True),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels // 16, out_channels, kernel_size=1, bias=True),
+            nn.Sigmoid()
+        )
+        
+        if use_dwsa:
+            self.dwsa = DWSABlock(channels=out_channels, num_heads=dwsa_num_heads,
+                                 spatial_kernel=7, drop=0.0)
+        else:
+            self.dwsa = None
+        
+        self.relu = nn.ReLU(inplace=True) if act else nn.Identity()
+    
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.bn2(out)
+        gc = self.global_context(out)
+        out = out * gc
+        out = out + self.shortcut(x)
+        out = self.relu(out)
+        if self.dwsa is not None:
+            out = self.dwsa(out)
+        return out
+    
+    def switch_to_deploy(self):
+        self.deploy = True
 
+
+class DWSABlock(nn.Module):
+    """Deformable Window Self-Attention Block"""
+    def __init__(self, channels, num_heads=8, spatial_kernel=7, drop=0.0, 
+                 window_size=8):
+        super().__init__()
+        self.channels = channels
+        self.num_heads = num_heads
+        self.spatial_kernel = spatial_kernel
+        self.scale = (channels // num_heads) ** -0.5
+        
+        self.to_q = nn.Linear(channels, channels, bias=True)
+        self.to_k = nn.Linear(channels, channels, bias=True)
+        self.to_v = nn.Linear(channels, channels, bias=True)
+        
+        self.offset_proj = nn.Sequential(
+            nn.Conv2d(channels, channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels, 2 * spatial_kernel * spatial_kernel, kernel_size=1)
+        )
+        
+        self.out_proj = nn.Linear(channels, channels, bias=True)
+        self.drop = nn.Dropout(drop)
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x_flat = x.view(B, C, -1).transpose(1, 2)
+        
+        q = self.to_q(x_flat)
+        k = self.to_k(x_flat)
+        v = self.to_v(x_flat)
+        
+        q = q.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+        k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+        v = v.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+        
+        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        attn = self.drop(attn)
+        
+        out = torch.matmul(attn, v)
+        out = out.transpose(1, 2).contiguous()
+        out = out.view(B, -1, C)
+        out = self.out_proj(out)
+        out = out.view(B, H, W, C).permute(0, 3, 1, 2)
+        
+        return out + x
+
+
+class MultiScaleContextModule(nn.Module):
+    """Multi-scale context aggregation module"""
+    def __init__(self, in_channels, out_channels, scales=None):
+        super().__init__()
+        if scales is None:
+            scales = [1, 2, 4, 8]
+        
+        self.scales = scales
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        
+        self.scale_branches = nn.ModuleList()
+        for scale in scales:
+            if scale == 1:
+                branch = nn.Identity()
+            else:
+                branch = nn.Sequential(
+                    nn.AvgPool2d(kernel_size=scale, stride=scale),
+                    nn.Conv2d(in_channels, in_channels // len(scales), kernel_size=1),
+                    nn.ReLU(inplace=True)
+                )
+            self.scale_branches.append(branch)
+        
+        self.fusion = nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=1)
+        )
+    
+    def forward(self, x):
+        B, C, H, W = x.shape
+        scale_outputs = []
+        for scale, branch in zip(self.scales, self.scale_branches):
+            out = branch(x)
+            if scale > 1:
+                out = F.interpolate(out, size=(H, W), mode='bilinear', 
+                                   align_corners=False)
+            scale_outputs.append(out)
+        
+        fused = torch.cat(scale_outputs, dim=1)
+        out = self.fusion(fused)
+        return out + x
 
 class GCNetWithDWSA_v2(BaseModule):
     """
