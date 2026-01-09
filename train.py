@@ -17,10 +17,6 @@ import warnings
 
 warnings.filterwarnings('ignore')
 
-# ============================================
-# IMPORTS - ENHANCED BACKBONE + UPGRADED HEAD
-# ============================================
-
 from model.backbone.model import GCNetWithDWSA
 from model.head.segmentation_head import (
     GCNetHead,
@@ -32,6 +28,153 @@ from model.head.segmentation_head import (
 )
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
+
+
+# ============================================
+# FREEZE/UNFREEZE UTILITIES
+# ============================================
+
+def freeze_backbone(model):
+    """Freeze toÃ n bá»™ backbone"""
+    for param in model.backbone.parameters():
+        param.requires_grad = False
+    print("ðŸ”’ Backbone FROZEN - chá»‰ head Ä‘Æ°á»£c train")
+
+
+def unfreeze_backbone(model):
+    """Unfreeze toÃ n bá»™ backbone"""
+    for param in model.backbone.parameters():
+        param.requires_grad = True
+    print("ðŸ”“ Backbone UNFROZEN - táº¥t cáº£ layers trainable")
+
+
+def unfreeze_backbone_progressive(model, stage_name):
+    """
+    Unfreeze má»™t stage cá»¥ thá»ƒ cá»§a backbone
+    stage_name: 'stem', 'stage1', 'stage2', 'stage3', 'stage4', 'bottleneck', 'ppm'
+    """
+    unfrozen_count = 0
+    for name, module in model.backbone.named_modules():
+        if stage_name in name:
+            for param in module.parameters():
+                param.requires_grad = True
+                unfrozen_count += 1
+    
+    print(f"ðŸ”“ Unfrozen stage: {stage_name} ({unfrozen_count} parameters)")
+
+
+def get_backbone_stages(model):
+    """Láº¥y danh sÃ¡ch cÃ¡c stages trong backbone theo thá»© tá»± tá»« input Ä‘áº¿n output"""
+    stages = []
+    
+    # Thá»© tá»± tá»« tháº¥p Ä‘áº¿n cao (cÃ ng gáº§n input cÃ ng tá»•ng quÃ¡t)
+    if hasattr(model.backbone, 'stem'):
+        stages.append('stem')
+    
+    for i in range(1, 6):  # stage1 Ä‘áº¿n stage5
+        stage_name = f'stage{i}'
+        if hasattr(model.backbone, stage_name):
+            stages.append(stage_name)
+    
+    if hasattr(model.backbone, 'bottleneck'):
+        stages.append('bottleneck')
+    
+    if hasattr(model.backbone, 'ppm'):
+        stages.append('ppm')
+    
+    return stages
+
+
+def count_trainable_params(model):
+    """Äáº¿m vÃ  hiá»ƒn thá»‹ sá»‘ parameters trainable/frozen"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+    
+    backbone_total = sum(p.numel() for p in model.backbone.parameters())
+    backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    
+    head_total = sum(p.numel() for p in model.decode_head.parameters())
+    head_trainable = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
+    
+    if hasattr(model, 'aux_head') and model.aux_head is not None:
+        aux_total = sum(p.numel() for p in model.aux_head.parameters())
+        aux_trainable = sum(p.numel() for p in model.aux_head.parameters() if p.requires_grad)
+    else:
+        aux_total = aux_trainable = 0
+    
+    print(f"\n{'='*70}")
+    print("ðŸ“Š PARAMETER STATISTICS")
+    print(f"{'='*70}")
+    print(f"Total:        {total:>15,} | 100%")
+    print(f"Trainable:    {trainable:>15,} | {100*trainable/total:.1f}%")
+    print(f"Frozen:       {frozen:>15,} | {100*frozen/total:.1f}%")
+    print(f"{'-'*70}")
+    print(f"Backbone:     {backbone_trainable:>15,} / {backbone_total:,} | {100*backbone_trainable/backbone_total:.1f}%")
+    print(f"Head:         {head_trainable:>15,} / {head_total:,} | {100*head_trainable/head_total:.1f}%")
+    if aux_total > 0:
+        print(f"Aux Head:     {aux_trainable:>15,} / {aux_total:,} | {100*aux_trainable/aux_total:.1f}%")
+    print(f"{'='*70}\n")
+    
+    return trainable, frozen
+
+
+def print_freeze_status(model):
+    """Hiá»ƒn thá»‹ tráº¡ng thÃ¡i freeze chi tiáº¿t tá»«ng stage"""
+    print(f"\n{'='*70}")
+    print("ðŸ” FREEZE STATUS")
+    print(f"{'='*70}")
+    
+    stages = get_backbone_stages(model)
+    for stage in stages:
+        stage_params = [p for n, p in model.backbone.named_parameters() if stage in n]
+        if stage_params:
+            trainable = sum(1 for p in stage_params if p.requires_grad)
+            total = len(stage_params)
+            status = "ðŸŸ¢" if trainable == total else "ðŸ”´" if trainable == 0 else "ðŸŸ¡"
+            print(f"{status} {stage:12s}: {trainable:>3}/{total:>3} trainable")
+    
+    # Heads
+    head_trainable = sum(1 for p in model.decode_head.parameters() if p.requires_grad)
+    head_total = sum(1 for p in model.decode_head.parameters())
+    print(f"ðŸŸ¢ {'head':12s}: {head_trainable:>3}/{head_total:>3} trainable")
+    
+    if hasattr(model, 'aux_head') and model.aux_head is not None:
+        aux_trainable = sum(1 for p in model.aux_head.parameters() if p.requires_grad)
+        aux_total = sum(1 for p in model.aux_head.parameters())
+        print(f"ðŸŸ¢ {'aux_head':12s}: {aux_trainable:>3}/{aux_total:>3} trainable")
+    
+    print(f"{'='*70}\n")
+
+
+def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
+    """
+    Táº¡o optimizer vá»›i LR khÃ¡c nhau cho backbone vs head
+    backbone_lr = base_lr * backbone_lr_factor
+    head_lr = base_lr
+    """
+    backbone_params = [p for n, p in model.named_parameters() 
+                      if 'backbone' in n and p.requires_grad]
+    head_params = [p for n, p in model.named_parameters() 
+                  if 'backbone' not in n and p.requires_grad]
+    
+    if len(backbone_params) == 0:
+        # Backbone fully frozen
+        optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
+        print(f"âš™ï¸  Optimizer: AdamW (lr={base_lr}) - chá»‰ head")
+    else:
+        backbone_lr = base_lr * backbone_lr_factor
+        param_groups = [
+            {'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
+            {'params': head_params, 'lr': base_lr, 'name': 'head'}
+        ]
+        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        
+        print(f"âš™ï¸  Optimizer: AdamW")
+        print(f"   â”œâ”€ Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
+        print(f"   â””â”€ Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
+    
+    return optimizer
 
 
 # ============================================
@@ -174,6 +317,29 @@ def setup_memory_efficient_training():
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
+def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
+    """Automatically detect backbone output channels"""
+    backbone.eval()
+    with torch.no_grad():
+        sample = torch.randn(1, 3, *img_size).to(device)
+        feats = backbone(sample)
+        
+        channels = {}
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in feats:
+                channels[key] = feats[key].shape[1]
+        
+        print(f"\n{'='*70}")
+        print("ðŸ” BACKBONE CHANNEL DETECTION")
+        print(f"{'='*70}")
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in channels:
+                print(f"   {key}: {channels[key]} channels")
+        print(f"{'='*70}\n")
+        
+        return channels
+
+
 # ============================================
 # MODEL CONFIG - ENHANCED BACKBONE WITH UPGRADED HEAD
 # ============================================
@@ -187,7 +353,7 @@ class ModelConfig:
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 48,
+                "channels": 32,
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
                 "dwsa_stages": ['stage3', 'stage4', 'bottleneck'],
@@ -198,7 +364,7 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 96,  # c5 = channels * 2 = 48 * 2 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 128,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -207,7 +373,7 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 192,  # c4 = channels * 4 = 48 * 4 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 256,
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -257,7 +423,7 @@ class Segmentor(nn.Module):
 # ============================================
 
 class Trainer:
-    """Training class with logging and checkpointing"""
+    """Training class with progressive unfreezing, logging vÃ  checkpointing"""
     
     def __init__(self, model, optimizer, scheduler, device, args, class_weights=None):
         self.model = model.to(device)
@@ -291,32 +457,106 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         
+        # ====== PROGRESSIVE UNFREEZING SETUP ======
+        self.unfreeze_epochs = [int(x) for x in args.unfreeze_schedule.split(',')] if args.unfreeze_schedule else []
+        self.unfreeze_mode = args.unfreeze_mode
+        self.current_unfreeze_idx = 0
+        
+        # Get backbone stages
+        self.backbone_stages = get_backbone_stages(model)
+        print(f"\nðŸ“‹ Backbone stages: {self.backbone_stages}")
+        
+        # Setup discriminative LR tracking
+        self.base_lr = args.lr
+        self.backbone_lr_factor = args.backbone_lr_factor
+        
+        # Save config
         self.save_config()
         self._print_config(loss_cfg)
-
+    
     def _print_config(self, loss_cfg):
         """Print training configuration"""
         print(f"\n{'='*70}")
-        print("⚙️  TRAINER CONFIGURATION")
+        print("âš™ï¸  TRAINER CONFIGURATION")
         print(f"{'='*70}")
-        print(f"📦 Batch size: {self.args.batch_size}")
-        print(f"🔁 Gradient accumulation: {self.args.accumulation_steps}")
-        print(f"📊 Effective batch size: {self.args.batch_size * self.args.accumulation_steps}")
-        print(f"⚡ Mixed precision: {self.args.use_amp}")
-        print(f"✂️  Gradient clipping: {self.args.grad_clip}")
-        print(f"📉 Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Focal({loss_cfg['focal_weight']})")
-        print(f"🔀 Gated Fusion: ENABLED (upgraded head)")
-        print(f"💾 Save dir: {self.args.save_dir}")
+        print(f"ðŸ“¦ Batch size: {self.args.batch_size}")
+        print(f"ðŸ” Gradient accumulation: {self.args.accumulation_steps}")
+        print(f"ðŸ“Š Effective batch size: {self.args.batch_size * self.args.accumulation_steps}")
+        print(f"âš¡ Mixed precision: {self.args.use_amp}")
+        print(f"âœ‚ï¸  Gradient clipping: {self.args.grad_clip}")
+        print(f"ðŸ“‰ Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Focal({loss_cfg['focal_weight']})")
+        print(f"ðŸ”€ Gated Fusion: ENABLED (upgraded head)")
+        print(f"ðŸ’¾ Save dir: {self.args.save_dir}")
+        print(f"â„ï¸  Freeze backbone: {self.args.freeze_backbone}")
+        print(f"ðŸ“… Unfreeze schedule: {self.unfreeze_epochs}")
+        print(f"ðŸ”„ Unfreeze mode: {self.unfreeze_mode}")
         print(f"{'='*70}\n")
-
+    
     def save_config(self):
         """Save training config"""
         config = vars(self.args)
         with open(self.save_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2, default=str)
-
+    
+    def _handle_unfreezing(self, epoch):
+        """Xá»­ lÃ½ unfreezing táº¡i epoch"""
+        print(f"\n{'='*70}")
+        print(f"ðŸ”“ UNFREEZING AT EPOCH {epoch}")
+        print(f"{'='*70}\n")
+        
+        if self.unfreeze_mode == 'all_at_once':
+            # Unfreeze toÃ n bá»™ backbone ngay láº­p tá»©c
+            unfreeze_backbone(self.model)
+            self.current_unfreeze_idx = len(self.backbone_stages)
+            print("âœ… Unfrozen toÃ n bá»™ backbone!")
+            
+        else:  # progressive
+            # Unfreeze tá»«ng stage má»™t
+            if self.current_unfreeze_idx < len(self.backbone_stages):
+                stage_to_unfreeze = self.backbone_stages[self.current_unfreeze_idx]
+                unfreeze_backbone_progressive(self.model, stage_to_unfreeze)
+                self.current_unfreeze_idx += 1
+                print(f"âœ… Unfrozen stage: {stage_to_unfreeze}")
+            else:
+                print("âš ï¸  Táº¥t cáº£ stages Ä‘Ã£ Ä‘Æ°á»£c unfreeze!")
+        
+        # Update optimizer sau khi unfreeze
+        self._update_optimizer_after_unfreeze()
+        
+        # Print status
+        print_freeze_status(self.model)
+        count_trainable_params(self.model)
+        
+        print(f"{'='*70}\n")
+    
+    def _update_optimizer_after_unfreeze(self):
+        """Cáº­p nháº­t optimizer sau khi unfreeze layers má»›i"""
+        # Giáº£m LR cho backbone khi unfreeze thÃªm
+        new_backbone_lr = self.base_lr * self.backbone_lr_factor * (0.5 ** self.current_unfreeze_idx)
+        new_head_lr = self.base_lr * (0.5 ** self.current_unfreeze_idx)
+        
+        # Táº¡o optimizer má»›i vá»›i params má»›i
+        self.optimizer = setup_discriminative_lr(
+            self.model,
+            base_lr=new_head_lr,
+            backbone_lr_factor=self.backbone_lr_factor * (0.5 ** self.current_unfreeze_idx),
+            weight_decay=self.args.weight_decay
+        )
+        
+        # Reset scaler Ä‘á»ƒ trÃ¡nh numerical issues
+        self.scaler = GradScaler(enabled=self.args.use_amp)
+        
+        print(f"ðŸ“‰ LR updated: Backbone={new_backbone_lr:.2e}, Head={new_head_lr:.2e}")
+    
     def train_epoch(self, loader, epoch):
-        """Train one epoch"""
+        """Train one epoch vá»›i progressive unfreezing"""
+        
+        # ====== PROGRESSIVE UNFREEZING LOGIC ======
+        if epoch in self.unfreeze_epochs:
+            self._handle_unfreezing(epoch)
+        
+        # ====== TRAINING CODE ======
+        
         self.model.train()
         
         total_loss = 0.0
@@ -344,7 +584,6 @@ class Trainer:
                 
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = outputs["aux"]
-                    # Aux output is at lower resolution, resize to mask size
                     aux_logits = F.interpolate(aux_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
                     aux_loss_dict = self.criterion(aux_logits, masks)
                     # Decay aux weight as training progresses
@@ -406,7 +645,7 @@ class Trainer:
         avg_focal = total_focal / len(loader)
         
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': avg_focal}
-
+    
     @torch.no_grad()
     def validate(self, loader, epoch):
         """Validate one epoch"""
@@ -456,7 +695,7 @@ class Trainer:
         avg_loss = total_loss / len(loader)
         
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
-
+    
     def save_checkpoint(self, epoch, metrics, is_best=False):
         """Save checkpoint"""
         checkpoint = {
@@ -467,61 +706,49 @@ class Trainer:
             'scaler': self.scaler.state_dict(),
             'best_miou': self.best_miou,
             'metrics': metrics,
-            'global_step': self.global_step
+            'global_step': self.global_step,
+            'unfreeze_epochs': self.unfreeze_epochs,
+            'current_unfreeze_idx': self.current_unfreeze_idx,
+            'backbone_stages': self.backbone_stages
         }
         
         torch.save(checkpoint, self.save_dir / "last.pth")
         
         if is_best:
             torch.save(checkpoint, self.save_dir / "best.pth")
-            print(f"✅ Best model saved! mIoU: {metrics['miou']:.4f}")
+            print(f"âœ… Best model saved! mIoU: {metrics['miou']:.4f}")
         
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
-
+    
     def load_checkpoint(self, checkpoint_path, reset_epoch=True):
         """Load checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
         
         self.model.load_state_dict(checkpoint['model'])
         self.optimizer.load_state_dict(checkpoint['optimizer'])
+        
         if 'scaler' in checkpoint and checkpoint['scaler'] is not None:
             self.scaler.load_state_dict(checkpoint['scaler'])
+        
         if reset_epoch:
             self.start_epoch = 0
             self.best_miou = 0.0
             self.global_step = 0
-            print(f"✅ Weights loaded from epoch {checkpoint['epoch']}, starting new phase from epoch 0")
+            print(f"âœ… Weights loaded from epoch {checkpoint['epoch']}, starting new phase from epoch 0")
         else:
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_miou = checkpoint.get('best_miou', 0.0)
             self.global_step = checkpoint.get('global_step', 0)
+            
+            # Restore unfreezing state
+            self.unfreeze_epochs = checkpoint.get('unfreeze_epochs', [])
+            self.current_unfreeze_idx = checkpoint.get('current_unfreeze_idx', 0)
+            
             if self.scheduler and checkpoint.get('scheduler'):
                 self.scheduler.load_state_dict(checkpoint['scheduler'])
-            print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
-
-
-def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
-    """Automatically detect backbone output channels"""
-    backbone.eval()
-    with torch.no_grad():
-        sample = torch.randn(1, 3, *img_size).to(device)
-        feats = backbone(sample)
-        
-        channels = {}
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in feats:
-                channels[key] = feats[key].shape[1]
-        
-        print(f"\n{'='*70}")
-        print("🔍 BACKBONE CHANNEL DETECTION")
-        print(f"{'='*70}")
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in channels:
-                print(f"   {key}: {channels[key]} channels")
-        print(f"{'='*70}\n")
-        
-        return channels
+            
+            print(f"âœ… Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
 # ============================================
@@ -529,19 +756,34 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
+    parser = argparse.ArgumentParser(description="ðŸš€ GCNet Training - Progressive Unfreezing")
     
-    # Dataset
+    # ========== TRANSFER LEARNING ARGUMENTS ==========
+    parser.add_argument("--pretrained_weights", type=str, default=None,
+                       help="Path to pretrained GCNet weights")
+    parser.add_argument("--freeze_backbone", action="store_true", default=False,
+                       help="Freeze toÃ n bá»™ backbone tá»« epoch 0")
+    parser.add_argument("--unfreeze_schedule", type=str, default="10,20,30,40",
+                       help="CÃ¡c epoch sáº½ unfreeze (VD: '10,20,30,40')")
+    parser.add_argument("--unfreeze_mode", type=str, default="progressive",
+                       choices=["progressive", "all_at_once"],
+                       help="CÃ¡ch unfreeze: progressive (tá»«ng stage) hoáº·c all_at_once")
+    parser.add_argument("--use_discriminative_lr", action="store_true", default=True,
+                       help="DÃ¹ng LR khÃ¡c nhau cho backbone vs head")
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.1,
+                       help="Backbone LR = head_lr * factor")
+    
+    # ========== DATASET ARGUMENTS ==========
     parser.add_argument("--train_txt", required=True, help="Path to training list")
     parser.add_argument("--val_txt", required=True, help="Path to validation list")
     parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
     
-    # Training
+    # ========== TRAINING ARGUMENTS ==========
     parser.add_argument("--epochs", type=int, default=100, help="Total epochs")
     
-    # Optimization
+    # ========== OPTIMIZATION ARGUMENTS ==========
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4, help="Max LR")
@@ -550,11 +792,11 @@ def main():
     parser.add_argument("--aux_weight", type=float, default=1.0, help="Auxiliary head weight (decays over epochs)")
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
-    # Data
+    # ========== DATA ARGUMENTS ==========
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
     
-    # System
+    # ========== SYSTEM ARGUMENTS ==========
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", default="./checkpoints")
@@ -576,13 +818,14 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
+    print(f"ðŸš€ GCNet Training - Progressive Unfreezing & Transfer Learning")
     print(f"{'='*70}")
-    print(f"📱 Device: {device}")
-    print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
-    print(f"📊 Epochs: {args.epochs}")
-    print(f"⚡ Scheduler: {args.scheduler}")
-    print(f"🔀 Gated Fusion: ENABLED")
+    print(f"ðŸ“± Device: {device}")
+    print(f"ðŸ–¼ï¸  Image size: {args.img_h}x{args.img_w}")
+    print(f"ðŸ“Š Epochs: {args.epochs}")
+    print(f"âš¡ Scheduler: {args.scheduler}")
+    print(f"â„ï¸  Freeze backbone: {args.freeze_backbone}")
+    print(f"ðŸ“… Unfreeze schedule: {args.unfreeze_schedule}")
     print(f"{'='*70}\n")
     
     # Config
@@ -590,7 +833,7 @@ def main():
     args.loss_config = cfg["loss"]
     
     # Dataloaders
-    print(f"📂 Creating dataloaders...")
+    print(f"ðŸ“‚ Creating dataloaders...")
     train_loader, val_loader, class_weights = create_dataloaders(
         train_txt=args.train_txt,
         val_txt=args.val_txt,
@@ -601,11 +844,11 @@ def main():
         compute_class_weights=True,
         dataset_type=args.dataset_type
     )
-    print(f"✅ Dataloaders created\n")
+    print(f"âœ… Dataloaders created\n")
     
     # Model
     print(f"{'='*70}")
-    print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
+    print("ðŸ—ï¸  BUILDING MODEL WITH PROGRESSIVE UNFREEZING")
     print(f"{'='*70}\n")
     
     # Build backbone
@@ -636,19 +879,73 @@ def main():
         aux_head=GCNetAuxHead(**aux_head_cfg),
     )
     
-    print("\n🔧 Applying Model Optimizations...")
-    print("   ├─ Converting BatchNorm → GroupNorm")
+    print("\nðŸ”§ Applying Model Optimizations...")
+    print("   â”œâ”€ Converting BatchNorm â†’ GroupNorm")
     model = replace_bn_with_gn(model)
     
-    print("   ├─ Applying Kaiming Initialization")
+    print("   â”œâ”€ Applying Kaiming Initialization")
     model.apply(init_weights)
     
-    print("   └─ Checking Model Health")
+    print("   â””â”€ Checking Model Health")
     check_model_health(model)
     print()
     
+    # ===================== TRANSFER LEARNING SETUP =====================
+    print(f"{'='*70}")
+    print("ðŸ”„ TRANSFER LEARNING SETUP")
+    print(f"{'='*70}\n")
+    
+    # Load pre-trained weights
+    if args.pretrained_weights:
+        print(f"ðŸ“¥ Loading pretrained weights from: {args.pretrained_weights}")
+        
+        try:
+            checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
+            
+            # Handle different checkpoint formats
+            if isinstance(checkpoint, dict):
+                if 'state_dict' in checkpoint:
+                    state_dict = checkpoint['state_dict']
+                    # Remove 'backbone.' prefix if loading from MMSegmentation
+                    state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items() if k.startswith('backbone.')}
+                elif 'model' in checkpoint:
+                    state_dict = checkpoint['model']
+                else:
+                    state_dict = checkpoint
+            else:
+                state_dict = checkpoint
+            
+            # Load backbone
+            backbone_state = {k: v for k, v in state_dict.items() if not k.startswith('decode_head') and not k.startswith('aux_head')}
+            
+            missing, unexpected = model.backbone.load_state_dict(backbone_state, strict=False)
+            if missing:
+                print(f"   âš ï¸  Missing keys in backbone: {len(missing)} keys")
+                if len(missing) <= 5:
+                    print(f"      Keys: {missing}")
+            if unexpected:
+                print(f"   âš ï¸  Unexpected keys: {len(unexpected)} keys")
+            
+            print(f"âœ… Weights loaded successfully!\n")
+            
+        except Exception as e:
+            print(f"âŒ Failed to load weights: {e}\n")
+            return
+    
+    # Freeze backbone if requested
+    if args.freeze_backbone:
+        print(f"â„ï¸  Freezing backbone...")
+        freeze_backbone(model)
+        print()
+    
+    # Print status
+    count_trainable_params(model)
+    print_freeze_status(model)
+    
+    # ===================== END TRANSFER LEARNING SETUP =====================
+    
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
+    print(f"ðŸ“Š Total parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
 
     # Test forward pass
     model = model.to(device)
@@ -656,23 +953,31 @@ def main():
         sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         try:
             outputs = model.forward_train(sample)
-            print(f"✅ Forward pass successful!")
+            print(f"âœ… Forward pass successful!")
             print(f"   Main head output:  {outputs['main'].shape}")
             if 'aux' in outputs:
                 print(f"   Aux head output:   {outputs['aux'].shape}")
         except Exception as e:
-            print(f"❌ Forward pass FAILED: {e}")
+            print(f"âŒ Forward pass FAILED: {e}")
             return
     
     print(f"{'='*70}\n")
-    
-    # Optimizer
-    optimizer = optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        betas=(0.9, 0.999)
-    )
+
+    # ===================== OPTIMIZER SETUP =====================
+    if args.use_discriminative_lr:
+        optimizer = setup_discriminative_lr(
+            model,
+            base_lr=args.lr,
+            backbone_lr_factor=args.backbone_lr_factor,
+            weight_decay=args.weight_decay
+        )
+    else:
+        optimizer = optim.AdamW(
+            filter(lambda p: p.requires_grad, model.parameters()),
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.999)
+        )
     
     # Scheduler
     if args.scheduler == 'onecycle':
@@ -689,14 +994,14 @@ def main():
             div_factor=25,
             final_div_factor=100000,
         )
-        print(f"✅ Using OneCycleLR scheduler (total_steps={total_steps})")
+        print(f"âœ… Using OneCycleLR scheduler (total_steps={total_steps})")
     elif args.scheduler == 'poly':
-        print(f"✅ Using Polynomial LR decay")
+        print(f"âœ… Using Polynomial LR decay")
         def poly_lr_lambda(epoch):
             return (1 - epoch / args.epochs) ** 0.9
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
     else:
-        print(f"✅ Using Cosine Annealing LR")
+        print(f"âœ… Using Cosine Annealing LR")
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6
         )
@@ -717,7 +1022,7 @@ def main():
     
     # Training loop
     print(f"\n{'='*70}")
-    print("🚀 STARTING TRAINING WITH UPGRADED HEAD")
+    print("ðŸš€ STARTING TRAINING")
     print(f"{'='*70}\n")
     
     for epoch in range(trainer.start_epoch, args.epochs):
@@ -725,7 +1030,7 @@ def main():
         val_metrics = trainer.validate(val_loader, epoch)
         
         print(f"\n{'='*70}")
-        print(f"📊 Epoch {epoch+1}/{args.epochs}")
+        print(f"ðŸ“Š Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
         print(f"Train - Loss: {train_metrics['loss']:.4f} | "
               f"CE: {train_metrics['ce']:.4f} | "
@@ -748,10 +1053,10 @@ def main():
     trainer.writer.close()
     
     print(f"\n{'='*70}")
-    print("✅ TRAINING COMPLETED!")
-    print(f"🏆 Best mIoU: {trainer.best_miou:.4f}")
-    print(f"💾 Checkpoints saved to: {args.save_dir}")
-    print(f"📊 Tensorboard logs at: {args.save_dir}/tensorboard")
+    print("âœ… TRAINING COMPLETED!")
+    print(f"ðŸ† Best mIoU: {trainer.best_miou:.4f}")
+    print(f"ðŸ’¾ Checkpoints saved to: {args.save_dir}")
+    print(f"ðŸ“Š Tensorboard logs at: {args.save_dir}/tensorboard")
     print(f"{'='*70}\n")
 
 
