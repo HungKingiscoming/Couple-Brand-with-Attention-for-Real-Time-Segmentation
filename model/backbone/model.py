@@ -621,7 +621,7 @@ class GCNetWithDWSA_v2(BaseModule):
         # FINAL PROJECTION (giống GCNet)
         # ======================================
         self.final_proj = ConvModule(
-            in_channels=channels * 2,
+            in_channels=channels * 4,
             out_channels=channels * 2,
             kernel_size=1,
             norm_cfg=norm_cfg,
