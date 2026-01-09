@@ -522,8 +522,8 @@ class GCNetWithDWSA_v2(BaseModule):
         for i in range(num_blocks_per_stage[4][1]):
             detail_stage6.append(
                 GCBlock(
-                    in_channels=channels * 2,
-                    out_channels=channels * 2,
+                    in_channels=channels * 4,
+                    out_channels=channels * 4,
                     stride=1,
                     norm_cfg=norm_cfg,
                     act_cfg=act_cfg,
