@@ -346,69 +346,87 @@ class GCBlock(nn.Module):
 # ===========================
 
 class DWSABlock(nn.Module):
-    def __init__(
-        self,
-        channels: int,
-        num_heads: int = 4,
-        drop: float = 0.0,
-        reduction: int = 4,
-    ):
-        """
-        Lightweight DWSA:
-        - Giảm kênh: C -> C' = C//reduction (ví dụ 512 -> 128).
-        - Attention chạy trên C', rồi project ngược lại C.
-        """
+    def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, qk_sharing=True, groups=4):
         super().__init__()
+        assert channels % reduction == 0
         self.channels = channels
         self.num_heads = num_heads
 
-        assert channels % reduction == 0, "channels phải chia hết reduction"
-        reduced = channels // reduction      # C' (vd: 512//4 = 128)
-        self.reduced_dim = reduced
+        reduced = channels // reduction      # C'
+        mid = max(reduced // 2, num_heads)   # bottleneck trong attention
+        self.reduced = reduced
+        self.mid = mid
 
         # C -> C'
-        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1)
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
         # C' -> C
-        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1)
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
 
-        # Linear Q,K,V,O trên C'
-        self.to_q = nn.Linear(reduced, reduced, bias=True)
-        self.to_k = nn.Linear(reduced, reduced, bias=True)
-        self.to_v = nn.Linear(reduced, reduced, bias=True)
-        self.proj_o = nn.Linear(reduced, reduced, bias=True)
+        # Thay Linear bằng 1x1 conv trên C' với group
+        g = min(groups, reduced) if groups > 1 else 1
+        if reduced % g != 0:  # đảm bảo chia hết
+            g = 1
+
+        # base proj cho QK sharing
+        self.qk_sharing = qk_sharing
+        if qk_sharing:
+            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
+            self.q_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+            self.k_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+        else:
+            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+
+        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
 
         self.drop = nn.Dropout(drop)
-        self.scale = (reduced // num_heads) ** -0.5
+        self.scale = (mid // num_heads) ** -0.5
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x):
         B, C, H, W = x.shape
 
-        # B, C, H, W -> B, C', H, W
-        x_red = self.in_proj(x)
-        B, C2, H, W = x_red.shape  # C2 = reduced
+        # Giảm chiều C -> C'
+        x_red = self.in_proj(x)              # B, C', H, W
+        B, C2, H, W = x_red.shape
+        N = H * W
 
-        # B, HW, C'
-        x_flat = x_red.view(B, C2, -1).transpose(1, 2)
+        # B, C', HW
+        x_flat = x_red.view(B, C2, N)
 
-        q = self.to_q(x_flat)
-        k = self.to_k(x_flat)
-        v = self.to_v(x_flat)
+        # Q, K, V (Conv1d + group, có thể chia sẻ)
+        if self.qk_sharing:
+            base = self.qk_base(x_flat)          # B, mid, N
+            q = self.q_head(base)
+            k = self.k_head(base)
+        else:
+            q = self.q_proj(x_flat)
+            k = self.k_proj(x_flat)
+        v = self.v_proj(x_flat)                  # B, mid, N
 
-        # reshape cho multi-head
-        q = q.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)  # B, heads, HW, C'/heads
-        k = k.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
+        # B, heads, N, dim
+        def reshape_heads(t):
+            B, Cmid, N = t.shape
+            head_dim = Cmid // self.num_heads
+            t = t.view(B, self.num_heads, head_dim, N)
+            return t.permute(0, 1, 3, 2)        # B, heads, N, head_dim
 
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(scores, dim=-1)
+        q = reshape_heads(q)
+        k = reshape_heads(k)
+        v = reshape_heads(v)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale   # B, heads, N, N
+        attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
-        out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, -1, C2)
-        out = self.proj_o(out)
-        out = out.view(B, H, W, C2).permute(0, 3, 1, 2)  # B, C', H, W
+        out = torch.matmul(attn, v)             # B, heads, N, head_dim
+        B_, Hn, N_, Hd = out.shape
+        out = out.permute(0, 1, 3, 2).contiguous().view(B, self.mid, N)  # B, mid, N
 
-        out = self.out_proj(out)  # B, C, H, W
+        # O proj
+        out = self.o_proj(out)                 # B, C', N
+        out = out.view(B, C2, H, W)
+        out = self.out_proj(out)               # B, C, H, W
 
         return out + x
 
