@@ -611,48 +611,62 @@ class GCNetCore(BaseModule):
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
-
-        # stage1-3
-        x = self.stem(x)
-
-        # stage4
+    
+        # ===== STEM (stage1-3) =====
+        c1 = None
+        c2 = None
+        feat = x
+        for i, layer in enumerate(self.stem):
+            feat = layer(feat)
+            # stem = [conv(stride2), conv(stride2), GCBlockx4, GCBlock(stride2), GCBlockx3]
+            if i == 0:
+                # sau conv1, H/2
+                c1 = feat
+            if i == 1:
+                # sau conv2, H/4
+                c2 = feat
+        x = feat  # output stem, H/8, channels*2
+    
+        # ===== stage4 =====
         x_s4 = self.semantic_branch_layers[0](x)
         x_d4 = self.detail_branch_layers[0](x)
         comp_c4 = self.compression_1(self.relu(x_s4))
         x_s4 = x_s4 + self.down_1(self.relu(x_d4))
-        x_d4 = x_d4 + resize(comp_c4, size=out_size,
-                             mode='bilinear',
-                             align_corners=self.align_corners)
-
-        # stage5
+        x_d4 = x_d4 + resize(
+            comp_c4, size=out_size,
+            mode='bilinear', align_corners=self.align_corners)
+    
+        # ===== stage5 =====
         x_s5 = self.semantic_branch_layers[1](self.relu(x_s4))
         x_d5 = self.detail_branch_layers[1](self.relu(x_d4))
         comp_c5 = self.compression_2(self.relu(x_s5))
         x_s5 = x_s5 + self.down_2(self.relu(x_d5))
-        x_d5 = x_d5 + resize(comp_c5, size=out_size,
-                             mode='bilinear',
-                             align_corners=self.align_corners)
-
-        # stage6
+        x_d5 = x_d5 + resize(
+            comp_c5, size=out_size,
+            mode='bilinear', align_corners=self.align_corners)
+    
+        # ===== stage6 =====
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
-
-        # SPP
+    
+        # ===== SPP =====
         x_spp = self.spp(x_s6)
         x_spp = resize(
             x_spp, size=out_size,
-            mode='bilinear',
-            align_corners=self.align_corners)
-
+            mode='bilinear', align_corners=self.align_corners)
+    
         out = x_d6 + x_spp
-
+    
         return dict(
-            c4=x_d4,   # H/8, detail
-            s4=x_s4,   # H/16, semantic
-            s5=x_s5,   # H/16
-            s6=x_s6,   # H/32
-            spp=x_spp, # H/8
-            out=out,   # H/8
+            c1=c1,        # H/2, 32 ch
+            c2=c2,        # H/4, 64 ch
+            c4=x_d4,      # H/8, 64 ch (detail)
+            s4=x_s4,
+            s5=x_s5,
+            s6=x_s6,
+            x_d6=x_d6,    # H/8, 128 ch
+            spp=x_spp,    # H/8, 128 ch
+            out=out,      # H/8, 128 ch (GCNet gốc)
         )
 
 
@@ -730,11 +744,10 @@ class GCNetWithEnhance(BaseModule):
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         feats = self.backbone(x)
     
-        # lấy các feature cần cho head
-        c1 = feats['c1']      # H/2, 32 ch (ví dụ)
-        c2 = feats['c2']      # H/4, 64 ch
-        c4 = feats['c4']      # H/8, 64 ch
-        x_d6 = feats['x_d6']  # H/8, 128 ch (detail stage6)
+        c1 = feats['c1']
+        c2 = feats['c2']
+        c4 = feats['c4']
+        x_d6 = feats['x_d6']
         s4, s5, s6 = feats['s4'], feats['s5'], feats['s6']
     
         # ===== DWSA =====
@@ -745,21 +758,20 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
     
-        # ===== DCN trên s5, s6 =====
+        # ===== DCN =====
         if self.dcn5 is not None:
             offset5 = torch.zeros(
                 x.size(0), 2 * 3 * 3, s5.size(2), s5.size(3),
                 device=s5.device, dtype=s5.dtype)
             s5 = self.dcn5(s5, offset5)
-    
         if self.dcn6 is not None:
             offset6 = torch.zeros(
                 x.size(0), 2 * 3 * 3, s6.size(2), s6.size(3),
                 device=s6.device, dtype=s6.dtype)
             s6 = self.dcn6(s6, offset6)
     
-        # ===== SPP + MultiScale trên semantic deep (s6) =====
-        x_spp = self.backbone.spp(s6)  # (B, 128, H/8, W/8)
+        # ===== SPP + MultiScale trên semantic deep =====
+        x_spp = self.backbone.spp(s6)
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         x_spp = resize(
             x_spp, size=out_size,
@@ -769,16 +781,17 @@ class GCNetWithEnhance(BaseModule):
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
     
-        x_spp = self.final_proj(x_spp)  # vẫn 128 ch
+        x_spp = self.final_proj(x_spp)   # 128 ch
     
-        # ===== C5: enhanced version của GCNet gốc =====
-        # GCNet gốc: out = x_d6 + spp(s6)
-        c5_gcnet = feats['out']       # nếu backbone đã trả out = x_d6 + spp
-        c5_enh = x_d6 + x_spp         # thay spp(s6) bằng phiên bản DWSA/DCN/MultiScale
+        # ===== C5 enhanced (H/8, 128ch) =====
+        c5_gcnet = feats['out']         # x_d6 + (SPP(s6) gốc)
+        c5_enh = x_d6 + x_spp           # detail + semantic enhanced
     
+        # Cho head dùng c5_enh
         return dict(
-            c1=c1,          # H/2, cho head
-            c2=c2,          # H/4, cho head
-            c4=c4,          # H/8, cho aux head
-            c5=c5_enh,      # H/8, 128 ch, cho main head
+            c1=c1,
+            c2=c2,
+            c4=c4,
+            c5=c5_enh,
+            c5_gcnet=c5_gcnet,
         )
