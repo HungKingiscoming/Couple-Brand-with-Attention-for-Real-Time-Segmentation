@@ -786,7 +786,7 @@ class GCNetWithEnhance(BaseModule):
         # ===== DWSA: chỉ stage5, stage6 =====
         self.dwsa4 = None  # không dùng DWSA ở stage4
         self.dwsa5 = None
-        self.dwsa6 = DWSABlock(C * 16, num_heads=4, reduction=4) if 'stage6' in dwsa_stages else None  # s6: 16C
+        self.dwsa6 = DWSABlock(C * 16, num_heads=2, reduction=4, qk_sharing=True, groups=4) 
 
         # ===== KHÔNG CÓ DCN =====
         # self.dcn5 = None
@@ -794,7 +794,8 @@ class GCNetWithEnhance(BaseModule):
 
         # ===== MultiScaleContext: sau SPP(s6) =====
         # SPP output: 4C (128 kênh nếu C=32)
-        self.ms_context = MultiScaleContextModule(C * 4, C * 4, scales=[1,2,4], branch_ratio=4)
+        self.ms_context = MultiScaleContextLite(C * 4, C * 4, scales=(1, 2), branch_ratio=8)
+
 
         # Projection cuối cho feature deep
         self.final_proj = ConvModule(
