@@ -916,9 +916,21 @@ def main():
                 state_dict = checkpoint
             
             # Load backbone
-            backbone_state = {k: v for k, v in state_dict.items() if not k.startswith('decode_head') and not k.startswith('aux_head')}
+            # Lọc backbone_state theo shape khớp
+            backbone_state = {k: v for k, v in state_dict.items()
+                              if not k.startswith('decode_head') and not k.startswith('aux_head')}
             
-            missing, unexpected = model.backbone.load_state_dict(backbone_state, strict=False)
+            model_state = model.backbone.state_dict()
+            compatible_state = {}
+            
+            for k, v in backbone_state.items():
+                if k in model_state and model_state[k].shape == v.shape:
+                    compatible_state[k] = v
+                # else: bỏ qua các layer bị lệch kênh như semantic_branch_layers.1.0...
+            
+            print(f"   ✅ Load được {len(compatible_state)}/{len(backbone_state)} tham số backbone (khớp shape)")
+            missing, unexpected = model.backbone.load_state_dict(compatible_state, strict=False)
+
             if missing:
                 print(f"   ⚠️  Missing keys in backbone: {len(missing)} keys")
                 if len(missing) <= 5:
