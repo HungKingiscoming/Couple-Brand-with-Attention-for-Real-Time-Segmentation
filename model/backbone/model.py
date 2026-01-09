@@ -794,7 +794,7 @@ class GCNetWithEnhance(BaseModule):
 
         # ===== MultiScaleContext: sau SPP(s6) =====
         # SPP output: 4C (128 kênh nếu C=32)
-        self.ms_context = MultiScaleContextLite(C * 4, C * 4, scales=(1, 2), branch_ratio=8)
+        self.ms_context = MultiScaleContextModule(C * 4, C * 4, scales=(1, 2), branch_ratio=8)
 
 
         # Projection cuối cho feature deep
