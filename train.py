@@ -776,65 +776,65 @@ def main():
     # Load pretrained weights
     # Load pretrained weights with EXACT KEY MAPPING (stem.stageX → stageX)
     if args.pretrained_weights:
-    print(f"📥 Loading pretrained weights from: {args.pretrained_weights}")
-    print(f"   Mapping MMSeg format → Your model...\n")
-    
-    try:
-        checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
-        state_dict = checkpoint['state_dict']
-        state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items()}
+        print(f"📥 Loading pretrained weights from: {args.pretrained_weights}")
+        print(f"   Mapping MMSeg format → Your model...\n")
         
-        model_state = model.backbone.state_dict()
-        compatible_state = {}
-        
-        for ckpt_key, ckpt_val in state_dict.items():
-            # Direct match first
-            if ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
-                compatible_state[ckpt_key] = ckpt_val
-                continue
+        try:
+            checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
+            state_dict = checkpoint['state_dict']
+            state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items()}
             
-            # stem.0 → stem.stage1_conv
-            if 'stem.0.' in ckpt_key:
-                new_key = ckpt_key.replace('stem.0.', 'stem.stage1_conv.')
-                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                    compatible_state[new_key] = ckpt_val
-                    continue
+            model_state = model.backbone.state_dict()
+            compatible_state = {}
             
-            # stem.1 → stem.stage2
-            if 'stem.1.' in ckpt_key:
-                new_key = ckpt_key.replace('stem.1.', 'stem.stage2.')
-                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                    compatible_state[new_key] = ckpt_val
+            for ckpt_key, ckpt_val in state_dict.items():
+                # Direct match first
+                if ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
+                    compatible_state[ckpt_key] = ckpt_val
                     continue
+                
+                # stem.0 → stem.stage1_conv
+                if 'stem.0.' in ckpt_key:
+                    new_key = ckpt_key.replace('stem.0.', 'stem.stage1_conv.')
+                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                        compatible_state[new_key] = ckpt_val
+                        continue
+                
+                # stem.1 → stem.stage2
+                if 'stem.1.' in ckpt_key:
+                    new_key = ckpt_key.replace('stem.1.', 'stem.stage2.')
+                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                        compatible_state[new_key] = ckpt_val
+                        continue
+                
+                # stem.2 → stem.stage3
+                if 'stem.2.' in ckpt_key:
+                    new_key = ckpt_key.replace('stem.2.', 'stem.stage3.')
+                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                        compatible_state[new_key] = ckpt_val
+                        continue
+                
+                # detail_branch_layers → detail_branch
+                if 'detail_branch_layers' in ckpt_key:
+                    new_key = ckpt_key.replace('detail_branch_layers', 'detail_branch')
+                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                        compatible_state[new_key] = ckpt_val
+                        continue
             
-            # stem.2 → stem.stage3
-            if 'stem.2.' in ckpt_key:
-                new_key = ckpt_key.replace('stem.2.', 'stem.stage3.')
-                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                    compatible_state[new_key] = ckpt_val
-                    continue
+            loaded = len(compatible_state)
+            total = len(model_state)
+            rate = 100 * loaded / total if total > 0 else 0
             
-            # detail_branch_layers → detail_branch
-            if 'detail_branch_layers' in ckpt_key:
-                new_key = ckpt_key.replace('detail_branch_layers', 'detail_branch')
-                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                    compatible_state[new_key] = ckpt_val
-                    continue
-        
-        loaded = len(compatible_state)
-        total = len(model_state)
-        rate = 100 * loaded / total if total > 0 else 0
-        
-        print(f"   📊 Loaded: {loaded}/{total} parameters ({rate:.1f}%)")
-        print(f"   🎉 Transfer rate: {rate:.1f}%\n")
-        
-        model.backbone.load_state_dict(compatible_state, strict=False)
-        
-    except Exception as e:
-        print(f"❌ Failed to load: {e}\n")
-        import traceback
-        traceback.print_exc()
-        return
+            print(f"   📊 Loaded: {loaded}/{total} parameters ({rate:.1f}%)")
+            print(f"   🎉 Transfer rate: {rate:.1f}%\n")
+            
+            model.backbone.load_state_dict(compatible_state, strict=False)
+            
+        except Exception as e:
+            print(f"❌ Failed to load: {e}\n")
+            import traceback
+            traceback.print_exc()
+            return
 
     
     # Freeze backbone if requested
