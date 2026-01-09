@@ -55,7 +55,7 @@ def load_pretrained_gcnet_core(model, ckpt_path):
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    model_state = model..state_dict()
+    model_state = model.state_dict()
     compatible = {}
     skipped = []
 
@@ -90,7 +90,7 @@ def load_pretrained_gcnet_core(model, ckpt_path):
     if loaded == 0:
         print("⚠️  WARNING: 0 params loaded. Check checkpoint format and key names.")
 
-    missing, unexpected = model..load_state_dict(compatible, strict=False)
+    missing, unexpected = model.load_state_dict(compatible, strict=False)
     print(f"Missing keys in loaded dict: {len(missing)}")
     print(f"Unexpected keys in loaded dict: {len(unexpected)}\n")
 
@@ -243,7 +243,7 @@ def setup_memory_efficient_training():
 
 def freeze_(model):
     """Freeze toàn bộ """
-    for param in model..parameters():
+    for param in model.parameters():
         param.requires_grad = False
     print("🔒  FROZEN - chỉ head được train")
 
@@ -258,7 +258,7 @@ def unfreeze__progressive(model, stage_names):
     
     unfrozen_count = 0
     for stage_name in stage_names:
-        for name, module in model..named_modules():
+        for name, module in model.named_modules():
             if stage_name in name:
                 for param in module.parameters():
                     param.requires_grad = True
@@ -273,8 +273,8 @@ def count_trainable_params(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = total - trainable
     
-    _total = sum(p.numel() for p in model..parameters())
-    _trainable = sum(p.numel() for p in model..parameters() if p.requires_grad)
+    _total = sum(p.numel() for p in model.parameters())
+    _trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     
     head_total = sum(p.numel() for p in model.decode_head.parameters())
     head_trainable = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
@@ -762,7 +762,7 @@ def main():
     args.loss_config = cfg["loss"]
     
     # Dataloaders
-    print(f"📂 Creating dataloaders...")
+    print(f"📂 Creating dataloaders..")
     train_loader, val_loader, class_weights = create_dataloaders(
         train_txt=args.train_txt,
         val_txt=args.val_txt,
@@ -808,7 +808,7 @@ def main():
         aux_head=GCNetAuxHead(**aux_head_cfg),
     )
     
-    print("\n🔧 Applying Model Optimizations...")
+    print("\n🔧 Applying Model Optimizations..")
     print("   ├─ Converting BatchNorm → GroupNorm")
     model = replace_bn_with_gn(model)
     
