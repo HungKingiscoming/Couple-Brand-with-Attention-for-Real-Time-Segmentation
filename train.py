@@ -1,538 +1,759 @@
-# ============================================
-# OPTIMIZED GCNetWithDWSA - MAXIMUM TRANSFER LEARNING COMPATIBILITY
-# ============================================
-# Strategy: Giữ nguyên DWSA/DCN/MultiScale ở các stage cuối,
-# nhưng khớp kênh với GCNet gốc ở stage 4-6 để tối đa reuse weight
-
+import os
 import torch
 import torch.nn as nn
+import torch.optim as optim
+from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
-from torch import Tensor
-import math
-from typing import List, Tuple, Union, Dict
-from torchvision.ops import DeformConv2d
+from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter
+import numpy as np
+from tqdm import tqdm
+import argparse
+from pathlib import Path
+import json
+import time
+import gc
+import warnings
 
-from components.components import (
-    ConvModule,
-    BaseModule,
-    build_norm_layer,
-    build_activation_layer,
-    resize,
-    DAPPM,
-    OptConfigType
+warnings.filterwarnings('ignore')
+
+# ============================================
+# IMPORTS - ENHANCED BACKBONE + UPGRADED HEAD
+# ============================================
+
+from model.backbone.model import GCNetWithDWSA
+from model.head.segmentation_head import (
+    GCNetHead,
+    GCNetAuxHead,
+    EnhancedDecoder,
+    GatedFusion,
+    DWConvModule,
+    ResidualBlock,
 )
+from data.custom import create_dataloaders
+from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
-# Import GCBlock, DWSABlock, MultiScaleContextModule từ file cũ của bạn
+
+# ============================================
+# LOSS FUNCTIONS
+# ============================================
+
+class DiceLoss(nn.Module):
+    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.reduction = reduction
+    
+    def forward(self, logits, targets):
+        B, C, H, W = logits.shape
+        
+        valid_mask = (targets != self.ignore_index).float()
+        targets_one_hot = F.one_hot(
+            targets.clamp(0, C - 1), num_classes=C
+        ).permute(0, 3, 1, 2).float()
+        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1)
+        
+        probs = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1)
+        
+        probs_flat = probs.reshape(B, C, -1)
+        targets_flat = targets_one_hot.reshape(B, C, -1)
+        
+        intersection = (probs_flat * targets_flat).sum(dim=2)
+        union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
+        
+        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
+        dice_loss = 1.0 - dice.mean(dim=1)
+        
+        return dice_loss.mean()
 
 
-class GCNetWithDWSA_v2(BaseModule):
-    """
-    ✅ OPTIMIZED FOR TRANSFER LEARNING
+class FocalLoss(nn.Module):
+    """Focal Loss for hard example mining"""
+    def __init__(self, alpha=0.25, gamma=2.0, ignore_index=255, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.ignore_index = ignore_index
+        self.reduction = reduction
     
-    Khác biệt chính so với v1:
-    1. Giữ nguyên kênh semantic branch ở stage 4-6 (×4, ×8, ×16 đúng như GCNet gốc)
-    2. Chỉ thêm DWSA/DCN ở các stage cuối (không thay đổi số kênh)
-    3. Detail branch vẫn ×2 kênh nhưng khớp lại với semantic ở fusion
-    4. Final_proj giữ nguyên cấu trúc fusion của GCNet, chỉ thêm multi-scale context
-    
-    Expected: ~80-90% tham số backbone được reuse từ GCNet Cityscapes
-    + Vẫn giữ DWSA, DCN, MultiScale enhancements
-    
-    Expected mIoU improvement:
-    - GCNet base: ~76.9% (Cityscapes)
-    - GCNetWithDWSA_v2: 0.77-0.78% (transfer learning + enhancements)
-    """
-    
+    def forward(self, logits, targets):
+        log_probs = F.log_softmax(logits, dim=1)
+        B, C, H, W = logits.shape
+        
+        log_probs = log_probs.permute(0, 2, 3, 1).reshape(-1, C)
+        targets_flat = targets.reshape(-1)
+        
+        valid_mask = targets_flat != self.ignore_index
+        log_probs = log_probs[valid_mask]
+        targets_flat = targets_flat[valid_mask]
+        
+        if targets_flat.numel() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        probs = log_probs.exp()
+        targets_probs = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        focal_weight = (1 - targets_probs) ** self.gamma
+        focal_loss = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss
+
+
+class HybridLoss(nn.Module):
+    """Combined loss: CE + Dice + Focal"""
     def __init__(
         self,
-        in_channels: int = 3,
-        channels: int = 32,  # GCNet base channels
-        ppm_channels: int = 128,
-        num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
-        dwsa_stages: List[str] = ['stage4', 'stage5', 'stage6'],  # Chỉ ở cuối
-        dwsa_num_heads: int = 8,
-        use_dcn_in_stage5_6: bool = True,
-        use_multi_scale_context: bool = True,
-        align_corners: bool = False,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
-        init_cfg: OptConfigType = None,
-        deploy: bool = False
+        ce_weight=1.0,
+        dice_weight=1.0,
+        focal_weight=0.0,
+        ignore_index=255,
+        class_weights=None,
+        focal_alpha=0.25,
+        focal_gamma=2.0,
+        dice_smooth=1e-5
     ):
-        super().__init__(init_cfg)
+        super().__init__()
         
-        self.in_channels = in_channels
-        self.channels = channels  # 32
-        self.ppm_channels = ppm_channels
-        self.num_blocks_per_stage = num_blocks_per_stage
-        self.dwsa_stages = dwsa_stages
-        self.use_dcn_in_stage5_6 = use_dcn_in_stage5_6
-        self.use_multi_scale_context = use_multi_scale_context
-        self.align_corners = align_corners
-        self.norm_cfg = norm_cfg
-        self.act_cfg = act_cfg
-        self.deploy = deploy
+        self.ce_weight = ce_weight
+        self.dice_weight = dice_weight
+        self.focal_weight = focal_weight
+        self.ignore_index = ignore_index
         
-        # ======================================
-        # STAGE 1-3: Stem (giống GCNet 100%)
-        # ======================================
-        self.stage1_conv = ConvModule(
-            in_channels=in_channels,
-            out_channels=channels,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+        self.ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights,
+            ignore_index=ignore_index,
+            reduction='mean'
         )
         
-        stage2_layers = [
-            ConvModule(
-                in_channels=channels,
-                out_channels=channels,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
-        ]
-        
-        for i in range(num_blocks_per_stage[0]):
-            stage2_layers.append(
-                GCBlock(
-                    in_channels=channels,
-                    out_channels=channels,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy
-                )
-            )
-        
-        self.stage2 = nn.Sequential(*stage2_layers)
-        
-        # Stage 3
-        stage3_layers = [
-            GCBlock(
-                in_channels=channels,
-                out_channels=channels * 2,
-                stride=2,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
-                deploy=deploy
-            )
-        ]
-        
-        for i in range(num_blocks_per_stage[1] - 1):
-            stage3_layers.append(
-                GCBlock(
-                    in_channels=channels * 2,
-                    out_channels=channels * 2,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy
-                )
-            )
-        
-        self.stage3 = nn.Sequential(*stage3_layers)
-        self.relu = build_activation_layer(act_cfg)
-        
-        # ======================================
-        # SEMANTIC BRANCH (GCNet compatible)
-        # Stage 4: channels×4 (128)
-        # Stage 5: channels×8 (256)  
-        # Stage 6: channels×16 (512) ... with DWSA+DCN
-        # ======================================
-        self.semantic_branch_layers = nn.ModuleList()
-        
-        # ✅ Stage 4 Semantic: giữ nguyên kênh ×4 = 128
-        stage4_sem = []
-        stage4_sem.append(
-            GCBlock(
-                in_channels=channels * 2,
-                out_channels=channels * 4,  # ×4, không phải ×4 giảm
-                stride=2,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
-                deploy=deploy
-            )
+        self.dice_loss = DiceLoss(
+            smooth=dice_smooth,
+            ignore_index=ignore_index,
+            reduction='mean'
         )
         
-        for i in range(num_blocks_per_stage[2][0] - 1):
-            # Thêm DWSA ở các block cuối của stage 4 nếu 'stage4' trong dwsa_stages
-            use_dwsa = ('stage4' in dwsa_stages) and (i >= num_blocks_per_stage[2][0] - 2)
-            stage4_sem.append(
-                GCBlock(
-                    in_channels=channels * 4,
-                    out_channels=channels * 4,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy,
-                    use_dwsa=use_dwsa,
-                    dwsa_num_heads=dwsa_num_heads,
-                    use_dcn=False  # Không dùng DCN ở stage 4, giữ nhẹ
-                )
-            )
-        
-        self.semantic_branch_layers.append(nn.Sequential(*stage4_sem))
-        
-        # ✅ Stage 5 Semantic: giữ nguyên kênh ×8 = 256
-        stage5_sem = []
-        stage5_sem.append(
-            GCBlock(
-                in_channels=channels * 4,
-                out_channels=channels * 8,  # ×8, không phải ×4
-                stride=2,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
-                deploy=deploy
-            )
+        self.focal_loss = FocalLoss(
+            alpha=focal_alpha,
+            gamma=focal_gamma,
+            ignore_index=ignore_index,
+            reduction='mean'
         )
-        
-        for i in range(num_blocks_per_stage[3][0] - 1):
-            use_dwsa = ('stage5' in dwsa_stages) and (i >= num_blocks_per_stage[3][0] - 2)
-            use_dcn = use_dcn_in_stage5_6 and (i >= num_blocks_per_stage[3][0] - 2)
-            stage5_sem.append(
-                GCBlock(
-                    in_channels=channels * 8,
-                    out_channels=channels * 8,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy,
-                    use_dwsa=use_dwsa,
-                    dwsa_num_heads=dwsa_num_heads,
-                    use_dcn=use_dcn
-                )
-            )
-        
-        self.semantic_branch_layers.append(nn.Sequential(*stage5_sem))
-        
-        # ✅ Stage 6 Semantic: giữ nguyên kênh ×16 = 512
-        stage6_sem = []
-        stage6_sem.append(
-            GCBlock(
-                in_channels=channels * 8,
-                out_channels=channels * 16,  # ×16, không phải ×4
-                stride=2,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg,
-                deploy=deploy
-            )
-        )
-        
-        for i in range(num_blocks_per_stage[4][0] - 1):
-            use_dwsa = ('stage6' in dwsa_stages) and (i >= num_blocks_per_stage[4][0] - 2)
-            use_dcn = use_dcn_in_stage5_6 and (i >= num_blocks_per_stage[4][0] - 2)
-            stage6_sem.append(
-                GCBlock(
-                    in_channels=channels * 16,
-                    out_channels=channels * 16,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy,
-                    use_dwsa=use_dwsa,
-                    dwsa_num_heads=dwsa_num_heads,
-                    use_dcn=use_dcn,
-                    act=False
-                )
-            )
-        
-        self.semantic_branch_layers.append(nn.Sequential(*stage6_sem))
-        
-        # ======================================
-        # DETAIL BRANCH (giữ nguyên ×2)
-        # ======================================
-        self.detail_branch_layers = nn.ModuleList()
-        
-        # Stage 4 Detail
-        detail_stage4 = []
-        for i in range(num_blocks_per_stage[2][1]):
-            detail_stage4.append(
-                GCBlock(
-                    in_channels=channels * 2,
-                    out_channels=channels * 2,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy
-                )
-            )
-        self.detail_branch_layers.append(nn.Sequential(*detail_stage4))
-        
-        # Stage 5 Detail
-        detail_stage5 = []
-        for i in range(num_blocks_per_stage[3][1]):
-            detail_stage5.append(
-                GCBlock(
-                    in_channels=channels * 2,
-                    out_channels=channels * 2,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy
-                )
-            )
-        self.detail_branch_layers.append(nn.Sequential(*detail_stage5))
-        
-        # Stage 6 Detail
-        detail_stage6 = []
-        for i in range(num_blocks_per_stage[4][1]):
-            detail_stage6.append(
-                GCBlock(
-                    in_channels=channels * 2,
-                    out_channels=channels * 2,
-                    stride=1,
-                    norm_cfg=norm_cfg,
-                    act_cfg=act_cfg,
-                    deploy=deploy,
-                    act=(i < num_blocks_per_stage[4][1] - 1)
-                )
-            )
-        self.detail_branch_layers.append(nn.Sequential(*detail_stage6))
-        
-        # ======================================
-        # BILATERAL FUSION (giống GCNet 100%)
-        # ======================================
-        # Stage 4 fusion
-        self.compression_1 = ConvModule(
-            in_channels=channels * 4,
-            out_channels=channels * 2,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        )
-        
-        self.down_1 = ConvModule(
-            in_channels=channels * 2,
-            out_channels=channels * 4,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        )
-        
-        # Stage 5 fusion
-        self.compression_2 = ConvModule(
-            in_channels=channels * 8,
-            out_channels=channels * 2,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        )
-        
-        self.down_2 = nn.Sequential(
-            ConvModule(
-                in_channels=channels * 2,
-                out_channels=channels * 4,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            ),
-            ConvModule(
-                in_channels=channels * 4,
-                out_channels=channels * 8,
-                kernel_size=3,
-                stride=2,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=None
-            )
-        )
-        
-        # ======================================
-        # BOTTLENECK (giống GCNet 100%)
-        # ======================================
-        self.spp = DAPPM(
-            in_channels=channels * 16,
-            branch_channels=ppm_channels,
-            out_channels=channels * 4,
-            num_scales=5,
-            kernel_sizes=[5, 9, 17, 33],
-            strides=[2, 4, 8, 16],
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-        
-        # ✅ Bottleneck DWSA (tuỳ chọn)
-        if 'bottleneck' in dwsa_stages:
-            self.bottleneck_dwsa = DWSABlock(
-                channels=channels * 4,
-                num_heads=dwsa_num_heads,
-                spatial_kernel=7,
-                drop=0.0
-            )
-        else:
-            self.bottleneck_dwsa = None
-        
-        # ✅ Multi-scale context (thêm tính năng, không thay structure)
-        if use_multi_scale_context:
-            self.multi_scale_context = MultiScaleContextModule(
-                in_channels=channels * 4,
-                out_channels=channels * 4
-            )
-        else:
-            self.multi_scale_context = None
-        
-        # ======================================
-        # FINAL PROJECTION (giống GCNet)
-        # ======================================
-        self.final_proj = ConvModule(
-            in_channels=channels * 2,
-            out_channels=channels * 2,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-        
-        self.init_weights()
     
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:   
-        outputs = {}
+    def forward(self, logits, targets):
+        losses = {}
         
-        # Stage 1-3 (giống GCNet)
-        c1 = self.stage1_conv(x)
-        outputs['c1'] = c1
+        losses['ce'] = self.ce_loss(logits, targets) if self.ce_weight > 0 else torch.tensor(0.0, device=logits.device)
+        losses['dice'] = self.dice_loss(logits, targets) if self.dice_weight > 0 else torch.tensor(0.0, device=logits.device)
+        losses['focal'] = self.focal_loss(logits, targets) if self.focal_weight > 0 else torch.tensor(0.0, device=logits.device)
         
-        c2 = self.stage2(c1)
-        outputs['c2'] = c2
+        losses['total'] = (
+            self.ce_weight * losses['ce'] +
+            self.dice_weight * losses['dice'] +
+            self.focal_weight * losses['focal']
+        )
         
-        c3 = self.stage3(c2)
-        outputs['c3'] = c3
-        
-        # ======================================
-        # STAGE 4: Dual Branch (giống GCNet structure)
-        # ======================================
-        out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
-        
-        x_s = self.semantic_branch_layers[0](c3)  # H/8 → H/16
-        x_d = self.detail_branch_layers[0](c3)     # H/8 → H/8
-        
-        x_s_relu = self.relu(x_s)
-        x_d_relu = self.relu(x_d)
-        
-        # Semantic → Detail
-        comp_c = self.compression_1(x_s_relu)
-        x_d = x_d + resize(comp_c, size=out_size, mode='bilinear', 
-                          align_corners=self.align_corners)
-        
-        # Detail → Semantic
-        x_s = x_s + self.down_1(x_d_relu)
-        
-        outputs['c4'] = x_s
-        
-        # ======================================
-        # STAGE 5: Continue (giống GCNet)
-        # ======================================
-        x_s = self.semantic_branch_layers[1](self.relu(x_s))
-        x_d = self.detail_branch_layers[1](self.relu(x_d))
-        
-        # Fusion
-        comp_c = self.compression_2(self.relu(x_s))
-        x_d = x_d + resize(comp_c, size=out_size, mode='bilinear',
-                          align_corners=self.align_corners)
-        
-        # ======================================
-        # STAGE 6: Final processing
-        # ======================================
-        x_d = self.detail_branch_layers[2](self.relu(x_d))
-        x_s = self.semantic_branch_layers[2](self.relu(x_s))
-        
-        # ======================================
-        # BOTTLENECK: DAPPM + DWSA + MultiScale
-        # ======================================
-        x_s = self.spp(x_s)
-        
-        if self.bottleneck_dwsa is not None:
-            x_s = self.bottleneck_dwsa(x_s)
-        
-        if self.multi_scale_context is not None:
-            x_s = self.multi_scale_context(x_s)
-        
-        # Resize
-        x_s = resize(x_s, size=out_size, mode='bilinear',
-                    align_corners=self.align_corners)
-        x_s = self.final_proj(x_s)
-        
-        # Final fusion
-        c5 = x_d + x_s
-        outputs['c5'] = c5
-        
+        return losses
+
+
+# ============================================
+# UTILITIES
+# ============================================
+
+def clear_gpu_memory():
+    """Clear GPU cache"""
+    gc.collect()
+    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def setup_memory_efficient_training():
+    """Enable memory efficient training"""
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
+
+# ============================================
+# MODEL CONFIG - ENHANCED BACKBONE WITH UPGRADED HEAD
+# ============================================
+
+class ModelConfig:
+    """Enhanced Backbone: channels=48 + Upgraded Head with Gated Fusion"""
+    
+    @staticmethod
+    def get_config():
+        """Optimized config for best mIoU"""
+        return {
+            "backbone": {
+                "in_channels": 3,
+                "channels": 48,
+                "ppm_channels": 128,
+                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
+                "dwsa_stages": ['stage3', 'stage4', 'bottleneck'],
+                "dwsa_num_heads": 8,
+                "use_dcn_in_stage4": True,
+                "use_multi_scale_context": True,
+                "align_corners": False,
+                "deploy": False
+            },
+            "head": {
+                "in_channels": 96,  # c5 = channels * 2 = 48 * 2 (sẽ override bằng detect_backbone_channels)
+                "decoder_channels": 128,
+                "dropout_ratio": 0.1,
+                "align_corners": False,
+                "use_gated_fusion": True,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
+            },
+            "aux_head": {
+                "in_channels": 192,  # c4 = channels * 4 = 48 * 4 (sẽ override bằng detect_backbone_channels)
+                "channels": 96,
+                "dropout_ratio": 0.1,
+                "align_corners": False,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
+            },
+            "loss": {
+                "ce_weight": 1.0,
+                "dice_weight": 1.0,
+                "focal_weight": 0.0,
+                "focal_alpha": 0.25,
+                "focal_gamma": 2.0,
+                "dice_smooth": 1e-5
+            }
+        }
+
+
+# ============================================
+# SEGMENTOR MODEL
+# ============================================
+
+class Segmentor(nn.Module):
+    """Segmentation model with backbone + upgraded head + auxiliary head"""
+    
+    def __init__(self, backbone, head, aux_head=None):
+        super().__init__()
+        self.backbone = backbone
+        self.decode_head = head
+        self.aux_head = aux_head
+
+    def forward(self, x):
+        """Inference mode"""
+        feats = self.backbone(x)
+        return self.decode_head(feats)
+
+    def forward_train(self, x):
+        """Training mode with auxiliary head"""
+        feats = self.backbone(x)
+        outputs = {"main": self.decode_head(feats)}
+        if self.aux_head is not None:
+            outputs["aux"] = self.aux_head(feats)
         return outputs
+
+
+# ============================================
+# TRAINER
+# ============================================
+
+class Trainer:
+    """Training class with logging and checkpointing"""
     
-    def switch_to_deploy(self):
-        """Switch all GCBlocks to deploy mode"""
-        for m in self.modules():
-            if isinstance(m, GCBlock):
-                m.switch_to_deploy()
-        self.deploy = True
-    
-    def init_weights(self):
-        """Initialize weights"""
-        if self.init_cfg is not None:
-            super().init_weights()
+    def __init__(self, model, optimizer, scheduler, device, args, class_weights=None):
+        self.model = model.to(device)
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.device = device
+        self.args = args
+        
+        # Loss function
+        loss_cfg = args.loss_config
+        self.criterion = HybridLoss(
+            ce_weight=loss_cfg['ce_weight'],
+            dice_weight=loss_cfg['dice_weight'],
+            focal_weight=loss_cfg['focal_weight'],
+            ignore_index=args.ignore_index,
+            class_weights=class_weights.to(device) if class_weights is not None else None,
+            focal_alpha=loss_cfg['focal_alpha'],
+            focal_gamma=loss_cfg['focal_gamma'],
+            dice_smooth=loss_cfg['dice_smooth']
+        )
+        
+        # Mixed precision
+        self.scaler = GradScaler(enabled=args.use_amp)
+        
+        # Tracking
+        self.save_dir = Path(args.save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.writer = SummaryWriter(log_dir=self.save_dir / "tensorboard")
+        
+        self.best_miou = 0.0
+        self.start_epoch = 0
+        self.global_step = 0
+        
+        self.save_config()
+        self._print_config(loss_cfg)
+
+    def _print_config(self, loss_cfg):
+        """Print training configuration"""
+        print(f"\n{'='*70}")
+        print("⚙️  TRAINER CONFIGURATION")
+        print(f"{'='*70}")
+        print(f"📦 Batch size: {self.args.batch_size}")
+        print(f"🔁 Gradient accumulation: {self.args.accumulation_steps}")
+        print(f"📊 Effective batch size: {self.args.batch_size * self.args.accumulation_steps}")
+        print(f"⚡ Mixed precision: {self.args.use_amp}")
+        print(f"✂️  Gradient clipping: {self.args.grad_clip}")
+        print(f"📉 Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Focal({loss_cfg['focal_weight']})")
+        print(f"🔀 Gated Fusion: ENABLED (upgraded head)")
+        print(f"💾 Save dir: {self.args.save_dir}")
+        print(f"{'='*70}\n")
+
+    def save_config(self):
+        """Save training config"""
+        config = vars(self.args)
+        with open(self.save_dir / "config.json", "w") as f:
+            json.dump(config, f, indent=2, default=str)
+
+    def train_epoch(self, loader, epoch):
+        """Train one epoch"""
+        self.model.train()
+        
+        total_loss = 0.0
+        total_ce = 0.0
+        total_dice = 0.0
+        total_focal = 0.0
+        
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
+        
+        for batch_idx, (imgs, masks) in enumerate(pbar):
+            imgs = imgs.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True).long()
+            
+            if masks.dim() == 4:
+                masks = masks.squeeze(1)
+
+            with autocast(device_type='cuda', enabled=self.args.use_amp):
+                outputs = self.model.forward_train(imgs)
+                logits = outputs["main"]
+                
+                logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+                
+                loss_dict = self.criterion(logits, masks)
+                loss = loss_dict['total']
+                
+                if "aux" in outputs and self.args.aux_weight > 0:
+                    aux_logits = outputs["aux"]
+                    # Aux output is at lower resolution, resize to mask size
+                    aux_logits = F.interpolate(aux_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+                    aux_loss_dict = self.criterion(aux_logits, masks)
+                    # Decay aux weight as training progresses
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    loss = loss + aux_weight * aux_loss_dict['total']
+                    
+                loss = loss / self.args.accumulation_steps
+
+            self.scaler.scale(loss).backward()
+            
+            if (batch_idx + 1) % self.args.accumulation_steps == 0:
+                self.scaler.unscale_(self.optimizer)
+                
+                if self.args.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+                self.optimizer.zero_grad(set_to_none=True)
+                self.global_step += 1
+            
+            if self.scheduler and self.args.scheduler == 'onecycle':
+                self.scheduler.step()
+            
+            total_loss += loss.item() * self.args.accumulation_steps
+            
+            ce_val = loss_dict['ce'].item() if isinstance(loss_dict['ce'], torch.Tensor) else loss_dict['ce']
+            dice_val = loss_dict['dice'].item() if isinstance(loss_dict['dice'], torch.Tensor) else loss_dict['dice']
+            focal_val = loss_dict['focal'].item() if isinstance(loss_dict['focal'], torch.Tensor) else loss_dict['focal']
+            
+            total_ce += ce_val
+            total_dice += dice_val
+            total_focal += focal_val
+            
+            current_lr = self.optimizer.param_groups[0]['lr']
+            pbar.set_postfix({
+                'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
+                'ce': f'{ce_val:.4f}',
+                'dice': f'{dice_val:.4f}',
+                'lr': f'{current_lr:.6f}'
+            })
+            
+            if batch_idx % 50 == 0:
+                clear_gpu_memory()
+            
+            if batch_idx % self.args.log_interval == 0:
+                self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
+                self.writer.add_scalar('train/ce_loss', ce_val, self.global_step)
+                self.writer.add_scalar('train/dice_loss', dice_val, self.global_step)
+                self.writer.add_scalar('train/focal_loss', focal_val, self.global_step)
+                self.writer.add_scalar('train/lr', current_lr, self.global_step)
+
+        if self.scheduler and self.args.scheduler != 'onecycle':
+            self.scheduler.step()
+
+        avg_loss = total_loss / len(loader)
+        avg_ce = total_ce / len(loader)
+        avg_dice = total_dice / len(loader)
+        avg_focal = total_focal / len(loader)
+        
+        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': avg_focal}
+
+    @torch.no_grad()
+    def validate(self, loader, epoch):
+        """Validate one epoch"""
+        self.model.eval()
+        total_loss = 0.0
+        
+        num_classes = self.args.num_classes
+        confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+        
+        pbar = tqdm(loader, desc=f"Validation")
+        
+        for batch_idx, (imgs, masks) in enumerate(pbar):
+            imgs = imgs.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True).long()
+            
+            if masks.dim() == 4:
+                masks = masks.squeeze(1)
+
+            with autocast(device_type='cuda', enabled=self.args.use_amp):
+                logits = self.model(imgs)
+                logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+                
+                loss_dict = self.criterion(logits, masks)
+                loss = loss_dict['total']
+            
+            total_loss += loss.item()
+            
+            pred = logits.argmax(1).cpu().numpy()
+            target = masks.cpu().numpy()
+            
+            mask = (target >= 0) & (target < num_classes)
+            label = num_classes * target[mask].astype('int') + pred[mask]
+            count = np.bincount(label, minlength=num_classes**2)
+            confusion_matrix += count.reshape(num_classes, num_classes)
+            
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+            if batch_idx % 20 == 0:
+                clear_gpu_memory()
+
+        intersection = np.diag(confusion_matrix)
+        union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
+        iou = intersection / (union + 1e-10)
+        miou = np.nanmean(iou)
+        
+        acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
+        avg_loss = total_loss / len(loader)
+        
+        return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
+
+    def save_checkpoint(self, epoch, metrics, is_best=False):
+        """Save checkpoint"""
+        checkpoint = {
+            'epoch': epoch,
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
+            'scaler': self.scaler.state_dict(),
+            'best_miou': self.best_miou,
+            'metrics': metrics,
+            'global_step': self.global_step
+        }
+        
+        torch.save(checkpoint, self.save_dir / "last.pth")
+        
+        if is_best:
+            torch.save(checkpoint, self.save_dir / "best.pth")
+            print(f"✅ Best model saved! mIoU: {metrics['miou']:.4f}")
+        
+        if (epoch + 1) % self.args.save_interval == 0:
+            torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
+
+    def load_checkpoint(self, checkpoint_path, reset_epoch=True):
+        """Load checkpoint"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        self.model.load_state_dict(checkpoint['model'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scaler' in checkpoint and checkpoint['scaler'] is not None:
+            self.scaler.load_state_dict(checkpoint['scaler'])
+        if reset_epoch:
+            self.start_epoch = 0
+            self.best_miou = 0.0
+            self.global_step = 0
+            print(f"✅ Weights loaded from epoch {checkpoint['epoch']}, starting new phase from epoch 0")
         else:
-            for m in self.modules():
-                if isinstance(m, nn.Conv2d):
-                    nn.init.kaiming_normal_(
-                        m.weight,
-                        mode='fan_out',
-                        nonlinearity='relu'
-                    )
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-                elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
-                    nn.init.constant_(m.weight, 1)
-                    nn.init.constant_(m.bias, 0)
-                elif isinstance(m, nn.Linear):
-                    nn.init.trunc_normal_(m.weight, std=0.02)
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
+            self.start_epoch = checkpoint['epoch'] + 1
+            self.best_miou = checkpoint.get('best_miou', 0.0)
+            self.global_step = checkpoint.get('global_step', 0)
+            if self.scheduler and checkpoint.get('scheduler'):
+                self.scheduler.load_state_dict(checkpoint['scheduler'])
+            print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
+
+
+def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
+    """Automatically detect backbone output channels"""
+    backbone.eval()
+    with torch.no_grad():
+        sample = torch.randn(1, 3, *img_size).to(device)
+        feats = backbone(sample)
+        
+        channels = {}
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in feats:
+                channels[key] = feats[key].shape[1]
+        
+        print(f"\n{'='*70}")
+        print("🔍 BACKBONE CHANNEL DETECTION")
+        print(f"{'='*70}")
+        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
+            if key in channels:
+                print(f"   {key}: {channels[key]} channels")
+        print(f"{'='*70}\n")
+        
+        return channels
 
 
 # ============================================
-# MIGRATION GUIDE (từ GCNetWithDWSA v1 → v2)
+# MAIN
 # ============================================
-"""
-Thay đổi chính:
 
-1. Semantic branch stage 4-6 kênh:
-   v1: ×4, ×4, ×4 (128, 128, 128) - quá nhẹ, khó match GCNet
-   v2: ×4, ×8, ×16 (128, 256, 512) - khớp GCNet 100%
-   → Kết quả: ~80-90% tham số reuse thay vì 20%
+def main():
+    parser = argparse.ArgumentParser(description="🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
+    
+    # Dataset
+    parser.add_argument("--train_txt", required=True, help="Path to training list")
+    parser.add_argument("--val_txt", required=True, help="Path to validation list")
+    parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
+    parser.add_argument("--num_classes", type=int, default=19)
+    parser.add_argument("--ignore_index", type=int, default=255)
+    
+    # Training
+    parser.add_argument("--epochs", type=int, default=100, help="Total epochs")
+    
+    # Optimization
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--accumulation_steps", type=int, default=2)
+    parser.add_argument("--lr", type=float, default=5e-4, help="Max LR")
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=1.0, help="Auxiliary head weight (decays over epochs)")
+    parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
+    
+    # Data
+    parser.add_argument("--img_h", type=int, default=512)
+    parser.add_argument("--img_w", type=int, default=1024)
+    
+    # System
+    parser.add_argument("--use_amp", action="store_true", default=True)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--save_dir", default="./checkpoints")
+    parser.add_argument("--resume", type=str, default=None)
+    parser.add_argument("--resume_mode", type=str, default="transfer", 
+                    choices=["transfer", "continue"],
+                    help="transfer: start from epoch 0, continue: resume from saved epoch")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--save_interval", type=int, default=10)
+    
+    args = parser.parse_args()
+    
+    # Setup
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    setup_memory_efficient_training()
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    print(f"\n{'='*70}")
+    print(f"🚀 GCNet Training - Enhanced Backbone + Upgraded Head")
+    print(f"{'='*70}")
+    print(f"📱 Device: {device}")
+    print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
+    print(f"📊 Epochs: {args.epochs}")
+    print(f"⚡ Scheduler: {args.scheduler}")
+    print(f"🔀 Gated Fusion: ENABLED")
+    print(f"{'='*70}\n")
+    
+    # Config
+    cfg = ModelConfig.get_config()
+    args.loss_config = cfg["loss"]
+    
+    # Dataloaders
+    print(f"📂 Creating dataloaders...")
+    train_loader, val_loader, class_weights = create_dataloaders(
+        train_txt=args.train_txt,
+        val_txt=args.val_txt,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        img_size=(args.img_h, args.img_w),
+        pin_memory=True,
+        compute_class_weights=True,
+        dataset_type=args.dataset_type
+    )
+    print(f"✅ Dataloaders created\n")
+    
+    # Model
+    print(f"{'='*70}")
+    print("🏗️  BUILDING MODEL WITH UPGRADED COMPONENTS")
+    print(f"{'='*70}\n")
+    
+    # Build backbone
+    backbone = GCNetWithDWSA(**cfg["backbone"]).to(device)
+    
+    # Auto-detect backbone channels
+    detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
+    
+    # Build head config with detected channels
+    head_cfg = {
+        **cfg["head"],
+        "in_channels": detected_channels['c5'],
+        "c1_channels": detected_channels['c1'],
+        "c2_channels": detected_channels['c2'],
+        "num_classes": args.num_classes,
+    }
+    
+    aux_head_cfg = {
+        **cfg["aux_head"],
+        "in_channels": detected_channels['c4'],
+        "num_classes": args.num_classes,
+    }
+    
+    # Build Segmentor
+    model = Segmentor(
+        backbone=backbone,
+        head=GCNetHead(**head_cfg),
+        aux_head=GCNetAuxHead(**aux_head_cfg),
+    )
+    
+    print("\n🔧 Applying Model Optimizations...")
+    print("   ├─ Converting BatchNorm → GroupNorm")
+    model = replace_bn_with_gn(model)
+    
+    print("   ├─ Applying Kaiming Initialization")
+    model.apply(init_weights)
+    
+    print("   └─ Checking Model Health")
+    check_model_health(model)
+    print()
+    
+    total_params = sum(p.numel() for p in model.parameters())
+    print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)\n")
 
-2. DWSA placement:
-   v1: 'stage3', 'stage4', 'bottleneck' - quá sớm, overhead cao
-   v2: 'stage4', 'stage5', 'stage6' - chỉ ở cuối, cân bằng
-   → Kết quả: hiệu năng cao hơn, memory tốt hơn
+    # Test forward pass
+    model = model.to(device)
+    with torch.no_grad():
+        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+        try:
+            outputs = model.forward_train(sample)
+            print(f"✅ Forward pass successful!")
+            print(f"   Main head output:  {outputs['main'].shape}")
+            if 'aux' in outputs:
+                print(f"   Aux head output:   {outputs['aux'].shape}")
+        except Exception as e:
+            print(f"❌ Forward pass FAILED: {e}")
+            return
+    
+    print(f"{'='*70}\n")
+    
+    # Optimizer
+    optimizer = optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        betas=(0.9, 0.999)
+    )
+    
+    # Scheduler
+    if args.scheduler == 'onecycle':
+        total_steps = len(train_loader) * args.epochs
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=args.lr,
+            total_steps=total_steps,
+            pct_start=0.05,
+            anneal_strategy='cos',
+            cycle_momentum=True,
+            base_momentum=0.85,
+            max_momentum=0.95,
+            div_factor=25,
+            final_div_factor=100000,
+        )
+        print(f"✅ Using OneCycleLR scheduler (total_steps={total_steps})")
+    elif args.scheduler == 'poly':
+        print(f"✅ Using Polynomial LR decay")
+        def poly_lr_lambda(epoch):
+            return (1 - epoch / args.epochs) ** 0.9
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
+    else:
+        print(f"✅ Using Cosine Annealing LR")
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=1e-6
+        )
+    
+    # Trainer
+    trainer = Trainer(
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        device=device,
+        args=args,
+        class_weights=class_weights
+    )
+    
+    if args.resume:
+        reset_epoch = (args.resume_mode == "transfer")
+        trainer.load_checkpoint(args.resume, reset_epoch=reset_epoch)
+    
+    # Training loop
+    print(f"\n{'='*70}")
+    print("🚀 STARTING TRAINING WITH UPGRADED HEAD")
+    print(f"{'='*70}\n")
+    
+    for epoch in range(trainer.start_epoch, args.epochs):
+        train_metrics = trainer.train_epoch(train_loader, epoch)
+        val_metrics = trainer.validate(val_loader, epoch)
+        
+        print(f"\n{'='*70}")
+        print(f"📊 Epoch {epoch+1}/{args.epochs}")
+        print(f"{'='*70}")
+        print(f"Train - Loss: {train_metrics['loss']:.4f} | "
+              f"CE: {train_metrics['ce']:.4f} | "
+              f"Dice: {train_metrics['dice']:.4f}")
+        print(f"Val   - Loss: {val_metrics['loss']:.4f} | "
+              f"mIoU: {val_metrics['miou']:.4f} | "
+              f"Acc: {val_metrics['accuracy']:.4f}")
+        print(f"{'='*70}\n")
+        
+        trainer.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
+        trainer.writer.add_scalar('val/miou', val_metrics['miou'], epoch)
+        trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
+        
+        is_best = val_metrics['miou'] > trainer.best_miou
+        if is_best:
+            trainer.best_miou = val_metrics['miou']
+        
+        trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
+    
+    trainer.writer.close()
+    
+    print(f"\n{'='*70}")
+    print("✅ TRAINING COMPLETED!")
+    print(f"🏆 Best mIoU: {trainer.best_miou:.4f}")
+    print(f"💾 Checkpoints saved to: {args.save_dir}")
+    print(f"📊 Tensorboard logs at: {args.save_dir}/tensorboard")
+    print(f"{'='*70}\n")
 
-3. DCN placement:
-   v1: stage4 - quá sớm, ít benefit
-   v2: stage5-6 - ở deep layers, có lợi hơn
-   → Kết quả: +1-2% mIoU
 
-4. Detail branch:
-   v1: ×2 (tất cả stage)
-   v2: ×2 (tất cả stage) - giữ nguyên, vì fusion tốt
-
-5. Final output:
-   v1: ×2 (c5 là detail branch output + projection)
-   v2: ×2 (giữ nguyên từ GCNet, chỉ thêm multi-scale context)
-
-Chi phí:
-- v1: ~267/1313 params reuse (20%)
-- v2: ~1100+/1313 params reuse (80%+)
-
-Lợi ích:
-- Transfer learning mạnh mẽ hơn 4× từ Cityscapes pretrained
-- Vẫn giữ DWSA, DCN, MultiScale enhancements
-- Model size gần như không thay đổi (channels vẫn 32 base)
-- mIoU expected: 77.5-78% trên Cityscapes (vs 76.9% GCNet base)
-"""
+if __name__ == "__main__":
+    main()
