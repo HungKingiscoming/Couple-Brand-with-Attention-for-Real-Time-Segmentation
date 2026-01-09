@@ -346,69 +346,86 @@ class GCBlock(nn.Module):
 # ===========================
 
 class DWSABlock(nn.Module):
-    def __init__(self, channels, num_heads=8, spatial_kernel=7, drop=0.0):
+    def __init__(self, channels, num_heads=4, spatial_kernel=7, drop=0.0, reduction: int = 4):
         super().__init__()
         self.channels = channels
         self.num_heads = num_heads
         self.spatial_kernel = spatial_kernel
         self.scale = (channels // num_heads) ** -0.5
-
+        reduced = channels // reduction  
+        self.reduced_dim = reduced
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1)
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1)
+        
         self.to_q = nn.Linear(channels, channels, bias=True)
         self.to_k = nn.Linear(channels, channels, bias=True)
         self.to_v = nn.Linear(channels, channels, bias=True)
 
         self.out_proj = nn.Linear(channels, channels, bias=True)
         self.drop = nn.Dropout(drop)
+        self.scale = (reduced // num_heads) ** -0.5
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
-        x_flat = x.view(B, C, -1).transpose(1, 2)  # B, HW, C
+
+        # B, C, H, W -> B, C', H, W
+        x_red = self.in_proj(x)
+        B, C2, H, W = x_red.shape
+
+        # B, HW, C'
+        x_flat = x_red.view(B, C2, -1).transpose(1, 2)
 
         q = self.to_q(x_flat)
         k = self.to_k(x_flat)
         v = self.to_v(x_flat)
 
-        q = q.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
-        k = k.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
-        v = v.view(B, -1, self.num_heads, C // self.num_heads).transpose(1, 2)
+        # (B, heads, HW, C'/heads)
+        q = q.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
+        k = k.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
+        v = v.view(B, -1, self.num_heads, C2 // self.num_heads).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(scores, dim=-1)
         attn = self.drop(attn)
 
         out = torch.matmul(attn, v)
-        out = out.transpose(1, 2).contiguous().view(B, -1, C)
-        out = self.out_proj(out)
-        out = out.view(B, H, W, C).permute(0, 3, 1, 2)
+        out = out.transpose(1, 2).contiguous().view(B, -1, C2)
+        out = self.proj_o(out)
+        out = out.view(B, H, W, C2).permute(0, 3, 1, 2)
+
+        out = self.out_proj(out)   # B, C, H, W
 
         return out + x
 
 
 class MultiScaleContextModule(nn.Module):
-    def __init__(self, in_channels, out_channels, scales=None):
+    def __init__(self, in_channels, out_channels, scales=None, branch_ratio=4):
         super().__init__()
         if scales is None:
-            scales = [1, 2, 4]
+            scales = [1, 2, 4]   # bớt scale 8 cho nhẹ
         self.scales = scales
 
-        branch_channels = in_channels // (len(scales)*2)
+        # Tổng kênh của tất cả branch = in_channels // branch_ratio
+        total_branch_channels = in_channels // branch_ratio
+        per_branch = total_branch_channels // len(scales)
+
         self.scale_branches = nn.ModuleList()
         for s in scales:
             if s == 1:
                 self.scale_branches.append(
-                    nn.Conv2d(in_channels, branch_channels, kernel_size=1)
+                    nn.Conv2d(in_channels, per_branch, kernel_size=1)
                 )
             else:
                 self.scale_branches.append(
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=s, stride=s),
-                        nn.Conv2d(in_channels, branch_channels, kernel_size=1),
+                        nn.Conv2d(in_channels, per_branch, kernel_size=1),
                         nn.ReLU(inplace=True),
                     )
                 )
 
         self.fusion = nn.Sequential(
-            nn.Conv2d(branch_channels * len(scales), out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(per_branch * len(scales), out_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=1),
         )
@@ -424,6 +441,7 @@ class MultiScaleContextModule(nn.Module):
         fused = torch.cat(outs, dim=1)
         out = self.fusion(fused)
         return out + x
+
 
 
 # ===========================
@@ -724,7 +742,7 @@ class GCNetWithEnhance(BaseModule):
         # ===== DWSA: chỉ stage5, stage6 =====
         self.dwsa4 = None  # không dùng DWSA ở stage4
         self.dwsa5 = None
-        self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads) if 'stage6' in dwsa_stages else None  # s6: 16C
+        self.dwsa6 = DWSABlock(C * 16, num_heads=4, reduction=4) if 'stage6' in dwsa_stages else None  # s6: 16C
 
         # ===== KHÔNG CÓ DCN =====
         # self.dcn5 = None
@@ -732,7 +750,7 @@ class GCNetWithEnhance(BaseModule):
 
         # ===== MultiScaleContext: sau SPP(s6) =====
         # SPP output: 4C (128 kênh nếu C=32)
-        self.ms_context = MultiScaleContextModule(C * 4, C * 4) if use_multi_scale_context else None
+        self.ms_context = MultiScaleContextModule(C * 4, C * 4, scales=[1,2,4], branch_ratio=4)
 
         # Projection cuối cho feature deep
         self.final_proj = ConvModule(
