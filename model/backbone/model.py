@@ -658,13 +658,14 @@ class GCNetWithDWSA_v2(BaseModule):
         outputs = {}
         
         # Stage 1-3 (giống GCNet)
-        c1 = self.stem['stage1_conv'](x)
+        c1 = self.stem[0](x)
+
         outputs['c1'] = c1
         
-        c2 = self.stem['stage2'](c1)
+        c2 = self.stem[1](c1)
         outputs['c2'] = c2
         
-        c3 = self.stem['stage3'](c2)
+        c3 = self.stem[2](c2))
         outputs['c3'] = c3
         
         # ======================================
