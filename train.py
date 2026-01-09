@@ -867,7 +867,7 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"🚀 GCNetWithDWSA_v2 Training - Maximum Transfer Learning")
+    print(f"🚀 GCNetWithEnhance Training - Maximum Transfer Learning")
     print(f"{'='*70}")
     print(f"📱 Device: {device}")
     print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
@@ -899,11 +899,11 @@ def main():
     
     # Model
     print(f"{'='*70}")
-    print("🏗️  BUILDING GCNetWithDWSA_v2 WITH TRANSFER LEARNING")
+    print("🏗️  BUILDING GCNetWithEnhance WITH TRANSFER LEARNING")
     print(f"{'='*70}\n")
     
     # Build backbone (v2)
-    backbone = GCNetWithDWSA_v2(**cfg["backbone"]).to(device)
+    backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
     
     # Auto-detect backbone channels
     detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
