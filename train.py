@@ -44,7 +44,180 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
-
+def load_pretrained_with_improved_mapping(model, checkpoint_path):
+    """
+    Load GCNet pretrained weights với mapping tối ưu
+    
+    Key improvements:
+    1. Stem mapping: stem.0/1/2 → stem.stage1_conv/stage2/stage3
+    2. Detail stage6 partial load: Load conv layers, skip mismatched parts
+    3. Better logging
+    """
+    print(f"📥 Loading pretrained weights from: {checkpoint_path}")
+    print(f"   Using improved key mapping...\n")
+    
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+        state_dict = checkpoint['state_dict']
+        
+        # Remove 'backbone.' prefix if exists
+        state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items()}
+        
+        model_state = model.backbone.state_dict()
+        compatible_state = {}
+        skipped_keys = []
+        
+        for ckpt_key, ckpt_val in state_dict.items():
+            matched = False
+            
+            # ========================================
+            # 1. STEM MAPPING (CRITICAL)
+            # ========================================
+            
+            # stem.0.* → stem.stage1_conv.*
+            if 'stem.0.' in ckpt_key:
+                new_key = ckpt_key.replace('stem.0.', 'stem.stage1_conv.')
+                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                    compatible_state[new_key] = ckpt_val
+                    matched = True
+            
+            # stem.1.* → stem.stage2.*
+            elif 'stem.1.' in ckpt_key:
+                new_key = ckpt_key.replace('stem.1.', 'stem.stage2.')
+                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                    compatible_state[new_key] = ckpt_val
+                    matched = True
+            
+            # stem.2.* → stem.stage3.*
+            elif 'stem.2.' in ckpt_key:
+                new_key = ckpt_key.replace('stem.2.', 'stem.stage3.')
+                if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
+                    compatible_state[new_key] = ckpt_val
+                    matched = True
+            
+            # ========================================
+            # 2. SEMANTIC BRANCH (với DWSA/DCN awareness)
+            # ========================================
+            elif 'semantic_branch_layers' in ckpt_key:
+                # Direct match first (cho các layer không có DWSA/DCN)
+                if ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
+                    compatible_state[ckpt_key] = ckpt_val
+                    matched = True
+                # Skip DWSA/DCN related keys (không tồn tại trong GCNet)
+                elif any(x in ckpt_key for x in ['dwsa', 'offset_conv']):
+                    skipped_keys.append(f"{ckpt_key} (DWSA/DCN - new module)")
+                    matched = True  # Đánh dấu đã xử lý
+            
+            # ========================================
+            # 3. DETAIL BRANCH (CRITICAL: Stage 6 mismatch)
+            # ========================================
+            elif 'detail_branch_layers' in ckpt_key:
+                # Stage 4-5: Direct match
+                if '.0.' in ckpt_key or '.1.' in ckpt_key:
+                    if ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
+                        compatible_state[ckpt_key] = ckpt_val
+                        matched = True
+                
+                # Stage 6: Partial match (GCNet 128ch vs Your 64ch)
+                elif '.2.' in ckpt_key:
+                    # Chỉ load block đầu tiên (downsample 64→128 trong GCNet)
+                    # Skip vì trong v2 không có downsample này
+                    if '.0.' in ckpt_key.split('detail_branch_layers.2.')[1]:
+                        skipped_keys.append(f"{ckpt_key} (stage6 first block - channel mismatch)")
+                        matched = True
+                    # Các block sau: Check shape trước khi load
+                    elif ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
+                        compatible_state[ckpt_key] = ckpt_val
+                        matched = True
+            
+            # ========================================
+            # 4. FUSION & SPP (Perfect match)
+            # ========================================
+            elif any(x in ckpt_key for x in ['compression_', 'down_', 'spp']):
+                if ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
+                    compatible_state[ckpt_key] = ckpt_val
+                    matched = True
+            
+            # ========================================
+            # 5. NEW MODULES (Skip gracefully)
+            # ========================================
+            elif any(x in ckpt_key for x in ['bottleneck_dwsa', 'multi_scale_context', 'final_proj']):
+                skipped_keys.append(f"{ckpt_key} (new module)")
+                matched = True
+            
+            # ========================================
+            # 6. DIRECT MATCH (fallback)
+            # ========================================
+            elif ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
+                compatible_state[ckpt_key] = ckpt_val
+                matched = True
+            
+            # Track unmatched keys
+            if not matched:
+                skipped_keys.append(f"{ckpt_key} (no match)")
+        
+        # ========================================
+        # STATISTICS
+        # ========================================
+        loaded = len(compatible_state)
+        total = len(model_state)
+        rate = 100 * loaded / total if total > 0 else 0
+        
+        print(f"{'='*70}")
+        print(f"📊 TRANSFER LEARNING STATISTICS")
+        print(f"{'='*70}")
+        print(f"Loaded:     {loaded:>6}/{total} parameters ({rate:.1f}%)")
+        print(f"Skipped:    {len(skipped_keys):>6} keys")
+        print(f"{'='*70}\n")
+        
+        # Show breakdown by component
+        component_stats = {}
+        for key in compatible_state.keys():
+            if 'stem' in key:
+                comp = 'Stem'
+            elif 'semantic_branch' in key:
+                comp = 'Semantic Branch'
+            elif 'detail_branch' in key:
+                comp = 'Detail Branch'
+            elif 'compression' in key or 'down' in key:
+                comp = 'Fusion'
+            elif 'spp' in key:
+                comp = 'SPP'
+            else:
+                comp = 'Other'
+            
+            component_stats[comp] = component_stats.get(comp, 0) + 1
+        
+        print("📦 Component-wise loading:")
+        for comp, count in sorted(component_stats.items()):
+            print(f"   {comp:<20}: {count:>4} params")
+        
+        if len(skipped_keys) > 0 and len(skipped_keys) <= 20:
+            print(f"\n⚠️  Skipped keys ({len(skipped_keys)}):")
+            for key in skipped_keys[:20]:
+                print(f"   - {key}")
+        elif len(skipped_keys) > 20:
+            print(f"\n⚠️  Skipped {len(skipped_keys)} keys (showing first 20):")
+            for key in skipped_keys[:20]:
+                print(f"   - {key}")
+        
+        print()
+        
+        # Load state dict
+        missing, unexpected = model.backbone.load_state_dict(compatible_state, strict=False)
+        
+        print(f"✅ Transfer learning completed!")
+        print(f"   Missing keys: {len(missing)}")
+        print(f"   Unexpected keys: {len(unexpected)}")
+        print(f"   Transfer rate: {rate:.1f}%")
+        
+        return rate
+        
+    except Exception as e:
+        print(f"❌ Failed to load: {e}\n")
+        import traceback
+        traceback.print_exc()
+        return 0.0
 # ============================================
 # LOSS FUNCTIONS
 # ============================================
@@ -776,65 +949,14 @@ def main():
     # Load pretrained weights
     # Load pretrained weights with EXACT KEY MAPPING (stem.stageX → stageX)
     if args.pretrained_weights:
-        print(f"📥 Loading pretrained weights from: {args.pretrained_weights}")
-        print(f"   Mapping MMSeg format → Your model...\n")
+        transfer_rate = load_pretrained_with_improved_mapping(
+            model, 
+            args.pretrained_weights
+        )
         
-        try:
-            checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
-            state_dict = checkpoint['state_dict']
-            state_dict = {k.replace('backbone.', ''): v for k, v in state_dict.items()}
-            
-            model_state = model.backbone.state_dict()
-            compatible_state = {}
-            
-            for ckpt_key, ckpt_val in state_dict.items():
-                # Direct match first
-                if ckpt_key in model_state and model_state[ckpt_key].shape == ckpt_val.shape:
-                    compatible_state[ckpt_key] = ckpt_val
-                    continue
-                
-                # stem.0 → stem.stage1_conv
-                if 'stem.0.' in ckpt_key:
-                    new_key = ckpt_key.replace('stem.0.', 'stem.stage1_conv.')
-                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                        compatible_state[new_key] = ckpt_val
-                        continue
-                
-                # stem.1 → stem.stage2
-                if 'stem.1.' in ckpt_key:
-                    new_key = ckpt_key.replace('stem.1.', 'stem.stage2.')
-                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                        compatible_state[new_key] = ckpt_val
-                        continue
-                
-                # stem.2 → stem.stage3
-                if 'stem.2.' in ckpt_key:
-                    new_key = ckpt_key.replace('stem.2.', 'stem.stage3.')
-                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                        compatible_state[new_key] = ckpt_val
-                        continue
-                
-                # detail_branch_layers → detail_branch
-                if 'detail_branch_layers' in ckpt_key:
-                    new_key = ckpt_key.replace('detail_branch_layers', 'detail_branch')
-                    if new_key in model_state and model_state[new_key].shape == ckpt_val.shape:
-                        compatible_state[new_key] = ckpt_val
-                        continue
-            
-            loaded = len(compatible_state)
-            total = len(model_state)
-            rate = 100 * loaded / total if total > 0 else 0
-            
-            print(f"   📊 Loaded: {loaded}/{total} parameters ({rate:.1f}%)")
-            print(f"   🎉 Transfer rate: {rate:.1f}%\n")
-            
-            model.backbone.load_state_dict(compatible_state, strict=False)
-            
-        except Exception as e:
-            print(f"❌ Failed to load: {e}\n")
-            import traceback
-            traceback.print_exc()
-            return
+        if transfer_rate < 70:
+            print(f"⚠️  WARNING: Transfer rate {transfer_rate:.1f}% is low!")
+            print(f"   Consider checking architecture compatibility")
 
     
     # Freeze backbone if requested
