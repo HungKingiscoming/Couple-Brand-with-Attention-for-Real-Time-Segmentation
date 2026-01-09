@@ -374,6 +374,7 @@ class GCNetWithDWSA_v2(BaseModule):
             )
         
         stem_dict['stage3'] = nn.Sequential(*stage3_layers)
+        self.stem = stem_dict
         self.relu = build_activation_layer(act_cfg)
         
         # ======================================
