@@ -24,39 +24,80 @@ from components.components import (
 
 # Import GCBlock, DWSABlock, MultiScaleContextModule từ file cũ của bạn
 class GCBlock(nn.Module):
-    """Global Context Block"""
-    def __init__(self, in_channels, out_channels, stride=1, norm_cfg=None, 
-                 act_cfg=None, deploy=False, use_dwsa=False, dwsa_num_heads=8,
-                 use_dcn=False, act=True):
+    """
+    Global Context Block with optional DCN support
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: int = 1,
+        norm_cfg: dict = None,
+        act_cfg: dict = None,
+        deploy: bool = False,
+        use_dwsa: bool = False,
+        dwsa_num_heads: int = 8,
+        use_dcn: bool = False,
+        act: bool = True
+    ):
         super().__init__()
+        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
         self.deploy = deploy
+        self.use_dwsa = use_dwsa
+        self.use_dcn = use_dcn
         
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, 
-                               stride=stride, padding=1, bias=False)
+        # Main conv path
+        self.conv1 = nn.Conv2d(
+            in_channels, out_channels, kernel_size=3, stride=stride, 
+            padding=1, bias=False
+        )
         self.bn1 = nn.BatchNorm2d(out_channels)
         
+        # ✅ Deformable Conv2d with offset generation
         if use_dcn:
             from torchvision.ops import DeformConv2d
-            self.conv2 = DeformConv2d(out_channels, out_channels, 
-                                      kernel_size=3, padding=1, bias=False)
+            
+            # Offset network: predicts 2 * kernel_h * kernel_w offsets
+            self.offset_conv = nn.Conv2d(
+                out_channels, 
+                2 * 3 * 3,  # 2 (x,y) * kernel_size^2
+                kernel_size=3, 
+                padding=1,
+                bias=True
+            )
+            # Initialize offset conv to zero (no deformation initially)
+            nn.init.constant_(self.offset_conv.weight, 0)
+            nn.init.constant_(self.offset_conv.bias, 0)
+            
+            self.conv2 = DeformConv2d(
+                out_channels, 
+                out_channels, 
+                kernel_size=3, 
+                padding=1, 
+                bias=False
+            )
         else:
-            self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3,
-                                   padding=1, bias=False)
+            self.offset_conv = None
+            self.conv2 = nn.Conv2d(
+                out_channels, out_channels, kernel_size=3, padding=1, bias=False
+            )
         
         self.bn2 = nn.BatchNorm2d(out_channels)
         
+        # Shortcut
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, 
-                         stride=stride, bias=False),
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
                 nn.BatchNorm2d(out_channels)
             )
         else:
             self.shortcut = nn.Identity()
         
+        # Global context
         self.global_context = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Conv2d(out_channels, out_channels // 16, kernel_size=1, bias=True),
@@ -65,29 +106,50 @@ class GCBlock(nn.Module):
             nn.Sigmoid()
         )
         
+        # DWSA Block (optional)
         if use_dwsa:
-            self.dwsa = DWSABlock(channels=out_channels, num_heads=dwsa_num_heads,
-                                 spatial_kernel=7, drop=0.0)
+            self.dwsa = DWSABlock(
+                channels=out_channels,
+                num_heads=dwsa_num_heads,
+                spatial_kernel=7,
+                drop=0.0
+            )
         else:
             self.dwsa = None
         
         self.relu = nn.ReLU(inplace=True) if act else nn.Identity()
     
     def forward(self, x):
+        # Main path
         out = self.conv1(x)
         out = self.bn1(out)
         out = self.relu(out)
-        out = self.conv2(out)
+        
+        # ✅ Deformable Conv with offset
+        if self.use_dcn and self.offset_conv is not None:
+            offset = self.offset_conv(out)
+            out = self.conv2(out, offset)
+        else:
+            out = self.conv2(out)
+        
         out = self.bn2(out)
+        
+        # Global context
         gc = self.global_context(out)
         out = out * gc
+        
+        # Shortcut
         out = out + self.shortcut(x)
         out = self.relu(out)
+        
+        # DWSA (optional)
         if self.dwsa is not None:
             out = self.dwsa(out)
+        
         return out
     
     def switch_to_deploy(self):
+        """Convert BatchNorm to deploy mode (if needed)"""
         self.deploy = True
 
 
