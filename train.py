@@ -473,9 +473,8 @@ class ModelConfig:
                 "channels": 32,  # ✅ Giữ nguyên = GCNet gốc
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],  # ✅ Giữ nguyên
-                "dwsa_stages": ['stage4', 'stage5', 'stage6'],  # ✅ Chỉ ở cuối
-                "dwsa_num_heads": 8,
-                "use_dcn_in_stage5_6": True,  # ✅ Deep layers
+                "dwsa_stages": [ 'stage6'],  # ✅ Chỉ ở cuối
+                "dwsa_num_heads": 4,
                 "use_multi_scale_context": True,
                 "align_corners": False,
                 "deploy": False
