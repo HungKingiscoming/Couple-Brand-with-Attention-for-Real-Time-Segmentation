@@ -432,7 +432,7 @@ class DWSABlock(nn.Module):
 
 
 
-class MultiScaleContext(nn.Module):
+class MultiScaleContextModule(nn.Module):
     def __init__(self, in_channels, out_channels, scales=(1, 2), branch_ratio=8):
         super().__init__()
         self.scales = scales
