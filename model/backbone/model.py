@@ -432,39 +432,48 @@ class DWSABlock(nn.Module):
 
 
 
-class MultiScaleContextModule(nn.Module):
-    def __init__(self, in_channels, out_channels, scales=None, branch_ratio=4):
+class MultiScaleContext(nn.Module):
+    def __init__(self, in_channels, out_channels, scales=(1, 2), branch_ratio=8):
         super().__init__()
-        if scales is None:
-            scales = [1, 2, 4]   # bớt scale 8 cho nhẹ
         self.scales = scales
 
-        # Tổng kênh của tất cả branch = in_channels // branch_ratio
         total_branch_channels = in_channels // branch_ratio
-        per_branch = total_branch_channels // len(scales)
+        per_branch = max(total_branch_channels // len(scales), 1)
 
         self.scale_branches = nn.ModuleList()
         for s in scales:
             if s == 1:
                 self.scale_branches.append(
-                    nn.Conv2d(in_channels, per_branch, kernel_size=1)
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, per_branch, kernel_size=1, bias=False),
+                        nn.ReLU(inplace=True),
+                    )
                 )
             else:
                 self.scale_branches.append(
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=s, stride=s),
-                        nn.Conv2d(in_channels, per_branch, kernel_size=1),
+                        nn.Conv2d(in_channels, per_branch, kernel_size=1, bias=False),
                         nn.ReLU(inplace=True),
                     )
                 )
 
+        fused_channels = per_branch * len(scales)
+        # fusion depthwise + pointwise
         self.fusion = nn.Sequential(
-            nn.Conv2d(per_branch * len(scales), out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(
+                fused_channels,
+                fused_channels,
+                kernel_size=3,
+                padding=1,
+                groups=fused_channels,    # depthwise
+                bias=False,
+            ),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=1),
+            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
         )
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x):
         B, C, H, W = x.shape
         outs = []
         for s, branch in zip(self.scales, self.scale_branches):
@@ -475,6 +484,7 @@ class MultiScaleContextModule(nn.Module):
         fused = torch.cat(outs, dim=1)
         out = self.fusion(fused)
         return out + x
+
 
 
 
