@@ -774,8 +774,10 @@ def main():
     print(f"{'='*70}\n")
     
     # Load pretrained weights
+    # Load pretrained weights with EXACT KEY MAPPING (stem.stageX → stageX)
     if args.pretrained_weights:
         print(f"📥 Loading pretrained weights from: {args.pretrained_weights}")
+        print(f"   Using EXACT key mapping (stem.stageX → stageX)...\n")
         
         try:
             checkpoint = torch.load(args.pretrained_weights, map_location='cpu', weights_only=False)
@@ -794,25 +796,64 @@ def main():
             backbone_state = {k: v for k, v in state_dict.items() 
                             if not k.startswith('decode_head') and not k.startswith('aux_head')}
             
-            # ✅ Filter by shape để tối đa transfer learning
+            # ✅ EXACT MAPPING: stem.stageX → stageX + keep everything else
             model_state = model.backbone.state_dict()
             compatible_state = {}
             
-            for k, v in backbone_state.items():
-                if k in model_state and model_state[k].shape == v.shape:
-                    compatible_state[k] = v
+            stats = {'stem': 0, 'semantic': 0, 'detail': 0, 'spp': 0, 'fusion': 0, 'other': 0}
             
-            print(f"   ✅ Load được {len(compatible_state)}/{len(backbone_state)} tham số backbone (khớp shape)")
-            missing, unexpected = model.backbone.load_state_dict(compatible_state, strict=False)
-            if missing:
-                print(f"   ⚠️  Missing keys in backbone: {len(missing)} keys")
-            if unexpected:
-                print(f"   ⚠️  Unexpected keys: {len(unexpected)} keys")
+            for ckpt_key, ckpt_weight in backbone_state.items():
+                # Map: stem.stageX → stageX
+                if ckpt_key.startswith('stem.'):
+                    model_key = ckpt_key.replace('stem.', '')
+                    cat = 'stem'
+                else:
+                    model_key = ckpt_key
+                    if 'semantic_branch' in ckpt_key:
+                        cat = 'semantic'
+                    elif 'detail_branch' in ckpt_key:
+                        cat = 'detail'
+                    elif 'spp' in ckpt_key:
+                        cat = 'spp'
+                    elif 'compression' in ckpt_key or 'down' in ckpt_key:
+                        cat = 'fusion'
+                    else:
+                        cat = 'other'
+                
+                # Load if exists and shape matches
+                if model_key in model_state and model_state[model_key].shape == ckpt_weight.shape:
+                    compatible_state[model_key] = ckpt_weight
+                    stats[cat] += 1
             
-            print(f"✅ Weights loaded successfully!\n")
+            loaded = len(compatible_state)
+            total = len(model_state)
+            rate = 100 * loaded / total
+            
+            print(f"   📊 Mapping Results:")
+            print(f"      Stem:             {stats['stem']:4d} params")
+            print(f"      Semantic branch:  {stats['semantic']:4d} params")
+            print(f"      Detail branch:    {stats['detail']:4d} params")
+            print(f"      SPP:              {stats['spp']:4d} params")
+            print(f"      Fusion:           {stats['fusion']:4d} params")
+            print(f"      Other:            {stats['other']:4d} params")
+            print(f"      {'─'*50}")
+            print(f"      TOTAL:            {loaded:4d} / {total} ({rate:.1f}%)\n")
+            
+            model.backbone.load_state_dict(compatible_state, strict=False)
+            
+            if rate >= 90:
+                print(f"   🎉 EXCELLENT {rate:.1f}% transfer rate! Strong initialization!\n")
+            elif rate >= 80:
+                print(f"   ✅ Great {rate:.1f}% transfer rate! Good backbone!\n")
+            elif rate >= 50:
+                print(f"   ✅ Good {rate:.1f}% transfer rate\n")
+            else:
+                print(f"   ⚠️  Low {rate:.1f}% transfer rate - check architecture\n")
             
         except Exception as e:
             print(f"❌ Failed to load weights: {e}\n")
+            import traceback
+            traceback.print_exc()
             return
     
     # Freeze backbone if requested
