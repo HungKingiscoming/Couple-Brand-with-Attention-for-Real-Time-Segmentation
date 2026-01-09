@@ -202,7 +202,7 @@ class DWSABlock(nn.Module):
 
 
 class MultiScaleContextModule(nn.Module):
-    """Multi-scale context aggregation module"""
+    """Multi-scale context aggregation module - FIXED"""
     def __init__(self, in_channels, out_channels, scales=None):
         super().__init__()
         if scales is None:
@@ -212,20 +212,28 @@ class MultiScaleContextModule(nn.Module):
         self.in_channels = in_channels
         self.out_channels = out_channels
         
+        # ✅ Calculate branch channels để tổng = in_channels
+        branch_channels = in_channels // len(scales)
+        
         self.scale_branches = nn.ModuleList()
         for scale in scales:
             if scale == 1:
-                branch = nn.Identity()
+                # Scale 1: giữ nguyên channels
+                branch = nn.Conv2d(in_channels, branch_channels, kernel_size=1)
             else:
+                # Scale > 1: downsample + reduce channels
                 branch = nn.Sequential(
                     nn.AvgPool2d(kernel_size=scale, stride=scale),
-                    nn.Conv2d(in_channels, in_channels // len(scales), kernel_size=1),
+                    nn.Conv2d(in_channels, branch_channels, kernel_size=1),
                     nn.ReLU(inplace=True)
                 )
             self.scale_branches.append(branch)
         
+        # ✅ Fusion input = branch_channels * len(scales) = in_channels
+        total_concat_channels = branch_channels * len(scales)
+        
         self.fusion = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.Conv2d(total_concat_channels, out_channels, kernel_size=3, padding=1),
             nn.ReLU(inplace=True),
             nn.Conv2d(out_channels, out_channels, kernel_size=1)
         )
@@ -233,16 +241,25 @@ class MultiScaleContextModule(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
         scale_outputs = []
+        
         for scale, branch in zip(self.scales, self.scale_branches):
             out = branch(x)
-            if scale > 1:
+            
+            # Upsample back to original size
+            if out.shape[-2:] != (H, W):
                 out = F.interpolate(out, size=(H, W), mode='bilinear', 
                                    align_corners=False)
+            
             scale_outputs.append(out)
         
+        # Concatenate scale outputs
         fused = torch.cat(scale_outputs, dim=1)
+        
+        # Fusion
         out = self.fusion(fused)
+        
         return out + x
+
 
 class GCNetWithDWSA_v2(BaseModule):
     """
