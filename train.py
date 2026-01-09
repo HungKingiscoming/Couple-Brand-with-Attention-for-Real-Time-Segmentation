@@ -942,14 +942,15 @@ def main():
         # Progressive unfreezing
         if epoch in unfreeze_epochs:
             k = len([e for e in unfreeze_epochs if e <= epoch])
+    
             if k == 1:
-                # Phase 1 unfreeze: semantic sâu nhất + DWSA/MSContext
+                # B1: mở semantic sâu nhất + attention/context
                 targets = ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
             elif k == 2:
-                # Phase 2: thêm semantic_branch_layers.1 (s5)
+                # B2: mở thêm semantic_branch_layers.1 (s5)
                 targets = ['semantic_branch_layers.1']
-            else:
-                # (tuỳ chọn) thêm s4/detail nếu muốn
+            elif k == 3:
+                # B3 (tuỳ chọn): mở thêm semantic_branch_layers.0 (s4) hoặc detail
                 targets = ['semantic_branch_layers.0']
     
             unfreeze_backbone_progressive(model, targets)
