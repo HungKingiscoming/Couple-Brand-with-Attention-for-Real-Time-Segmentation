@@ -635,14 +635,25 @@ class Trainer:
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
 
-    def load_checkpoint(self, checkpoint_path, reset_epoch=True):
-        """Load checkpoint"""
+    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True):
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-        
+    
         self.model.load_state_dict(checkpoint['model'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        if 'scaler' in checkpoint and checkpoint['scaler'] is not None:
-            self.scaler.load_state_dict(checkpoint['scaler'])
+    
+        if load_optimizer and checkpoint.get('optimizer') is not None:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer'])
+            except ValueError as e:
+                print(f"⚠️  Optimizer state not loaded: {e}")
+        else:
+            print("⚠️  Skipping optimizer state loading.")
+    
+        if 'scaler' in checkpoint and checkpoint['scaler'] is not None and load_optimizer:
+            try:
+                self.scaler.load_state_dict(checkpoint['scaler'])
+            except Exception as e:
+                print(f"⚠️  AMP scaler state not loaded: {e}")
+    
         if reset_epoch:
             self.start_epoch = 0
             self.best_miou = 0.0
@@ -652,8 +663,11 @@ class Trainer:
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_miou = checkpoint.get('best_miou', 0.0)
             self.global_step = checkpoint.get('global_step', 0)
-            if self.scheduler and checkpoint.get('scheduler'):
-                self.scheduler.load_state_dict(checkpoint['scheduler'])
+            if self.scheduler and checkpoint.get('scheduler') and load_optimizer:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler'])
+                except Exception as e:
+                    print(f"⚠️  Scheduler state not loaded: {e}")
             print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
@@ -909,7 +923,7 @@ def main():
     
     if args.resume:
         reset_epoch = (args.resume_mode == "transfer")
-        trainer.load_checkpoint(args.resume, reset_epoch=reset_epoch)
+        trainer.load_checkpoint(args.resume, reset_epoch=reset_epoch, load_optimizer=False)
     
     # Training loop
     print(f"\n{'='*70}")
