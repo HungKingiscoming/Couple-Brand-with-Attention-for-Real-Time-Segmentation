@@ -388,10 +388,10 @@ class MultiScaleContextModule(nn.Module):
     def __init__(self, in_channels, out_channels, scales=None):
         super().__init__()
         if scales is None:
-            scales = [1, 2, 4, 8]
+            scales = [1, 2, 4]
         self.scales = scales
 
-        branch_channels = in_channels // len(scales)
+        branch_channels = in_channels // (len(scales)*2)
         self.scale_branches = nn.ModuleList()
         for s in scales:
             if s == 1:
@@ -694,7 +694,7 @@ class GCNetWithEnhance(BaseModule):
                  ppm_channels: int = 128,
                  num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
                  dwsa_stages: List[str] = ('stage5', 'stage6'),
-                 dwsa_num_heads: int = 8,
+                 dwsa_num_heads: int = 4,
                  use_multi_scale_context: bool = True,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
@@ -723,7 +723,7 @@ class GCNetWithEnhance(BaseModule):
 
         # ===== DWSA: chỉ stage5, stage6 =====
         self.dwsa4 = None  # không dùng DWSA ở stage4
-        self.dwsa5 = DWSABlock(C * 8, num_heads=dwsa_num_heads) if 'stage5' in dwsa_stages else None  # s5: 8C
+        self.dwsa5 = None
         self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads) if 'stage6' in dwsa_stages else None  # s6: 16C
 
         # ===== KHÔNG CÓ DCN =====
