@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torchvision.ops import DeformConv2d
+# from torchvision.ops import DeformConv2d   # <-- BỎ DÒNG NÀY
 
 from components.components import (
     ConvModule,
@@ -427,7 +427,7 @@ class MultiScaleContextModule(nn.Module):
 
 
 # ===========================
-# GCNet gốc nhưng trả ra feature
+# GCNetCore (giữ nguyên)
 # ===========================
 
 class GCNetCore(BaseModule):
@@ -671,16 +671,15 @@ class GCNetCore(BaseModule):
 
 
 # ===========================
-# Backbone có DWSA/DCN/MultiScale
+# Backbone có DWSA/MultiScale (không DCN)
 # ===========================
 
 class GCNetWithEnhance(BaseModule):
     """
-    GCNet backbone + DWSA/DCN/MultiScale đặt ở các stage hợp lý:
+    GCNet backbone + DWSA/MultiScale (không DCN):
 
     - Backbone: GCNetCore (giống GCNet-s gốc, load 90%+ weight).
     - DWSA: chỉ trên semantic deep (stage5: s5, stage6: s6).
-    - DCN: chỉ trên s6 (deepest semantic feature).
     - MultiScaleContext: sau SPP(s6), trước khi fuse với detail.
     - Output cho head:
         c1: (B, C,   H/2,  W/2)
@@ -696,7 +695,6 @@ class GCNetWithEnhance(BaseModule):
                  num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
                  dwsa_stages: List[str] = ('stage5', 'stage6'),
                  dwsa_num_heads: int = 8,
-                 use_dcn_in_stage5_6: bool = True,
                  use_multi_scale_context: bool = True,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
@@ -728,13 +726,9 @@ class GCNetWithEnhance(BaseModule):
         self.dwsa5 = DWSABlock(C * 8, num_heads=dwsa_num_heads) if 'stage5' in dwsa_stages else None  # s5: 8C
         self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads) if 'stage6' in dwsa_stages else None  # s6: 16C
 
-        # ===== DCN: chỉ trên s6 =====
-        if use_dcn_in_stage5_6:
-            self.dcn5 = None  # bỏ DCN ở s5 để tiết kiệm
-            self.dcn6 = DeformConv2d(C * 16, C * 16, kernel_size=3, padding=1, bias=False)
-        else:
-            self.dcn5 = None
-            self.dcn6 = None
+        # ===== KHÔNG CÓ DCN =====
+        # self.dcn5 = None
+        # self.dcn6 = None
 
         # ===== MultiScaleContext: sau SPP(s6) =====
         # SPP output: 4C (128 kênh nếu C=32)
@@ -775,12 +769,8 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
 
-        # ===== DCN chỉ trên s6 =====
-        if self.dcn6 is not None:
-            offset6 = torch.zeros(
-                x.size(0), 2 * 3 * 3, s6.size(2), s6.size(3),
-                device=s6.device, dtype=s6.dtype)
-            s6 = self.dcn6(s6, offset6)
+        # ===== KHÔNG DCN TRÊN s6 =====
+        # (s6 giữ nguyên sau DWSA)
 
         # ===== SPP + MultiScale trên semantic deep =====
         # Dùng lại DAPPM của GCNetCore, nhưng input là s6 đã enhance
