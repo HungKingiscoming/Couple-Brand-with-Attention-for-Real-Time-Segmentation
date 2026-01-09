@@ -351,7 +351,7 @@ class ModelConfig:
                 "channels": 32,  # ✅ Giữ nguyên = GCNet gốc
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],  # ✅ Giữ nguyên
-                "dwsa_stages": [ 'stage6'],  # ✅ Chỉ ở cuối
+                "dwsa_stages": ['stage6'],  # ✅ Chỉ ở cuối
                 "dwsa_num_heads": 4,
                 "use_multi_scale_context": True,
                 "align_corners": False,
@@ -826,15 +826,7 @@ def main():
     # Load pretrained weights
     # Load pretrained weights with EXACT KEY MAPPING (stem.stageX → stageX)
     if args.pretrained_weights:
-        transfer_rate = load_pretrained_with_improved_mapping(
-            model, 
-            args.pretrained_weights
-        )
-        
-        if transfer_rate < 70:
-            print(f"⚠️  WARNING: Transfer rate {transfer_rate:.1f}% is low!")
-            print(f"   Consider checking architecture compatibility")
-
+       load_pretrained_gcnet_core(model, args.pretrained_weights)
     
     # Freeze backbone if requested
     if args.freeze_backbone:
