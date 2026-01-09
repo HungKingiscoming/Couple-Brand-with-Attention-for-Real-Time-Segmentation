@@ -46,28 +46,56 @@ from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
 def load_pretrained_gcnet_core(model, ckpt_path):
+    """
+    Load GCNet pretrained weights vào model.backbone với matching theo shape.
+    - Không giả định checkpoint có prefix 'backbone.'
+    - Bỏ qua các layer mới (DWSA/DCN/MultiScale), chỉ load phần trùng tên + shape.
+    """
+    print(f"📥 Loading pretrained GCNet weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
-
-    # Lấy backbone.* và bỏ prefix
-    backbone_state = {}
-    for k, v in state.items():
-        if k.startswith('backbone.'):
-            new_k = k[len('backbone.'):]
-            backbone_state[new_k] = v
 
     model_state = model.backbone.state_dict()
     compatible = {}
     skipped = []
 
-    for k, v in backbone_state.items():
-        if k in model_state and model_state[k].shape == v.shape:
-            compatible[k] = v
-        else:
-            skipped.append(k)
+    for ckpt_key, ckpt_val in state.items():
+        # Bỏ một số prefix hay gặp: 'backbone.', 'model.', 'module.'
+        k = ckpt_key
+        for pref in ['backbone.', 'model.', 'module.']:
+            if k.startswith(pref):
+                k = k[len(pref):]
 
-    print(f"Loaded {len(compatible)}/{len(model_state)} params from GCNet.")
-    model.backbone.load_state_dict(compatible, strict=False)
+        # 1) Thử match trực tiếp
+        if k in model_state and model_state[k].shape == ckpt_val.shape:
+            compatible[k] = ckpt_val
+            continue
+
+        # 2) Thử match theo hậu tố (endswith), phòng trường hợp tên hơi khác
+        matched = False
+        for mk in model_state.keys():
+            if mk.endswith(k) and model_state[mk].shape == ckpt_val.shape:
+                compatible[mk] = ckpt_val
+                matched = True
+                break
+
+        if not matched:
+            skipped.append(ckpt_key)
+
+    loaded = len(compatible)
+    total = len(model_state)
+    rate = 100 * loaded / total if total > 0 else 0.0
+
+    print(f"Loaded {loaded}/{total} params into backbone ({rate:.1f}%).")
+    if loaded == 0:
+        print("⚠️  WARNING: 0 params loaded. Check checkpoint format and key names.")
+
+    missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
+    print(f"Missing keys in loaded dict: {len(missing)}")
+    print(f"Unexpected keys in loaded dict: {len(unexpected)}\n")
+
+    return rate
+
 
 # ============================================
 # LOSS FUNCTIONS
