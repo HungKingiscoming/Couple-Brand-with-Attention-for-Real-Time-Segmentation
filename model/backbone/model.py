@@ -676,10 +676,17 @@ class GCNetCore(BaseModule):
 
 class GCNetWithEnhance(BaseModule):
     """
-    GCNet + DWSA + DCN + MultiScale context.
+    GCNet backbone + DWSA/DCN/MultiScale đặt ở các stage hợp lý:
 
-    - Tận dụng tối đa weight GCNet: mọi GCBlock/conv giữ nguyên tên/shape.
-    - DWSA/DCN/MultiScale là layer mới, random init, dùng strict=False để load.
+    - Backbone: GCNetCore (giống GCNet-s gốc, load 90%+ weight).
+    - DWSA: chỉ trên semantic deep (stage5: s5, stage6: s6).
+    - DCN: chỉ trên s6 (deepest semantic feature).
+    - MultiScaleContext: sau SPP(s6), trước khi fuse với detail.
+    - Output cho head:
+        c1: (B, C,   H/2,  W/2)
+        c2: (B, 2C,  H/4,  W/4)
+        c4: (B, 2C,  H/8,  W/8)  # detail H/8
+        c5: (B, 4C,  H/8,  W/8)  # enhanced deep feature
     """
 
     def __init__(self,
@@ -687,7 +694,7 @@ class GCNetWithEnhance(BaseModule):
                  channels: int = 32,
                  ppm_channels: int = 128,
                  num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
-                 dwsa_stages: List[str] = ('stage4', 'stage5', 'stage6'),
+                 dwsa_stages: List[str] = ('stage5', 'stage6'),
                  dwsa_num_heads: int = 8,
                  use_dcn_in_stage5_6: bool = True,
                  use_multi_scale_context: bool = True,
@@ -701,7 +708,7 @@ class GCNetWithEnhance(BaseModule):
         self.align_corners = align_corners
         self.channels = channels
 
-        # GCNet core giữ nguyên để load weight
+        # ===== GCNet core giữ nguyên để load weight GCNet-s =====
         self.backbone = GCNetCore(
             in_channels=in_channels,
             channels=channels,
@@ -714,25 +721,26 @@ class GCNetWithEnhance(BaseModule):
             deploy=deploy,
         )
 
-        C = channels
+        C = channels  # C=32 cho GCNet-s
 
-        # DWSA trên semantic feature
-        self.dwsa4 = DWSABlock(C * 4, num_heads=dwsa_num_heads) if 'stage4' in dwsa_stages else None
-        self.dwsa5 = DWSABlock(C * 8, num_heads=dwsa_num_heads) if 'stage5' in dwsa_stages else None
-        self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads) if 'stage6' in dwsa_stages else None
+        # ===== DWSA: chỉ stage5, stage6 =====
+        self.dwsa4 = None  # không dùng DWSA ở stage4
+        self.dwsa5 = DWSABlock(C * 8, num_heads=dwsa_num_heads) if 'stage5' in dwsa_stages else None  # s5: 8C
+        self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads) if 'stage6' in dwsa_stages else None  # s6: 16C
 
-        # DCN trên semantic stage5/6
+        # ===== DCN: chỉ trên s6 =====
         if use_dcn_in_stage5_6:
-            self.dcn5 = DeformConv2d(C * 8, C * 8, kernel_size=3, padding=1, bias=False)
+            self.dcn5 = None  # bỏ DCN ở s5 để tiết kiệm
             self.dcn6 = DeformConv2d(C * 16, C * 16, kernel_size=3, padding=1, bias=False)
         else:
             self.dcn5 = None
             self.dcn6 = None
 
-        # Multi-scale context sau SPP
+        # ===== MultiScaleContext: sau SPP(s6) =====
+        # SPP output: 4C (128 kênh nếu C=32)
         self.ms_context = MultiScaleContextModule(C * 4, C * 4) if use_multi_scale_context else None
 
-        # Final proj
+        # Projection cuối cho feature deep
         self.final_proj = ConvModule(
             in_channels=C * 4,
             out_channels=C * 4,
@@ -742,52 +750,59 @@ class GCNetWithEnhance(BaseModule):
         )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        """
+        Returns:
+            {
+                'c1': (B, C,   H/2,  W/2),
+                'c2': (B, 2C,  H/4,  W/4),
+                'c4': (B, 2C,  H/8,  W/8),
+                'c5': (B, 4C,  H/8,  W/8),  # enhanced
+                'c5_gcnet': (B, 4C, H/8, W/8)  # optional, GCNet original out
+            }
+        """
         feats = self.backbone(x)
-    
-        c1 = feats['c1']
-        c2 = feats['c2']
-        c4 = feats['c4']
-        x_d6 = feats['x_d6']
+
+        # lấy feature chuẩn cho head
+        c1 = feats['c1']      # H/2,  C
+        c2 = feats['c2']      # H/4,  2C
+        c4 = feats['c4']      # H/8,  2C (detail)
+        x_d6 = feats['x_d6']  # H/8,  4C (detail stage6)
         s4, s5, s6 = feats['s4'], feats['s5'], feats['s6']
-    
-        # ===== DWSA =====
-        if self.dwsa4 is not None:
-            s4 = self.dwsa4(s4)
+
+        # ===== DWSA chỉ ở s5, s6 =====
         if self.dwsa5 is not None:
             s5 = self.dwsa5(s5)
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
-    
-        # ===== DCN =====
-        if self.dcn5 is not None:
-            offset5 = torch.zeros(
-                x.size(0), 2 * 3 * 3, s5.size(2), s5.size(3),
-                device=s5.device, dtype=s5.dtype)
-            s5 = self.dcn5(s5, offset5)
+
+        # ===== DCN chỉ trên s6 =====
         if self.dcn6 is not None:
             offset6 = torch.zeros(
                 x.size(0), 2 * 3 * 3, s6.size(2), s6.size(3),
                 device=s6.device, dtype=s6.dtype)
             s6 = self.dcn6(s6, offset6)
-    
+
         # ===== SPP + MultiScale trên semantic deep =====
-        x_spp = self.backbone.spp(s6)
+        # Dùng lại DAPPM của GCNetCore, nhưng input là s6 đã enhance
+        x_spp = self.backbone.spp(s6)  # (B, 4C, H/8, W/8)
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         x_spp = resize(
             x_spp, size=out_size,
             mode='bilinear',
             align_corners=self.align_corners)
-    
+
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
-    
-        x_spp = self.final_proj(x_spp)   # 128 ch
-    
-        # ===== C5 enhanced (H/8, 128ch) =====
-        c5_gcnet = feats['out']         # x_d6 + (SPP(s6) gốc)
-        c5_enh = x_d6 + x_spp           # detail + semantic enhanced
-    
-        # Cho head dùng c5_enh
+
+        x_spp = self.final_proj(x_spp)     # (B, 4C, H/8, W/8)
+
+        # ===== C5 enhanced =====
+        # GCNet gốc: out = x_d6 + spp(s6_gốc)
+        c5_gcnet = feats['out']            # (B, 4C, H/8, W/8)
+        # Phiên bản enhanced: detail stage6 + spp(s6_enhanced)
+        c5_enh = x_d6 + x_spp              # (B, 4C, H/8, W/8)
+
+        # Cho head dùng c5_enh là 'c5'
         return dict(
             c1=c1,
             c2=c2,
