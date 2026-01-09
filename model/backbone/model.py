@@ -645,7 +645,7 @@ class GCNetWithDWSA_v2(BaseModule):
         # ======================================
         self.final_proj = ConvModule(
             in_channels=channels * 4,
-            out_channels=channels * 2,
+            out_channels=channels * 4,
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg
