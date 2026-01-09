@@ -31,7 +31,7 @@ warnings.filterwarnings('ignore')
 # IMPORTS
 # ============================================
 
-from model.backbone.model import (
+from model..model import (
     GCNetWithEnhance,
     GCNetCore,      # nếu cần
     GCBlock,
@@ -47,22 +47,22 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 
 def load_pretrained_gcnet_core(model, ckpt_path):
     """
-    Load GCNet pretrained weights vào model.backbone với matching theo shape.
-    - Không giả định checkpoint có prefix 'backbone.'
+    Load GCNet pretrained weights vào model. với matching theo shape.
+    - Không giả định checkpoint có prefix '.'
     - Bỏ qua các layer mới (DWSA/DCN/MultiScale), chỉ load phần trùng tên + shape.
     """
     print(f"📥 Loading pretrained GCNet weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    model_state = model.backbone.state_dict()
+    model_state = model..state_dict()
     compatible = {}
     skipped = []
 
     for ckpt_key, ckpt_val in state.items():
-        # Bỏ một số prefix hay gặp: 'backbone.', 'model.', 'module.'
+        # Bỏ một số prefix hay gặp: '.', 'model.', 'module.'
         k = ckpt_key
-        for pref in ['backbone.', 'model.', 'module.']:
+        for pref in ['.', 'model.', 'module.']:
             if k.startswith(pref):
                 k = k[len(pref):]
 
@@ -86,11 +86,11 @@ def load_pretrained_gcnet_core(model, ckpt_path):
     total = len(model_state)
     rate = 100 * loaded / total if total > 0 else 0.0
 
-    print(f"Loaded {loaded}/{total} params into backbone ({rate:.1f}%).")
+    print(f"Loaded {loaded}/{total} params into  ({rate:.1f}%).")
     if loaded == 0:
         print("⚠️  WARNING: 0 params loaded. Check checkpoint format and key names.")
 
-    missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
+    missing, unexpected = model..load_state_dict(compatible, strict=False)
     print(f"Missing keys in loaded dict: {len(missing)}")
     print(f"Unexpected keys in loaded dict: {len(unexpected)}\n")
 
@@ -241,16 +241,16 @@ def setup_memory_efficient_training():
 # FREEZE/UNFREEZE UTILITIES FOR TRANSFER LEARNING
 # ============================================
 
-def freeze_backbone(model):
-    """Freeze toàn bộ backbone"""
-    for param in model.backbone.parameters():
+def freeze_(model):
+    """Freeze toàn bộ """
+    for param in model..parameters():
         param.requires_grad = False
-    print("🔒 Backbone FROZEN - chỉ head được train")
+    print("🔒  FROZEN - chỉ head được train")
 
 
-def unfreeze_backbone_progressive(model, stage_names):
+def unfreeze__progressive(model, stage_names):
     """
-    Unfreeze các stage cụ thể của backbone
+    Unfreeze các stage cụ thể của 
     stage_names: list như ['stage1', 'stage2'] hoặc string như 'stage4'
     """
     if isinstance(stage_names, str):
@@ -258,7 +258,7 @@ def unfreeze_backbone_progressive(model, stage_names):
     
     unfrozen_count = 0
     for stage_name in stage_names:
-        for name, module in model.backbone.named_modules():
+        for name, module in model..named_modules():
             if stage_name in name:
                 for param in module.parameters():
                     param.requires_grad = True
@@ -273,8 +273,8 @@ def count_trainable_params(model):
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = total - trainable
     
-    backbone_total = sum(p.numel() for p in model.backbone.parameters())
-    backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    _total = sum(p.numel() for p in model..parameters())
+    _trainable = sum(p.numel() for p in model..parameters() if p.requires_grad)
     
     head_total = sum(p.numel() for p in model.decode_head.parameters())
     head_trainable = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
@@ -292,7 +292,7 @@ def count_trainable_params(model):
     print(f"Trainable:    {trainable:>15,} | {100*trainable/total:.1f}%")
     print(f"Frozen:       {frozen:>15,} | {100*frozen/total:.1f}%")
     print(f"{'-'*70}")
-    print(f"Backbone:     {backbone_trainable:>15,} / {backbone_total:,} | {100*backbone_trainable/backbone_total:.1f}%")
+    print(f":     {_trainable:>15,} / {_total:,} | {100*_trainable/_total:.1f}%")
     print(f"Head:         {head_trainable:>15,} / {head_total:,} | {100*head_trainable/head_total:.1f}%")
     if aux_total > 0:
         print(f"Aux Head:     {aux_trainable:>15,} / {aux_total:,} | {100*aux_trainable/aux_total:.1f}%")
@@ -301,37 +301,37 @@ def count_trainable_params(model):
     return trainable, frozen
 
 
-def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
+def setup_discriminative_lr(model, base_lr, _lr_factor=0.1, weight_decay=1e-4):
     """
-    Tạo optimizer với LR khác nhau cho backbone vs head
-    backbone_lr = base_lr * backbone_lr_factor
+    Tạo optimizer với LR khác nhau cho  vs head
+    _lr = base_lr * _lr_factor
     head_lr = base_lr
     """
-    backbone_params = [p for n, p in model.named_parameters() 
-                      if 'backbone' in n and p.requires_grad]
+    _params = [p for n, p in model.named_parameters() 
+                      if '' in n and p.requires_grad]
     head_params = [p for n, p in model.named_parameters() 
-                  if 'backbone' not in n and p.requires_grad]
+                  if '' not in n and p.requires_grad]
     
-    if len(backbone_params) == 0:
+    if len(_params) == 0:
         optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
         print(f"⚙️  Optimizer: AdamW (lr={base_lr}) - chỉ head")
     else:
-        backbone_lr = base_lr * backbone_lr_factor
+        _lr = base_lr * _lr_factor
         param_groups = [
-            {'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
+            {'params': _params, 'lr': _lr, 'name': ''},
             {'params': head_params, 'lr': base_lr, 'name': 'head'}
         ]
         optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
         
         print(f"⚙️  Optimizer: AdamW (Discriminative LR)")
-        print(f"   ├─ Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
+        print(f"   ├─  LR: {_lr:.2e} ({len(_params):,} params)")
         print(f"   └─ Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
     
     return optimizer
 
 
 # ============================================
-# MODEL CONFIG - OPTIMIZED v2 BACKBONE FOR TRANSFER LEARNING
+# MODEL CONFIG - OPTIMIZED v2  FOR TRANSFER LEARNING
 # ============================================
 
 class ModelConfig:
@@ -351,15 +351,15 @@ class ModelConfig:
                 "in_channels": 3,
                 "channels": 32,  # ✅ Giữ nguyên = GCNet gốc
                 "ppm_channels": 128,
-                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],  # ✅ Giữ nguyên
-                "dwsa_stages": ['stage4', 'stage5', 'stage6'],  # ✅ Chỉ ở cuối
-                "dwsa_num_heads": 8,
+                "num_blocks_per_stage": [3, 3, [3, 2], [3, 2], [2, 2]],  # ✅ Giữ nguyên
+                "dwsa_stages": [ 'stage6'],  # ✅ Chỉ ở cuối
+                "dwsa_num_heads": 4,
                 "use_multi_scale_context": True,
                 "align_corners": False,
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,  # channels * 2 = 32 * 2 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 64,  # channels * 2 = 32 * 2 (sẽ override bằng detect__channels)
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
