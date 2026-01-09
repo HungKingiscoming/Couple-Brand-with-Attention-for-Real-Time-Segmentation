@@ -32,10 +32,11 @@ warnings.filterwarnings('ignore')
 # ============================================
 
 from model.backbone.model import (
-    GCNetWithDWSA_v2,
-    GCBlock,           # ✅ Thêm
-    DWSABlock,         # ✅ Thêm  
-    MultiScaleContextModule  # ✅ Thêm
+    GCNetWithEnhance,
+    GCNetCore,      # nếu cần
+    GCBlock,
+    DWSABlock,
+    MultiScaleContextModule,
 )
 from model.head.segmentation_head import (
     GCNetHead,
