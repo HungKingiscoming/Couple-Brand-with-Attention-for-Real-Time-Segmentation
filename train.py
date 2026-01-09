@@ -31,7 +31,7 @@ warnings.filterwarnings('ignore')
 # IMPORTS
 # ============================================
 
-from model.backbone.gcnet_dwsa_optimized import GCNetWithDWSA_v2
+from model.backbone.model import GCNetWithDWSA_v2
 from model.head.segmentation_head import (
     GCNetHead,
     GCNetAuxHead,
