@@ -665,7 +665,7 @@ class GCNetWithDWSA_v2(BaseModule):
         c2 = self.stem[1](c1)
         outputs['c2'] = c2
         
-        c3 = self.stem[2](c2))
+        c3 = self.stem[2](c2)
         outputs['c3'] = c3
         
         # ======================================
