@@ -357,17 +357,13 @@ class DWSABlock(nn.Module):
         self.reduced = reduced
         self.mid = mid
 
-        # C -> C'
         self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
-        # C' -> C
         self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
 
-        # Thay Linear bằng 1x1 conv trên C' với group
         g = min(groups, reduced) if groups > 1 else 1
-        if reduced % g != 0:  # đảm bảo chia hết
+        if reduced % g != 0:
             g = 1
 
-        # base proj cho QK sharing
         self.qk_sharing = qk_sharing
         if qk_sharing:
             self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
@@ -386,51 +382,45 @@ class DWSABlock(nn.Module):
     def forward(self, x):
         B, C, H, W = x.shape
 
-        # Giảm chiều C -> C'
         x_red = self.in_proj(x)              # B, C', H, W
         B, C2, H, W = x_red.shape
         N = H * W
+        x_flat = x_red.view(B, C2, N)        # B, C', N
 
-        # B, C', HW
-        x_flat = x_red.view(B, C2, N)
-
-        # Q, K, V (Conv1d + group, có thể chia sẻ)
         if self.qk_sharing:
-            base = self.qk_base(x_flat)          # B, mid, N
+            base = self.qk_base(x_flat)      # B, mid, N
             q = self.q_head(base)
             k = self.k_head(base)
         else:
             q = self.q_proj(x_flat)
             k = self.k_proj(x_flat)
-        v = self.v_proj(x_flat)                  # B, mid, N
+        v = self.v_proj(x_flat)              # B, mid, N
 
         # B, heads, N, dim
-        def reshape_heads(t):
+        def split_heads(t):
             B, Cmid, N = t.shape
             head_dim = Cmid // self.num_heads
-            t = t.view(B, self.num_heads, head_dim, N)
-            return t.permute(0, 1, 3, 2)        # B, heads, N, head_dim
+            t = t.view(B, self.num_heads, head_dim, N)  # B, h, d, N
+            return t
 
-        q = reshape_heads(q)
-        k = reshape_heads(k)
-        v = reshape_heads(v)
+        q = split_heads(q).permute(0, 1, 3, 2)  # B, h, N, d
+        k = split_heads(k).permute(0, 1, 3, 2)
+        v = split_heads(v).permute(0, 1, 3, 2)
 
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale   # B, heads, N, N
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale   # B, h, N, N
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
-        out = torch.matmul(attn, v)             # B, heads, N, head_dim
-        B_, Hn, N_, Hd = out.shape
-        out = out.permute(0, 1, 3, 2).contiguous().view(B, self.mid, N)  # B, mid, N
+        out = torch.matmul(attn, v)          # B, h, N, d
+        out = out.permute(0, 1, 3, 2).contiguous()  # B, h, d, N
+        B_, Hn, Hd, N_ = out.shape
+        out = out.view(B, self.mid, N_)      # B, mid, N
 
-        # O proj
-        out = self.o_proj(out)                 # B, C', N
+        out = self.o_proj(out)               # B, C', N
         out = out.view(B, C2, H, W)
-        out = self.out_proj(out)               # B, C, H, W
+        out = self.out_proj(out)             # B, C, H, W
 
         return out + x
-
-
 
 class MultiScaleContextModule(nn.Module):
     def __init__(self, in_channels, out_channels, scales=(1, 2), branch_ratio=8):
@@ -438,14 +428,21 @@ class MultiScaleContextModule(nn.Module):
         self.scales = scales
 
         total_branch_channels = in_channels // branch_ratio
-        per_branch = max(total_branch_channels // len(scales), 1)
+        # chia đều + dồn phần dư, đảm bảo tổng đúng total_branch_channels
+        base = total_branch_channels // len(scales)
+        extra = total_branch_channels % len(scales)
+        per_branch_list = []
+        for i in range(len(scales)):
+            c = base + (1 if i < extra else 0)
+            per_branch_list.append(max(c, 1))
+        fused_channels = sum(per_branch_list)
 
         self.scale_branches = nn.ModuleList()
-        for s in scales:
+        for s, c_out in zip(scales, per_branch_list):
             if s == 1:
                 self.scale_branches.append(
                     nn.Sequential(
-                        nn.Conv2d(in_channels, per_branch, kernel_size=1, bias=False),
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
                         nn.ReLU(inplace=True),
                     )
                 )
@@ -453,25 +450,26 @@ class MultiScaleContextModule(nn.Module):
                 self.scale_branches.append(
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=s, stride=s),
-                        nn.Conv2d(in_channels, per_branch, kernel_size=1, bias=False),
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
                         nn.ReLU(inplace=True),
                     )
                 )
 
-        fused_channels = per_branch * len(scales)
-        # fusion depthwise + pointwise
         self.fusion = nn.Sequential(
             nn.Conv2d(
                 fused_channels,
                 fused_channels,
                 kernel_size=3,
                 padding=1,
-                groups=fused_channels,    # depthwise
+                groups=fused_channels,
                 bias=False,
             ),
             nn.ReLU(inplace=True),
             nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
         )
+
+        # scale residual để tránh mất cân bằng
+        self.res_scale = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -481,9 +479,15 @@ class MultiScaleContextModule(nn.Module):
             if o.shape[-2:] != (H, W):
                 o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=False)
             outs.append(o)
+
         fused = torch.cat(outs, dim=1)
-        out = self.fusion(fused)
-        return out + x
+        out = self.fusion(fused)  # B, out_channels, H, W
+
+        if out.shape[1] == C:
+            return x + self.res_scale * out
+        else:
+            return out
+
 
 
 
@@ -741,8 +745,8 @@ class GCNetWithEnhance(BaseModule):
     GCNet backbone + DWSA/MultiScale (không DCN):
 
     - Backbone: GCNetCore (giống GCNet-s gốc, load 90%+ weight).
-    - DWSA: chỉ trên semantic deep (stage5: s5, stage6: s6).
-    - MultiScaleContext: sau SPP(s6), trước khi fuse với detail.
+    - DWSA: cấu hình qua dwsa_stages (vd: ('stage5','stage6') hoặc ('stage6',)).
+    - MultiScaleContext: sau SPP(s6), trước khi fuse với detail (có thể tắt).
     - Output cho head:
         c1: (B, C,   H/2,  W/2)
         c2: (B, 2C,  H/4,  W/4)
@@ -783,19 +787,24 @@ class GCNetWithEnhance(BaseModule):
 
         C = channels  # C=32 cho GCNet-s
 
-        # ===== DWSA: chỉ stage5, stage6 =====
-        self.dwsa4 = None  # không dùng DWSA ở stage4
+        # ===== DWSA theo dwsa_stages =====
+        self.dwsa4 = None
         self.dwsa5 = None
-        self.dwsa6 = DWSABlock(C * 16, num_heads=2, reduction=4, qk_sharing=True, groups=4) 
+        self.dwsa6 = None
 
-        # ===== KHÔNG CÓ DCN =====
-        # self.dcn5 = None
-        # self.dcn6 = None
+        for stage in dwsa_stages:
+            if stage == 'stage4':
+                self.dwsa4 = DWSABlock(C * 4, num_heads=dwsa_num_heads, reduction=4, qk_sharing=True, groups=4)
+            elif stage == 'stage5':
+                self.dwsa5 = DWSABlock(C * 8, num_heads=dwsa_num_heads, reduction=4, qk_sharing=True, groups=4)
+            elif stage == 'stage6':
+                self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads, reduction=4, qk_sharing=True, groups=4)
 
         # ===== MultiScaleContext: sau SPP(s6) =====
-        # SPP output: 4C (128 kênh nếu C=32)
-        self.ms_context = MultiScaleContextModule(C * 4, C * 4, scales=(1, 2), branch_ratio=8)
-
+        if use_multi_scale_context:
+            self.ms_context = MultiScaleContextModule(C * 4, C * 4, scales=(1, 2), branch_ratio=8)
+        else:
+            self.ms_context = None
 
         # Projection cuối cho feature deep
         self.final_proj = ConvModule(
@@ -819,24 +828,21 @@ class GCNetWithEnhance(BaseModule):
         """
         feats = self.backbone(x)
 
-        # lấy feature chuẩn cho head
         c1 = feats['c1']      # H/2,  C
         c2 = feats['c2']      # H/4,  2C
         c4 = feats['c4']      # H/8,  2C (detail)
         x_d6 = feats['x_d6']  # H/8,  4C (detail stage6)
         s4, s5, s6 = feats['s4'], feats['s5'], feats['s6']
 
-        # ===== DWSA chỉ ở s5, s6 =====
+        # ===== DWSA theo từng stage =====
+        if self.dwsa4 is not None:
+            s4 = self.dwsa4(s4)
         if self.dwsa5 is not None:
             s5 = self.dwsa5(s5)
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
 
-        # ===== KHÔNG DCN TRÊN s6 =====
-        # (s6 giữ nguyên sau DWSA)
-
         # ===== SPP + MultiScale trên semantic deep =====
-        # Dùng lại DAPPM của GCNetCore, nhưng input là s6 đã enhance
         x_spp = self.backbone.spp(s6)  # (B, 4C, H/8, W/8)
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         x_spp = resize(
@@ -849,13 +855,11 @@ class GCNetWithEnhance(BaseModule):
 
         x_spp = self.final_proj(x_spp)     # (B, 4C, H/8, W/8)
 
-        # ===== C5 enhanced =====
         # GCNet gốc: out = x_d6 + spp(s6_gốc)
         c5_gcnet = feats['out']            # (B, 4C, H/8, W/8)
-        # Phiên bản enhanced: detail stage6 + spp(s6_enhanced)
+        # Enhanced: detail stage6 + spp(s6_enhanced)
         c5_enh = x_d6 + x_spp              # (B, 4C, H/8, W/8)
 
-        # Cho head dùng c5_enh là 'c5'
         return dict(
             c1=c1,
             c2=c2,
