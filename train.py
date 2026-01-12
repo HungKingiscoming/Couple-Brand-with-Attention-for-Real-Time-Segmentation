@@ -249,35 +249,53 @@ def freeze_backbone(model):
 
 def unfreeze_backbone_progressive(model, stage_names):
     """
-    stage_names: list như ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
-    Áp dụng lên cả model.backbone và model (cho các module nằm ngoài backbone).
+    Unfreeze specific stages in backbone.
+    
+    Args:
+        stage_names: List of exact module names to unfreeze
+                    e.g., ['semantic_branch_layers.2', 'dwsa6']
     """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
-    unfrozen = 0
+    unfrozen_params = 0
+    unfrozen_modules = []
 
-    # unfreeze trong backbone
     for stage_name in stage_names:
-        for name, module in model.backbone.named_modules():
-            if stage_name in name:
+        # Method 1: Exact match trong backbone
+        if hasattr(model.backbone, stage_name):
+            module = getattr(model.backbone, stage_name)
+            for p in module.parameters():
+                if not p.requires_grad:
+                    p.requires_grad = True
+                    unfrozen_params += 1
+            unfrozen_modules.append(f"backbone.{stage_name}")
+        
+        # Method 2: Nested attribute (e.g., 'semantic_branch_layers.2')
+        else:
+            parts = stage_name.split('.')
+            module = model.backbone
+            try:
+                for part in parts:
+                    if part.isdigit():
+                        module = module[int(part)]
+                    else:
+                        module = getattr(module, part)
+                
                 for p in module.parameters():
                     if not p.requires_grad:
                         p.requires_grad = True
-                        unfrozen += 1
+                        unfrozen_params += 1
+                unfrozen_modules.append(f"backbone.{stage_name}")
+            except (AttributeError, IndexError, TypeError):
+                print(f"⚠️  Module '{stage_name}' not found in backbone, skipping")
 
-    # unfreeze các module nằm ngoài backbone (vd: dwsa6, ms_context nếu bạn để ở model.backbone thì có thể bỏ phần này)
-    for stage_name in stage_names:
-        for name, module in model.named_modules():
-            if stage_name == name and not name.startswith("backbone."):
-                for p in module.parameters():
-                    if not p.requires_grad:
-                        p.requires_grad = True
-                        unfrozen += 1
-
-    print(f"🔓 Unfrozen stages: {stage_names} ({unfrozen} parameters)")
-
-
+    if unfrozen_modules:
+        print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} params):")
+        for mod in unfrozen_modules:
+            print(f"   └─ {mod}")
+    else:
+        print(f"⚠️  No modules were unfrozen. Check stage_names: {stage_names}")
 
 def count_trainable_params(model):
     """Đếm và hiển thị số parameters trainable/frozen"""
@@ -437,19 +455,20 @@ class Trainer:
         self.scheduler = scheduler
         self.device = device
         self.args = args
+        self.best_miou = 0.0
+        self.start_epoch = 0
+        self.global_step = 0
+        self.validated_pretrained = False
+        self.class_weights = class_weights.to(device) if class_weights is not None else None
 
         loss_cfg = args.loss_config
-        self.base_loss_cfg = loss_cfg  # lưu lại cấu hình gốc
+        self.base_loss_cfg = loss_cfg
+        self.loss_phase = 'full'  # 'full' hoặc 'ce_only'
 
-        self.criterion = HybridLoss(
+        self._setup_loss(
             ce_weight=loss_cfg['ce_weight'],
             dice_weight=loss_cfg['dice_weight'],
             focal_weight=loss_cfg['focal_weight'],
-            ignore_index=args.ignore_index,
-            class_weights=class_weights.to(device) if class_weights is not None else None,
-            focal_alpha=loss_cfg['focal_alpha'],
-            focal_gamma=loss_cfg['focal_gamma'],
-            dice_smooth=loss_cfg['dice_smooth']
         )
         
         # Mixed precision
@@ -466,6 +485,36 @@ class Trainer:
         
         self.save_config()
         self._print_config(loss_cfg)
+    def _setup_loss(self, ce_weight, dice_weight, focal_weight):
+        self.criterion = HybridLoss(
+            ce_weight=ce_weight,
+            dice_weight=dice_weight,
+            focal_weight=focal_weight,
+            ignore_index=self.args.ignore_index,
+            class_weights=self.class_weights,
+            focal_alpha=self.base_loss_cfg['focal_alpha'],
+            focal_gamma=self.base_loss_cfg['focal_gamma'],
+            dice_smooth=self.base_loss_cfg['dice_smooth'],
+        )
+
+    def set_loss_phase(self, phase: str):
+        """phase: 'full' hoặc 'ce_only'."""
+        if phase == self.loss_phase:
+            return
+
+        cfg = self.base_loss_cfg.copy()
+        if phase == 'ce_only':
+            cfg['dice_weight'] = 0.0
+            cfg['focal_weight'] = 0.0
+
+        self._setup_loss(
+            ce_weight=cfg['ce_weight'],
+            dice_weight=cfg['dice_weight'],
+            focal_weight=cfg['focal_weight'],
+        )
+        self.loss_phase = phase
+        print(f"📉 Loss phase changed to: {phase} "
+              f"(CE={cfg['ce_weight']}, Dice={cfg['dice_weight']}, Focal={cfg['focal_weight']})")
     def set_loss_weights(self, ce_weight=None, dice_weight=None, focal_weight=None):
         cfg = self.base_loss_cfg.copy()
         if ce_weight is not None:
@@ -667,11 +716,11 @@ class Trainer:
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
 
-    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True):
+    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-    
+
         self.model.load_state_dict(checkpoint['model'])
-    
+
         if load_optimizer and checkpoint.get('optimizer') is not None:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -679,17 +728,21 @@ class Trainer:
                 print(f"⚠️  Optimizer state not loaded: {e}")
         else:
             print("⚠️  Skipping optimizer state loading.")
-    
+
         if 'scaler' in checkpoint and checkpoint['scaler'] is not None and load_optimizer:
             try:
                 self.scaler.load_state_dict(checkpoint['scaler'])
             except Exception as e:
                 print(f"⚠️  AMP scaler state not loaded: {e}")
-    
+
         if reset_epoch:
             self.start_epoch = 0
-            self.best_miou = 0.0
             self.global_step = 0
+            if reset_best_metric:
+                self.best_miou = 0.0
+            else:
+                # giữ best_miou từ checkpoint để so sánh
+                self.best_miou = checkpoint.get('best_miou', 0.0)
             print(f"✅ Weights loaded from epoch {checkpoint['epoch']}, starting new phase from epoch 0")
         else:
             self.start_epoch = checkpoint['epoch'] + 1
@@ -701,6 +754,7 @@ class Trainer:
                 except Exception as e:
                     print(f"⚠️  Scheduler state not loaded: {e}")
             print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
+
 
 
 def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
@@ -784,6 +838,14 @@ def main():
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3,
                         help="Số epoch đầu sau khi unfreeze chỉ dùng CE (không Dice/Focal)")
     args = parser.parse_args()
+
+    # Validate config
+    if args.ce_only_epochs_after_unfreeze < 0:
+        raise ValueError("ce_only_epochs_after_unfreeze must be >= 0")
+
+    if args.freeze_epochs >= args.epochs:
+        raise ValueError(f"freeze_epochs ({args.freeze_epochs}) must be < total epochs ({args.epochs})")
+
     
     # Setup
     torch.manual_seed(args.seed)
@@ -922,9 +984,17 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
+        if args.use_discriminative_lr:
+            max_lrs = [
+                args.lr * args.backbone_lr_factor,  # group 0: backbone
+                args.lr,                            # group 1: head
+            ]
+        else:
+            max_lrs = args.lr
+
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=args.lr,
+            max_lr=max_lrs,
             total_steps=total_steps,
             pct_start=0.05,
             anneal_strategy='cos',
@@ -971,58 +1041,45 @@ def main():
     if args.unfreeze_schedule:
         try:
             unfreeze_epochs = sorted(int(e) for e in args.unfreeze_schedule.split(','))
-        except:
-            unfreeze_epochs = []
+        except Exception:
+            raise ValueError("unfreeze_schedule must be comma-separated integers")
+
+        if any(e <= args.freeze_epochs for e in unfreeze_epochs):
+            raise ValueError(f"All unfreeze epochs must be > freeze_epochs ({args.freeze_epochs})")
+        if any(e >= args.epochs for e in unfreeze_epochs):
+            raise ValueError(f"Unfreeze epochs must be < total epochs ({args.epochs})")
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
         # Phase 1: freeze backbone trong những epoch đầu
         if epoch < args.freeze_epochs:
-            # đảm bảo backbone đang frozen
             freeze_backbone(model)
-            # dùng full loss (CE + Dice)
-            trainer.set_loss_weights(
-                ce_weight=cfg["loss"]["ce_weight"],
-                dice_weight=cfg["loss"]["dice_weight"],
-                focal_weight=cfg["loss"]["focal_weight"],
-            )
+            trainer.set_loss_phase('full')
 
         # Phase 2+: progressive unfreezing
         if epoch in unfreeze_epochs:
             k = len([e for e in unfreeze_epochs if e <= epoch])
 
             if k == 1:
-                # B1: mở semantic sâu nhất + attention/context
                 targets = ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
             elif k == 2:
-                # B2: mở thêm semantic_branch_layers.1 (s5)
                 targets = ['semantic_branch_layers.1']
             elif k == 3:
-                # B3 (tuỳ chọn): mở thêm semantic_branch_layers.0 (s4)
                 targets = ['semantic_branch_layers.0']
             else:
                 targets = []
 
             if targets:
                 unfreeze_backbone_progressive(model, targets)
-                # sau khi unfreeze, vài epoch đầu chỉ dùng CE để tránh gradient nổ
-                trainer.set_loss_weights(
-                    ce_weight=cfg["loss"]["ce_weight"],
-                    dice_weight=0.0,
-                    focal_weight=0.0,
-                )
-                print()
+                trainer.set_loss_phase('ce_only')
 
-        # Sau một số epoch sau unfreeze, bật lại Dice
-        # ví dụ: nếu mới unfreeze 5 epoch trước thì bật lại
+        # Sau ce_only_epochs_after_unfreeze → quay lại full loss
         if unfreeze_epochs:
-            last_unfreeze = max(e for e in unfreeze_epochs if e <= epoch) if any(e <= epoch for e in unfreeze_epochs) else None
-            if last_unfreeze is not None and epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
-                trainer.set_loss_weights(
-                    ce_weight=cfg["loss"]["ce_weight"],
-                    dice_weight=cfg["loss"]["dice_weight"],
-                    focal_weight=cfg["loss"]["focal_weight"],
-                )
+            past = [e for e in unfreeze_epochs if e <= epoch]
+            if past:
+                last_unfreeze = max(past)
+                if epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
+                    trainer.set_loss_phase('full')
 
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics = trainer.validate(val_loader, epoch)
