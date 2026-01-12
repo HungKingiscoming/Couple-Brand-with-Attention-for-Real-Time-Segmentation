@@ -1009,15 +1009,20 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
-        if args.use_discriminative_lr:
-            # optimizer phải có 2 param_groups (backbone + head)
+    
+        # Số group thực tế trong optimizer
+        n_groups = len(optimizer.param_groups)
+    
+        if n_groups == 1:
+            max_lrs = args.lr  # scalar
+        elif n_groups == 2:
             max_lrs = [
-                args.lr * args.backbone_lr_factor,  # group 0
-                args.lr,                            # group 1
+                args.lr * args.backbone_lr_factor,  # group 0: backbone
+                args.lr,                            # group 1: head
             ]
         else:
-            max_lrs = args.lr  # scalar
-
+            raise ValueError(f"Unexpected number of param_groups: {n_groups}")
+    
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=max_lrs,
