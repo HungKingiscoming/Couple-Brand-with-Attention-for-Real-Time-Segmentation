@@ -865,5 +865,4 @@ class GCNetWithEnhance(BaseModule):
             c2=c2,
             c4=c4,
             c5=c5_enh,
-            c5_gcnet=c5_gcnet,
         )
