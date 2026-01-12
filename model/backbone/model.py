@@ -344,7 +344,16 @@ class GCBlock(nn.Module):
 # ===========================
 # DWSA + MultiScale
 # ===========================
-
+def _get_valid_groups(channels, desired_groups):
+    """Tìm số group lớn nhất chia hết cho channels."""
+    if desired_groups <= 1:
+        return 1
+    g = min(desired_groups, channels)
+    while g > 1:
+        if channels % g == 0:
+            return g
+        g -= 1
+    return 1
 class DWSABlock(nn.Module):
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, qk_sharing=True, groups=4):
         super().__init__()
@@ -360,9 +369,12 @@ class DWSABlock(nn.Module):
         self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
         self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
 
-        g = min(groups, reduced) if groups > 1 else 1
-        if reduced % g != 0:
-            g = 1
+        g = _get_valid_groups(reduced, groups)
+        if g != groups:
+            import warnings
+            warnings.warn(
+                f"DWSABlock: adjusted groups from {groups} to {g} for channels={reduced}"
+            )
 
         self.qk_sharing = qk_sharing
         if qk_sharing:
@@ -426,11 +438,13 @@ class MultiScaleContextModule(nn.Module):
     def __init__(self, in_channels, out_channels, scales=(1, 2), branch_ratio=8):
         super().__init__()
         self.scales = scales
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
         total_branch_channels = in_channels // branch_ratio
-        # chia đều + dồn phần dư, đảm bảo tổng đúng total_branch_channels
         base = total_branch_channels // len(scales)
         extra = total_branch_channels % len(scales)
+
         per_branch_list = []
         for i in range(len(scales)):
             c = base + (1 if i < extra else 0)
@@ -461,15 +475,19 @@ class MultiScaleContextModule(nn.Module):
                 fused_channels,
                 kernel_size=3,
                 padding=1,
-                groups=fused_channels,
+                groups=fused_channels,    # depthwise
                 bias=False,
             ),
             nn.ReLU(inplace=True),
             nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
         )
 
-        # scale residual để tránh mất cân bằng
+        # residual scaling + projection nếu cần
         self.res_scale = nn.Parameter(torch.ones(1))
+        if in_channels != out_channels:
+            self.proj = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        else:
+            self.proj = None
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -483,10 +501,12 @@ class MultiScaleContextModule(nn.Module):
         fused = torch.cat(outs, dim=1)
         out = self.fusion(fused)  # B, out_channels, H, W
 
-        if out.shape[1] == C:
-            return x + self.res_scale * out
+        if self.proj is not None:
+            x_proj = self.proj(x)
         else:
-            return out
+            x_proj = x
+
+        return x_proj + self.res_scale * out
 
 
 
@@ -761,7 +781,13 @@ class GCNetWithEnhance(BaseModule):
                  num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
                  dwsa_stages: List[str] = ('stage5', 'stage6'),
                  dwsa_num_heads: int = 4,
+                 dwsa_reduction: int = 4,
+                 dwsa_qk_sharing: bool = True,
+                 dwsa_groups: int = 4,
+                 dwsa_drop: float = 0.0,
                  use_multi_scale_context: bool = True,
+                 ms_scales: Tuple[int, ...] = (1, 2),
+                 ms_branch_ratio: int = 8,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
@@ -772,7 +798,12 @@ class GCNetWithEnhance(BaseModule):
         self.align_corners = align_corners
         self.channels = channels
 
-        # ===== GCNet core giữ nguyên để load weight GCNet-s =====
+        # validate dwsa_stages
+        valid_stages = {'stage4', 'stage5', 'stage6'}
+        invalid = set(dwsa_stages) - valid_stages
+        if invalid:
+            raise ValueError(f"Invalid dwsa_stages: {invalid}. Valid: {valid_stages}")
+
         self.backbone = GCNetCore(
             in_channels=in_channels,
             channels=channels,
@@ -785,28 +816,52 @@ class GCNetWithEnhance(BaseModule):
             deploy=deploy,
         )
 
-        C = channels  # C=32 cho GCNet-s
+        C = channels
 
-        # ===== DWSA theo dwsa_stages =====
+        # DWSA theo cấu hình
         self.dwsa4 = None
         self.dwsa5 = None
         self.dwsa6 = None
 
         for stage in dwsa_stages:
             if stage == 'stage4':
-                self.dwsa4 = DWSABlock(C * 4, num_heads=dwsa_num_heads, reduction=4, qk_sharing=True, groups=4)
+                self.dwsa4 = DWSABlock(
+                    C * 4,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                )
             elif stage == 'stage5':
-                self.dwsa5 = DWSABlock(C * 8, num_heads=dwsa_num_heads, reduction=4, qk_sharing=True, groups=4)
+                self.dwsa5 = DWSABlock(
+                    C * 8,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                )
             elif stage == 'stage6':
-                self.dwsa6 = DWSABlock(C * 16, num_heads=dwsa_num_heads, reduction=4, qk_sharing=True, groups=4)
+                self.dwsa6 = DWSABlock(
+                    C * 16,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                )
 
-        # ===== MultiScaleContext: sau SPP(s6) =====
+        # MultiScale context
         if use_multi_scale_context:
-            self.ms_context = MultiScaleContextModule(C * 4, C * 4, scales=(1, 2), branch_ratio=8)
+            self.ms_context = MultiScaleContextModule(
+                C * 4, C * 4,
+                scales=ms_scales,
+                branch_ratio=ms_branch_ratio,
+            )
         else:
             self.ms_context = None
 
-        # Projection cuối cho feature deep
         self.final_proj = ConvModule(
             in_channels=C * 4,
             out_channels=C * 4,
