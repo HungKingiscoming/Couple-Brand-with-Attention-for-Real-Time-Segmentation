@@ -818,7 +818,11 @@ def main():
                        help="Dùng LR khác nhau cho backbone vs head")
     parser.add_argument("--backbone_lr_factor", type=float, default=0.1,
                        help="Backbone LR = head_lr * factor")
-    
+    parser.add_argument(
+        "--use_class_weights",
+        action="store_true",
+        help="Dùng class weights cho CrossEntropyLoss (mặc định: không dùng)"
+    )
     # Dataset
     parser.add_argument("--train_txt", required=True, help="Path to training list")
     parser.add_argument("--val_txt", required=True, help="Path to validation list")
@@ -901,7 +905,7 @@ def main():
         num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w),
         pin_memory=True,
-        compute_class_weights=False,
+        compute_class_weights=args.use_class_weights,
         dataset_type=args.dataset_type
     )
     print(f"✅ Dataloaders created\n")
@@ -1044,7 +1048,7 @@ def main():
         scheduler=scheduler,
         device=device,
         args=args,
-        class_weights=class_weights
+        class_weights=class_weights if args.use_class_weights else None
     )
     
     if args.resume:
