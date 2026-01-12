@@ -249,21 +249,34 @@ def freeze_backbone(model):
 
 def unfreeze_backbone_progressive(model, stage_names):
     """
-    Unfreeze các stage cụ thể của backbone
-    stage_names: list như ['stage1', 'stage2'] hoặc string như 'stage4'
+    stage_names: list như ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
+    Áp dụng lên cả model.backbone và model (cho các module nằm ngoài backbone).
     """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
-    
-    unfrozen_count = 0
+
+    unfrozen = 0
+
+    # unfreeze trong backbone
     for stage_name in stage_names:
         for name, module in model.backbone.named_modules():
             if stage_name in name:
-                for param in module.parameters():
-                    param.requires_grad = True
-                    unfrozen_count += 1
-    
-    print(f"🔓 Unfrozen stages: {stage_names} ({unfrozen_count} parameters)")
+                for p in module.parameters():
+                    if not p.requires_grad:
+                        p.requires_grad = True
+                        unfrozen += 1
+
+    # unfreeze các module nằm ngoài backbone (vd: dwsa6, ms_context nếu bạn để ở model.backbone thì có thể bỏ phần này)
+    for stage_name in stage_names:
+        for name, module in model.named_modules():
+            if stage_name == name and not name.startswith("backbone."):
+                for p in module.parameters():
+                    if not p.requires_grad:
+                        p.requires_grad = True
+                        unfrozen += 1
+
+    print(f"🔓 Unfrozen stages: {stage_names} ({unfrozen} parameters)")
+
 
 
 def count_trainable_params(model):
@@ -351,7 +364,7 @@ class ModelConfig:
                 "channels": 32,  # ✅ Giữ nguyên = GCNet gốc
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],  # ✅ Giữ nguyên
-                "dwsa_stages": ['stage6'],  # ✅ Chỉ ở cuối
+                "dwsa_stages": ['stage5','stage6'],  # ✅ Chỉ ở cuối
                 "dwsa_num_heads": 4,
                 "use_multi_scale_context": True,
                 "align_corners": False,
@@ -424,9 +437,10 @@ class Trainer:
         self.scheduler = scheduler
         self.device = device
         self.args = args
-        
-        # Loss function
+
         loss_cfg = args.loss_config
+        self.base_loss_cfg = loss_cfg  # lưu lại cấu hình gốc
+
         self.criterion = HybridLoss(
             ce_weight=loss_cfg['ce_weight'],
             dice_weight=loss_cfg['dice_weight'],
@@ -452,7 +466,25 @@ class Trainer:
         
         self.save_config()
         self._print_config(loss_cfg)
+    def set_loss_weights(self, ce_weight=None, dice_weight=None, focal_weight=None):
+        cfg = self.base_loss_cfg.copy()
+        if ce_weight is not None:
+            cfg['ce_weight'] = ce_weight
+        if dice_weight is not None:
+            cfg['dice_weight'] = dice_weight
+        if focal_weight is not None:
+            cfg['focal_weight'] = focal_weight
 
+        self.criterion = HybridLoss(
+            ce_weight=cfg['ce_weight'],
+            dice_weight=cfg['dice_weight'],
+            focal_weight=cfg['focal_weight'],
+            ignore_index=self.args.ignore_index,
+            class_weights=None,  # hoặc truyền lại class_weights nếu cần
+            focal_alpha=cfg['focal_alpha'],
+            focal_gamma=cfg['focal_gamma'],
+            dice_smooth=cfg['dice_smooth']
+        )
     def _print_config(self, loss_cfg):
         """Print training configuration"""
         print(f"\n{'='*70}")
@@ -747,7 +779,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=10)
-    
+    parser.add_argument("--freeze_epochs", type=int, default=10,
+                        help="Số epoch chỉ train head, backbone frozen")
+    parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3,
+                        help="Số epoch đầu sau khi unfreeze chỉ dùng CE (không Dice/Focal)")
     args = parser.parse_args()
     
     # Setup
@@ -931,18 +966,31 @@ def main():
     print(f"{'='*70}\n")
     
     # Parse unfreeze schedule
+    # Parse unfreeze schedule (ví dụ "30,50")
     unfreeze_epochs = []
     if args.unfreeze_schedule:
         try:
-            unfreeze_epochs = [int(e) for e in args.unfreeze_schedule.split(',')]
+            unfreeze_epochs = sorted(int(e) for e in args.unfreeze_schedule.split(','))
         except:
             unfreeze_epochs = []
-    
+
     for epoch in range(trainer.start_epoch, args.epochs):
-        # Progressive unfreezing
+
+        # Phase 1: freeze backbone trong những epoch đầu
+        if epoch < args.freeze_epochs:
+            # đảm bảo backbone đang frozen
+            freeze_backbone(model)
+            # dùng full loss (CE + Dice)
+            trainer.set_loss_weights(
+                ce_weight=cfg["loss"]["ce_weight"],
+                dice_weight=cfg["loss"]["dice_weight"],
+                focal_weight=cfg["loss"]["focal_weight"],
+            )
+
+        # Phase 2+: progressive unfreezing
         if epoch in unfreeze_epochs:
             k = len([e for e in unfreeze_epochs if e <= epoch])
-    
+
             if k == 1:
                 # B1: mở semantic sâu nhất + attention/context
                 targets = ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
@@ -950,12 +998,32 @@ def main():
                 # B2: mở thêm semantic_branch_layers.1 (s5)
                 targets = ['semantic_branch_layers.1']
             elif k == 3:
-                # B3 (tuỳ chọn): mở thêm semantic_branch_layers.0 (s4) hoặc detail
+                # B3 (tuỳ chọn): mở thêm semantic_branch_layers.0 (s4)
                 targets = ['semantic_branch_layers.0']
-    
-            unfreeze_backbone_progressive(model, targets)
-            print()
-        
+            else:
+                targets = []
+
+            if targets:
+                unfreeze_backbone_progressive(model, targets)
+                # sau khi unfreeze, vài epoch đầu chỉ dùng CE để tránh gradient nổ
+                trainer.set_loss_weights(
+                    ce_weight=cfg["loss"]["ce_weight"],
+                    dice_weight=0.0,
+                    focal_weight=0.0,
+                )
+                print()
+
+        # Sau một số epoch sau unfreeze, bật lại Dice
+        # ví dụ: nếu mới unfreeze 5 epoch trước thì bật lại
+        if unfreeze_epochs:
+            last_unfreeze = max(e for e in unfreeze_epochs if e <= epoch) if any(e <= epoch for e in unfreeze_epochs) else None
+            if last_unfreeze is not None and epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
+                trainer.set_loss_weights(
+                    ce_weight=cfg["loss"]["ce_weight"],
+                    dice_weight=cfg["loss"]["dice_weight"],
+                    focal_weight=cfg["loss"]["focal_weight"],
+                )
+
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics = trainer.validate(val_loader, epoch)
         
