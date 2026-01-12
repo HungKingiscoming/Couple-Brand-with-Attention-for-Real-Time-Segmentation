@@ -45,13 +45,8 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
-def load_pretrained_gcnet_core(model, ckpt_path):
-    """
-    Load GCNet pretrained weights vào model.backbone với matching theo shape.
-    - Không giả định checkpoint có prefix 'backbone.'
-    - Bỏ qua các layer mới (DWSA/DCN/MultiScale), chỉ load phần trùng tên + shape.
-    """
-    print(f"📥 Loading pretrained GCNet weights from: {ckpt_path}")
+def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
+    print(f"📥 Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
@@ -59,25 +54,38 @@ def load_pretrained_gcnet_core(model, ckpt_path):
     compatible = {}
     skipped = []
 
-    for ckpt_key, ckpt_val in state.items():
-        # Bỏ một số prefix hay gặp: 'backbone.', 'model.', 'module.'
-        k = ckpt_key
+    # map key chuẩn hoá → key thật của model
+    model_key_map = {}
+    for mk in model_state.keys():
+        normalized = mk
         for pref in ['backbone.', 'model.', 'module.']:
-            if k.startswith(pref):
-                k = k[len(pref):]
+            if normalized.startswith(pref):
+                normalized = normalized[len(pref):]
+        model_key_map[normalized] = mk
 
-        # 1) Thử match trực tiếp
-        if k in model_state and model_state[k].shape == ckpt_val.shape:
-            compatible[k] = ckpt_val
-            continue
+    for ckpt_key, ckpt_val in state.items():
+        normalized_ckpt = ckpt_key
+        for pref in ['backbone.', 'model.', 'module.']:
+            if normalized_ckpt.startswith(pref):
+                normalized_ckpt = normalized_ckpt[len(pref):]
 
-        # 2) Thử match theo hậu tố (endswith), phòng trường hợp tên hơi khác
         matched = False
-        for mk in model_state.keys():
-            if mk.endswith(k) and model_state[mk].shape == ckpt_val.shape:
+
+        # 1) exact match sau normalize
+        if normalized_ckpt in model_key_map:
+            mk = model_key_map[normalized_ckpt]
+            if model_state[mk].shape == ckpt_val.shape:
                 compatible[mk] = ckpt_val
                 matched = True
-                break
+
+        # 2) fuzzy match nếu không strict
+        if not matched and not strict_match:
+            for norm_model, mk in model_key_map.items():
+                if norm_model.endswith(normalized_ckpt) or normalized_ckpt.endswith(norm_model):
+                    if model_state[mk].shape == ckpt_val.shape:
+                        compatible[mk] = ckpt_val
+                        matched = True
+                        break
 
         if not matched:
             skipped.append(ckpt_key)
@@ -86,16 +94,28 @@ def load_pretrained_gcnet_core(model, ckpt_path):
     total = len(model_state)
     rate = 100 * loaded / total if total > 0 else 0.0
 
-    print(f"Loaded {loaded}/{total} params into backbone ({rate:.1f}%).")
-    if loaded == 0:
-        print("⚠️  WARNING: 0 params loaded. Check checkpoint format and key names.")
+    print(f"\n{'='*70}")
+    print("📊 WEIGHT LOADING SUMMARY")
+    print(f"{'='*70}")
+    print(f"Loaded:   {loaded:>5} / {total} params ({rate:.1f}%)")
+    print(f"Skipped:  {len(skipped):>5} params from checkpoint")
+    print(f"{'='*70}")
+
+    if rate < 50:
+        print("⚠️  WARNING: Less than 50% params loaded!")
+        print(f"   First 5 skipped keys: {skipped[:5]}")
 
     missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
-    print(f"Missing keys in loaded dict: {len(missing)}")
-    print(f"Unexpected keys in loaded dict: {len(unexpected)}\n")
+
+    if missing:
+        print(f"\n⚠️  Missing keys in model ({len(missing)}):")
+        for key in missing[:10]:
+            print(f"   - {key}")
+        if len(missing) > 10:
+            print(f"   ... and {len(missing)-10} more")
+    print()
 
     return rate
-
 # ============================================
 # LOSS FUNCTIONS
 # ============================================
@@ -805,7 +825,8 @@ def main():
     parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
-    
+    parser.add_argument("--reset_best_metric", action="store_true",
+                        help="Reset best mIoU when transfer learning")
     # Training
     parser.add_argument("--epochs", type=int, default=100, help="Total epochs")
     
@@ -1028,7 +1049,12 @@ def main():
     
     if args.resume:
         reset_epoch = (args.resume_mode == "transfer")
-        trainer.load_checkpoint(args.resume, reset_epoch=reset_epoch, load_optimizer=False)
+        trainer.load_checkpoint(
+            args.resume,
+            reset_epoch=reset_epoch,
+            load_optimizer=False,
+            reset_best_metric=args.reset_best_metric,
+        )
     
     # Training loop
     print(f"\n{'='*70}")
