@@ -1010,12 +1010,13 @@ def main():
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
         if args.use_discriminative_lr:
+            # optimizer phải có 2 param_groups (backbone + head)
             max_lrs = [
-                args.lr * args.backbone_lr_factor,  # group 0: backbone
-                args.lr,                            # group 1: head
+                args.lr * args.backbone_lr_factor,  # group 0
+                args.lr,                            # group 1
             ]
         else:
-            max_lrs = args.lr
+            max_lrs = args.lr  # scalar
 
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
