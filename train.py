@@ -482,6 +482,18 @@ class Trainer:
         self.class_weights = class_weights.to(device) if class_weights is not None else None
 
         loss_cfg = args.loss_config
+        self.dice = Dice(
+            smooth=loss_cfg['dice_smooth'],
+            ignore_index=args.ignore_index,
+            reduction='mean'
+        )
+        self.ce = nn.CrossEntropyLoss(
+            ignore_index=args.ignore_index,
+            reduction='mean'
+        )
+        
+        self.ce_weight = loss_cfg['ce_weight']
+        self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'  # 'full' hoặc 'ce_only'
 
@@ -581,7 +593,7 @@ class Trainer:
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
-        total_focal = 0.0
+        total_focal = 0.0  # luôn 0 trong setup hiện tại
         
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
         
@@ -591,33 +603,54 @@ class Trainer:
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
+    
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
                 logits = outputs["main"]
-                
-                logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                
-                loss_dict = self.criterion(logits, masks)
-                loss = loss_dict['total']
-                
+                logits = F.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+    
+                # ----- CE + (optional) Dice -----
+                ce_loss = self.ce(logits, masks)
+    
+                if self.dice_weight > 0:
+                    dice_loss = self.dice(logits, masks)
+                else:
+                    dice_loss = torch.tensor(0.0, device=logits.device)
+    
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+    
+                # aux head
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = outputs["aux"]
-                    aux_logits = F.interpolate(aux_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                    aux_loss_dict = self.criterion(aux_logits, masks)
+                    aux_logits = F.interpolate(
+                        aux_logits,
+                        size=masks.shape[-2:],
+                        mode="bilinear",
+                        align_corners=False
+                    )
+                    aux_ce_loss = self.ce(aux_logits, masks)
+                    if self.dice_weight > 0:
+                        aux_dice_loss = self.dice(aux_logits, masks)
+                    else:
+                        aux_dice_loss = torch.tensor(0.0, device=logits.device)
+    
+                    aux_total = self.ce_weight * aux_ce_loss + self.dice_weight * aux_dice_loss
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
-                    loss = loss + aux_weight * aux_loss_dict['total']
-                    
+                    loss = loss + aux_weight * aux_total
+    
                 loss = loss / self.args.accumulation_steps
-
+    
             self.scaler.scale(loss).backward()
             
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -627,20 +660,16 @@ class Trainer:
                 self.scheduler.step()
             
             total_loss += loss.item() * self.args.accumulation_steps
-            
-            ce_val = loss_dict['ce'].item() if isinstance(loss_dict['ce'], torch.Tensor) else loss_dict['ce']
-            dice_val = loss_dict['dice'].item() if isinstance(loss_dict['dice'], torch.Tensor) else loss_dict['dice']
-            focal_val = loss_dict['focal'].item() if isinstance(loss_dict['focal'], torch.Tensor) else loss_dict['focal']
-            
-            total_ce += ce_val
-            total_dice += dice_val
+            total_ce += ce_loss.item()
+            total_dice += dice_loss.item()
+            focal_val = 0.0  # không dùng focal
             total_focal += focal_val
             
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ce': f'{ce_val:.4f}',
-                'dice': f'{dice_val:.4f}',
+                'ce': f'{ce_loss.item():.4f}',
+                'dice': f'{dice_loss.item():.4f}',
                 'lr': f'{current_lr:.6f}'
             })
             
@@ -649,20 +678,21 @@ class Trainer:
             
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ce_loss', ce_val, self.global_step)
-                self.writer.add_scalar('train/dice_loss', dice_val, self.global_step)
+                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
+                self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
                 self.writer.add_scalar('train/focal_loss', focal_val, self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
-
+    
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
-
+    
         avg_loss = total_loss / len(loader)
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
         avg_focal = total_focal / len(loader)
         
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': avg_focal}
+
 
     @torch.no_grad()
     def validate(self, loader, epoch):
