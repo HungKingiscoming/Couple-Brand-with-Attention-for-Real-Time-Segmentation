@@ -117,10 +117,10 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
 
     return rate
 # ============================================
-# LOSS FUNCTIONS
+#  FUNCTIONS
 # ============================================
 
-class DiceLoss(nn.Module):
+class Dice(nn.Module):
     def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
         super().__init__()
         self.smooth = smooth
@@ -145,13 +145,13 @@ class DiceLoss(nn.Module):
         union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
         
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1.0 - dice.mean(dim=1)
+        dice_ = 1.0 - dice.mean(dim=1)
         
-        return dice_loss.mean()
+        return dice_.mean()
 
 
-class FocalLoss(nn.Module):
-    """Focal Loss for hard example mining"""
+class Focal(nn.Module):
+    """Focal  for hard example mining"""
     def __init__(self, alpha=0.25, gamma=2.0, ignore_index=255, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -176,13 +176,13 @@ class FocalLoss(nn.Module):
         probs = log_probs.exp()
         targets_probs = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
         focal_weight = (1 - targets_probs) ** self.gamma
-        focal_loss = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        focal_ = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
         
-        return focal_loss.mean() if self.reduction == 'mean' else focal_loss
+        return focal_.mean() if self.reduction == 'mean' else focal_
 
 
-class HybridLoss(nn.Module):
-    """Combined loss: CE + Dice + Focal"""
+class Hybrid(nn.Module):
+    """Combined : CE + Dice + Focal"""
     def __init__(
         self,
         ce_weight=1.0,
@@ -201,13 +201,13 @@ class HybridLoss(nn.Module):
         self.focal_weight = focal_weight
         self.ignore_index = ignore_index
         
-        self.ce_loss = nn.CrossEntropyLoss(
+        self.ce_ = nn.CrossEntropy(
             weight=class_weights,
             ignore_index=ignore_index,
             reduction='mean'
         )
         
-        self.dice_loss = DiceLoss(
+        self.dice_ = Dice(
             smooth=dice_smooth,
             ignore_index=ignore_index,
             reduction='mean'
@@ -426,7 +426,7 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight": 1.0,
-                "dice_weight": 1.0,
+                "dice_weight": 0.0,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
