@@ -498,11 +498,7 @@ class Trainer:
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'  # 'full' hoặc 'ce_only'
 
-        self._setup_loss(
-            ce_weight=loss_cfg['ce_weight'],
-            dice_weight=loss_cfg['dice_weight'],
-            focal_weight=loss_cfg['focal_weight'],
-        )
+        
         
         # Mixed precision
         self.scaler = GradScaler(enabled=args.use_amp)
@@ -532,25 +528,7 @@ class Trainer:
         self.loss_phase = phase
         print(f"📉 Loss phase changed to: {phase} "
               f"(CE={self.ce_weight}, Dice={self.dice_weight})")
-    def set_loss_weights(self, ce_weight=None, dice_weight=None, focal_weight=None):
-        cfg = self.base_loss_cfg.copy()
-        if ce_weight is not None:
-            cfg['ce_weight'] = ce_weight
-        if dice_weight is not None:
-            cfg['dice_weight'] = dice_weight
-        if focal_weight is not None:
-            cfg['focal_weight'] = focal_weight
-
-        self.criterion = HybridLoss(
-            ce_weight=cfg['ce_weight'],
-            dice_weight=cfg['dice_weight'],
-            focal_weight=cfg['focal_weight'],
-            ignore_index=self.args.ignore_index,
-            class_weights=None,  # hoặc truyền lại class_weights nếu cần
-            focal_alpha=cfg['focal_alpha'],
-            focal_gamma=cfg['focal_gamma'],
-            dice_smooth=cfg['dice_smooth']
-        )
+    
     def _print_config(self, loss_cfg):
         """Print training configuration"""
         print(f"\n{'='*70}")
