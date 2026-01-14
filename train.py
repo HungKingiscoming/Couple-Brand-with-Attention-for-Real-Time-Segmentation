@@ -677,10 +677,20 @@ class Trainer:
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 logits = self.model(imgs)
-                logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-                
-                loss_dict = self.criterion(logits, masks)
-                loss = loss_dict['total']
+                logits = F.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False
+                )
+            
+                ce_loss = self.ce(logits, masks)
+                if self.dice_weight > 0:
+                    dice_loss = self.dice(logits, masks)
+                else:
+                    dice_loss = torch.tensor(0.0, device=logits.device)
+            
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             
             total_loss += loss.item()
             
