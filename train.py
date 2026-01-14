@@ -463,7 +463,7 @@ class Segmentor(nn.Module):
 
 
 # ============================================
-# TRAINER
+# 
 # ============================================
 
 class Trainer:
@@ -488,10 +488,11 @@ class Trainer:
             reduction='mean'
         )
         self.ce = nn.CrossEntropyLoss(
+            weight=class_weights.to(device) if class_weights is not None else None,
             ignore_index=args.ignore_index,
             reduction='mean'
         )
-        
+        self.focal_weight = 0.0
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
@@ -517,36 +518,20 @@ class Trainer:
         
         self.save_config()
         self._print_config(loss_cfg)
-    def _setup_loss(self, ce_weight, dice_weight, focal_weight):
-        self.criterion = HybridLoss(
-            ce_weight=ce_weight,
-            dice_weight=dice_weight,
-            focal_weight=focal_weight,
-            ignore_index=self.args.ignore_index,
-            class_weights=self.class_weights,
-            focal_alpha=self.base_loss_cfg['focal_alpha'],
-            focal_gamma=self.base_loss_cfg['focal_gamma'],
-            dice_smooth=self.base_loss_cfg['dice_smooth'],
-        )
+    
 
     def set_loss_phase(self, phase: str):
-        """phase: 'full' hoặc 'ce_only'."""
         if phase == self.loss_phase:
             return
-
-        cfg = self.base_loss_cfg.copy()
+    
         if phase == 'ce_only':
-            cfg['dice_weight'] = 0.0
-            cfg['focal_weight'] = 0.0
-
-        self._setup_loss(
-            ce_weight=cfg['ce_weight'],
-            dice_weight=cfg['dice_weight'],
-            focal_weight=cfg['focal_weight'],
-        )
+            self.dice_weight = 0.0
+        elif phase == 'full':
+            self.dice_weight = self.base_loss_cfg['dice_weight']
+    
         self.loss_phase = phase
         print(f"📉 Loss phase changed to: {phase} "
-              f"(CE={cfg['ce_weight']}, Dice={cfg['dice_weight']}, Focal={cfg['focal_weight']})")
+              f"(CE={self.ce_weight}, Dice={self.dice_weight})")
     def set_loss_weights(self, ce_weight=None, dice_weight=None, focal_weight=None):
         cfg = self.base_loss_cfg.copy()
         if ce_weight is not None:
