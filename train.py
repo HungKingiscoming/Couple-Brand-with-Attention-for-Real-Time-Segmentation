@@ -1,12 +1,6 @@
 # ============================================
-# OPTIMIZED train.py - MAXIMUM TRANSFER LEARNING + v2 BACKBONE
+# FIXED train.py - Proper Gradient Clipping + Monitoring
 # ============================================
-# Key changes:
-# 1. Import GCNetWithDWSA_v2 (optimized for 80%+ transfer learning)
-# 2. Backbone config: channels=32, dwsa_stages=['stage4','stage5','stage6']
-# 3. Load pretrained weights with shape-based filtering
-# 4. Progressive unfreezing schedule
-# 5. Discriminative learning rates (backbone_lr_factor=0.1)
 
 import os
 import torch
@@ -33,7 +27,7 @@ warnings.filterwarnings('ignore')
 
 from model.backbone.model import (
     GCNetWithEnhance,
-    GCNetCore,      # nếu cần
+    GCNetCore,
     GCBlock,
     DWSABlock,
     MultiScaleContextModule,
@@ -54,7 +48,6 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     compatible = {}
     skipped = []
 
-    # map key chuẩn hoá → key thật của model
     model_key_map = {}
     for mk in model_state.keys():
         normalized = mk
@@ -71,14 +64,12 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
 
         matched = False
 
-        # 1) exact match sau normalize
         if normalized_ckpt in model_key_map:
             mk = model_key_map[normalized_ckpt]
             if model_state[mk].shape == ckpt_val.shape:
                 compatible[mk] = ckpt_val
                 matched = True
 
-        # 2) fuzzy match nếu không strict
         if not matched and not strict_match:
             for norm_model, mk in model_key_map.items():
                 if norm_model.endswith(normalized_ckpt) or normalized_ckpt.endswith(norm_model):
@@ -116,11 +107,13 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print()
 
     return rate
+
+
 # ============================================
-#  FUNCTIONS
+# LOSS FUNCTIONS
 # ============================================
 
-class Dice(nn.Module):
+class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
         super().__init__()
         self.smooth = smooth
@@ -145,13 +138,12 @@ class Dice(nn.Module):
         union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
         
         dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_ = 1.0 - dice.mean(dim=1)
+        dice_loss = 1.0 - dice.mean(dim=1)
         
-        return dice_.mean()
+        return dice_loss.mean()
 
 
-class Focal(nn.Module):
-    """Focal  for hard example mining"""
+class FocalLoss(nn.Module):
     def __init__(self, alpha=0.25, gamma=2.0, ignore_index=255, reduction='mean'):
         super().__init__()
         self.alpha = alpha
@@ -176,64 +168,9 @@ class Focal(nn.Module):
         probs = log_probs.exp()
         targets_probs = probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
         focal_weight = (1 - targets_probs) ** self.gamma
-        focal_ = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
+        focal_loss = -self.alpha * focal_weight * log_probs.gather(1, targets_flat.unsqueeze(1)).squeeze(1)
         
-        return focal_.mean() if self.reduction == 'mean' else focal_
-
-
-class Hybrid(nn.Module):
-    """Combined : CE + Dice + Focal"""
-    def __init__(
-        self,
-        ce_weight=1.0,
-        dice_weight=1.0,
-        focal_weight=0.0,
-        ignore_index=255,
-        class_weights=None,
-        focal_alpha=0.25,
-        focal_gamma=2.0,
-        dice_smooth=1e-5
-    ):
-        super().__init__()
-        
-        self.ce_weight = ce_weight
-        self.dice_weight = dice_weight
-        self.focal_weight = focal_weight
-        self.ignore_index = ignore_index
-        
-        self.ce_ = nn.CrossEntropy(
-            weight=class_weights,
-            ignore_index=ignore_index,
-            reduction='mean'
-        )
-        
-        self.dice_ = Dice(
-            smooth=dice_smooth,
-            ignore_index=ignore_index,
-            reduction='mean'
-        )
-        
-        self.focal_loss = FocalLoss(
-            alpha=focal_alpha,
-            gamma=focal_gamma,
-            ignore_index=ignore_index,
-            reduction='mean'
-        )
-    
-    def forward(self, logits, targets):
-        losses = {}
-        
-        losses['ce'] = self.ce_loss(logits, targets) if self.ce_weight > 0 else torch.tensor(0.0, device=logits.device)
-        losses['dice'] = self.dice_loss(logits, targets) if self.dice_weight > 0 else torch.tensor(0.0, device=logits.device)
-        losses['focal'] = self.focal_loss(logits, targets) if self.focal_weight > 0 else torch.tensor(0.0, device=logits.device)
-        
-        losses['total'] = (
-            self.ce_weight * losses['ce'] +
-            self.dice_weight * losses['dice'] +
-            self.focal_weight * losses['focal']
-        )
-        
-        return losses
+        return focal_loss.mean() if self.reduction == 'mean' else focal_loss
 
 
 # ============================================
@@ -241,7 +178,6 @@ class Hybrid(nn.Module):
 # ============================================
 
 def clear_gpu_memory():
-    """Clear GPU cache"""
     gc.collect()
     torch.cuda.empty_cache()
     if torch.cuda.is_available():
@@ -249,32 +185,19 @@ def clear_gpu_memory():
 
 
 def setup_memory_efficient_training():
-    """Enable memory efficient training"""
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
-# ============================================
-# FREEZE/UNFREEZE UTILITIES FOR TRANSFER LEARNING
-# ============================================
-
 def freeze_backbone(model):
-    """Freeze toàn bộ backbone"""
     for param in model.backbone.parameters():
         param.requires_grad = False
-    print("🔒 Backbone FROZEN - chỉ head được train")
+    print("🔒 Backbone FROZEN")
 
 
 def unfreeze_backbone_progressive(model, stage_names):
-    """
-    Unfreeze specific stages in backbone.
-    
-    Args:
-        stage_names: List of exact module names to unfreeze
-                    e.g., ['semantic_branch_layers.2', 'dwsa6']
-    """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
@@ -282,7 +205,6 @@ def unfreeze_backbone_progressive(model, stage_names):
     unfrozen_modules = []
 
     for stage_name in stage_names:
-        # Method 1: Exact match trong backbone
         if hasattr(model.backbone, stage_name):
             module = getattr(model.backbone, stage_name)
             for p in module.parameters():
@@ -290,8 +212,6 @@ def unfreeze_backbone_progressive(model, stage_names):
                     p.requires_grad = True
                     unfrozen_params += 1
             unfrozen_modules.append(f"backbone.{stage_name}")
-        
-        # Method 2: Nested attribute (e.g., 'semantic_branch_layers.2')
         else:
             parts = stage_name.split('.')
             module = model.backbone
@@ -308,17 +228,15 @@ def unfreeze_backbone_progressive(model, stage_names):
                         unfrozen_params += 1
                 unfrozen_modules.append(f"backbone.{stage_name}")
             except (AttributeError, IndexError, TypeError):
-                print(f"⚠️  Module '{stage_name}' not found in backbone, skipping")
+                print(f"⚠️  Module '{stage_name}' not found, skipping")
 
     if unfrozen_modules:
         print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} params):")
         for mod in unfrozen_modules:
             print(f"   └─ {mod}")
-    else:
-        print(f"⚠️  No modules were unfrozen. Check stage_names: {stage_names}")
+
 
 def count_trainable_params(model):
-    """Đếm và hiển thị số parameters trainable/frozen"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = total - trainable
@@ -352,11 +270,6 @@ def count_trainable_params(model):
 
 
 def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
-    """
-    Tạo optimizer với LR khác nhau cho backbone vs head
-    backbone_lr = base_lr * backbone_lr_factor
-    head_lr = base_lr
-    """
     backbone_params = [p for n, p in model.named_parameters() 
                       if 'backbone' in n and p.requires_grad]
     head_params = [p for n, p in model.named_parameters() 
@@ -364,7 +277,7 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
     
     if len(backbone_params) == 0:
         optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
-        print(f"⚙️  Optimizer: AdamW (lr={base_lr}) - chỉ head")
+        print(f"⚙️  Optimizer: AdamW (lr={base_lr}) - head only")
     else:
         backbone_lr = base_lr * backbone_lr_factor
         param_groups = [
@@ -380,36 +293,56 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
     return optimizer
 
 
+# FIX: Monitor gradients
+def check_gradients(model, threshold=10.0):
+    """Monitor gradient norms"""
+    max_grad = 0.0
+    max_grad_name = ""
+    total_norm = 0.0
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            total_norm += grad_norm ** 2
+            if grad_norm > max_grad:
+                max_grad = grad_norm
+                max_grad_name = name
+    
+    total_norm = total_norm ** 0.5
+    
+    if max_grad > threshold:
+        print(f"⚠️  Large gradient detected: {max_grad_name[:50]}... = {max_grad:.2f}")
+    
+    return max_grad, total_norm
+
+
 # ============================================
-# MODEL CONFIG - OPTIMIZED v2 BACKBONE FOR TRANSFER LEARNING
+# MODEL CONFIG
 # ============================================
 
 class ModelConfig:
-    """✅ Optimized Config: GCNetWithDWSA_v2 + Transfer Learning"""
-    
     @staticmethod
     def get_config():
-        """
-        Config để tối đa transfer learning từ GCNet Cityscapes:
-        - channels=32 (khớp GCNet gốc)
-        - dwsa_stages=['stage4','stage5','stage6'] (chỉ deep layers)
-        - use_dcn_in_stage5_6=True (ở nơi cần nhất)
-        Expected: 80%+ params reuse từ Cityscapes pretrained
-        """
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 32,  # ✅ Giữ nguyên = GCNet gốc
+                "channels": 32,
                 "ppm_channels": 128,
-                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],  # ✅ Giữ nguyên
-                "dwsa_stages": ['stage5','stage6'],  # ✅ Chỉ ở cuối
+                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
+                "dwsa_stages": ['stage5', 'stage6'],
                 "dwsa_num_heads": 4,
+                "dwsa_reduction": 4,
+                "dwsa_qk_sharing": True,
+                "dwsa_groups": 4,
+                "dwsa_drop": 0.1,  # ← Dropout
+                "dwsa_alpha": 0.1,  # ← Learnable residual weight
                 "use_multi_scale_context": True,
+                "ms_alpha": 0.1,  # ← MS residual weight
                 "align_corners": False,
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,  # channels * 2 = 32 * 2 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 64,
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -417,7 +350,7 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 128,  # channels * 4 = 32 * 4 (sẽ override bằng detect_backbone_channels)
+                "in_channels": 128,
                 "channels": 96,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -436,12 +369,10 @@ class ModelConfig:
 
 
 # ============================================
-# SEGMENTOR MODEL
+# SEGMENTOR
 # ============================================
 
 class Segmentor(nn.Module):
-    """Segmentation model with backbone + head + auxiliary head"""
-    
     def __init__(self, backbone, head, aux_head=None):
         super().__init__()
         self.backbone = backbone
@@ -449,12 +380,10 @@ class Segmentor(nn.Module):
         self.aux_head = aux_head
 
     def forward(self, x):
-        """Inference mode"""
         feats = self.backbone(x)
         return self.decode_head(feats)
 
     def forward_train(self, x):
-        """Training mode with auxiliary head"""
         feats = self.backbone(x)
         outputs = {"main": self.decode_head(feats)}
         if self.aux_head is not None:
@@ -463,12 +392,10 @@ class Segmentor(nn.Module):
 
 
 # ============================================
-# 
+# TRAINER - FIXED VERSION
 # ============================================
 
 class Trainer:
-    """Training class with logging and checkpointing"""
-    
     def __init__(self, model, optimizer, scheduler, device, args, class_weights=None):
         self.model = model.to(device)
         self.optimizer = optimizer
@@ -478,11 +405,10 @@ class Trainer:
         self.best_miou = 0.0
         self.start_epoch = 0
         self.global_step = 0
-        self.validated_pretrained = False
         self.class_weights = class_weights.to(device) if class_weights is not None else None
 
         loss_cfg = args.loss_config
-        self.dice = Dice(
+        self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
             ignore_index=args.ignore_index,
             reduction='mean'
@@ -492,30 +418,21 @@ class Trainer:
             ignore_index=args.ignore_index,
             reduction='mean'
         )
-        self.focal_weight = 0.0
+        
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
-        self.loss_phase = 'full'  # 'full' hoặc 'ce_only'
-
+        self.loss_phase = 'full'
         
-        
-        # Mixed precision
         self.scaler = GradScaler(enabled=args.use_amp)
         
-        # Tracking
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.writer = SummaryWriter(log_dir=self.save_dir / "tensorboard")
         
-        self.best_miou = 0.0
-        self.start_epoch = 0
-        self.global_step = 0
-        
         self.save_config()
         self._print_config(loss_cfg)
     
-
     def set_loss_phase(self, phase: str):
         if phase == self.loss_phase:
             return
@@ -526,37 +443,32 @@ class Trainer:
             self.dice_weight = self.base_loss_cfg['dice_weight']
     
         self.loss_phase = phase
-        print(f"📉 Loss phase changed to: {phase} "
-              f"(CE={self.ce_weight}, Dice={self.dice_weight})")
+        print(f"📉 Loss phase: {phase} (CE={self.ce_weight}, Dice={self.dice_weight})")
     
     def _print_config(self, loss_cfg):
-        """Print training configuration"""
         print(f"\n{'='*70}")
         print("⚙️  TRAINER CONFIGURATION")
         print(f"{'='*70}")
         print(f"📦 Batch size: {self.args.batch_size}")
         print(f"🔁 Gradient accumulation: {self.args.accumulation_steps}")
-        print(f"📊 Effective batch size: {self.args.batch_size * self.args.accumulation_steps}")
+        print(f"📊 Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"⚡ Mixed precision: {self.args.use_amp}")
         print(f"✂️  Gradient clipping: {self.args.grad_clip}")
-        print(f"📉 Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Focal({loss_cfg['focal_weight']})")
-        print(f"💾 Save dir: {self.args.save_dir}")
+        print(f"📉 Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
         print(f"{'='*70}\n")
 
     def save_config(self):
-        """Save training config"""
         config = vars(self.args)
         with open(self.save_dir / "config.json", "w") as f:
             json.dump(config, f, indent=2, default=str)
 
     def train_epoch(self, loader, epoch):
-        """Train one epoch"""
         self.model.train()
         
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
-        total_focal = 0.0  # luôn 0 trong setup hiện tại
+        max_grad_epoch = 0.0
         
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
         
@@ -577,7 +489,6 @@ class Trainer:
                     align_corners=False
                 )
     
-                # ----- CE + (optional) Dice -----
                 ce_loss = self.ce(logits, masks)
     
                 if self.dice_weight > 0:
@@ -587,7 +498,6 @@ class Trainer:
     
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
     
-                # aux head
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = outputs["aux"]
                     aux_logits = F.interpolate(
@@ -608,12 +518,30 @@ class Trainer:
     
                 loss = loss / self.args.accumulation_steps
     
+            # FIX 1: Check NaN BEFORE backward
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"\n⚠️  NaN/Inf loss at epoch {epoch}, batch {batch_idx}")
+                print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
+                self.optimizer.zero_grad(set_to_none=True)
+                continue
+            
             self.scaler.scale(loss).backward()
             
+            # FIX 2: ALWAYS clip gradients (không phụ thuộc accumulation)
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
+                
+                # FIX 3: Monitor gradients
+                max_grad, total_norm = check_gradients(self.model, threshold=10.0)
+                max_grad_epoch = max(max_grad_epoch, max_grad)
+                
+                # FIX 4: ALWAYS apply gradient clipping
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), 
+                        max_norm=self.args.grad_clip
+                    )
+                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -625,15 +553,14 @@ class Trainer:
             total_loss += loss.item() * self.args.accumulation_steps
             total_ce += ce_loss.item()
             total_dice += dice_loss.item()
-            focal_val = 0.0  # không dùng focal
-            total_focal += focal_val
             
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
                 'ce': f'{ce_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
-                'lr': f'{current_lr:.6f}'
+                'lr': f'{current_lr:.6f}',
+                'max_grad': f'{max_grad:.2f}'  # ← Monitor
             })
             
             if batch_idx % 50 == 0:
@@ -643,8 +570,8 @@ class Trainer:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
                 self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
                 self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
-                self.writer.add_scalar('train/focal_loss', focal_val, self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
+                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # ← Log
     
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
@@ -652,14 +579,13 @@ class Trainer:
         avg_loss = total_loss / len(loader)
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
-        avg_focal = total_focal / len(loader)
         
-        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': avg_focal}
-
+        print(f"\n📊 Epoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
+        
+        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
     @torch.no_grad()
     def validate(self, loader, epoch):
-        """Validate one epoch"""
         self.model.eval()
         total_loss = 0.0
         
@@ -718,7 +644,6 @@ class Trainer:
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
-        """Save checkpoint"""
         checkpoint = {
             'epoch': epoch,
             'model': self.model.state_dict(),
@@ -764,9 +689,8 @@ class Trainer:
             if reset_best_metric:
                 self.best_miou = 0.0
             else:
-                # giữ best_miou từ checkpoint để so sánh
                 self.best_miou = checkpoint.get('best_miou', 0.0)
-            print(f"✅ Weights loaded from epoch {checkpoint['epoch']}, starting new phase from epoch 0")
+            print(f"✅ Weights loaded from epoch {checkpoint['epoch']}, starting from epoch 0")
         else:
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_miou = checkpoint.get('best_miou', 0.0)
@@ -779,9 +703,7 @@ class Trainer:
             print(f"✅ Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
-
 def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
-    """Automatically detect backbone output channels"""
     backbone.eval()
     with torch.no_grad():
         sample = torch.randn(1, 3, *img_size).to(device)
@@ -808,42 +730,32 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="🚀 GCNetWithDWSA_v2 Training - Maximum Transfer Learning")
+    parser = argparse.ArgumentParser(description="🚀 GCNetWithEnhance Training - FIXED")
     
-    # Transfer Learning Arguments
-    parser.add_argument("--pretrained_weights", type=str, default=None,
-                       help="Path to pretrained GCNet weights (Cityscapes)")
-    parser.add_argument("--freeze_backbone", action="store_true", default=False,
-                       help="Freeze backbone từ epoch 0")
-    parser.add_argument("--unfreeze_schedule", type=str, default="",
-                       help="Các epoch sẽ unfreeze (VD: '10,20,30,40' hoặc rỗng để không unfreeze)")
-    parser.add_argument("--use_discriminative_lr", action="store_true", default=True,
-                       help="Dùng LR khác nhau cho backbone vs head")
-    parser.add_argument("--backbone_lr_factor", type=float, default=0.1,
-                       help="Backbone LR = head_lr * factor")
-    parser.add_argument(
-        "--use_class_weights",
-        action="store_true",
-        help="Dùng class weights cho CrossEntropyLoss (mặc định: không dùng)"
-    )
+    # Transfer Learning
+    parser.add_argument("--pretrained_weights", type=str, default=None)
+    parser.add_argument("--freeze_backbone", action="store_true", default=False)
+    parser.add_argument("--unfreeze_schedule", type=str, default="")
+    parser.add_argument("--use_discriminative_lr", action="store_true", default=True)
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
+    parser.add_argument("--use_class_weights", action="store_true")
+    
     # Dataset
-    parser.add_argument("--train_txt", required=True, help="Path to training list")
-    parser.add_argument("--val_txt", required=True, help="Path to validation list")
+    parser.add_argument("--train_txt", required=True)
+    parser.add_argument("--val_txt", required=True)
     parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
-    parser.add_argument("--reset_best_metric", action="store_true",
-                        help="Reset best mIoU when transfer learning")
-    # Training
-    parser.add_argument("--epochs", type=int, default=100, help="Total epochs")
+    parser.add_argument("--reset_best_metric", action="store_true")
     
-    # Optimization
+    # Training
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=5e-4, help="Max LR (for head)")
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)
-    parser.add_argument("--aux_weight", type=float, default=1.0, help="Auxiliary head weight (decays over epochs)")
+    parser.add_argument("--grad_clip", type=float, default=5.0)  # ← INCREASED from 1.0
+    parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
     # Data
@@ -856,25 +768,21 @@ def main():
     parser.add_argument("--save_dir", default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--resume_mode", type=str, default="transfer", 
-                    choices=["transfer", "continue"],
-                    help="transfer: start from epoch 0, continue: resume from saved epoch")
+                        choices=["transfer", "continue"])
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=10)
-    parser.add_argument("--freeze_epochs", type=int, default=10,
-                        help="Số epoch chỉ train head, backbone frozen")
-    parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3,
-                        help="Số epoch đầu sau khi unfreeze chỉ dùng CE (không Dice/Focal)")
+    parser.add_argument("--freeze_epochs", type=int, default=10)
+    parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
+    
     args = parser.parse_args()
 
-    # Validate config
+    # Validate
     if args.ce_only_epochs_after_unfreeze < 0:
         raise ValueError("ce_only_epochs_after_unfreeze must be >= 0")
-
     if args.freeze_epochs >= args.epochs:
-        raise ValueError(f"freeze_epochs ({args.freeze_epochs}) must be < total epochs ({args.epochs})")
+        raise ValueError(f"freeze_epochs must be < total epochs")
 
-    
     # Setup
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -883,21 +791,27 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"🚀 GCNetWithEnhance Training - Maximum Transfer Learning")
+    print(f"🚀 GCNetWithEnhance Training - FIXED VERSION")
     print(f"{'='*70}")
     print(f"📱 Device: {device}")
     print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
     print(f"📊 Epochs: {args.epochs}")
     print(f"⚡ Scheduler: {args.scheduler}")
+    print(f"✂️  Gradient clipping: {args.grad_clip}")  # ← SHOW
     print(f"❄️  Freeze backbone: {args.freeze_backbone}")
     if args.unfreeze_schedule:
         print(f"📅 Unfreeze schedule: {args.unfreeze_schedule}")
-    print(f"🔀 Discriminative LR: {args.use_discriminative_lr} (backbone_factor={args.backbone_lr_factor})")
+    print(f"🔀 Discriminative LR: {args.use_discriminative_lr} (factor={args.backbone_lr_factor})")
     print(f"{'='*70}\n")
     
     # Config
     cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
+    
+    print(f"🔧 Model Config:")
+    print(f"   ├─ DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
+    print(f"   ├─ DWSA drop: {cfg['backbone']['dwsa_drop']}")
+    print(f"   └─ MS alpha: {cfg['backbone']['ms_alpha']}\n")
     
     # Dataloaders
     print(f"📂 Creating dataloaders...")
@@ -915,16 +829,13 @@ def main():
     
     # Model
     print(f"{'='*70}")
-    print("🏗️  BUILDING GCNetWithEnhance WITH TRANSFER LEARNING")
+    print("🏗️  BUILDING MODEL")
     print(f"{'='*70}\n")
     
-    # Build backbone (v2)
     backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
     
-    # Auto-detect backbone channels
     detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
     
-    # Build head config
     head_cfg = {
         **cfg["head"],
         "in_channels": detected_channels['c5'],
@@ -939,35 +850,31 @@ def main():
         "num_classes": args.num_classes,
     }
     
-    # Build Segmentor
     model = Segmentor(
         backbone=backbone,
         head=GCNetHead(**head_cfg),
         aux_head=GCNetAuxHead(**aux_head_cfg),
     )
     
-    print("\n🔧 Applying Model Optimizations...")
-    print("   ├─ Converting BatchNorm → GroupNorm")
+    print("\n🔧 Applying Optimizations...")
+    print("   ├─ Converting BN → GN")
     model = replace_bn_with_gn(model)
     
-    print("   ├─ Applying Kaiming Initialization")
+    print("   ├─ Kaiming Init")
     model.apply(init_weights)
     
-    print("   └─ Checking Model Health")
+    print("   └─ Health Check")
     check_model_health(model)
     print()
     
-    # ===================== TRANSFER LEARNING SETUP =====================
+    # Transfer Learning
     print(f"{'='*70}")
     print("🔄 TRANSFER LEARNING SETUP")
     print(f"{'='*70}\n")
     
-    # Load pretrained weights
-    # Load pretrained weights with EXACT KEY MAPPING (stem.stageX → stageX)
     if args.pretrained_weights:
-       load_pretrained_gcnet_core(model, args.pretrained_weights)
+        load_pretrained_gcnet_core(model, args.pretrained_weights)
     
-    # Freeze backbone if requested
     if args.freeze_backbone:
         freeze_backbone(model)
         print()
@@ -976,23 +883,21 @@ def main():
     print(f"📊 Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     count_trainable_params(model)
     
-    # ===================== END TRANSFER LEARNING SETUP =====================
-    
-    # Test forward pass
+    # Test forward
     model = model.to(device)
     with torch.no_grad():
         sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         try:
             outputs = model.forward_train(sample)
             print(f"✅ Forward pass successful!")
-            print(f"   Main head output:  {outputs['main'].shape}")
+            print(f"   Main:  {outputs['main'].shape}")
             if 'aux' in outputs:
-                print(f"   Aux head output:   {outputs['aux'].shape}\n")
+                print(f"   Aux:   {outputs['aux'].shape}\n")
         except Exception as e:
             print(f"❌ Forward pass FAILED: {e}\n")
             return
     
-    # Optimizer with discriminative LR
+    # Optimizer
     if args.use_discriminative_lr:
         optimizer = setup_discriminative_lr(
             model,
@@ -1012,19 +917,17 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
-    
-        # Số group thực tế trong optimizer
         n_groups = len(optimizer.param_groups)
     
         if n_groups == 1:
-            max_lrs = args.lr  # scalar
+            max_lrs = args.lr
         elif n_groups == 2:
             max_lrs = [
-                args.lr * args.backbone_lr_factor,  # group 0: backbone
-                args.lr,                            # group 1: head
+                args.lr * args.backbone_lr_factor,
+                args.lr,
             ]
         else:
-            raise ValueError(f"Unexpected number of param_groups: {n_groups}")
+            raise ValueError(f"Unexpected param_groups: {n_groups}")
     
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -1038,14 +941,14 @@ def main():
             div_factor=25,
             final_div_factor=100000,
         )
-        print(f"✅ Using OneCycleLR scheduler (total_steps={total_steps})")
+        print(f"✅ OneCycleLR (total_steps={total_steps})")
     elif args.scheduler == 'poly':
-        print(f"✅ Using Polynomial LR decay")
+        print(f"✅ Polynomial LR decay")
         def poly_lr_lambda(epoch):
             return (1 - epoch / args.epochs) ** 0.9
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
     else:
-        print(f"✅ Using Cosine Annealing LR")
+        print(f"✅ Cosine Annealing LR")
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6
         )
@@ -1074,8 +977,6 @@ def main():
     print("🚀 STARTING TRAINING")
     print(f"{'='*70}\n")
     
-    # Parse unfreeze schedule
-    # Parse unfreeze schedule (ví dụ "30,50")
     unfreeze_epochs = []
     if args.unfreeze_schedule:
         try:
@@ -1084,35 +985,44 @@ def main():
             raise ValueError("unfreeze_schedule must be comma-separated integers")
 
         if any(e <= args.freeze_epochs for e in unfreeze_epochs):
-            raise ValueError(f"All unfreeze epochs must be > freeze_epochs ({args.freeze_epochs})")
+            raise ValueError(f"Unfreeze epochs must be > freeze_epochs ({args.freeze_epochs})")
         if any(e >= args.epochs for e in unfreeze_epochs):
-            raise ValueError(f"Unfreeze epochs must be < total epochs ({args.epochs})")
+            raise ValueError(f"Unfreeze epochs must be < total epochs")
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
-        # Phase 1: freeze backbone trong những epoch đầu
+        # Phase 1: Freeze backbone
         if epoch < args.freeze_epochs:
             freeze_backbone(model)
             trainer.set_loss_phase('full')
 
-        # Phase 2+: progressive unfreezing
+        # Phase 2+: Progressive unfreezing
         if epoch in unfreeze_epochs:
             k = len([e for e in unfreeze_epochs if e <= epoch])
 
             if k == 1:
                 targets = ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
             elif k == 2:
-                targets = ['semantic_branch_layers.1']
+                targets = ['semantic_branch_layers.1', 'dwsa5']
             elif k == 3:
-                targets = ['semantic_branch_layers.0']
+                targets = ['semantic_branch_layers.0', 'dwsa4']
             else:
                 targets = []
 
             if targets:
                 unfreeze_backbone_progressive(model, targets)
                 trainer.set_loss_phase('ce_only')
+                
+                # FIX: Print LR của từng group sau unfreeze
+                print(f"\n{'='*70}")
+                print(f"📊 Learning Rates after unfreezing:")
+                print(f"{'='*70}")
+                for i, group in enumerate(optimizer.param_groups):
+                    name = group.get('name', f'group_{i}')
+                    print(f"   {name}: {group['lr']:.2e}")
+                print(f"{'='*70}\n")
 
-        # Sau ce_only_epochs_after_unfreeze → quay lại full loss
+        # Switch back to full loss
         if unfreeze_epochs:
             past = [e for e in unfreeze_epochs if e <= epoch]
             if past:
@@ -1149,8 +1059,7 @@ def main():
     print(f"\n{'='*70}")
     print("✅ TRAINING COMPLETED!")
     print(f"🏆 Best mIoU: {trainer.best_miou:.4f}")
-    print(f"💾 Checkpoints saved to: {args.save_dir}")
-    print(f"📊 Tensorboard logs at: {args.save_dir}/tensorboard")
+    print(f"💾 Checkpoints: {args.save_dir}")
     print(f"{'='*70}\n")
 
 
