@@ -195,9 +195,31 @@ def freeze_backbone(model):
     for param in model.backbone.parameters():
         param.requires_grad = False
     print("🔒 Backbone FROZEN")
+def print_backbone_structure(model):
+    """In ra cấu trúc backbone để debug"""
+    print(f"\n{'='*70}")
+    print("🔍 BACKBONE STRUCTURE")
+    print(f"{'='*70}")
+    
+    for name, module in model.backbone.named_children():
+        print(f"├─ {name}: {type(module).__name__}")
+        
+        # If ModuleList
+        if isinstance(module, nn.ModuleList):
+            for i, submodule in enumerate(module):
+                print(f"│  └─ [{i}]: {type(submodule).__name__}")
+    
+    print(f"{'='*70}\n")
+
 
 
 def unfreeze_backbone_progressive(model, stage_names):
+    """
+    Unfreeze specific stages in backbone.
+    
+    Args:
+        stage_names: List of module names (e.g., ['semantic_branch_layers.2', 'dwsa6'])
+    """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
@@ -205,35 +227,47 @@ def unfreeze_backbone_progressive(model, stage_names):
     unfrozen_modules = []
 
     for stage_name in stage_names:
+        module = None
+        
+        # Method 1: Direct attribute
         if hasattr(model.backbone, stage_name):
             module = getattr(model.backbone, stage_name)
+            unfrozen_modules.append(f"backbone.{stage_name}")
+        
+        # Method 2: Nested attribute (e.g., 'semantic_branch_layers.0')
+        else:
+            parts = stage_name.split('.')
+            current = model.backbone
+            
+            try:
+                for part in parts:
+                    if part.isdigit():
+                        current = current[int(part)]
+                    else:
+                        current = getattr(current, part)
+                
+                module = current
+                unfrozen_modules.append(f"backbone.{stage_name}")
+            
+            except (AttributeError, IndexError, TypeError) as e:
+                print(f"⚠️  Module '{stage_name}' not found in backbone: {e}")
+                continue  # ← FIX: Skip to next stage
+        
+        # ← FIX: Check if module is valid
+        if module is not None:
             for p in module.parameters():
                 if not p.requires_grad:
                     p.requires_grad = True
                     unfrozen_params += 1
-            unfrozen_modules.append(f"backbone.{stage_name}")
         else:
-            parts = stage_name.split('.')
-            module = model.backbone
-            try:
-                for part in parts:
-                    if part.isdigit():
-                        module = module[int(part)]
-                    else:
-                        module = getattr(module, part)
-                
-                for p in module.parameters():
-                    if not p.requires_grad:
-                        p.requires_grad = True
-                        unfrozen_params += 1
-                unfrozen_modules.append(f"backbone.{stage_name}")
-            except (AttributeError, IndexError, TypeError):
-                print(f"⚠️  Module '{stage_name}' not found, skipping")
+            print(f"⚠️  Module '{stage_name}' resolved to None, skipping")
 
     if unfrozen_modules:
         print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} params):")
         for mod in unfrozen_modules:
             print(f"   └─ {mod}")
+    else:
+        print(f"⚠️  No modules were unfrozen. Check stage_names: {stage_names}")
 
 
 def count_trainable_params(model):
@@ -952,7 +986,7 @@ def main():
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6
         )
-    
+    print_backbone_structure(model)
     # Trainer
     trainer = Trainer(
         model=model,
