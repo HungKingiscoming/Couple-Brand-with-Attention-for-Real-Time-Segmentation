@@ -211,10 +211,11 @@ def print_backbone_structure(model):
     
     print(f"{'='*70}\n")
 
-
-
 def unfreeze_backbone_progressive(model, stage_names):
-    """Unfreeze specific stages in backbone."""
+    """
+    Unfreeze specific stages - Works with ANY nested structure
+    Tìm kiếm trong: model.backbone, model.backbone.backbone, và nested modules
+    """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
@@ -223,49 +224,110 @@ def unfreeze_backbone_progressive(model, stage_names):
 
     for stage_name in stage_names:
         module = None
+        found_path = None
         
-        # Method 1: Direct attribute
-        if hasattr(model.backbone, stage_name):
-            module = getattr(model.backbone, stage_name)
-            unfrozen_modules.append(f"backbone.{stage_name}")
+        # Define all possible search paths
+        search_paths = [
+            ('backbone', stage_name),                           # model.backbone.dwsa5
+            ('backbone', 'backbone', stage_name),               # model.backbone.backbone.stem
+            ('backbone', 'backbone', stage_name, '0'),          # model.backbone.backbone.semantic_branch_layers.0
+            ('backbone', 'backbone', stage_name, '1'),          # model.backbone.backbone.semantic_branch_layers.1
+            ('backbone', 'backbone', stage_name, '2'),          # model.backbone.backbone.semantic_branch_layers.2
+        ]
         
-        # Method 2: Nested attribute (e.g., 'semantic_branch_layers.0')
-        else:
-            parts = stage_name.split('.')
-            current = model.backbone
-            
+        # Try each path
+        for path_parts in search_paths:
             try:
+                current = model
+                
+                for part in path_parts:
+                    if part.isdigit():
+                        current = current[int(part)]
+                    else:
+                        current = getattr(current, part)
+                
+                # Found it!
+                if current is not None:
+                    module = current
+                    found_path = '.'.join(path_parts)
+                    break
+            
+            except (AttributeError, TypeError, IndexError):
+                continue  # Try next path
+        
+        # If still not found, try parsing the stage_name itself
+        if module is None and '.' in stage_name:
+            # e.g., 'semantic_branch_layers.0' → ['semantic_branch_layers', '0']
+            parts = stage_name.split('.')
+            
+            # Try: model.backbone.backbone.<parts>
+            try:
+                current = model.backbone.backbone
                 for part in parts:
                     if part.isdigit():
                         current = current[int(part)]
                     else:
                         current = getattr(current, part)
                 
-                module = current
-                unfrozen_modules.append(f"backbone.{stage_name}")
-            
-            except (AttributeError, IndexError, TypeError) as e:
-                print(f"⚠️  Module '{stage_name}' not found: {e}")
-                continue  # ← QUAN TRỌNG: Skip to next iteration
+                if current is not None:
+                    module = current
+                    found_path = f"backbone.backbone.{stage_name}"
+            except (AttributeError, TypeError, IndexError):
+                pass
         
-        # ← THÊM CHECK NÀY (DÒNG 210)
+        # Check if module was found and is not None
         if module is None:
-            print(f"⚠️  Module '{stage_name}' is None, skipping")
-            continue  # ← Skip if module not found
+            print(f"⚠️  Module '{stage_name}' not found or is None")
+            continue
         
-        # Now safe to call .parameters()
+        # Unfreeze parameters
+        param_count = 0
         for p in module.parameters():
             if not p.requires_grad:
                 p.requires_grad = True
                 unfrozen_params += 1
+                param_count += 1
+        
+        if param_count > 0:
+            unfrozen_modules.append((found_path, param_count))
 
+    # Print results
     if unfrozen_modules:
-        print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} params):")
-        for mod in unfrozen_modules:
-            print(f"   └─ {mod}")
+        print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} total params):")
+        for path, count in unfrozen_modules:
+            print(f"   └─ {path}: {count:,} params")
     else:
-        print(f"⚠️  No modules were unfrozen. Check stage_names: {stage_names}")
+        print(f"⚠️  No modules were unfrozen. Requested: {stage_names}")
+        print(f"\n💡 Available modules:")
+        print_available_modules(model)
+    
+    return unfrozen_params
 
+def print_available_modules(model):
+    """Debug helper - print all available modules in backbone"""
+    print(f"\n{'='*70}")
+    print("📋 AVAILABLE BACKBONE MODULES")
+    print(f"{'='*70}")
+    
+    print("\n1️⃣ At model.backbone level:")
+    for name, module in model.backbone.named_children():
+        if module is not None:
+            param_count = sum(p.numel() for p in module.parameters())
+            print(f"   ├─ {name}: {type(module).__name__} ({param_count:,} params)")
+    
+    print("\n2️⃣ At model.backbone.backbone level (GCNetCore):")
+    if hasattr(model.backbone, 'backbone'):
+        for name, module in model.backbone.backbone.named_children():
+            if isinstance(module, nn.ModuleList):
+                print(f"   ├─ {name}: ModuleList[{len(module)}]")
+                for i, submodule in enumerate(module):
+                    param_count = sum(p.numel() for p in submodule.parameters())
+                    print(f"   │  └─ [{i}]: {type(submodule).__name__} ({param_count:,} params)")
+            elif module is not None:
+                param_count = sum(p.numel() for p in module.parameters())
+                print(f"   ├─ {name}: {type(module).__name__} ({param_count:,} params)")
+    
+    print(f"{'='*70}\n")
 
 def count_trainable_params(model):
     total = sum(p.numel() for p in model.parameters())
@@ -1032,11 +1094,11 @@ def main():
             k = len([e for e in unfreeze_epochs if e <= epoch])
 
             if k == 1:
-                targets = ['semantic_branch_layers.2', 'dwsa6', 'ms_context']
+                targets = ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa6']
             elif k == 2:
-                targets = ['semantic_branch_layers.1', 'dwsa5']
+                targets = ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
             elif k == 3:
-                targets = ['semantic_branch_layers.0', 'dwsa4']
+                targets = ['semantic_branch_layers.0', 'detail_branch_layers.0', 'stem']
             else:
                 targets = []
 
