@@ -213,8 +213,7 @@ def print_backbone_structure(model):
 
 def unfreeze_backbone_progressive(model, stage_names):
     """
-    Unfreeze specific stages - Works with ANY nested structure
-    Tìm kiếm trong: model.backbone, model.backbone.backbone, và nested modules
+    Unfreeze specific stages - FIXED to work with nested GCNetCore
     """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
@@ -226,58 +225,44 @@ def unfreeze_backbone_progressive(model, stage_names):
         module = None
         found_path = None
         
-        # Define all possible search paths
-        search_paths = [
-            ('backbone', stage_name),                           # model.backbone.dwsa5
-            ('backbone', 'backbone', stage_name),               # model.backbone.backbone.stem
-            ('backbone', 'backbone', stage_name, '0'),          # model.backbone.backbone.semantic_branch_layers.0
-            ('backbone', 'backbone', stage_name, '1'),          # model.backbone.backbone.semantic_branch_layers.1
-            ('backbone', 'backbone', stage_name, '2'),          # model.backbone.backbone.semantic_branch_layers.2
-        ]
+        # Strategy 1: Direct lookup at model.backbone level
+        if hasattr(model.backbone, stage_name):
+            attr = getattr(model.backbone, stage_name)
+            if attr is not None:
+                module = attr
+                found_path = f"backbone.{stage_name}"
         
-        # Try each path
-        for path_parts in search_paths:
-            try:
-                current = model
-                
-                for part in path_parts:
-                    if part.isdigit():
-                        current = current[int(part)]
-                    else:
-                        current = getattr(current, part)
-                
-                # Found it!
-                if current is not None:
-                    module = current
-                    found_path = '.'.join(path_parts)
-                    break
-            
-            except (AttributeError, TypeError, IndexError):
-                continue  # Try next path
-        
-        # If still not found, try parsing the stage_name itself
-        if module is None and '.' in stage_name:
-            # e.g., 'semantic_branch_layers.0' → ['semantic_branch_layers', '0']
-            parts = stage_name.split('.')
-            
-            # Try: model.backbone.backbone.<parts>
-            try:
-                current = model.backbone.backbone
-                for part in parts:
-                    if part.isdigit():
-                        current = current[int(part)]
-                    else:
-                        current = getattr(current, part)
-                
-                if current is not None:
-                    module = current
+        # Strategy 2: Lookup at model.backbone.backbone level (GCNetCore)
+        if module is None and hasattr(model.backbone, 'backbone'):
+            if hasattr(model.backbone.backbone, stage_name):
+                attr = getattr(model.backbone.backbone, stage_name)
+                if attr is not None:
+                    module = attr
                     found_path = f"backbone.backbone.{stage_name}"
-            except (AttributeError, TypeError, IndexError):
-                pass
         
-        # Check if module was found and is not None
+        # Strategy 3: Parse dotted names like 'semantic_branch_layers.0'
+        if module is None and '.' in stage_name:
+            parts = stage_name.split('.')
+            base_name = parts[0]  # e.g., 'semantic_branch_layers'
+            index = parts[1] if len(parts) > 1 else None
+            
+            # Try model.backbone.backbone.<base_name>[index]
+            if hasattr(model.backbone.backbone, base_name):
+                base_module = getattr(model.backbone.backbone, base_name)
+                
+                if index is not None and index.isdigit():
+                    try:
+                        module = base_module[int(index)]
+                        found_path = f"backbone.backbone.{stage_name}"
+                    except (IndexError, TypeError):
+                        pass
+                else:
+                    module = base_module
+                    found_path = f"backbone.backbone.{base_name}"
+        
+        # If still not found, skip
         if module is None:
-            print(f"⚠️  Module '{stage_name}' not found or is None")
+            print(f"⚠️  Module '{stage_name}' not found")
             continue
         
         # Unfreeze parameters
@@ -290,19 +275,15 @@ def unfreeze_backbone_progressive(model, stage_names):
         
         if param_count > 0:
             unfrozen_modules.append((found_path, param_count))
+            print(f"✅ Unfrozen: {found_path} ({param_count:,} params)")
 
-    # Print results
+    # Summary
     if unfrozen_modules:
-        print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} total params):")
-        for path, count in unfrozen_modules:
-            print(f"   └─ {path}: {count:,} params")
+        print(f"\n🔓 Total: {len(unfrozen_modules)} modules, {unfrozen_params:,} params unfrozen")
     else:
-        print(f"⚠️  No modules were unfrozen. Requested: {stage_names}")
-        print(f"\n💡 Available modules:")
-        print_available_modules(model)
+        print(f"\n⚠️  WARNING: No modules were unfrozen!")
     
     return unfrozen_params
-
 def print_available_modules(model):
     """Debug helper - print all available modules in backbone"""
     print(f"\n{'='*70}")
