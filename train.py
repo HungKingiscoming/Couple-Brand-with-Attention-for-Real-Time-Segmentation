@@ -214,12 +214,7 @@ def print_backbone_structure(model):
 
 
 def unfreeze_backbone_progressive(model, stage_names):
-    """
-    Unfreeze specific stages in backbone.
-    
-    Args:
-        stage_names: List of module names (e.g., ['semantic_branch_layers.2', 'dwsa6'])
-    """
+    """Unfreeze specific stages in backbone."""
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
@@ -250,17 +245,19 @@ def unfreeze_backbone_progressive(model, stage_names):
                 unfrozen_modules.append(f"backbone.{stage_name}")
             
             except (AttributeError, IndexError, TypeError) as e:
-                print(f"⚠️  Module '{stage_name}' not found in backbone: {e}")
-                continue  # ← FIX: Skip to next stage
+                print(f"⚠️  Module '{stage_name}' not found: {e}")
+                continue  # ← QUAN TRỌNG: Skip to next iteration
         
-        # ← FIX: Check if module is valid
-        if module is not None:
-            for p in module.parameters():
-                if not p.requires_grad:
-                    p.requires_grad = True
-                    unfrozen_params += 1
-        else:
-            print(f"⚠️  Module '{stage_name}' resolved to None, skipping")
+        # ← THÊM CHECK NÀY (DÒNG 210)
+        if module is None:
+            print(f"⚠️  Module '{stage_name}' is None, skipping")
+            continue  # ← Skip if module not found
+        
+        # Now safe to call .parameters()
+        for p in module.parameters():
+            if not p.requires_grad:
+                p.requires_grad = True
+                unfrozen_params += 1
 
     if unfrozen_modules:
         print(f"🔓 Unfrozen {len(unfrozen_modules)} modules ({unfrozen_params:,} params):")
