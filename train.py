@@ -998,7 +998,7 @@ def main():
     model = Segmentor(
         backbone=backbone,
         head=GCNetHead(**head_cfg),
-        auxhead=GCNetAuxHead(**aux_head_cfg),
+        aux_head=GCNetAuxHead(**aux_head_cfg),  # ✅ đúng: aux_head
     )
     
     print("\n🔧 Applying Optimizations...")
