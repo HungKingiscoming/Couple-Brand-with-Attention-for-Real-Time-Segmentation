@@ -889,7 +889,7 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=5.0)  # ← INCREASED from 1.0
+    parser.add_argument("--grad_clip", type=float, default=2.0)  # ← INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
@@ -1075,7 +1075,7 @@ def main():
             optimizer,
             max_lr=max_lrs,
             total_steps=total_steps,
-            pct_start=0.05,
+            pct_start=0.1,
             anneal_strategy='cos',
             cycle_momentum=True,
             base_momentum=0.85,
