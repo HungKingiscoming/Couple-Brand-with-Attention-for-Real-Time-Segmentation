@@ -397,48 +397,52 @@ def check_gradients(model, threshold=10.0):
 
 class ModelConfig:
     @staticmethod
-    def get_config():
+    def get_base_config():
+        """Base config với dynamic channels"""
         return {
-            "backbone": {
-                "in_channels": 3,
-                "channels": 32,
-                "ppm_channels": 128,
-                "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
-                "dwsa_stages": ['stage5', 'stage6'],
-                "dwsa_num_heads": 4,
-                "dwsa_reduction": 4,
-                "dwsa_qk_sharing": True,
-                "dwsa_groups": 4,
-                "dwsa_drop": 0.1,  # ← Dropout
-                "dwsa_alpha": 0.1,  # ← Learnable residual weight
-                "use_multi_scale_context": True,
-                "ms_alpha": 0.1,  # ← MS residual weight
-                "align_corners": False,
-                "deploy": False
+            'backbone': {
+                'in_channels': 3,
+                'channels': 32,
+                'ppm_channels': 128,
+                'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
+                'dwsa_stages': ['stage5', 'stage6'],
+                'dwsa_num_heads': 4,
+                'dwsa_reduction': 4,
+                'dwsa_qk_sharing': True,
+                'dwsa_groups': 4,
+                'dwsa_drop': 0.1,
+                'dwsa_alpha': 0.1,
+                'use_multi_scale_context': True,
+                'ms_scales': (1, 2),
+                'ms_branch_ratio': 8,
+                'ms_alpha': 0.1,
+                'align_corners': False,
+                'deploy': False
             },
-            "head": {
-                "in_channels": 64,
-                "decoder_channels": 128,
-                "dropout_ratio": 0.1,
-                "align_corners": False,
-                "norm_cfg": {'type': 'BN', 'requires_grad': True},
-                "act_cfg": {'type': 'ReLU', 'inplace': False}
+            'head': {
+                'decoder_channels': 128,
+                'dropout_ratio': 0.1,
+                'use_gated_fusion': True,
+                'norm_cfg': dict(type='BN', requires_grad=True),
+                'act_cfg': dict(type='ReLU', inplace=False),
+                'align_corners': False,
+                # Dynamic: in_channels, c1_channels, c2_channels
             },
-            "aux_head": {
-                "in_channels": 128,
-                "channels": 96,
-                "dropout_ratio": 0.1,
-                "align_corners": False,
-                "norm_cfg": {'type': 'BN', 'requires_grad': True},
-                "act_cfg": {'type': 'ReLU', 'inplace': False}
+            'auxhead': {
+                'channels': 96,
+                'dropout_ratio': 0.1,
+                'norm_cfg': dict(type='BN', requires_grad=True),
+                'act_cfg': dict(type='ReLU', inplace=False),
+                'align_corners': False,
+                # Dynamic: in_channels
             },
-            "loss": {
-                "ce_weight": 1.0,
-                "dice_weight": 0.0,
-                "focal_weight": 0.0,
-                "focal_alpha": 0.25,
-                "focal_gamma": 2.0,
-                "dice_smooth": 1e-5
+            'loss': {
+                'ce_weight': 1.0,
+                'dice_weight': 0.0,
+                'focal_weight': 0.0,
+                'focal_alpha': 0.25,
+                'focal_gamma': 2.0,
+                'dice_smooth': 1e-5
             }
         }
 
@@ -947,8 +951,8 @@ def main():
     print(f"{'='*70}\n")
     
     # Config
-    cfg = ModelConfig.get_config()
-    args.loss_config = cfg["loss"]
+    cfg = ModelConfig.get_base_config()
+    args.loss_config = cfg['loss']
     
     print(f"🔧 Model Config:")
     print(f"   ├─ DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
@@ -978,19 +982,17 @@ def main():
     
     detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
     
-    head_cfg = {
-        **cfg["head"],
-        "in_channels": detected_channels['c5'],
-        "c1_channels": detected_channels['c1'],
-        "c2_channels": detected_channels['c2'],
-        "num_classes": args.num_classes,
-    }
+    cfg['head'].update({
+        'in_channels': detected_channels.get('c5', 128),
+        'c1_channels': detected_channels.get('c1', 32),
+        'c2_channels': detected_channels.get('c2', 64),
+        'num_classes': args.num_classes
+    })
     
-    aux_head_cfg = {
-        **cfg["aux_head"],
-        "in_channels": detected_channels['c4'],
-        "num_classes": args.num_classes,
-    }
+    cfg['auxhead'].update({
+        'in_channels': detected_channels.get('c4', 128),
+        'num_classes': args.num_classes
+    })
     
     model = Segmentor(
         backbone=backbone,
