@@ -978,7 +978,7 @@ def main():
     print("🏗️  BUILDING MODEL")
     print(f"{'='*70}\n")
     
-    backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
+    backbone = GCNetWithEnhance(**cfg['backbone']).to(device)
     
     detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
     
@@ -986,18 +986,19 @@ def main():
         'in_channels': detected_channels.get('c5', 128),
         'c1_channels': detected_channels.get('c1', 32),
         'c2_channels': detected_channels.get('c2', 64),
-        'num_classes': args.num_classes
+        'num_classes': args.num_classes,
     })
-    
+    head_cfg = cfg['head']
+    aux_head_cfg = cfg['auxhead']
     cfg['auxhead'].update({
         'in_channels': detected_channels.get('c4', 128),
-        'num_classes': args.num_classes
+        'num_classes': args.num_classes,
     })
     
     model = Segmentor(
         backbone=backbone,
         head=GCNetHead(**head_cfg),
-        aux_head=GCNetAuxHead(**aux_head_cfg),
+        auxhead=GCNetAuxHead(**aux_head_cfg),
     )
     
     print("\n🔧 Applying Optimizations...")
