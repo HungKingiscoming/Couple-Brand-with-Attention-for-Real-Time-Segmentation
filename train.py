@@ -813,25 +813,32 @@ class Trainer:
 
 
 def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
+    """FIX: Return dict, không phải dict_keys"""
     backbone.eval()
     with torch.no_grad():
         sample = torch.randn(1, 3, *img_size).to(device)
         feats = backbone(sample)
         
-        channels = {}
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in feats:
-                channels[key] = feats[key].shape[1]
-        
-        print(f"\n{'='*70}")
-        print("🔍 BACKBONE CHANNEL DETECTION")
-        print(f"{'='*70}")
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in channels:
-                print(f"   {key}: {channels[key]} channels")
-        print(f"{'='*70}\n")
-        
-        return channels
+        # Convert feats to dict + handle tuple/dict
+        if isinstance(feats, tuple):
+            feats_dict = {
+                'c1': feats[0] if len(feats) > 0 else torch.zeros(1,32,*img_size//2).to(device),
+                'c2': feats[1] if len(feats) > 1 else torch.zeros(1,64,*img_size//4).to(device),
+                'c4': feats[0],  # GCNet tuple: (c4, final)
+                'c5': feats[1],
+            }
+        elif isinstance(feats, dict):
+            feats_dict = feats
+        else:
+            feats_dict = {'c5': feats}
+    
+    channels = {k: v.shape[1] for k, v in feats_dict.items()}
+    print("====== BACKBONE CHANNEL DETECTION ======")
+    for k, ch in channels.items():
+        print(f"{k}: {ch}")
+    print("=======================================")
+    return channels  # ✅ Return dict
+
 
 
 def model_soup(checkpoint_paths, device='cpu'):
