@@ -19,9 +19,8 @@ import time
 import gc
 import warnings
 import torch_optimizer as optim
-AveragedModel = optim.AveragedModel
-SWALR = optim.SWALR
-update_bn = optim.update_bn
+from torch.optim.swautils import AveragedModel, SWALR, update_bn
+
 warnings.filterwarnings('ignore')
 
 # ============================================
