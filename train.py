@@ -18,7 +18,10 @@ import json
 import time
 import gc
 import warnings
-from torch.optim.swautils import AveragedModel, SWALR, update_bn
+import torch_optimizer as optim
+AveragedModel = optim.AveragedModel
+SWALR = optim.SWALR
+update_bn = optim.update_bn
 warnings.filterwarnings('ignore')
 
 # ============================================
