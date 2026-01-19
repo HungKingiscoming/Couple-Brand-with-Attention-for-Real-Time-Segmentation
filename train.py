@@ -312,36 +312,44 @@ def print_available_modules(model):
     print(f"{'='*70}\n")
 
 def count_trainable_params(model):
+    """Count total/trainable/frozen params - FIXED for your model structure"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = total - trainable
     
+    # Backbone params
     backbone_total = sum(p.numel() for p in model.backbone.parameters())
     backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
     
-    head_total = sum(p.numel() for p in model.decode_head.parameters())
-    head_trainable = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
+    # Head params - model có 'head', không phải 'decodehead'
+    head_total = 0
+    head_trainable = 0
+    if hasattr(model, 'head') and model.head is not None:
+        head_total = sum(p.numel() for p in model.head.parameters())
+        head_trainable = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
     
-    if hasattr(model, 'aux_head') and model.aux_head is not None:
-        aux_total = sum(p.numel() for p in model.aux_head.parameters())
-        aux_trainable = sum(p.numel() for p in model.aux_head.parameters() if p.requires_grad)
-    else:
-        aux_total = aux_trainable = 0
+    # Aux Head params
+    aux_total = 0
+    aux_trainable = 0
+    if hasattr(model, 'auxhead') and model.auxhead is not None:
+        aux_total = sum(p.numel() for p in model.auxhead.parameters())
+        aux_trainable = sum(p.numel() for p in model.auxhead.parameters() if p.requires_grad)
     
-    print(f"\n{'='*70}")
-    print("ðŸ“Š PARAMETER STATISTICS")
-    print(f"{'='*70}")
-    print(f"Total:        {total:>15,} | 100%")
-    print(f"Trainable:    {trainable:>15,} | {100*trainable/total:.1f}%")
-    print(f"Frozen:       {frozen:>15,} | {100*frozen/total:.1f}%")
-    print(f"{'-'*70}")
-    print(f"Backbone:     {backbone_trainable:>15,} / {backbone_total:,} | {100*backbone_trainable/backbone_total:.1f}%")
-    print(f"Head:         {head_trainable:>15,} / {head_total:,} | {100*head_trainable/head_total:.1f}%")
+    print("=" * 70)
+    print("📊 PARAMETER STATISTICS")
+    print("=" * 70)
+    print(f"Total:        {total:15,} | 100%")
+    print(f"Trainable:    {trainable:15,} | {100*trainable/total:.1f}%")
+    print(f"Frozen:       {frozen:15,} | {100*frozen/total:.1f}%")
+    print("-" * 70)
+    print(f"Backbone:     {backbone_trainable:15,} / {backbone_total} | {100*backbone_trainable/backbone_total:.1f}%")
+    print(f"Head:         {head_trainable:15,} / {head_total} | {100*head_trainable/head_total:.1f}%")
     if aux_total > 0:
-        print(f"Aux Head:     {aux_trainable:>15,} / {aux_total:,} | {100*aux_trainable/aux_total:.1f}%")
-    print(f"{'='*70}\n")
+        print(f"Aux Head:     {aux_trainable:15,} / {aux_total} | {100*aux_trainable/aux_total:.1f}%")
+    print("=" * 70)
     
     return trainable, frozen
+
 
 
 def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
