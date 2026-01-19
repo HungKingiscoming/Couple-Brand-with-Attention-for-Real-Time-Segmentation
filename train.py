@@ -19,7 +19,7 @@ import time
 import gc
 import warnings
 import torch_optimizer as optim
-from torch.optim.swautils import AveragedModel, SWALR, update_bn
+from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
 
 warnings.filterwarnings('ignore')
 
