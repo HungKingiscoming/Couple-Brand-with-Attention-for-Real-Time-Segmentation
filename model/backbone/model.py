@@ -877,38 +877,48 @@ class GCNetWithEnhance(BaseModule):
             act_cfg=act_cfg,
         )
 
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        feats = self.backbone(x)
-
-        c1 = feats['c1']
-        c2 = feats['c2']
-        c4 = feats['c4']
-        x_d6 = feats['x_d6']
-        s4, s5, s6 = feats['s4'], feats['s5'], feats['s6']
-
+    def forward(self, x: Tensor) -> tuple | Dict[str, Tensor]:
+        """✅ FIXED: GCNet compatibility + Dict outputs"""
+        out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
+        
+        # GCNetCore forward (extract all intermediate feats)
+        gcnet_feats = self.backbone(x)
+        
+        # Extract GCNet features (stem → final)
+        c1 = gcnet_feats.get('c1', F.interpolate(gcnet_feats.get('stem_out', x), scale_factor=0.5, mode='bilinear', align_corners=self.align_corners))  # H/2
+        c2 = gcnet_feats['c2']  # H/4, stage3
+        c4 = gcnet_feats['c4']  # H/8, stage4 detail
+        x_d6 = gcnet_feats['x_d6']  # H/8 stage6 detail
+        s4, s5, s6 = gcnet_feats['s4'], gcnet_feats['s5'], gcnet_feats['s6']  # Semantic branches
+        
+        # ✅ DWSA modules
         if self.dwsa4 is not None:
             s4 = self.dwsa4(s4)
         if self.dwsa5 is not None:
             s5 = self.dwsa5(s5)
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
-
+        
+        # SPP + resize (GCNet style)
         x_spp = self.backbone.spp(s6)
-        out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
-        x_spp = resize(
-            x_spp, size=out_size,
-            mode='bilinear',
-            align_corners=self.align_corners)
-
+        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
+        
+        # ✅ MultiScaleContext
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
-
+        
+        # Final projection + fusion
         x_spp = self.final_proj(x_spp)
-        c5_enh = x_d6 + x_spp
-
-        return dict(
-            c1=c1,
-            c2=c2,
-            c4=c4,
-            c5=c5_enh,
-        )
+        c5_enh = x_d6 + x_spp  # Enhanced c5 (H/8)
+        
+        # ✅ GCNet COMPATIBILITY: Return tuple cho training (c4_feat, final)
+        if self.training:
+            return (c4.clone() if self.training else None, c5_enh)  # Match GCNet signature
+        else:
+            # Dict cho head consistency
+            return {
+                'c1': c1,      # H/2 ~32ch
+                'c2': c2,      # H/4 ~64ch  
+                'c4': c4,      # H/8 ~128ch (aux)
+                'c5': c5_enh   # H/8 enhanced final
+            }
