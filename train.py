@@ -813,31 +813,41 @@ class Trainer:
 
 
 def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
+    """FIX Return dict of channels, handle tuple/dict properly"""
     backbone.eval()
     with torch.no_grad():
         sample = torch.randn(1, 3, *img_size).to(device)
         feats = backbone(sample)
+        
+        # DEBUG: Print actual type
+        print(f"DEBUG: feats type = {type(feats)}")
+        if hasattr(feats, '__len__'):
+            print(f"DEBUG: feats length/shape = {getattr(feats, 'shape', len(feats))}")
+        
+        feats_dict = {}
         if isinstance(feats, tuple):
-            feats_dict = {
-                'c1': feats[0] if len(feats) > 0 else torch.zeros(1, 32, img_size[0]//4, img_size[1]//4).to(device),
-                'c2': feats[1] if len(feats) > 1 else torch.zeros(1, 64, img_size[0]//8, img_size[1]//8).to(device),
-                'c4': feats[2] if len(feats) > 2 else feats[0],
-                'c5': feats[-1]
-            }
+            # Handle tuple output from GCNet (common: (c4, c5))
+            if len(feats) >= 2:
+                feats_dict = {'c4': feats[0], 'c5': feats[1]}
+            elif len(feats) == 1:
+                feats_dict = {'c4': feats[0]}
+            else:
+                feats_dict = {'default': feats[0]}
         elif isinstance(feats, dict):
             feats_dict = feats
         else:
-            feats_dict = {'c5': feats}
+            # Fallback
+            feats_dict = {'default': feats}
         
-        channels = {}
-        for k, v in feats_dict.items():
-            if isinstance(v, torch.Tensor):
-                channels[k] = v.shape[1]
+        # Extract channels
+        channels = {k: v.shape[1] for k, v in feats_dict.items()}
+        
+        print("BACKBONE CHANNEL DETECTION")
+        for k, ch in channels.items():
+            print(f"{k}: {ch}")
     
-    print("BACKBONE CHANNEL DETECTION")
-    for k, ch in list(channels.items()):  # Convert to list(items) safe
-        print(f"{k}: {ch}")
-    return channels  # Always dict
+    return channels  # Return dict
+
 
 
 
