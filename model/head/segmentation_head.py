@@ -427,24 +427,25 @@ class GCNetHead(nn.Module):
             nn.Conv2d(output_channels, num_classes, kernel_size=1)
         )
     
-    def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
-        """
-        Args:
-            inputs: Dictionary containing c1, c2, c5 tensors
-        Returns:
-            Segmentation logits
-        """
-        # ✅ CRITICAL: Extract tensors from dict FIRST
-        if isinstance(inputs, dict):
-            c1 = inputs['c1']
-            c2 = inputs['c2']
-            c5 = inputs['c5']
-        else:
-            # Fallback for tuple input
-            c1, c2, c5 = inputs[0], inputs[1], inputs[2]
+    def forward(self, feats: Dict[str, Tensor] | tuple | Tensor) -> Tensor:
+        """Handle GCNet tuple output + dict/tensor fallback"""
+        if isinstance(feats, tuple):
+            # GCNet training: (c4_feat, final_x_d+x_s) hoặc (c1,c2,c5...)
+            if len(feats) == 2 and self.training:
+                # Main head chỉ dùng final feature (x_d + x_s)
+                final_feat = feats[1]  # H/8 size
+                # Upsample final_feat to match decoder expectation (H/2)
+                x = F.interpolate(final_feat, scale_factor=4, mode='bilinear', align_corners=self.align_corners)
+            else:
+                # Assume (c1,c2,c5) tuple
+                c1, c2, c5 = feats[0], feats[1], feats[2]
+                x = self.decoder(c5, c2, c1)
+        elif isinstance(feats, dict):
+            c1 = feats.get('c1', feats.get(feats.keys()[0]))
+            c2 = feats.get('c2', feats.get(list(feats.keys())[1]))
+            c5 = feats.get('c5', list(feats.values())[-1])
+            x = self.decoder(c5, c2, c1)
+        else:  # Single tensor
+            x = F.interpolate(feats, scale_factor=4, mode='bilinear', align_corners=self.align_corners)
         
-        # Now pass individual tensors (NOT dict!)
-        x = self.decoder(c5, c2, c1)
-        x = self.conv_seg(x)
-        
-        return x
+        return self.conv_seg(x)
