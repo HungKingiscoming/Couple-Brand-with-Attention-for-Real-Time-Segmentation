@@ -844,33 +844,34 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
 
 def model_soup(checkpoint_paths, device='cpu'):
     """Average weights from multiple checkpoints"""
-    print(f"\n{'='*70}")
-    print("🍲 CREATING MODEL SOUP")
-    print(f"{'='*70}")
-    print(f"Averaging {len(checkpoint_paths)} checkpoints:")
+    print("=" * 70)
+    print("CREATING MODEL SOUP")
+    print("=" * 70)
+    print(f"Averaging {len(checkpoint_paths)} checkpoints")
     
-    # Load first model
     first_ckpt = torch.load(checkpoint_paths[0], map_location=device, weights_only=False)
     avg_state_dict = first_ckpt['model'].copy()
-    print(f"   ├─ {checkpoint_paths[0]}")
+    print(f"✓ {checkpoint_paths[0]}")
     
-    # Average with others
+    # FIX: Convert keys() to list BEFORE iterating
+    all_keys = list(avg_state_dict.keys())
+    
     for ckpt_path in checkpoint_paths[1:]:
-        print(f"   ├─ {ckpt_path}")
+        print(f"✓ {ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         state_dict = ckpt['model']
-        
-        for key in avg_state_dict.keys():
+        for key in all_keys:  # ← Use list, not dict_keys
             avg_state_dict[key] += state_dict[key]
     
     # Divide by number of models
-    for key in avg_state_dict.keys():
+    for key in all_keys:  # ← Use list here too
         avg_state_dict[key] /= len(checkpoint_paths)
     
-    print(f"   └─ ✅ Soup created!")
-    print(f"{'='*70}\n")
-    
+    print("✓ Soup created!")
+    print("=" * 70)
     return avg_state_dict
+
+
 
 # ============================================
 # MAIN
