@@ -18,7 +18,7 @@ import json
 import time
 import gc
 import warnings
-
+from torch.optim.swautils import AveragedModel, SWALR, update_bn
 warnings.filterwarnings('ignore')
 
 # ============================================
@@ -659,14 +659,19 @@ class Trainer:
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
     @torch.no_grad()
-    def validate(self, loader, epoch):
+    def validate(self, loader, epoch, use_multiscale=False):
+        """Validation with optional multi-scale testing"""
         self.model.eval()
         total_loss = 0.0
         
         num_classes = self.args.num_classes
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
-        pbar = tqdm(loader, desc=f"Validation")
+        # Multi-scale settings
+        scales = [0.75, 1.0, 1.25] if use_multiscale else [1.0]
+        desc = f"Validation (MS={len(scales)} scales)" if use_multiscale else "Validation"
+        
+        pbar = tqdm(loader, desc=desc)
         
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs = imgs.to(self.device, non_blocking=True)
@@ -674,27 +679,52 @@ class Trainer:
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
-            with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)
-                logits = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False
-                )
             
-                ce_loss = self.ce(logits, masks)
-                if self.dice_weight > 0:
-                    dice_loss = self.dice(logits, masks)
-                else:
-                    dice_loss = torch.tensor(0.0, device=logits.device)
+            H, W = masks.shape[-2:]
+    
+            # Multi-scale prediction
+            if use_multiscale:
+                final_pred = torch.zeros(imgs.size(0), num_classes, H, W).to(self.device)
+                
+                for scale in scales:
+                    h, w = int(H * scale), int(W * scale)
+                    img_scaled = F.interpolate(imgs, size=(h, w), mode='bilinear', align_corners=False)
+                    
+                    with autocast(device_type='cuda', enabled=self.args.use_amp):
+                        logits_scaled = self.model(img_scaled)
+                        logits_scaled = F.interpolate(logits_scaled, size=(H, W), mode='bilinear', align_corners=False)
+                    
+                    final_pred += F.softmax(logits_scaled, dim=1)
+                
+                final_pred /= len(scales)
+                pred = final_pred.argmax(1).cpu().numpy()
+                
+                # Compute loss on original scale only
+                with autocast(device_type='cuda', enabled=self.args.use_amp):
+                    logits = self.model(imgs)
+                    logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+                    ce_loss = self.ce(logits, masks)
+                    if self.dice_weight > 0:
+                        dice_loss = self.dice(logits, masks)
+                    else:
+                        dice_loss = torch.tensor(0.0, device=logits.device)
+                    loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+            else:
+                # Single scale (original)
+                with autocast(device_type='cuda', enabled=self.args.use_amp):
+                    logits = self.model(imgs)
+                    logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+                    ce_loss = self.ce(logits, masks)
+                    if self.dice_weight > 0:
+                        dice_loss = self.dice(logits, masks)
+                    else:
+                        dice_loss = torch.tensor(0.0, device=logits.device)
+                    loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+                
+                pred = logits.argmax(1).cpu().numpy()
             
             total_loss += loss.item()
-            
-            pred = logits.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             
             mask = (target >= 0) & (target < num_classes)
@@ -706,7 +736,7 @@ class Trainer:
             
             if batch_idx % 20 == 0:
                 clear_gpu_memory()
-
+    
         intersection = np.diag(confusion_matrix)
         union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
         iou = intersection / (union + 1e-10)
@@ -799,6 +829,36 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
         return channels
 
 
+def model_soup(checkpoint_paths, device='cpu'):
+    """Average weights from multiple checkpoints"""
+    print(f"\n{'='*70}")
+    print("🍲 CREATING MODEL SOUP")
+    print(f"{'='*70}")
+    print(f"Averaging {len(checkpoint_paths)} checkpoints:")
+    
+    # Load first model
+    first_ckpt = torch.load(checkpoint_paths[0], map_location=device, weights_only=False)
+    avg_state_dict = first_ckpt['model'].copy()
+    print(f"   ├─ {checkpoint_paths[0]}")
+    
+    # Average with others
+    for ckpt_path in checkpoint_paths[1:]:
+        print(f"   ├─ {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        state_dict = ckpt['model']
+        
+        for key in avg_state_dict.keys():
+            avg_state_dict[key] += state_dict[key]
+    
+    # Divide by number of models
+    for key in avg_state_dict.keys():
+        avg_state_dict[key] /= len(checkpoint_paths)
+    
+    print(f"   └─ ✅ Soup created!")
+    print(f"{'='*70}\n")
+    
+    return avg_state_dict
+
 # ============================================
 # MAIN
 # ============================================
@@ -848,7 +908,14 @@ def main():
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--freeze_epochs", type=int, default=10)
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
-    
+    parser.add_argument("--use_swa", action="store_true", default=False,
+                       help="Use Stochastic Weight Averaging")
+    parser.add_argument("--swa_lr", type=float, default=5e-6,
+                       help="SWA learning rate")
+    parser.add_argument("--use_model_soup", action="store_true", default=False,
+                       help="Create model soup from best checkpoints")
+    parser.add_argument("--use_multiscale_val", action="store_true", default=False,
+                       help="Use multi-scale testing in final validation")
     args = parser.parse_args()
 
     # Validate
@@ -1062,6 +1129,21 @@ def main():
             raise ValueError(f"Unfreeze epochs must be > freeze_epochs ({args.freeze_epochs})")
         if any(e >= args.epochs for e in unfreeze_epochs):
             raise ValueError(f"Unfreeze epochs must be < total epochs")
+        # ===== SWA SETUP =====
+    swa_model = None
+    swa_scheduler = None
+    swa_start = 75  # Epoch bắt đầu SWA
+
+    if args.use_swa and args.epochs > swa_start:
+        print(f"{'='*70}")
+        print("📊 STOCHASTIC WEIGHT AVERAGING (SWA) ENABLED")
+        print(f"{'='*70}")
+        print(f"SWA Start Epoch: {swa_start}")
+        print(f"SWA LR: {args.swa_lr:.2e}")
+        print(f"{'='*70}\n")
+
+        swa_model = AveragedModel(model)
+        swa_scheduler = SWALR(optimizer, swa_lr=args.swa_lr)
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
@@ -1105,7 +1187,20 @@ def main():
                     trainer.set_loss_phase('full')
 
         train_metrics = trainer.train_epoch(train_loader, epoch)
-        val_metrics = trainer.validate(val_loader, epoch)
+
+        # ===== SWA UPDATE =====
+        if swa_model is not None and epoch >= swa_start:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+            print(f"🔄 SWA: Updated averaged model")
+        elif epoch < swa_start:
+            # scheduler thường đã được gọi trong train_epoch nếu bạn muốn
+            pass
+    
+        # ===== VALIDATION =====
+        # Dùng multi-scale cho các epoch cuối nếu muốn auto
+        use_ms = (epoch >= args.epochs - 5) or args.use_multiscale_val
+        val_metrics = trainer.validate(val_loader, epoch, use_multiscale=use_ms)
         
         print(f"\n{'='*70}")
         print(f"📊 Epoch {epoch+1}/{args.epochs}")
@@ -1129,13 +1224,83 @@ def main():
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
     
     trainer.writer.close()
+    print("="*70)
+    print("TRAINING COMPLETED!")
+    print(f"Best mIoU: {trainer.best_miou:.4f}")
+    print(f"Checkpoints: {args.save_dir}")
+    print("="*70)
     
-    print(f"\n{'='*70}")
-    print("✅ TRAINING COMPLETED!")
-    print(f"🏆 Best mIoU: {trainer.best_miou:.4f}")
-    print(f"💾 Checkpoints: {args.save_dir}")
-    print(f"{'='*70}\n")
-
+    # ===== SWA FINALIZATION =====
+    if swa_model is not None:
+        print(f"\n{'='*70}")
+        print("🔧 FINALIZING SWA MODEL")
+        print(f"{'='*70}")
+    
+        # Update BN statistics
+        print("Updating BatchNorm statistics...")
+        update_bn(train_loader, swa_model, device)
+    
+        # Save SWA model
+        swa_path = trainer.save_dir / "swa_model.pth"
+        torch.save({
+            'model': swa_model.module.state_dict(),
+            'epoch': args.epochs,
+        }, swa_path)
+        print(f"✅ SWA model saved: {swa_path}")
+    
+        # Validate SWA model
+        print("\n🧪 Validating SWA model with multi-scale...")
+        trainer.model = swa_model.module
+        swa_metrics = trainer.validate(val_loader, args.epochs, use_multiscale=True)
+    
+        print(f"\n📊 SWA Results:")
+        print(f"   mIoU: {swa_metrics['miou']:.4f}")
+        print(f"   Acc:  {swa_metrics['accuracy']:.4f}")
+        print(f"{'='*70}\n")
+    # ===== MODEL SOUP =====
+    if args.use_model_soup:
+        print(f"\n{'='*70}")
+        print("🍲 CREATING MODEL SOUP FROM BEST CHECKPOINTS")
+        print(f"{'='*70}")
+    
+        checkpoint_dir = Path(args.save_dir)
+        best_ckpts = []
+    
+        # Always include best.pth
+        if (checkpoint_dir / "best.pth").exists():
+            best_ckpts.append(str(checkpoint_dir / "best.pth"))
+    
+        # Add SWA if available
+        if (checkpoint_dir / "swa_model.pth").exists():
+            best_ckpts.append(str(checkpoint_dir / "swa_model.pth"))
+    
+        # Add specific epochs if they exist
+        for ep in [60, 65, 70]:
+            ep_path = checkpoint_dir / f"epoch_{ep}.pth"
+            if ep_path.exists():
+                best_ckpts.append(str(ep_path))
+    
+        if len(best_ckpts) >= 2:
+            soup_weights = model_soup(best_ckpts, device=device)
+    
+            # Save soup
+            soup_path = checkpoint_dir / "model_soup.pth"
+            torch.save({'model': soup_weights}, soup_path)
+            print(f"✅ Model soup saved: {soup_path}")
+    
+            # Validate soup
+            print("\n🧪 Validating Model Soup with multi-scale...")
+            model.load_state_dict(soup_weights)
+            trainer.model = model
+            soup_metrics = trainer.validate(val_loader, args.epochs, use_multiscale=True)
+    
+            print(f"\n📊 Model Soup Results:")
+            print(f"   mIoU: {soup_metrics['miou']:.4f}")
+            print(f"   Acc:  {soup_metrics['accuracy']:.4f}")
+            print(f"{'='*70}\n")
+        else:
+            print(f"⚠️  Not enough checkpoints for soup (need ≥2, found {len(best_ckpts)})")
+    
 
 if __name__ == "__main__":
     main()
