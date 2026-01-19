@@ -830,7 +830,7 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
         elif isinstance(feats, dict):
             feats_dict = feats
         else:
-            feats_dict = {'c5': feats}
+            feats_dict = {'default': feats}
     
     channels = {k: v.shape[1] for k, v in feats_dict.items()}
     print("====== BACKBONE CHANNEL DETECTION ======")
