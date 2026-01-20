@@ -283,14 +283,28 @@ class GCNetHead(nn.Module):
     """✅ PERFECT FIX cho tất cả cases GCNetWithEnhance"""
     
     def __init__(self, backbone_channels: int = 32, num_classes: int = 19, 
-                 decoder_channels: int = 128, **kwargs):
+                 decoder_channels: int = 128, in_channels: Optional[int] = None,  # ← Accept override
+                 c1_channels: Optional[int] = None,
+                 c2_channels: Optional[int] = None,
+                 **kwargs):  # Catch all other args
+        
         super().__init__()
-        c1_ch, c2_ch, c5_ch = backbone_channels, backbone_channels*2, backbone_channels*4
+        
+        # ✅ PRIORITY: Use provided channels > auto-compute
+        c1_ch = c1_channels or backbone_channels           # 32
+        c2_ch = c2_channels or backbone_channels * 2       # 64  
+        c5_ch = in_channels or backbone_channels * 4       # 128
+        
+        print(f"GCNetHead channels: c1={c1_ch}, c2={c2_ch}, c5={c5_ch}")  # Debug
         
         self.decoder = EnhancedDecoder(
-            in_channels=c5_ch, c2_channels=c2_ch, c1_channels=c1_ch,
-            decoder_channels=decoder_channels, **kwargs
+            in_channels=c5_ch,
+            c2_channels=c2_ch, 
+            c1_channels=c1_ch,
+            decoder_channels=decoder_channels,
+            **kwargs  # Pass remaining args (norm_cfg, etc.)
         )
+        
         self.conv_seg = nn.Sequential(
             nn.Dropout2d(kwargs.get('dropout_ratio', 0.1)),
             nn.Conv2d(decoder_channels//2, num_classes, 1)
