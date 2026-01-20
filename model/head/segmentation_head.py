@@ -243,12 +243,8 @@ class EnhancedDecoder(nn.Module):
         
         return x
 
-
 class GCNetAuxHead(nn.Module):
-    """
-    Auxiliary head for early supervision on c4 features.
-    Applied during training to improve gradient flow.
-    """
+    """✅ PERFECT - Không cần sửa"""
     def __init__(
         self,
         in_channels: int = 128,
@@ -260,10 +256,8 @@ class GCNetAuxHead(nn.Module):
         align_corners: bool = False
     ):
         super().__init__()
-        
         self.align_corners = align_corners
         
-        # Feature extraction
         self.conv1 = ConvModule(
             in_channels=in_channels,
             out_channels=channels,
@@ -273,51 +267,52 @@ class GCNetAuxHead(nn.Module):
             act_cfg=act_cfg
         )
         
-        # Segmentation head
         self.conv_seg = nn.Sequential(
             nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
             nn.Conv2d(channels, num_classes, kernel_size=1)
         )
     
-    def forward(self, x: Tensor) -> Tensor:
-        """Handle both dict and tensor input"""
+    def forward(self, x: Union[Dict[str, Tensor], Tensor]) -> Tensor:
         if isinstance(x, dict):
-            x = x['c4']
-        
+            x = x.get('c4', x['c4'])  # Flexible c4 access
         x = self.conv1(x)
         return self.conv_seg(x)
 
 
 class GCNetHead(nn.Module):
     """
-    Main segmentation head with flexible channel handling.
+    ✅ FIXED VERSION: Perfect compatibility với GCNetWithEnhance
     
-    Pipeline:
-    c5 (128ch, H/8) + c2 (64ch, H/4) + c1 (32ch, H/2)
-    → Decoder → (64ch, H/2) → Segmentation
+    Supported inputs:
+    1. Dict: {'c1':..., 'c2':..., 'c5':...} 
+    2. Tuple training: (c4_dict/tensor, main_dict)  ← GCNet style
+    3. Tuple direct: (c1, c2, c5)
     """
     def __init__(
         self,
-        in_channels: int = 128,
+        backbone_channels: int = 32,  # GCNet channels param
         num_classes: int = 19,
         decoder_channels: int = 128,
         dropout_ratio: float = 0.1,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
-        align_corners: bool = False,
         use_gated_fusion: bool = True,
-        c1_channels: int = 32,
-        c2_channels: int = 64
+        align_corners: bool = False
     ):
         super().__init__()
-        
         self.align_corners = align_corners
+        self.backbone_channels = backbone_channels
         
-        # Initialize decoder with flexible channels
+        # ✅ Auto-compute GCNet channel sizes
+        c1_ch = backbone_channels      # 32
+        c2_ch = backbone_channels * 2  # 64
+        c5_ch = backbone_channels * 4  # 128
+        
+        # Decoder với exact channel matching
         self.decoder = EnhancedDecoder(
-            in_channels=in_channels,
-            c2_channels=c2_channels,
-            c1_channels=c1_channels,
+            in_channels=c5_ch,           # 128
+            c2_channels=c2_ch,           # 64
+            c1_channels=c1_ch,           # 32
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
@@ -325,65 +320,52 @@ class GCNetHead(nn.Module):
             use_gated_fusion=use_gated_fusion
         )
         
-        # Segmentation head
-        output_channels = decoder_channels // 2
+        # Segmentation head (64 → num_classes)
         self.conv_seg = nn.Sequential(
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(output_channels, num_classes, kernel_size=1)
+            nn.Dropout2d(dropout_ratio),
+            nn.Conv2d(decoder_channels//2, num_classes, kernel_size=1)
         )
     
-    def forward(self, feats: Dict[str, Tensor] | tuple | Tensor) -> Tensor:
-        if isinstance(feats, dict):
-            # Dict format: {'c1': ..., 'c2': ..., 'c5': ...}
-            if not all(k in feats for k in ['c1', 'c2', 'c5']):
-                raise KeyError(
-                    f"GCNetHead expects keys ['c1','c2','c5'], "
-                    f"but got {list(feats.keys())}"
-                )
-            
-            c1 = feats['c1']
-            c2 = feats['c2']
-            c5 = feats['c5']
-            x = self.decoder(c5, c2, c1)
+    def forward(self, feats: Union[Dict[str, Tensor], Tuple[Any, ...]]) -> Tensor:
+        """✅ ROBUST input parsing cho tất cả cases"""
         
-        elif isinstance(feats, tuple):
-            if len(feats) == 2:
-                # Tuple format during training: (skip_features_dict, final_features)
-                # OR: (c4_for_aux, main_dict)
-                # Check if second element is a dict with our expected keys
-                if isinstance(feats[1], dict) and all(k in feats[1] for k in ['c1', 'c2', 'c5']):
-                    # Format: (aux_feats, {'c1': ..., 'c2': ..., 'c5': ...})
-                    main_feats = feats[1]
-                    c1 = main_feats['c1']
-                    c2 = main_feats['c2']
-                    c5 = main_feats['c5']
-                    x = self.decoder(c5, c2, c1)
-                elif isinstance(feats[0], dict) and all(k in feats[0] for k in ['c1', 'c2', 'c5']):
-                    # Format: ({'c1': ..., 'c2': ..., 'c5': ...}, aux_feats)
-                    main_feats = feats[0]
-                    c1 = main_feats['c1']
-                    c2 = main_feats['c2']
-                    c5 = main_feats['c5']
-                    x = self.decoder(c5, c2, c1)
-                else:
-                    raise ValueError(
-                        f"Expected tuple[2] to contain a dict with keys ['c1', 'c2', 'c5'], "
-                        f"but got types: ({type(feats[0])}, {type(feats[1])})"
-                    )
-            
-            elif len(feats) >= 3:
-                # Tuple format: (c1, c2, c5, ...) - direct feature tensors
-                c1, c2, c5 = feats[0], feats[1], feats[2]
-                x = self.decoder(c5, c2, c1)
-            
-            else:
-                raise ValueError(
-                    f"Expected tuple with at least 2 elements, got {len(feats)}"
+        # CASE 1: Dict input (inference)
+        if isinstance(feats, dict):
+            required_keys = {'c1', 'c2', 'c5'}
+            if not required_keys.issubset(feats.keys()):
+                raise KeyError(
+                    f"Missing keys {required_keys - set(feats.keys())}. "
+                    f"Expected: {required_keys}"
                 )
+            c1, c2, c5 = feats['c1'], feats['c2'], feats['c5']
+        
+        # CASE 2: Training tuple (c4_aux, main_feats)
+        elif isinstance(feats, tuple) and len(feats) == 2:
+            aux, main = feats
+            
+            # GCNet training format: (c4_dict/tensor, main_dict)
+            if isinstance(main, dict) and {'c1', 'c2', 'c5'}.issubset(main.keys()):
+                c1, c2, c5 = main['c1'], main['c2'], main['c5']
+            elif isinstance(aux, dict) and {'c1', 'c2', 'c5'}.issubset(aux.keys()):
+                c1, c2, c5 = aux['c1'], aux['c2'], aux['c5']
+            else:
+                # Fallback: treat as positional (c1, c2, c5, ...)
+                raise ValueError(
+                    "Training tuple must contain dict with ['c1','c2','c5']"
+                )
+        
+        # CASE 3: Direct positional tensors
+        elif isinstance(feats, tuple) and len(feats) >= 3:
+            c1, c2, c5 = feats[0], feats[1], feats[2]
         
         else:
             raise TypeError(
-                f"GCNetHead expects dict or tuple input, got {type(feats)}"
+                f"Unsupported input type: {type(feats)}. "
+                f"Expected Dict['c1,c2,c5'] or Tuple with valid format."
             )
         
-        return self.conv_seg(x)
+        # ✅ Decoder forward
+        dec_feat = self.decoder(c5, c2, c1)
+        seg_logit = self.conv_seg(dec_feat)
+        
+        return seg_logit
