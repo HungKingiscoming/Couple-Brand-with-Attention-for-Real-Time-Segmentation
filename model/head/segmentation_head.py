@@ -428,45 +428,43 @@ class GCNetHead(nn.Module):
         )
     
     def forward(self, feats: Dict[str, Tensor] | tuple | Tensor) -> Tensor:
-    """Robust forward: supports dict / tuple / tensor"""
-
-    if isinstance(feats, dict):
-        # ✅ Explicit keys (SAFE)
-        if not all(k in feats for k in ['c1', 'c2', 'c5']):
-            raise KeyError(
-                f"GCNetHead expects keys ['c1','c2','c5'], "
-                f"but got {list(feats.keys())}"
-            )
-
-        c1 = feats['c1']
-        c2 = feats['c2']
-        c5 = feats['c5']
-        x = self.decoder(c5, c2, c1)
-
-    elif isinstance(feats, tuple):
-        if len(feats) == 2 and self.training:
-            # (aux_feat, final_feat)
-            final_feat = feats[1]  # usually H/8
+        if isinstance(feats, dict):
+            # ✅ Explicit keys (SAFE)
+            if not all(k in feats for k in ['c1', 'c2', 'c5']):
+                raise KeyError(
+                    f"GCNetHead expects keys ['c1','c2','c5'], "
+                    f"but got {list(feats.keys())}"
+                )
+    
+            c1 = feats['c1']
+            c2 = feats['c2']
+            c5 = feats['c5']
+            x = self.decoder(c5, c2, c1)
+    
+        elif isinstance(feats, tuple):
+            if len(feats) == 2 and self.training:
+                # (aux_feat, final_feat)
+                final_feat = feats[1]  # usually H/8
+                x = F.interpolate(
+                    final_feat,
+                    scale_factor=4,
+                    mode='bilinear',
+                    align_corners=self.align_corners
+                )
+            elif len(feats) >= 3:
+                # (c1, c2, c5, ...)
+                c1, c2, c5 = feats[0], feats[1], feats[2]
+                x = self.decoder(c5, c2, c1)
+            else:
+                raise ValueError(f"Unsupported tuple length: {len(feats)}")
+    
+        else:
+            # Single tensor fallback
             x = F.interpolate(
-                final_feat,
+                feats,
                 scale_factor=4,
                 mode='bilinear',
                 align_corners=self.align_corners
             )
-        elif len(feats) >= 3:
-            # (c1, c2, c5, ...)
-            c1, c2, c5 = feats[0], feats[1], feats[2]
-            x = self.decoder(c5, c2, c1)
-        else:
-            raise ValueError(f"Unsupported tuple length: {len(feats)}")
-
-    else:
-        # Single tensor fallback
-        x = F.interpolate(
-            feats,
-            scale_factor=4,
-            mode='bilinear',
-            align_corners=self.align_corners
-        )
-
-    return self.conv_seg(x)
+    
+        return self.conv_seg(x)
