@@ -937,7 +937,7 @@ def main():
     # Training
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--accumulation_steps", type=int, default=2)
+    parser.add_argument("--accumulation_steps", type=int, default=4)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=2.0)  # â† INCREASED from 1.0
@@ -1201,7 +1201,6 @@ def main():
         # Phase 1: Freeze backbone
         if epoch < args.freeze_epochs:
             freeze_backbone(model)
-            trainer.set_loss_phase('full')
 
         # Phase 2+: Progressive unfreezing
         if epoch in unfreeze_epochs:
