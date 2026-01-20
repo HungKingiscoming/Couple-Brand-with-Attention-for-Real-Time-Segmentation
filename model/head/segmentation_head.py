@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Dict
+from typing import Dict, Union, Optional, Tuple, Any
 
 from components.components import (
     ConvModule,
