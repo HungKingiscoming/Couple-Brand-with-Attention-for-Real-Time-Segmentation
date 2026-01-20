@@ -657,9 +657,6 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
             
-            if self.scheduler and self.args.scheduler == 'onecycle':
-                self.scheduler.step()
-            
             total_loss += loss.item() * self.args.accumulation_steps
             total_ce += ce_loss.item()
             total_dice += dice_loss.item()
@@ -1247,9 +1244,9 @@ def main():
             swa_model.update_parameters(model)
             swa_scheduler.step()
             print(f"ðŸ”„ SWA: Updated averaged model")
-        elif epoch < swa_start:
-            # scheduler thÆ°á»ng Ä‘Ã£ Ä‘Æ°á»£c gá»i trong train_epoch náº¿u báº¡n muá»‘n
-            pass
+        elif:
+            if args.scheduler != 'onecycle':
+                scheduler.step()
     
         # ===== VALIDATION =====
         # DÃ¹ng multi-scale cho cÃ¡c epoch cuá»‘i náº¿u muá»‘n auto
