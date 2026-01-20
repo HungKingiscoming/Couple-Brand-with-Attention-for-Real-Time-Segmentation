@@ -375,8 +375,6 @@ def count_trainable_params(model):
     
     return trainable, frozen
 
-
-
 def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
     backbone_params = [p for n, p in model.named_parameters() 
                       if 'backbone' in n and p.requires_grad]
