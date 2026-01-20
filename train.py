@@ -1243,7 +1243,7 @@ def main():
             swa_model.update_parameters(model)
             swa_scheduler.step()
             print(f"ðŸ”„ SWA: Updated averaged model")
-        elif:
+        else:
             if args.scheduler != 'onecycle':
                 scheduler.step()
     
