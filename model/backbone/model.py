@@ -777,7 +777,7 @@ class GCNetCore(BaseModule):
 # ===========================
 
 class GCNetWithEnhance(BaseModule):
-    """FIXED VERSION - Complete với gradient clipping"""
+    """FIXED VERSION - Complete với input/output matching"""
     
     def __init__(self,
                  in_channels: int = 3,
@@ -789,12 +789,12 @@ class GCNetWithEnhance(BaseModule):
                  dwsa_reduction: int = 4,
                  dwsa_qk_sharing: bool = True,
                  dwsa_groups: int = 4,
-                 dwsa_drop: float = 0.1,  # ← Default 0.1 cho regularization
-                 dwsa_alpha: float = 0.1,  # ← Learnable residual weight
+                 dwsa_drop: float = 0.1,
+                 dwsa_alpha: float = 0.1,
                  use_multi_scale_context: bool = True,
                  ms_scales: Tuple[int, ...] = (1, 2),
                  ms_branch_ratio: int = 8,
-                 ms_alpha: float = 0.1,  # ← Learnable residual weight
+                 ms_alpha: float = 0.1,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
@@ -805,6 +805,7 @@ class GCNetWithEnhance(BaseModule):
         self.align_corners = align_corners
         self.channels = channels
 
+        # ✅ VALIDATE stages
         valid_stages = {'stage4', 'stage5', 'stage6'}
         invalid = set(dwsa_stages) - valid_stages
         if invalid:
@@ -827,10 +828,11 @@ class GCNetWithEnhance(BaseModule):
         self.dwsa5 = None
         self.dwsa6 = None
 
+        # ✅ DWSA modules theo channels đúng
         for stage in dwsa_stages:
             if stage == 'stage4':
                 self.dwsa4 = DWSABlock(
-                    C * 4,
+                    C * 4,  # s4: channels*4
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -840,7 +842,7 @@ class GCNetWithEnhance(BaseModule):
                 )
             elif stage == 'stage5':
                 self.dwsa5 = DWSABlock(
-                    C * 8,
+                    C * 8,  # s5: channels*8  
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -850,7 +852,7 @@ class GCNetWithEnhance(BaseModule):
                 )
             elif stage == 'stage6':
                 self.dwsa6 = DWSABlock(
-                    C * 16,
+                    C * 16,  # s6: channels*16
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -859,6 +861,7 @@ class GCNetWithEnhance(BaseModule):
                     alpha=dwsa_alpha,
                 )
 
+        # ✅ MultiScaleContext cho x_spp (channels*4)
         if use_multi_scale_context:
             self.ms_context = MultiScaleContextModule(
                 C * 4, C * 4,
@@ -869,29 +872,33 @@ class GCNetWithEnhance(BaseModule):
         else:
             self.ms_context = None
 
+        # ✅ Final projection channels matching
         self.final_proj = ConvModule(
-            in_channels=C * 4,
+            in_channels=C * 4,  # x_d6 + x_spp đều channels*4
             out_channels=C * 4,
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
         )
 
-    def forward(self, x: Tensor) -> tuple | Dict[str, Tensor]:
-        """✅ FIXED: GCNet compatibility + Dict outputs"""
+    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        """✅ FIXED: Consistent Dict output, no training/eval branching"""
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         
-        # GCNetCore forward (extract all intermediate feats)
+        # ✅ 1. GCNetCore forward
         gcnet_feats = self.backbone(x)
         
-        # Extract GCNet features (stem → final)
-        c1 = gcnet_feats.get('c1', F.interpolate(gcnet_feats.get('stem_out', x), scale_factor=0.5, mode='bilinear', align_corners=self.align_corners))  # H/2
-        c2 = gcnet_feats['c2']  # H/4, stage3
-        c4 = gcnet_feats['c4']  # H/8, stage4 detail
-        x_d6 = gcnet_feats['x_d6']  # H/8 stage6 detail
-        s4, s5, s6 = gcnet_feats['s4'], gcnet_feats['s5'], gcnet_feats['s6']  # Semantic branches
+        # ✅ 2. Extract features theo GCNetCore output
+        c1 = gcnet_feats['c1']      # H/2, channels
+        c2 = gcnet_feats['c2']      # H/4, channels*2  
+        c4 = gcnet_feats['c4']      # H/8, channels*4 (detail stage4)
+        s4 = gcnet_feats['s4']      # H/16, channels*4 (semantic stage4)
+        s5 = gcnet_feats['s5']      # H/32, channels*8
+        s6 = gcnet_feats['s6']      # H/64, channels*16
+        x_d6 = gcnet_feats['x_d6']  # H/8, channels*4 (detail stage6)
+        x_spp = gcnet_feats['spp']  # H/8, channels*4 (pre-resized)
         
-        # ✅ DWSA modules
+        # ✅ 3. Apply DWSA modules
         if self.dwsa4 is not None:
             s4 = self.dwsa4(s4)
         if self.dwsa5 is not None:
@@ -899,26 +906,22 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
         
-        # SPP + resize (GCNet style)
-        x_spp = self.backbone.spp(s6)
-        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
-        
-        # ✅ MultiScaleContext
+        # ✅ 4. MultiScaleContext (optional)
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
         
-        # Final projection + fusion
-        x_spp = self.final_proj(x_spp)
-        c5_enh = x_d6 + x_spp  # Enhanced c5 (H/8)
+        # ✅ 5. Final fusion & projection
+        final_feat = self.final_proj(x_spp + x_d6)  # C*4 + C*4 → C*4
         
-        # ✅ GCNet COMPATIBILITY: Return tuple cho training (c4_feat, final)
-        if self.training:
-            return (c4.clone() if self.training else None, c5_enh)  # Match GCNet signature
-        else:
-            # Dict cho head consistency
-            return {
-                'c1': c1,      # H/2 ~32ch
-                'c2': c2,      # H/4 ~64ch  
-                'c4': c4,      # H/8 ~128ch (aux)
-                'c5': c5_enh   # H/8 enhanced final
-            }
+        # ✅ 6. CONSISTENT OUTPUT: luôn return Dict
+        return {
+            'c1': c1,           # Stem1: H/2, C
+            'c2': c2,           # Stem2: H/4, C*2  
+            'c4': c4,           # Detail4: H/8, C*4 (aux)
+            'c5': final_feat,   # Final enhanced: H/8, C*4
+            # Bonus features nếu cần
+            's4': s4,
+            's5': s5, 
+            's6': s6,
+            'x_d6': x_d6,
+        }
