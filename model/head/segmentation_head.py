@@ -123,9 +123,9 @@ class EnhancedDecoder(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int,         # c5 channels
-        c2_channels: int,         # c2 channels from backbone
-        c1_channels: int,         # c1 channels from backbone
+        in_channels: int,
+        c2_channels: int,
+        c1_channels: int,
         decoder_channels: int = 128,
         norm_cfg: dict = dict(type='BN', requires_grad=True),
         act_cfg: dict = dict(type='ReLU', inplace=False),
@@ -149,7 +149,6 @@ class EnhancedDecoder(nn.Module):
             )
         )
         
-        # Project c2 to match decoder_channels
         self.c2_proj = ConvModule(
             in_channels=c2_channels,
             out_channels=decoder_channels,
@@ -183,7 +182,6 @@ class EnhancedDecoder(nn.Module):
             )
         )
         
-        # Project c1 to match decoder_channels // 2
         self.c1_proj = ConvModule(
             in_channels=c1_channels,
             out_channels=decoder_channels // 2,
@@ -203,13 +201,12 @@ class EnhancedDecoder(nn.Module):
                 act_cfg=act_cfg
             )
 
-        # Stage 3: H/2 → H/2 (refine only, no upsampling)
+        # Stage 3: H/2 → H/2 (refine)
         self.refine3 = nn.Sequential(
             DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
             DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
         
-        # Final projection to ensure correct output channels
         self.final_proj = ConvModule(
             in_channels=decoder_channels // 2,
             out_channels=decoder_channels // 2,
@@ -239,21 +236,65 @@ class EnhancedDecoder(nn.Module):
         else:
             x = self.fusion2(torch.cat([x, c1_proj], dim=1))
 
-        # Stage 3: refine at H/2 (no upsampling here!)
+        # Stage 3: refine H/2
         x = self.refine3(x)
         x = self.final_proj(x)
         x = self.dropout(x)
         
-        # Output: (B, decoder_channels // 2, H/2, W/2)
         return x
+
+
+class GCNetAuxHead(nn.Module):
+    """
+    Auxiliary head for early supervision on c4 features.
+    Applied during training to improve gradient flow.
+    """
+    def __init__(
+        self,
+        in_channels: int = 128,
+        channels: int = 96,
+        num_classes: int = 19,
+        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
+        dropout_ratio: float = 0.1,
+        align_corners: bool = False
+    ):
+        super().__init__()
+        
+        self.align_corners = align_corners
+        
+        # Feature extraction
+        self.conv1 = ConvModule(
+            in_channels=in_channels,
+            out_channels=channels,
+            kernel_size=3,
+            padding=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
+        )
+        
+        # Segmentation head
+        self.conv_seg = nn.Sequential(
+            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
+            nn.Conv2d(channels, num_classes, kernel_size=1)
+        )
+    
+    def forward(self, x: Tensor) -> Tensor:
+        """Handle both dict and tensor input"""
+        if isinstance(x, dict):
+            x = x['c4']
+        
+        x = self.conv1(x)
+        return self.conv_seg(x)
 
 
 class GCNetHead(nn.Module):
     """
     Main segmentation head with flexible channel handling.
     
-    Expects input features with keys: 'c1', 'c2', 'c5'
-    Outputs segmentation map at H/2 resolution.
+    Pipeline:
+    c5 (128ch, H/8) + c2 (64ch, H/4) + c1 (32ch, H/2)
+    → Decoder → (64ch, H/2) → Segmentation
     """
     def __init__(
         self,
@@ -275,8 +316,8 @@ class GCNetHead(nn.Module):
         # Initialize decoder with flexible channels
         self.decoder = EnhancedDecoder(
             in_channels=in_channels,
-            c2_channels=c2_channels,  # Use parameter, not hardcoded!
-            c1_channels=c1_channels,  # Use parameter, not hardcoded!
+            c2_channels=c2_channels,
+            c1_channels=c1_channels,
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
@@ -284,7 +325,7 @@ class GCNetHead(nn.Module):
             use_gated_fusion=use_gated_fusion
         )
         
-        # Segmentation head expects decoder_channels // 2
+        # Segmentation head
         output_channels = decoder_channels // 2
         self.conv_seg = nn.Sequential(
             nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
@@ -330,5 +371,4 @@ class GCNetHead(nn.Module):
                 align_corners=self.align_corners
             )
         
-        # x should be (B, 64, H/2, W/2) here
         return self.conv_seg(x)
