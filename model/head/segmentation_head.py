@@ -334,6 +334,7 @@ class GCNetHead(nn.Module):
     
     def forward(self, feats: Dict[str, Tensor] | tuple | Tensor) -> Tensor:
         if isinstance(feats, dict):
+            # Dict format: {'c1': ..., 'c2': ..., 'c5': ...}
             if not all(k in feats for k in ['c1', 'c2', 'c5']):
                 raise KeyError(
                     f"GCNetHead expects keys ['c1','c2','c5'], "
@@ -346,14 +347,38 @@ class GCNetHead(nn.Module):
             x = self.decoder(c5, c2, c1)
         
         elif isinstance(feats, tuple):
-            if len(feats) >= 3:
-                # (c1, c2, c5, ...) or similar
+            if len(feats) == 2:
+                # Tuple format during training: (skip_features_dict, final_features)
+                # OR: (c4_for_aux, main_dict)
+                # Check if second element is a dict with our expected keys
+                if isinstance(feats[1], dict) and all(k in feats[1] for k in ['c1', 'c2', 'c5']):
+                    # Format: (aux_feats, {'c1': ..., 'c2': ..., 'c5': ...})
+                    main_feats = feats[1]
+                    c1 = main_feats['c1']
+                    c2 = main_feats['c2']
+                    c5 = main_feats['c5']
+                    x = self.decoder(c5, c2, c1)
+                elif isinstance(feats[0], dict) and all(k in feats[0] for k in ['c1', 'c2', 'c5']):
+                    # Format: ({'c1': ..., 'c2': ..., 'c5': ...}, aux_feats)
+                    main_feats = feats[0]
+                    c1 = main_feats['c1']
+                    c2 = main_feats['c2']
+                    c5 = main_feats['c5']
+                    x = self.decoder(c5, c2, c1)
+                else:
+                    raise ValueError(
+                        f"Expected tuple[2] to contain a dict with keys ['c1', 'c2', 'c5'], "
+                        f"but got types: ({type(feats[0])}, {type(feats[1])})"
+                    )
+            
+            elif len(feats) >= 3:
+                # Tuple format: (c1, c2, c5, ...) - direct feature tensors
                 c1, c2, c5 = feats[0], feats[1], feats[2]
                 x = self.decoder(c5, c2, c1)
+            
             else:
                 raise ValueError(
-                    f"Expected tuple with at least 3 elements (c1, c2, c5), "
-                    f"got {len(feats)} elements"
+                    f"Expected tuple with at least 2 elements, got {len(feats)}"
                 )
         
         else:
@@ -361,6 +386,4 @@ class GCNetHead(nn.Module):
                 f"GCNetHead expects dict or tuple input, got {type(feats)}"
             )
         
-        # x should be (B, 64, H/2, W/2) here
-        # Debug: print(f"Decoder output shape: {x.shape}, expected channels: 64")
         return self.conv_seg(x)
