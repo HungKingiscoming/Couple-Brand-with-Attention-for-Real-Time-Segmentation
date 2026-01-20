@@ -190,7 +190,7 @@ class EnhancedDecoder(nn.Module):
             self.fusion2_gate = GatedFusion(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion2 = ConvModule(
-                in_channels=decoder_channels,
+                in_channels=(decoder_channels // 2) * 2,
                 out_channels=decoder_channels // 2,
                 kernel_size=1,
                 norm_cfg=norm_cfg,
