@@ -312,7 +312,7 @@ def print_available_modules(model):
     print(f"{'='*70}\n")
 
 def count_trainable_params(model):
-    """Count total/trainable/frozen params - FIXED for your model structure"""
+    """Count total/trainable/frozen params - FIXED for Segmentor structure"""
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen = total - trainable
@@ -321,19 +321,33 @@ def count_trainable_params(model):
     backbone_total = sum(p.numel() for p in model.backbone.parameters())
     backbone_trainable = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
     
-    # Head params - model có 'head', không phải 'decodehead'
+    # Decode Head params - check both 'decode_head' and 'head'
     head_total = 0
     head_trainable = 0
-    if hasattr(model, 'head') and model.head is not None:
-        head_total = sum(p.numel() for p in model.head.parameters())
-        head_trainable = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
+    head_attr = None
     
-    # Aux Head params
+    if hasattr(model, 'decode_head') and model.decode_head is not None:
+        head_attr = model.decode_head
+    elif hasattr(model, 'head') and model.head is not None:
+        head_attr = model.head
+    
+    if head_attr is not None:
+        head_total = sum(p.numel() for p in head_attr.parameters())
+        head_trainable = sum(p.numel() for p in head_attr.parameters() if p.requires_grad)
+    
+    # Aux Head params - check both 'aux_head' and 'auxhead'
     aux_total = 0
     aux_trainable = 0
-    if hasattr(model, 'auxhead') and model.auxhead is not None:
-        aux_total = sum(p.numel() for p in model.auxhead.parameters())
-        aux_trainable = sum(p.numel() for p in model.auxhead.parameters() if p.requires_grad)
+    aux_attr = None
+    
+    if hasattr(model, 'aux_head') and model.aux_head is not None:
+        aux_attr = model.aux_head
+    elif hasattr(model, 'auxhead') and model.auxhead is not None:
+        aux_attr = model.auxhead
+    
+    if aux_attr is not None:
+        aux_total = sum(p.numel() for p in aux_attr.parameters())
+        aux_trainable = sum(p.numel() for p in aux_attr.parameters() if p.requires_grad)
     
     print("=" * 70)
     print("📊 PARAMETER STATISTICS")
@@ -342,10 +356,21 @@ def count_trainable_params(model):
     print(f"Trainable:    {trainable:15,} | {100*trainable/total:.1f}%")
     print(f"Frozen:       {frozen:15,} | {100*frozen/total:.1f}%")
     print("-" * 70)
-    print(f"Backbone:     {backbone_trainable:15,} / {backbone_total} | {100*backbone_trainable/backbone_total:.1f}%")
-    print(f"Head:         {head_trainable:15,} / {head_total} | {100*head_trainable/head_total:.1f}%")
+    
+    # Safe division with proper checks
+    if backbone_total > 0:
+        print(f"Backbone:     {backbone_trainable:15,} / {backbone_total:,} | {100*backbone_trainable/backbone_total:.1f}%")
+    else:
+        print(f"Backbone:     {backbone_trainable:15,} / 0 | N/A")
+    
+    if head_total > 0:
+        print(f"Decode Head:  {head_trainable:15,} / {head_total:,} | {100*head_trainable/head_total:.1f}%")
+    else:
+        print(f"Decode Head:  {head_trainable:15,} / 0 | N/A")
+    
     if aux_total > 0:
-        print(f"Aux Head:     {aux_trainable:15,} / {aux_total} | {100*aux_trainable/aux_total:.1f}%")
+        print(f"Aux Head:     {aux_trainable:15,} / {aux_total:,} | {100*aux_trainable/aux_total:.1f}%")
+    
     print("=" * 70)
     
     return trainable, frozen
