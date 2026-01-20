@@ -219,27 +219,27 @@ class EnhancedDecoder(nn.Module):
 
     def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
         # Stage 1: H/8 → H/4
-        x = self.up1(c5)
-        x = self.refine1(x)
-        c2_proj = self.c2_proj(c2)
+        x = self.up1(c5)  # (B, in_channels, H/4, W/4)
+        x = self.refine1(x)  # (B, decoder_channels=128, H/4, W/4)
+        c2_proj = self.c2_proj(c2)  # (B, decoder_channels=128, H/4, W/4)
         if self.use_gated_fusion:
-            x = self.fusion1_gate(c2_proj, x)
+            x = self.fusion1_gate(c2_proj, x)  # (B, 128, H/4, W/4)
         else:
-            x = self.fusion1(torch.cat([x, c2_proj], dim=1))
+            x = self.fusion1(torch.cat([x, c2_proj], dim=1))  # (B, 128, H/4, W/4)
 
         # Stage 2: H/4 → H/2
-        x = self.up2(x)
-        x = self.refine2(x)
-        c1_proj = self.c1_proj(c1)
+        x = self.up2(x)  # (B, 128, H/2, W/2)
+        x = self.refine2(x)  # (B, 64, H/2, W/2)
+        c1_proj = self.c1_proj(c1)  # (B, 64, H/2, W/2)
         if self.use_gated_fusion:
-            x = self.fusion2_gate(c1_proj, x)
+            x = self.fusion2_gate(c1_proj, x)  # (B, 64, H/2, W/2)
         else:
-            x = self.fusion2(torch.cat([x, c1_proj], dim=1))
+            x = self.fusion2(torch.cat([x, c1_proj], dim=1))  # (B, 64, H/2, W/2)
 
         # Stage 3: refine H/2
-        x = self.refine3(x)
-        x = self.final_proj(x)
-        x = self.dropout(x)
+        x = self.refine3(x)  # (B, 64, H/2, W/2)
+        x = self.final_proj(x)  # (B, 64, H/2, W/2)
+        x = self.dropout(x)  # (B, 64, H/2, W/2)
         
         return x
 
@@ -346,29 +346,21 @@ class GCNetHead(nn.Module):
             x = self.decoder(c5, c2, c1)
         
         elif isinstance(feats, tuple):
-            if len(feats) == 2 and self.training:
-                # (aux_feat, final_feat)
-                final_feat = feats[1]
-                x = F.interpolate(
-                    final_feat,
-                    scale_factor=4,
-                    mode='bilinear',
-                    align_corners=self.align_corners
-                )
-            elif len(feats) >= 3:
-                # (c1, c2, c5, ...)
+            if len(feats) >= 3:
+                # (c1, c2, c5, ...) or similar
                 c1, c2, c5 = feats[0], feats[1], feats[2]
                 x = self.decoder(c5, c2, c1)
             else:
-                raise ValueError(f"Unsupported tuple length: {len(feats)}")
+                raise ValueError(
+                    f"Expected tuple with at least 3 elements (c1, c2, c5), "
+                    f"got {len(feats)} elements"
+                )
         
         else:
-            # Single tensor fallback
-            x = F.interpolate(
-                feats,
-                scale_factor=4,
-                mode='bilinear',
-                align_corners=self.align_corners
+            raise TypeError(
+                f"GCNetHead expects dict or tuple input, got {type(feats)}"
             )
         
+        # x should be (B, 64, H/2, W/2) here
+        # Debug: print(f"Decoder output shape: {x.shape}, expected channels: 64")
         return self.conv_seg(x)
