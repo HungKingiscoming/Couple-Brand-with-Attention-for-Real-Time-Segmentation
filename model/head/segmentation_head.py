@@ -411,8 +411,8 @@ class GCNetHead(nn.Module):
         # ✅ Pass detected channels to decoder
         self.decoder = EnhancedDecoder(
             in_channels=in_channels,
-            c2_channels=64,      # From backbone
-            c1_channels=32,      # From backbone
+            c2_channels=c2_channels,      # From backbone
+            c1_channels=c1_channels,      # From backbone
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
