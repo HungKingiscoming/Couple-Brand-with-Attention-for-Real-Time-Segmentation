@@ -223,7 +223,7 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     # Build model
     backbone_cfg = {
         'in_channels': 3,
-        'channels': channels,
+        'channels': 32,
         'ppm_channels': 128,
         'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
         'dwsa_stages': ['stage5', 'stage6'],
