@@ -1,20 +1,48 @@
 #!/usr/bin/env python3
 """
-Model vs Checkpoint Diagnostic Tool
-Compare model structure with checkpoint keys to find mismatches
+Checkpoint Adapter - Adapt old checkpoints to new model structure
+Handles:
+1. Missing fake_proj layers (initialize from c1/c2_proj)
+2. BN → no-BN conversion (fuse BN into conv bias)
+3. FP16 → FP32 conversion
 """
 
 import torch
+import torch.nn as nn
 import argparse
-from collections import defaultdict
 
 
-def analyze_checkpoint(ckpt_path):
-    """Analyze checkpoint structure"""
+def fuse_bn_into_conv(conv_weight, bn_weight, bn_bias, bn_running_mean, bn_running_var, bn_eps=1e-5):
+    """
+    Fuse BatchNorm parameters into Conv layer
+    Returns: fused_weight, fused_bias
+    """
+    # BN formula: (x - mean) / sqrt(var + eps) * gamma + beta
+    # We want to fuse this into: conv_weight * x + conv_bias
+    
+    std = torch.sqrt(bn_running_var + bn_eps)
+    
+    # Fused weight = conv_weight * (gamma / std)
+    fused_weight = conv_weight * (bn_weight / std).reshape(-1, 1, 1, 1)
+    
+    # Fused bias = beta - (mean * gamma / std)
+    fused_bias = bn_bias - (bn_running_mean * bn_weight / std)
+    
+    return fused_weight, fused_bias
+
+
+def adapt_checkpoint(ckpt_path, output_path):
+    """
+    Adapt checkpoint to current model structure
+    """
     print(f"\n{'='*70}")
-    print("📦 CHECKPOINT STRUCTURE")
+    print("🔧 CHECKPOINT ADAPTER")
     print(f"{'='*70}\n")
     
+    print(f"Input:  {ckpt_path}")
+    print(f"Output: {output_path}")
+    
+    # Load checkpoint
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     
     if 'model' in ckpt:
@@ -22,192 +50,130 @@ def analyze_checkpoint(ckpt_path):
     else:
         state_dict = ckpt
     
-    # Group keys by component
-    components = defaultdict(list)
+    print(f"\n📦 Original checkpoint: {len(state_dict)} keys")
     
-    for key in state_dict.keys():
-        if key.startswith('backbone.'):
-            components['backbone'].append(key)
-        elif key.startswith('decode_head.'):
-            # Further breakdown
-            if 'decoder' in key:
-                components['decode_head.decoder'].append(key)
-            elif 'fake_proj' in key:
-                components['decode_head.fake_proj'].append(key)
-            else:
-                components['decode_head.other'].append(key)
-        elif key.startswith('aux_head.'):
-            components['aux_head'].append(key)
-        else:
-            components['other'].append(key)
+    # Convert FP16 to FP32
+    is_fp16 = False
+    first_param = next(iter(state_dict.values()))
+    if first_param.dtype == torch.float16:
+        is_fp16 = True
+        print(f"🔍 Converting FP16 → FP32")
+        state_dict = {k: v.float() if v.dtype == torch.float16 else v 
+                     for k, v in state_dict.items()}
     
-    print("Components in checkpoint:")
-    for comp, keys in sorted(components.items()):
-        print(f"  {comp:<30} {len(keys):>4} keys")
-        if comp == 'decode_head.fake_proj' or comp == 'decode_head.decoder':
-            for k in keys[:10]:
-                print(f"    - {k}")
-            if len(keys) > 10:
-                print(f"    ... and {len(keys)-10} more")
+    adapted = {}
+    adaptations = []
     
-    # Look for specific keys
     print(f"\n{'='*70}")
-    print("🔍 SEARCHING FOR SPECIFIC KEYS")
+    print("🔄 ADAPTING...")
     print(f"{'='*70}\n")
     
-    search_patterns = ['fake_proj', 'c1_proj', 'c2_proj', 'decoder.convs']
+    # Process each key
+    for key, value in state_dict.items():
+        new_key = key
+        new_value = value
+        
+        # 1. Handle BN fusion in decoder projections
+        if '.bn.weight' in key or '.bn.bias' in key:
+            # Skip BN keys - we'll fuse them
+            continue
+        
+        # 2. For conv layers that had BN, fuse the BN
+        if '.conv.weight' in key:
+            base_key = key.replace('.conv.weight', '')
+            bn_weight_key = f'{base_key}.bn.weight'
+            bn_bias_key = f'{base_key}.bn.bias'
+            
+            if bn_weight_key in state_dict and bn_bias_key in state_dict:
+                # This conv had a BN - fuse it
+                conv_weight = value
+                bn_weight = state_dict[bn_weight_key]
+                bn_bias = state_dict[bn_bias_key]
+                
+                # Check for running stats (not always present)
+                bn_mean_key = f'{base_key}.bn.running_mean'
+                bn_var_key = f'{base_key}.bn.running_var'
+                
+                if bn_mean_key in state_dict and bn_var_key in state_dict:
+                    bn_mean = state_dict[bn_mean_key]
+                    bn_var = state_dict[bn_var_key]
+                else:
+                    # No running stats - use identity BN
+                    bn_mean = torch.zeros_like(bn_weight)
+                    bn_var = torch.ones_like(bn_weight)
+                
+                # Fuse
+                fused_weight, fused_bias = fuse_bn_into_conv(
+                    conv_weight, bn_weight, bn_bias, bn_mean, bn_var
+                )
+                
+                # Store fused conv
+                adapted[key] = fused_weight
+                bias_key = key.replace('.weight', '.bias')
+                adapted[bias_key] = fused_bias
+                
+                adaptations.append(f"Fused BN: {base_key}")
+                continue
+        
+        # 3. Initialize fake_proj from corresponding proj layers
+        # This is the KEY adaptation for your model
+        if key == 'decode_head.decoder.c1_proj.conv.weight':
+            # Also initialize fake_proj
+            adapted['decode_head.c1_fake_proj.weight'] = value.clone()
+            adaptations.append("Initialized c1_fake_proj from c1_proj")
+        
+        if key == 'decode_head.decoder.c2_proj.conv.weight':
+            # Also initialize fake_proj
+            adapted['decode_head.c2_fake_proj.weight'] = value.clone()
+            adaptations.append("Initialized c2_fake_proj from c2_proj")
+        
+        # 4. Keep the original key
+        adapted[new_key] = new_value
     
-    for pattern in search_patterns:
-        matching = [k for k in state_dict.keys() if pattern in k]
-        if matching:
-            print(f"{pattern}:")
-            for k in matching[:5]:
-                shape = state_dict[k].shape if hasattr(state_dict[k], 'shape') else 'N/A'
-                print(f"  - {k:<60} {shape}")
-            if len(matching) > 5:
-                print(f"  ... and {len(matching)-5} more")
-        else:
-            print(f"{pattern}: NOT FOUND")
-        print()
+    print("✅ Adaptations applied:")
+    # Show unique adaptations
+    unique_adaptations = list(set(adaptations))
+    for adapt in unique_adaptations[:20]:
+        print(f"  - {adapt}")
+    if len(unique_adaptations) > 20:
+        print(f"  ... and {len(unique_adaptations)-20} more")
     
-    return state_dict
-
-
-def build_model_structure():
-    """Build model and show its structure"""
-    print(f"\n{'='*70}")
-    print("🏗️  BUILDING MODEL STRUCTURE")
-    print(f"{'='*70}\n")
+    print(f"\n📊 Summary:")
+    print(f"  Original keys:  {len(state_dict)}")
+    print(f"  Adapted keys:   {len(adapted)}")
+    print(f"  Added keys:     {len(adapted) - len(state_dict)}")
     
-    try:
-        from model.backbone.model import GCNetWithEnhance
-        from model.head.segmentation_head import GCNetHead
-        
-        # Build with default config
-        backbone = GCNetWithEnhance(
-            in_channels=3,
-            channels=32,
-            ppm_channels=128,
-            num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
-            dwsa_stages=['stage5', 'stage6'],
-            deploy=False
-        )
-        
-        head = GCNetHead(
-            in_channels=128,
-            c1_channels=32,
-            c2_channels=32,
-            decoder_channels=128,
-            num_classes=19,
-            dropout_ratio=0.1,
-            use_gated_fusion=True,
-        )
-        
-        print("✅ Model built successfully\n")
-        
-        # Show head structure
-        print("decode_head attributes:")
-        for name, module in head.named_children():
-            print(f"  - {name}: {type(module).__name__}")
-        
-        print("\ndecode_head parameters:")
-        param_groups = defaultdict(list)
-        for name, param in head.named_parameters():
-            prefix = name.split('.')[0]
-            param_groups[prefix].append(name)
-        
-        for prefix, params in sorted(param_groups.items()):
-            print(f"\n  {prefix}:")
-            for p in params[:5]:
-                print(f"    - {p}")
-            if len(params) > 5:
-                print(f"    ... and {len(params)-5} more")
-        
-        # Check for fake_proj
-        print(f"\n{'='*70}")
-        print("🔍 CHECKING FOR FAKE_PROJ")
-        print(f"{'='*70}\n")
-        
-        has_fake_proj = any('fake_proj' in name for name, _ in head.named_modules())
-        if has_fake_proj:
-            print("✅ Model HAS fake_proj layers")
-            fake_modules = [(n, m) for n, m in head.named_modules() if 'fake_proj' in n]
-            for name, module in fake_modules:
-                print(f"  - {name}: {type(module).__name__}")
-        else:
-            print("❌ Model DOES NOT have fake_proj layers")
-            print("   This is the architecture mismatch!")
-        
-        return head
-        
-    except Exception as e:
-        print(f"❌ Failed to build model: {e}")
-        import traceback
-        traceback.print_exc()
-        return None
-
-
-def compare(ckpt_path):
-    """Compare checkpoint with model"""
-    state_dict = analyze_checkpoint(ckpt_path)
-    model = build_model_structure()
+    # Save adapted checkpoint
+    output_ckpt = {
+        'model': adapted,
+        'epoch': ckpt.get('epoch', 0),
+        'best_miou': ckpt.get('best_miou', 0.0),
+        'adapted': True,
+        'original_fp16': is_fp16,
+    }
     
-    if model is None:
-        return
+    torch.save(output_ckpt, output_path)
     
     print(f"\n{'='*70}")
-    print("🔍 MISMATCH ANALYSIS")
-    print(f"{'='*70}\n")
-    
-    # Get checkpoint head keys
-    ckpt_head_keys = [k for k in state_dict.keys() if k.startswith('decode_head.')]
-    
-    # Get model head keys
-    model_keys = ['decode_head.' + k for k, _ in model.named_parameters()]
-    
-    # Find mismatches
-    ckpt_only = set(ckpt_head_keys) - set(model_keys)
-    model_only = set(model_keys) - set(ckpt_head_keys)
-    
-    print(f"Keys in CHECKPOINT but not in MODEL ({len(ckpt_only)}):")
-    for k in sorted(ckpt_only)[:10]:
-        print(f"  - {k}")
-    if len(ckpt_only) > 10:
-        print(f"  ... and {len(ckpt_only)-10} more")
-    
-    print(f"\nKeys in MODEL but not in CHECKPOINT ({len(model_only)}):")
-    for k in sorted(model_only)[:10]:
-        print(f"  - {k}")
-    if len(model_only) > 10:
-        print(f"  ... and {len(model_only)-10} more")
-    
-    # Summary
-    print(f"\n{'='*70}")
-    print("📊 SUMMARY")
+    print("✅ ADAPTATION COMPLETE")
     print(f"{'='*70}")
-    print(f"Checkpoint head keys:  {len(ckpt_head_keys)}")
-    print(f"Model head keys:       {len(model_keys)}")
-    print(f"Missing in model:      {len(ckpt_only)}")
-    print(f"Missing in checkpoint: {len(model_only)}")
-    
-    if ckpt_only:
-        fake_proj_missing = [k for k in ckpt_only if 'fake_proj' in k]
-        if fake_proj_missing:
-            print(f"\n⚠️  CRITICAL: {len(fake_proj_missing)} fake_proj keys in checkpoint but not in model!")
-            print("   This is why your model gets 0.40% mIOU")
-            print("   You need to either:")
-            print("   1. Find the old code with fake_proj layers")
-            print("   2. Retrain with your current code")
+    print(f"Saved: {output_path}")
+    print(f"\n💡 Now run evaluation with:")
+    print(f"   python test.py --checkpoint {output_path} --val_txt <val.txt>")
+    print(f"{'='*70}\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Model vs Checkpoint Diagnostic")
-    parser.add_argument("--checkpoint", "-c", required=True,
-                       help="Path to checkpoint file")
+    parser = argparse.ArgumentParser(description="Adapt checkpoint to current model")
+    
+    parser.add_argument("--input", "-i", required=True,
+                       help="Input checkpoint path")
+    parser.add_argument("--output", "-o", required=True,
+                       help="Output checkpoint path")
     
     args = parser.parse_args()
     
-    compare(args.checkpoint)
+    adapt_checkpoint(args.input, args.output)
 
 
 if __name__ == "__main__":
