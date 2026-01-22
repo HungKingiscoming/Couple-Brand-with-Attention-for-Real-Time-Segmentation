@@ -521,8 +521,7 @@ def main():
         batch_size=args.batch_size,
         num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w),
-        dataset_type='normal',
-        augmentation_level='none'
+        dataset_type='foggy',
     )
     print(f"✅ Loaded {len(val_loader.dataset)} validation samples")
 
