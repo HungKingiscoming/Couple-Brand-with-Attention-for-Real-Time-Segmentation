@@ -248,7 +248,6 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
         channels = detected_channels
     
     # ✅ AUTO-DETECT c1, c2 từ checkpoint
-    c1_key = None
     c2_key = 'decode_head.decoder.c2_proj.conv.weight'
     
     if c2_key in state_dict:
@@ -302,8 +301,8 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
 
     head_cfg = {
         'in_channels': channels * 4,
-        'c1_channels': c1_channels_ckpt,  # ← Use detected
-        'c2_channels': c2_channels_ckpt,  # ← Use detected
+        'c1_channels': c1_channels_ckpt,
+        'c2_channels': c2_channels_ckpt,
         'decoder_channels': 128,
         'num_classes': num_classes,
         'dropout_ratio': 0.1,
@@ -320,6 +319,10 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
 
     # Load state dict
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    
+    # ✅ FIX: Initialize variables
+    other_missing = []
+    bn_missing = []
     
     if missing:
         bn_missing = [k for k in missing if 'running_mean' in k or 'running_var' in k or 'num_batches_tracked' in k]
@@ -341,7 +344,7 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     if unexpected:
         print(f"⚠️  Unexpected {len(unexpected)} keys")
     
-    if not other_missing:
+    if len(other_missing) == 0:
         print(f"\n✅ Model loaded successfully!")
     else:
         print(f"\n❌ Model load has errors!")
