@@ -520,8 +520,7 @@ def main():
         val_txt=args.val_txt,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        img_h=args.img_h,
-        img_w=args.img_w,
+        img_size=(args.img_h, args.img_w),
         dataset_type='normal',
         augmentation_level='none'
     )
