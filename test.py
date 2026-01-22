@@ -189,9 +189,21 @@ def visualize_predictions(images, masks, predictions, save_path, num_samples=5):
         img = img * std + mean
         img = np.clip(img, 0, 1)
 
+        # ✅ FIX: Handle ignore_index (255)
+        mask = masks[i].copy()
+        pred = predictions[i].copy()
+        
+        # Replace ignore_index (255) with 0 for visualization
+        mask[mask == 255] = 0
+        pred[pred == 255] = 0
+        
+        # Clip to valid range [0, 18]
+        mask = np.clip(mask, 0, len(PALETTE) - 1)
+        pred = np.clip(pred, 0, len(PALETTE) - 1)
+        
         # Convert labels to RGB
-        mask_rgb = PALETTE[masks[i]] / 255.0
-        pred_rgb = PALETTE[predictions[i]] / 255.0
+        mask_rgb = PALETTE[mask] / 255.0
+        pred_rgb = PALETTE[pred] / 255.0
 
         # Plot
         axes[i, 0].imshow(img)
@@ -210,6 +222,7 @@ def visualize_predictions(images, masks, predictions, save_path, num_samples=5):
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     print(f"\n📷 Visualization saved: {save_path}")
     plt.close()
+
 
 
 # ============================================
