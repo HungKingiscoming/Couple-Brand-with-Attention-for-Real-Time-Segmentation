@@ -1,670 +1,527 @@
+#!/usr/bin/env python3
+# ============================================
+# evaluation_deploy.py - Full Evaluation with Auto-Reparameter
+# ============================================
+"""
+Evaluation script với:
+1. Auto-reparameter GCBlock (deploy mode) → Tăng 30-50% tốc độ
+2. Tính metrics trên toàn bộ val set (mIOU, Accuracy, Dice)
+3. Visualize 5 ảnh predict random
+4. Export metrics to JSON
+"""
+
 import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader
 import numpy as np
-from PIL import Image
-import argparse
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-import cv2
 from tqdm import tqdm
-import albumentations as A
-from albumentations.pytorch import ToTensorV2
-from torch.cuda.amp import autocast
-from torch.utils.data import Dataset, DataLoader
+import argparse
+import matplotlib.pyplot as plt
+from pathlib import Path
 import json
+import random
+import time
 
-# ===================== MODEL =====================
-from model.backbone.model import GCNetImproved
+# Import từ project
+from model.backbone.model import GCNetWithEnhance
 from model.head.segmentation_head import GCNetHead
+from data.custom import create_dataloaders
 
-# ===================== PALETTE =====================
-CITYSCAPES_PALETTE = [
-    [128, 64, 128], [244, 35, 232], [70, 70, 70], [102, 102, 156],
-    [190, 153, 153], [153, 153, 153], [250, 170, 30], [220, 220, 0],
-    [107, 142, 35], [152, 251, 152], [70, 130, 180], [220, 20, 60],
-    [255, 0, 0], [0, 0, 142], [0, 0, 70], [0, 60, 100],
-    [0, 80, 100], [0, 0, 230], [119, 11, 32]
-]
 
-CITYSCAPES_CLASSES = [
-    'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
-    'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
-    'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
-]
+# ============================================
+# SEGMENTOR
+# ============================================
 
-# ===================== DATASET =====================
-class ValidationDataset(Dataset):
-    """Dataset for validation with ground truth labels from txt file"""
-    
-    # Cityscapes ID to train_id mapping
-    ID_TO_TRAINID = {
-        7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
-        21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
-        28: 15, 31: 16, 32: 17, 33: 18, -1: 255
-    }
-    
-    def __init__(
-        self,
-        txt_file: str,
-        img_size: Tuple[int, int] = (512, 1024),
-        ignore_index: int = 255,
-        use_label_mapping: bool = True
-    ):
-        """
-        Args:
-            txt_file: Path to txt file with format: image_path,label_path
-            img_size: Target image size (H, W)
-            ignore_index: Ignore index value
-            use_label_mapping: Convert Cityscapes ID to train_id (0-18)
-        """
-        self.img_size = img_size
-        self.ignore_index = ignore_index
-        self.use_label_mapping = use_label_mapping
-        
-        # Create label mapping lookup table
-        self.label_map = np.ones(256, dtype=np.uint8) * ignore_index
-        if use_label_mapping:
-            for id_val, train_id in self.ID_TO_TRAINID.items():
-                if train_id != 255:
-                    self.label_map[id_val] = train_id
-        
-        # Read txt file
-        self.samples = []
-        with open(txt_file, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    parts = line.split(',')
-                    if len(parts) == 2:
-                        img_path, label_path = parts
-                        self.samples.append((img_path.strip(), label_path.strip()))
-        
-        print(f"✓ Loaded {len(self.samples)} validation samples from {txt_file}")
-        
-        # Build transforms
-        self.transform = A.Compose([
-            A.Resize(*img_size),
-            A.Normalize(mean=[0.485, 0.456, 0.406],
-                       std=[0.229, 0.224, 0.225]),
-            ToTensorV2()
-        ])
-        
-        self.gt_transform = A.Compose([
-            A.Resize(*img_size, interpolation=cv2.INTER_NEAREST)
-        ])
-    
-    def __len__(self):
-        return len(self.samples)
-    
-    def __getitem__(self, idx):
-        img_path, label_path = self.samples[idx]
-        
-        # Load image
-        img = np.array(Image.open(img_path).convert('RGB'))
-        
-        # Load ground truth
-        gt = np.array(Image.open(label_path), dtype=np.uint8)
-        
-        # Apply label mapping if needed
-        if self.use_label_mapping:
-            gt = self.label_map[gt]
-        
-        # Apply transforms
-        img_transformed = self.transform(image=img)['image']
-        gt_transformed = self.gt_transform(image=gt)['image']
-        
-        return {
-            'image': img_transformed,
-            'gt': torch.from_numpy(gt_transformed).long(),
-            'img_path': img_path,
-            'original_size': img.shape[:2]
-        }
-
-# ===================== MODEL WRAPPER =====================
-class GCNetSegmentor(nn.Module):
-    def __init__(self, num_classes, backbone_cfg, head_cfg):
+class Segmentor(nn.Module):
+    def __init__(self, backbone, head, aux_head=None):
         super().__init__()
-        self.backbone = GCNetImproved(**backbone_cfg)
-        self.decode_head = GCNetHead(
-            in_channels=head_cfg['in_channels'],
-            channels=head_cfg['channels'],
-            num_classes=num_classes,
-            decode_enabled=True,
-            decoder_channels=head_cfg['decoder_channels'],
-            skip_channels=head_cfg['skip_channels'],
-            use_gated_fusion=True,
-            dropout_ratio=0.1,
-            align_corners=False
-        )
+        self.backbone = backbone
+        self.decode_head = head
+        self.aux_head = aux_head
 
     def forward(self, x):
         feats = self.backbone(x)
         return self.decode_head(feats)
 
-# ===================== METRICS =====================
+
+# ============================================
+# AUTO-REPARAMETER
+# ============================================
+
+def convert_to_deploy_mode(model):
+    """
+    🚀 Auto-convert tất cả GCBlock sang deploy mode
+    → Fuse 4 branches thành 1 Conv3x3
+    → Tăng 30-50% FPS
+    """
+    print("\n" + "="*70)
+    print("🚀 AUTO-REPARAMETER: Converting to Deploy Mode")
+    print("="*70)
+
+    total_blocks = 0
+    converted_blocks = 0
+
+    def switch_gcblock_recursive(module, prefix=''):
+        nonlocal total_blocks, converted_blocks
+
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+
+            # Nếu là GCBlock
+            if child.__class__.__name__ == 'GCBlock':
+                total_blocks += 1
+                if not child.deploy:
+                    try:
+                        child.switch_to_deploy()
+                        converted_blocks += 1
+                        print(f"  ✅ {full_name}")
+                    except Exception as e:
+                        print(f"  ❌ {full_name}: {e}")
+            else:
+                # Recursively process children
+                switch_gcblock_recursive(child, full_name)
+
+    # Convert
+    switch_gcblock_recursive(model)
+
+    print(f"\n📊 Summary:")
+    print(f"   Total GCBlocks:  {total_blocks}")
+    print(f"   Converted:       {converted_blocks}")
+    print(f"   Success rate:    {converted_blocks/max(total_blocks,1)*100:.1f}%")
+    print("="*70)
+
+    return model
+
+
+# ============================================
+# METRICS
+# ============================================
+
 class SegmentationMetrics:
-    """Calculate IoU, Dice, Pixel Accuracy for semantic segmentation"""
-    
-    def __init__(self, num_classes: int, ignore_index: int = 255):
+    """Tính toán mIOU, Accuracy, Dice Score"""
+
+    def __init__(self, num_classes, ignore_index=255):
         self.num_classes = num_classes
         self.ignore_index = ignore_index
         self.reset()
-    
+
     def reset(self):
-        """Reset all metrics"""
-        self.confusion_matrix = np.zeros((self.num_classes, self.num_classes))
-        self.total_samples = 0
-    
-    def update(self, pred: np.ndarray, target: np.ndarray):
-        """
-        Update confusion matrix
-        
-        Args:
-            pred: (H, W) predicted labels
-            target: (H, W) ground truth labels
-        """
-        # Flatten
+        self.confusion_matrix = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
+
+    def update(self, pred, target):
+        """Update confusion matrix"""
         pred = pred.flatten()
         target = target.flatten()
-        
-        # Remove ignore index
-        valid_mask = target != self.ignore_index
-        pred = pred[valid_mask]
-        target = target[valid_mask]
-        
+
+        # Filter valid pixels
+        mask = (target >= 0) & (target < self.num_classes) & (target != self.ignore_index)
+        pred = pred[mask]
+        target = target[mask]
+
         # Update confusion matrix
-        for t, p in zip(target, pred):
-            self.confusion_matrix[t, p] += 1
-        
-        self.total_samples += 1
-    
-    def compute_iou(self) -> Dict[str, float]:
-        """Compute IoU (Intersection over Union) per class"""
-        iou_per_class = []
-        
-        for i in range(self.num_classes):
-            # True Positive
-            tp = self.confusion_matrix[i, i]
-            
-            # False Positive + False Negative
-            fp_fn = self.confusion_matrix[i, :].sum() + \
-                    self.confusion_matrix[:, i].sum() - tp
-            
-            if fp_fn == 0:
-                iou = float('nan')
-            else:
-                iou = tp / fp_fn
-            
-            iou_per_class.append(iou)
-        
-        # Mean IoU (ignore nan)
-        iou_per_class = np.array(iou_per_class)
-        valid_iou = iou_per_class[~np.isnan(iou_per_class)]
-        mean_iou = valid_iou.mean() if len(valid_iou) > 0 else 0.0
-        
-        return {
-            'mIoU': mean_iou,
-            'IoU_per_class': iou_per_class
-        }
-    
-    def compute_dice(self) -> Dict[str, float]:
-        """Compute Dice coefficient per class"""
-        dice_per_class = []
-        
-        for i in range(self.num_classes):
-            tp = self.confusion_matrix[i, i]
-            fp = self.confusion_matrix[:, i].sum() - tp
-            fn = self.confusion_matrix[i, :].sum() - tp
-            
-            denominator = 2 * tp + fp + fn
-            
-            if denominator == 0:
-                dice = float('nan')
-            else:
-                dice = (2 * tp) / denominator
-            
-            dice_per_class.append(dice)
-        
-        # Mean Dice
-        dice_per_class = np.array(dice_per_class)
-        valid_dice = dice_per_class[~np.isnan(dice_per_class)]
-        mean_dice = valid_dice.mean() if len(valid_dice) > 0 else 0.0
-        
-        return {
-            'mDice': mean_dice,
-            'Dice_per_class': dice_per_class
-        }
-    
-    def compute_pixel_accuracy(self) -> float:
-        """Compute overall pixel accuracy"""
-        correct = np.diag(self.confusion_matrix).sum()
+        label = self.num_classes * target.astype('int') + pred
+        count = np.bincount(label, minlength=self.num_classes**2)
+        self.confusion_matrix += count.reshape(self.num_classes, self.num_classes)
+
+    def get_miou(self):
+        """Calculate mean IoU"""
+        intersection = np.diag(self.confusion_matrix)
+        union = self.confusion_matrix.sum(axis=1) + self.confusion_matrix.sum(axis=0) - intersection
+        iou = intersection / (union + 1e-10)
+        valid_iou = iou[union > 0]
+        miou = np.mean(valid_iou)
+        return miou, iou
+
+    def get_accuracy(self):
+        """Calculate pixel accuracy"""
+        intersection = np.diag(self.confusion_matrix)
         total = self.confusion_matrix.sum()
-        
-        if total == 0:
-            return 0.0
-        
-        return correct / total
-    
-    def compute_mean_accuracy(self) -> float:
-        """Compute mean class accuracy"""
-        acc_per_class = []
-        
-        for i in range(self.num_classes):
-            tp = self.confusion_matrix[i, i]
-            total = self.confusion_matrix[i, :].sum()
-            
-            if total == 0:
-                acc = float('nan')
-            else:
-                acc = tp / total
-            
-            acc_per_class.append(acc)
-        
-        acc_per_class = np.array(acc_per_class)
-        valid_acc = acc_per_class[~np.isnan(acc_per_class)]
-        
-        return valid_acc.mean() if len(valid_acc) > 0 else 0.0
-    
-    def get_results(self) -> Dict:
-        """Get all metrics"""
-        iou_results = self.compute_iou()
-        dice_results = self.compute_dice()
-        
-        return {
-            'mIoU': iou_results['mIoU'],
-            'mDice': dice_results['mDice'],
-            'Pixel_Accuracy': self.compute_pixel_accuracy(),
-            'Mean_Accuracy': self.compute_mean_accuracy(),
-            'IoU_per_class': iou_results['IoU_per_class'],
-            'Dice_per_class': dice_results['Dice_per_class']
-        }
+        accuracy = intersection.sum() / (total + 1e-10)
+        return accuracy
 
-# ===================== TESTER =====================
-class Tester:
-    """Validation tester with comprehensive metrics"""
-    
-    def __init__(
-        self,
-        model: nn.Module,
-        device: str,
-        num_classes: int = 19,
-        ignore_index: int = 255,
-        use_amp: bool = True,
-        sliding_window: bool = False,
-        window_size: Tuple[int, int] = (512, 1024),
-        stride: Tuple[int, int] = (256, 512)
-    ):
-        self.model = model.to(device).eval()
-        self.device = device
-        self.num_classes = num_classes
-        self.ignore_index = ignore_index
-        self.use_amp = use_amp
-        self.sliding_window = sliding_window
-        self.window_size = window_size
-        self.stride = stride
-        
-        # Metrics
-        self.metrics = SegmentationMetrics(num_classes, ignore_index)
-    
-    @torch.no_grad()
-    def predict(self, img_tensor: torch.Tensor) -> np.ndarray:
-        """
-        Predict single image
-        
-        Args:
-            img_tensor: (1, 3, H, W)
-        
-        Returns:
-            pred: (H, W) uint8 array
-        """
-        img_tensor = img_tensor.to(self.device)
-        
-        with autocast(enabled=self.use_amp):
-            if not self.sliding_window:
-                logits = self.model(img_tensor)
-            else:
-                logits = self._sliding_window_inference(img_tensor)
-        
-        # Get predictions
-        pred = logits.argmax(1).squeeze(0).cpu().numpy().astype(np.uint8)
-        
-        return pred
-    
-    def _sliding_window_inference(self, x: torch.Tensor) -> torch.Tensor:
-        """Sliding window inference for large images"""
-        B, C, H, W = x.shape
-        wh, ww = self.window_size
-        sh, sw = self.stride
-        
-        logits_sum = torch.zeros((1, self.num_classes, H, W), 
-                                device=self.device)
-        count = torch.zeros((1, 1, H, W), device=self.device)
-        
-        for y in range(0, H - wh + 1, sh):
-            for x0 in range(0, W - ww + 1, sw):
-                patch = x[:, :, y:y+wh, x0:x0+ww]
-                
-                with autocast(enabled=self.use_amp):
-                    out = self.model(patch)
-                
-                logits_sum[:, :, y:y+wh, x0:x0+ww] += out
-                count[:, :, y:y+wh, x0:x0+ww] += 1
-        
-        return logits_sum / count.clamp(min=1)
-    
-    def evaluate(
-        self,
-        dataloader: DataLoader,
-        save_dir: Optional[str] = None,
-        save_visualizations: bool = False
-    ) -> Dict:
-        """
-        Evaluate on validation set
-        
-        Args:
-            dataloader: Validation dataloader
-            save_dir: Directory to save results
-            save_visualizations: Whether to save prediction visualizations
-        
-        Returns:
-            Dict of metrics
-        """
-        self.metrics.reset()
-        
-        if save_dir:
-            save_dir = Path(save_dir)
-            save_dir.mkdir(parents=True, exist_ok=True)
-            
-            if save_visualizations:
-                vis_dir = save_dir / 'visualizations'
-                vis_dir.mkdir(exist_ok=True)
-        
-        print("\n🚀 Starting evaluation...")
-        
-        for batch in tqdm(dataloader, desc="Evaluating"):
-            img = batch['image']  # (B, 3, H, W)
-            gt = batch['gt']      # (B, H, W)
-            
-            # Predict
-            pred = self.predict(img)  # (H, W)
-            
-            # Update metrics
-            gt_np = gt.squeeze(0).numpy()
-            self.metrics.update(pred, gt_np)
-            
-            # Save visualizations
-            if save_visualizations and save_dir:
-                img_path = batch['img_path'][0]
-                img_name = Path(img_path).stem
-                
-                # Colorize prediction
-                vis = self.visualize(pred)
-                vis_img = Image.fromarray(vis)
-                vis_img.save(vis_dir / f'{img_name}_pred.png')
-                
-                # Colorize ground truth
-                gt_vis = self.visualize(gt_np)
-                gt_vis_img = Image.fromarray(gt_vis)
-                gt_vis_img.save(vis_dir / f'{img_name}_gt.png')
-        
-        # Compute final metrics
-        results = self.metrics.get_results()
-        
-        # Print results
-        self.print_results(results)
-        
-        # Save results
-        if save_dir:
-            self.save_results(results, save_dir)
-        
-        return results
-    
-    @staticmethod
-    def visualize(mask: np.ndarray) -> np.ndarray:
-        """Convert label mask to RGB visualization"""
-        h, w = mask.shape
-        out = np.zeros((h, w, 3), dtype=np.uint8)
-        
-        for i, color in enumerate(CITYSCAPES_PALETTE):
-            out[mask == i] = color
-        
-        return out
-    
-    def print_results(self, results: Dict):
-        """Pretty print evaluation results"""
-        print("\n" + "="*60)
-        print("📊 EVALUATION RESULTS")
-        print("="*60)
-        
-        print(f"\n{'Metric':<30} {'Value':>10}")
-        print("-"*60)
-        print(f"{'mIoU (Mean IoU)':<30} {results['mIoU']*100:>9.2f}%")
-        print(f"{'mDice (Mean Dice)':<30} {results['mDice']*100:>9.2f}%")
-        print(f"{'Pixel Accuracy':<30} {results['Pixel_Accuracy']*100:>9.2f}%")
-        print(f"{'Mean Class Accuracy':<30} {results['Mean_Accuracy']*100:>9.2f}%")
-        
-        print("\n" + "-"*60)
-        print("Per-Class IoU:")
-        print("-"*60)
-        
-        for i, (cls_name, iou) in enumerate(zip(CITYSCAPES_CLASSES, 
-                                                results['IoU_per_class'])):
-            if not np.isnan(iou):
-                print(f"{cls_name:<30} {iou*100:>9.2f}%")
-        
-        print("="*60 + "\n")
-    
-    def save_results(self, results: Dict, save_dir: Path):
-        """Save results to JSON file"""
-        # Convert numpy arrays to lists for JSON serialization
-        results_serializable = {
-            'mIoU': float(results['mIoU']),
-            'mDice': float(results['mDice']),
-            'Pixel_Accuracy': float(results['Pixel_Accuracy']),
-            'Mean_Accuracy': float(results['Mean_Accuracy']),
-            'IoU_per_class': {
-                cls_name: float(iou) if not np.isnan(iou) else None
-                for cls_name, iou in zip(CITYSCAPES_CLASSES, 
-                                        results['IoU_per_class'])
-            },
-            'Dice_per_class': {
-                cls_name: float(dice) if not np.isnan(dice) else None
-                for cls_name, dice in zip(CITYSCAPES_CLASSES, 
-                                         results['Dice_per_class'])
-            }
-        }
-        
-        # Save to JSON
-        json_path = save_dir / 'eval_results.json'
-        with open(json_path, 'w') as f:
-            json.dump(results_serializable, f, indent=4)
-        
-        print(f"✅ Results saved to {json_path}")
+    def get_dice(self):
+        """Calculate Dice Score"""
+        intersection = np.diag(self.confusion_matrix)
+        pred_sum = self.confusion_matrix.sum(axis=0)
+        target_sum = self.confusion_matrix.sum(axis=1)
+        dice = (2.0 * intersection) / (pred_sum + target_sum + 1e-10)
+        valid_dice = dice[target_sum > 0]
+        mean_dice = np.mean(valid_dice)
+        return mean_dice, dice
 
-# ===================== LOAD MODEL =====================
-def load_model(ckpt_path: str, device: str) -> nn.Module:
-    """Load trained model from checkpoint with auto-detect deploy mode"""
-    
-    # Load checkpoint first to check keys
-    try:
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    except Exception as e:
-        print(f"⚠️  Error loading checkpoint with weights_only=False: {e}")
-        print("Trying with weights_only=True...")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-    
-    state_dict = ckpt.get('model_state_dict', ckpt)
-    
-    # Auto-detect deploy mode from checkpoint keys
-    # If checkpoint has 'reparam_3x3' only -> deploy=True
-    # If checkpoint has 'branch_3x3', 'branch_1x1' -> deploy=False
-    has_reparam = any('reparam_3x3' in k for k in state_dict.keys())
-    has_branches = any('branch_3x3' in k for k in state_dict.keys())
-    
-    if has_branches and not has_reparam:
-        deploy_mode = False
-        print("🔧 Detected training mode checkpoint (with branches)")
-    elif has_reparam and not has_branches:
-        deploy_mode = True
-        print("🚀 Detected deploy mode checkpoint (reparameterized)")
-    else:
-        # Default fallback
-        deploy_mode = False
-        print("⚠️  Could not auto-detect mode, using deploy=False")
-    
+
+# ============================================
+# VISUALIZATION
+# ============================================
+
+# Cityscapes palette
+PALETTE = np.array([
+    [128, 64, 128], [244, 35, 232], [70, 70, 70], [102, 102, 156],
+    [190, 153, 153], [153, 153, 153], [250, 170, 30], [220, 220, 0],
+    [107, 142, 35], [152, 251, 152], [70, 130, 180], [220, 20, 60],
+    [255, 0, 0], [0, 0, 142], [0, 0, 70], [0, 60, 100],
+    [0, 80, 100], [0, 0, 230], [119, 11, 32]
+], dtype=np.uint8)
+
+CLASS_NAMES = [
+    'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
+    'traffic light', 'traffic sign', 'vegetation', 'terrain',
+    'sky', 'person', 'rider', 'car', 'truck', 'bus',
+    'train', 'motorcycle', 'bicycle'
+]
+
+
+def visualize_predictions(images, masks, predictions, save_path, num_samples=5):
+    """Visualize predictions với ground truth"""
+    num_samples = min(num_samples, images.shape[0])
+
+    fig, axes = plt.subplots(num_samples, 3, figsize=(15, 5*num_samples))
+    if num_samples == 1:
+        axes = axes.reshape(1, -1)
+
+    for i in range(num_samples):
+        # Denormalize image (ImageNet normalization)
+        img = images[i].cpu().numpy().transpose(1, 2, 0)
+        mean = np.array([0.485, 0.456, 0.406])
+        std = np.array([0.229, 0.224, 0.225])
+        img = img * std + mean
+        img = np.clip(img, 0, 1)
+
+        # Convert labels to RGB
+        mask_rgb = PALETTE[masks[i]] / 255.0
+        pred_rgb = PALETTE[predictions[i]] / 255.0
+
+        # Plot
+        axes[i, 0].imshow(img)
+        axes[i, 0].set_title(f'Sample {i+1}: Input Image', fontsize=14, fontweight='bold')
+        axes[i, 0].axis('off')
+
+        axes[i, 1].imshow(mask_rgb)
+        axes[i, 1].set_title('Ground Truth', fontsize=14, fontweight='bold')
+        axes[i, 1].axis('off')
+
+        axes[i, 2].imshow(pred_rgb)
+        axes[i, 2].set_title('Prediction', fontsize=14, fontweight='bold')
+        axes[i, 2].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches='tight')
+    print(f"\n📷 Visualization saved: {save_path}")
+    plt.close()
+
+
+# ============================================
+# MODEL LOADING
+# ============================================
+
+def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_deploy=True):
+    """Load model với option auto-deploy"""
+    print(f"\n📦 Loading model from: {checkpoint_path}")
+
+    # Build model
     backbone_cfg = {
         'in_channels': 3,
-        'channels': 32,
+        'channels': channels,
         'ppm_channels': 128,
         'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
-        'use_flash_attention': True,
-        'flash_attn_stage': 4,
-        'flash_attn_layers': 2,
-        'flash_attn_heads': 8,
-        'use_se': True,
-        'deploy': deploy_mode
+        'dwsa_stages': ['stage5', 'stage6'],
+        'dwsa_num_heads': 4,
+        'dwsa_reduction': 4,
+        'dwsa_qk_sharing': True,
+        'dwsa_groups': 4,
+        'dwsa_drop': 0.1,
+        'dwsa_alpha': 0.1,
+        'use_multi_scale_context': True,
+        'ms_scales': (1, 2),
+        'ms_branch_ratio': 8,
+        'ms_alpha': 0.1,
+        'align_corners': False,
+        'deploy': False  # Load as training mode first
     }
 
     head_cfg = {
-        'in_channels': 64,
-        'channels': 128,
+        'in_channels': channels * 4,
+        'c1_channels': channels,
+        'c2_channels': channels * 2,
         'decoder_channels': 128,
-        'skip_channels': [64, 32, 32]
+        'num_classes': num_classes,
+        'dropout_ratio': 0.1,
+        'use_gated_fusion': True,
+        'norm_cfg': dict(type='BN', requires_grad=True),
+        'act_cfg': dict(type='ReLU', inplace=False),
+        'align_corners': False,
     }
 
-    model = GCNetSegmentor(19, backbone_cfg, head_cfg)
-    
-    # Load state dict
-    try:
-        model.load_state_dict(state_dict, strict=True)
-        print(f"✅ Model loaded successfully (deploy={deploy_mode})")
-    except RuntimeError as e:
-        print(f"⚠️  Strict loading failed, trying non-strict mode...")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        
-        if missing:
-            print(f"⚠️  Missing keys: {len(missing)}")
-            if len(missing) <= 10:
-                for k in missing:
-                    print(f"   - {k}")
-        
-        if unexpected:
-            print(f"⚠️  Unexpected keys: {len(unexpected)}")
-            if len(unexpected) <= 10:
-                for k in unexpected:
-                    print(f"   - {k}")
-        
-        print(f"✅ Model loaded with warnings")
-    
+    # Build
+    backbone = GCNetWithEnhance(**backbone_cfg)
+    head = GCNetHead(**head_cfg)
+    model = Segmentor(backbone, head, aux_head=None)
+
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    if 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
+
+    model.load_state_dict(state_dict, strict=True)
+    print(f"✅ Model loaded successfully!")
+
+    # Print checkpoint info
+    if 'epoch' in checkpoint:
+        print(f"   Epoch: {checkpoint['epoch']}")
+    if 'best_miou' in checkpoint:
+        print(f"   Best mIOU: {checkpoint['best_miou']:.4f}")
+
+    # Auto-reparameter
+    if auto_deploy:
+        model = convert_to_deploy_mode(model)
+
+    model = model.to(device)
+    model.eval()
+
     return model
 
-# ===================== MAIN =====================
+
+# ============================================
+# EVALUATION
+# ============================================
+
+@torch.no_grad()
+def evaluate_full(model, dataloader, device, num_classes, ignore_index=255, 
+                  save_vis_samples=5, output_dir='./evaluation_results'):
+    """
+    Full evaluation trên toàn bộ val set
+    + Auto-reparameter
+    + Metrics: mIOU, Accuracy, Dice
+    + Visualization 5 ảnh
+    """
+    model.eval()
+    metrics = SegmentationMetrics(num_classes, ignore_index)
+
+    # Storage for visualization
+    vis_images = []
+    vis_masks = []
+    vis_preds = []
+
+    # Storage for FPS calculation
+    inference_times = []
+
+    print("\n" + "="*70)
+    print("🔍 EVALUATING ON FULL VALIDATION SET")
+    print("="*70)
+
+    pbar = tqdm(dataloader, desc="Evaluating", ncols=100)
+
+    for batch_idx, (images, masks) in enumerate(pbar):
+        images = images.to(device, non_blocking=True)
+        masks_np = masks.numpy().astype(np.int32)
+
+        # Measure inference time
+        if device == 'cuda':
+            torch.cuda.synchronize()
+            start = time.time()
+        else:
+            start = time.time()
+
+        # Forward pass
+        logits = model(images)
+
+        if device == 'cuda':
+            torch.cuda.synchronize()
+
+        inference_times.append(time.time() - start)
+
+        # Resize to original size
+        if logits.shape[-2:] != masks.shape[-2:]:
+            logits = F.interpolate(
+                logits, 
+                size=masks.shape[-2:], 
+                mode='bilinear', 
+                align_corners=False
+            )
+
+        # Get predictions
+        preds = logits.argmax(dim=1).cpu().numpy().astype(np.int32)
+
+        # Update metrics
+        metrics.update(preds, masks_np)
+
+        # Store samples for visualization (random sampling)
+        if len(vis_images) < save_vis_samples and random.random() < 0.05:
+            vis_images.append(images.cpu())
+            vis_masks.append(masks_np)
+            vis_preds.append(preds)
+
+        # Update progress bar
+        if batch_idx % 10 == 0:
+            current_miou, _ = metrics.get_miou()
+            pbar.set_postfix({'mIOU': f'{current_miou:.4f}'})
+
+    # Calculate final metrics
+    miou, per_class_iou = metrics.get_miou()
+    accuracy = metrics.get_accuracy()
+    dice, per_class_dice = metrics.get_dice()
+
+    # Calculate FPS
+    avg_time = np.mean(inference_times[10:])  # Skip first 10 for warmup
+    fps = 1.0 / avg_time
+
+    # Print results
+    print("\n" + "="*70)
+    print("📊 EVALUATION RESULTS")
+    print("="*70)
+    print(f"✅ mIOU:     {miou:.4f} ({miou*100:.2f}%)")
+    print(f"✅ Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"✅ Dice:     {dice:.4f} ({dice*100:.2f}%)")
+    print(f"⚡ FPS:      {fps:.2f} frames/sec")
+    print(f"⏱️  Avg time: {avg_time*1000:.2f} ms/frame")
+    print("="*70)
+
+    # Print per-class metrics
+    print("\n📈 PER-CLASS METRICS:")
+    print("-"*70)
+    print(f"{'Class':<20} {'IoU':<15} {'Dice':<15}")
+    print("-"*70)
+
+    for i in range(num_classes):
+        class_name = CLASS_NAMES[i] if i < len(CLASS_NAMES) else f'class_{i}'
+        if metrics.confusion_matrix[i].sum() > 0:
+            print(f"{class_name:<20} {per_class_iou[i]:<15.4f} {per_class_dice[i]:<15.4f}")
+    print("-"*70)
+
+    # Visualization
+    os.makedirs(output_dir, exist_ok=True)
+
+    if len(vis_images) > 0:
+        # Pad to save_vis_samples if needed
+        while len(vis_images) < save_vis_samples:
+            vis_images.append(vis_images[-1])
+            vis_masks.append(vis_masks[-1])
+            vis_preds.append(vis_preds[-1])
+
+        vis_images = torch.cat(vis_images, dim=0)[:save_vis_samples]
+        vis_masks = np.concatenate(vis_masks, axis=0)[:save_vis_samples]
+        vis_preds = np.concatenate(vis_preds, axis=0)[:save_vis_samples]
+
+        vis_path = os.path.join(output_dir, 'predictions_visualization.png')
+        visualize_predictions(vis_images, vis_masks, vis_preds, vis_path, save_vis_samples)
+
+    # Save metrics to JSON
+    results = {
+        'miou': float(miou),
+        'accuracy': float(accuracy),
+        'dice': float(dice),
+        'fps': float(fps),
+        'avg_inference_time_ms': float(avg_time * 1000),
+        'per_class_iou': per_class_iou.tolist(),
+        'per_class_dice': per_class_dice.tolist(),
+        'class_names': CLASS_NAMES[:num_classes]
+    }
+
+    metrics_path = os.path.join(output_dir, 'metrics.json')
+    with open(metrics_path, 'w') as f:
+        json.dump(results, f, indent=2)
+    print(f"\n💾 Metrics saved: {metrics_path}")
+
+    return results
+
+
+# ============================================
+# MAIN
+# ============================================
+
 def main():
-    parser = argparse.ArgumentParser(
-        description='Test GCNet Segmentation Model on Validation Set',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Example:
-  python test.py \\
-      --checkpoint best_model.pth \\
-      --val_txt val.txt \\
-      --output_dir eval_results \\
-      --amp --save_vis
-        """
-    )
-    
-    # Model args
-    parser.add_argument('--checkpoint', type=str, required=True,
-                       help='Path to model checkpoint')
-    
-    # Data args
-    parser.add_argument('--val_txt', type=str, required=True,
-                       help='Path to validation txt file (format: img_path,label_path)')
-    parser.add_argument('--img_size', type=int, nargs=2, default=[512, 1024],
-                       help='Image size (H W)')
-    
-    # Inference args
-    parser.add_argument('--batch_size', type=int, default=1,
-                       help='Batch size for evaluation')
-    parser.add_argument('--num_workers', type=int, default=4,
-                       help='Number of data loading workers')
-    parser.add_argument('--amp', action='store_true',
-                       help='Use automatic mixed precision')
-    parser.add_argument('--sliding', action='store_true',
-                       help='Use sliding window inference')
-    parser.add_argument('--window_size', type=int, nargs=2, default=[512, 1024],
-                       help='Sliding window size')
-    parser.add_argument('--stride', type=int, nargs=2, default=[256, 512],
-                       help='Sliding window stride')
-    
-    # Output args
-    parser.add_argument('--output_dir', type=str, default='eval_results',
-                       help='Directory to save evaluation results')
-    parser.add_argument('--save_vis', action='store_true',
-                       help='Save prediction visualizations')
-    parser.add_argument('--num_classes', type=int, default=19,
-                       help='Number of classes')
-    parser.add_argument('--ignore_index', type=int, default=255,
-                       help='Ignore index in ground truth')
-    
+    parser = argparse.ArgumentParser(description="🚀 Full Evaluation with Auto-Reparameter")
+
+    # Model & Checkpoint
+    parser.add_argument("--checkpoint", type=str, required=True,
+                       help="Path to model checkpoint")
+    parser.add_argument("--channels", type=int, default=32,
+                       help="Base channel count")
+
+    # Dataset
+    parser.add_argument("--val_txt", type=str, required=True,
+                       help="Path to validation txt file")
+    parser.add_argument("--num_classes", type=int, default=19,
+                       help="Number of classes")
+    parser.add_argument("--ignore_index", type=int, default=255)
+
+    # Data settings
+    parser.add_argument("--img_h", type=int, default=512)
+    parser.add_argument("--img_w", type=int, default=1024)
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=4)
+
+    # Evaluation settings
+    parser.add_argument("--num_vis_samples", type=int, default=5,
+                       help="Number of visualization samples")
+    parser.add_argument("--no_deploy", action="store_true",
+                       help="Disable auto-reparameter (slower)")
+
+    # Output
+    parser.add_argument("--output_dir", type=str, default="./evaluation_results",
+                       help="Directory to save results")
+
+    # System
+    parser.add_argument("--device", type=str, default="cuda")
+
     args = parser.parse_args()
-    
-    print("="*60)
-    print("🔬 GCNet Validation Testing")
-    print("="*60)
-    
+
     # Device
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Device: {device}")
-    
+    device = args.device if torch.cuda.is_available() else "cpu"
+
+    print("\n" + "="*70)
+    print("🚀 FULL EVALUATION WITH AUTO-REPARAMETER")
+    print("="*70)
+    print(f"📁 Checkpoint:  {args.checkpoint}")
+    print(f"📂 Val set:     {args.val_txt}")
+    print(f"🖥️  Device:      {device}")
+    print(f"🎨 Vis samples: {args.num_vis_samples}")
+    print(f"⚡ Deploy mode: {'YES' if not args.no_deploy else 'NO'}")
+
     # Load model
-    print(f"\n📦 Loading model...")
-    model = load_model(args.checkpoint, device)
-    
-    # Create dataset
+    model = load_model(
+        checkpoint_path=args.checkpoint,
+        num_classes=args.num_classes,
+        channels=args.channels,
+        device=device,
+        auto_deploy=not args.no_deploy
+    )
+
+    # Create dataloader
     print(f"\n📂 Loading validation dataset...")
-    val_dataset = ValidationDataset(
-        txt_file=args.val_txt,
-        img_size=tuple(args.img_size),
-        ignore_index=args.ignore_index,
-        use_label_mapping=True  # Convert Cityscapes ID to train_id
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
+    _, val_loader = create_dataloaders(
+        train_txt=args.val_txt,  # dummy
+        val_txt=args.val_txt,
         batch_size=args.batch_size,
-        shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=True
+        img_h=args.img_h,
+        img_w=args.img_w,
+        dataset_type='normal',
+        augmentation_level='none'
     )
-    
-    print(f"✓ Found {len(val_dataset)} validation images")
-    print(f"✓ Batch size: {args.batch_size}")
-    print(f"✓ Total batches: {len(val_loader)}")
-    
-    # Create tester
-    tester = Tester(
+    print(f"✅ Loaded {len(val_loader.dataset)} validation samples")
+
+    # Evaluate
+    results = evaluate_full(
         model=model,
+        dataloader=val_loader,
         device=device,
         num_classes=args.num_classes,
         ignore_index=args.ignore_index,
-        use_amp=args.amp,
-        sliding_window=args.sliding,
-        window_size=tuple(args.window_size),
-        stride=tuple(args.stride)
+        save_vis_samples=args.num_vis_samples,
+        output_dir=args.output_dir
     )
-    
-    # Evaluate
-    results = tester.evaluate(
-        dataloader=val_loader,
-        save_dir=args.output_dir,
-        save_visualizations=args.save_vis
-    )
-    
-    print("\n✅ Evaluation completed!")
-    print(f"📁 Results saved to {args.output_dir}")
+
+    print(f"\n✅ Evaluation completed!")
+    print(f"\n📁 Results saved to: {args.output_dir}/")
+    print(f"   - predictions_visualization.png")
+    print(f"   - metrics.json")
+
 
 if __name__ == "__main__":
     main()
