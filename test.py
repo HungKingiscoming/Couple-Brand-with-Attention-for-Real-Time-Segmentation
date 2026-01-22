@@ -257,15 +257,9 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
             c2_channels = detected_c2
     
     # ✅ CHECK NORM TYPE
-    bn_keys = [k for k in state_dict.keys() if '.bn.' in k]
-    gn_keys = [k for k in state_dict.keys() if '.gn.' in k]
-    
-    if len(gn_keys) > 0:
-        norm_cfg = dict(type='GN', num_groups=8, requires_grad=True)
-        print(f"🔍 Detected GroupNorm")
-    else:
-        norm_cfg = dict(type='BN', requires_grad=True)
-        print(f"🔍 Detected BatchNorm")
+    # ✅ FORCE GROUPNORM (đúng với mô hình đã train)
+    norm_cfg = dict(type='GN', num_groups=8, requires_grad=True)
+    print("🔍 Using GroupNorm (forced, same as training)")
 
     print(f"\n✅ Building model with:")
     print(f"   channels={channels}")
