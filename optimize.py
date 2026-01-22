@@ -4,6 +4,7 @@
 # ============================================
 """
 FIXED VERSION - Giữ đầy đủ BatchNorm running_mean/var
+Sửa lỗi: Script cũ thiếu BN stats khi convert FP16
 """
 
 import torch
@@ -104,7 +105,7 @@ def optimize_checkpoint_size(input_path, output_path,
             if use_fp16:
                 # Check if it's a trainable parameter (weight/bias)
                 if param.dtype == torch.float32:
-                    # Keep BN running_mean/var as FP32 for stability
+                    # Keep BN running_mean/var/num_batches_tracked as FP32 for stability
                     if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
                         model_state[key] = param  # ← Keep FP32
                     else:
