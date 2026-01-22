@@ -1,13 +1,9 @@
 #!/usr/bin/env python3
 # ============================================
-# optimize_weight_size.py - Giảm Kích Thước Checkpoint
+# optimize_weight_size_FIXED.py - FIXED BatchNorm stats
 # ============================================
 """
-Tối ưu hóa kích thước checkpoint file:
-1. Remove optimizer state, scheduler, scaler
-2. Remove aux_head (chỉ dùng training)
-3. Convert FP32 → FP16 (optional)
-4. Reparameter GCBlock
+FIXED VERSION - Giữ đầy đủ BatchNorm running_mean/var
 """
 
 import torch
@@ -58,6 +54,11 @@ def analyze_checkpoint(checkpoint_path):
         print(f"    • decode_head:  {head_size:>8.2f} MB")
         print(f"    • aux_head:     {aux_size:>8.2f} MB")
 
+        # ✅ Check BatchNorm stats
+        bn_keys = [k for k in model_params.keys() 
+                   if 'running_mean' in k or 'running_var' in k]
+        print(f"    • BN stats:     {len(bn_keys)} keys")
+
     print("="*70)
 
     return component_sizes
@@ -68,7 +69,7 @@ def optimize_checkpoint_size(input_path, output_path,
                              use_fp16=False,
                              remove_aux=True):
     """
-    Tối ưu checkpoint size
+    ✅ FIXED: Giữ đầy đủ BatchNorm running_mean/var
 
     Args:
         input_path: Đường dẫn checkpoint gốc
@@ -78,7 +79,7 @@ def optimize_checkpoint_size(input_path, output_path,
         remove_aux: Remove aux_head (chỉ dùng training)
     """
     print("\n" + "="*70)
-    print("🔧 OPTIMIZING CHECKPOINT SIZE")
+    print("🔧 OPTIMIZING CHECKPOINT SIZE (FIXED)")
     print("="*70)
 
     # Load checkpoint
@@ -89,26 +90,42 @@ def optimize_checkpoint_size(input_path, output_path,
     # Create optimized checkpoint
     optimized = {}
 
-    # 1. Keep only model weights
+    # 1. Process model weights
     if 'model' in ckpt:
-        model_state = ckpt['model'].copy()
+        model_state = {}  # ← NEW: Create new dict instead of copy
 
-        # Remove aux_head if requested
-        if remove_aux:
-            keys_to_remove = [k for k in model_state.keys() if 'aux_head' in k or 'auxhead' in k]
-            for k in keys_to_remove:
-                del model_state[k]
-            if keys_to_remove:
-                print(f"✅ Removed aux_head: {len(keys_to_remove)} parameters")
+        # ✅ FIX: Iterate and preserve ALL keys (including BN stats)
+        for key, param in ckpt['model'].items():
+            # Skip aux_head if requested
+            if remove_aux and ('aux_head' in key or 'auxhead' in key):
+                continue
 
-        # Convert to FP16 if requested
-        if use_fp16:
-            for k in model_state.keys():
-                if model_state[k].dtype == torch.float32:
-                    model_state[k] = model_state[k].half()
-            print(f"✅ Converted to FP16 (half precision)")
+            # ✅ FIX: Convert to FP16 but KEEP BN running stats as FP32
+            if use_fp16:
+                # Check if it's a trainable parameter (weight/bias)
+                if param.dtype == torch.float32:
+                    # Keep BN running_mean/var as FP32 for stability
+                    if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
+                        model_state[key] = param  # ← Keep FP32
+                    else:
+                        model_state[key] = param.half()  # ← Convert to FP16
+                else:
+                    model_state[key] = param
+            else:
+                # FP32 mode - keep everything as is
+                model_state[key] = param
+
+        # Count what we kept
+        bn_stats_kept = len([k for k in model_state.keys() 
+                            if 'running_mean' in k or 'running_var' in k])
+        removed_aux = len(ckpt['model']) - len(model_state)
 
         optimized['model'] = model_state
+
+        print(f"✅ Model weights: {len(model_state)} keys")
+        print(f"   • BN stats kept: {bn_stats_kept}")
+        if removed_aux > 0:
+            print(f"   • Removed aux_head: {removed_aux} keys")
 
     # 2. Keep metadata
     for key in ['epoch', 'best_miou', 'metrics']:
@@ -146,22 +163,28 @@ def optimize_checkpoint_size(input_path, output_path,
     print(f"Original size:  {original_size:>8.2f} MB")
     print(f"Optimized size: {new_size:>8.2f} MB")
     print(f"Reduction:      {original_size - new_size:>8.2f} MB ({(1-new_size/original_size)*100:.1f}%)")
+
+    if use_fp16:
+        print("\n⚠️  FP16 Mode:")
+        print("   • Weights/bias: FP16")
+        print("   • BN running stats: FP32 (for stability)")
+
     print("="*70)
 
     return new_size, original_size
 
 
 def main():
-    parser = argparse.ArgumentParser(description="🔧 Optimize Checkpoint File Size")
+    parser = argparse.ArgumentParser(description="🔧 Optimize Checkpoint File Size (FIXED)")
 
     parser.add_argument("--input", type=str, required=True,
                        help="Input checkpoint path")
     parser.add_argument("--output", type=str, default=None,
-                       help="Output checkpoint path (default: input_optimized.pth)")
+                       help="Output checkpoint path (default: input_inference.pth)")
 
     # Optimization options
     parser.add_argument("--fp16", action="store_true",
-                       help="Convert to FP16 (half size, ~0.1% accuracy loss)")
+                       help="Convert to FP16 (half size, ~0.1%% accuracy loss)")
     parser.add_argument("--keep-optimizer", action="store_true",
                        help="Keep optimizer state (for resume training)")
     parser.add_argument("--keep-aux", action="store_true",
@@ -174,10 +197,11 @@ def main():
     # Set output path
     if args.output is None:
         input_path = Path(args.input)
-        args.output = str(input_path.parent / f"{input_path.stem}_optimized.pth")
+        suffix = "_fp16" if args.fp16 else "_inference"
+        args.output = str(input_path.parent / f"{input_path.stem}{suffix}.pth")
 
     print("\n" + "="*70)
-    print("🔧 CHECKPOINT SIZE OPTIMIZER")
+    print("🔧 CHECKPOINT SIZE OPTIMIZER (FIXED)")
     print("="*70)
     print(f"Input:  {args.input}")
     print(f"Output: {args.output}")
@@ -200,9 +224,14 @@ def main():
         # Usage instructions
         print("\n💡 USAGE:")
         if args.fp16:
-            print("⚠️  FP16 model - Load với:")
+            print("   # Load FP16 checkpoint:")
+            print("   model.load_state_dict(checkpoint['model'])")
             print("   model.half()  # Convert model to FP16")
-            print("   images = images.half()  # Convert inputs to FP16")
+            print("   images = images.half()  # Input as FP16")
+        else:
+            print("   # Load FP32 checkpoint (normal):")
+            print("   model.load_state_dict(checkpoint['model'])")
+
         print("\n   python evaluation_deploy.py \\")
         print(f"       --checkpoint {args.output}")
 
