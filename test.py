@@ -269,8 +269,6 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
 
     print(f"\n✅ Building model with:")
     print(f"   channels={channels}")
-    print(f"   c1_channels={c1_channels_ckpt}")
-    print(f"   c2_channels={c2_channels_ckpt}")
     print(f"   in_channels={channels*4}")
     print(f"   norm_cfg={norm_cfg['type']}")
     
