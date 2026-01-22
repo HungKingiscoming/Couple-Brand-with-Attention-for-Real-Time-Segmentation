@@ -71,13 +71,6 @@ def optimize_checkpoint_size(input_path, output_path,
                              remove_aux=True):
     """
     ✅ FIXED: Giữ đầy đủ BatchNorm running_mean/var
-
-    Args:
-        input_path: Đường dẫn checkpoint gốc
-        output_path: Đường dẫn lưu checkpoint tối ưu
-        keep_optimizer: Giữ optimizer state (False = remove)
-        use_fp16: Convert sang FP16 (True = half size)
-        remove_aux: Remove aux_head (chỉ dùng training)
     """
     print("\n" + "="*70)
     print("🔧 OPTIMIZING CHECKPOINT SIZE (FIXED)")
@@ -88,45 +81,78 @@ def optimize_checkpoint_size(input_path, output_path,
     original_size = Path(input_path).stat().st_size / (1024*1024)
     print(f"Original size: {original_size:.2f} MB")
 
+    # ✅ CHECK INPUT có BN stats không
+    if 'model' in ckpt:
+        input_bn_keys = [k for k in ckpt['model'].keys() 
+                         if 'running_mean' in k or 'running_var' in k]
+        print(f"\n🔍 Input checkpoint:")
+        print(f"   Total keys: {len(ckpt['model'])}")
+        print(f"   BN stats: {len(input_bn_keys)} keys")
+        
+        if len(input_bn_keys) == 0:
+            print("   ⚠️  WARNING: Input checkpoint has NO BatchNorm stats!")
+            print("   → Output will also have no BN stats")
+
     # Create optimized checkpoint
     optimized = {}
 
     # 1. Process model weights
     if 'model' in ckpt:
-        model_state = {}  # ← NEW: Create new dict instead of copy
+        model_state = {}
+        
+        # ✅ Track statistics
+        weights_converted = 0
+        bn_stats_kept = 0
+        aux_removed = 0
 
-        # ✅ FIX: Iterate and preserve ALL keys (including BN stats)
+        # ✅ Iterate and preserve ALL keys (including BN stats)
         for key, param in ckpt['model'].items():
             # Skip aux_head if requested
             if remove_aux and ('aux_head' in key or 'auxhead' in key):
+                aux_removed += 1
                 continue
 
-            # ✅ FIX: Convert to FP16 but KEEP BN running stats as FP32
+            # ✅ FP16 conversion logic
             if use_fp16:
-                # Check if it's a trainable parameter (weight/bias)
                 if param.dtype == torch.float32:
-                    # Keep BN running_mean/var/num_batches_tracked as FP32 for stability
+                    # Keep BN stats as FP32
                     if 'running_mean' in key or 'running_var' in key or 'num_batches_tracked' in key:
-                        model_state[key] = param  # ← Keep FP32
+                        model_state[key] = param  # ← FP32
+                        bn_stats_kept += 1
                     else:
-                        model_state[key] = param.half()  # ← Convert to FP16
+                        model_state[key] = param.half()  # ← FP16
+                        weights_converted += 1
                 else:
                     model_state[key] = param
             else:
-                # FP32 mode - keep everything as is
+                # FP32 mode - keep everything
                 model_state[key] = param
-
-        # Count what we kept
-        bn_stats_kept = len([k for k in model_state.keys() 
-                            if 'running_mean' in k or 'running_var' in k])
-        removed_aux = len(ckpt['model']) - len(model_state)
+                if 'running_mean' in key or 'running_var' in key:
+                    bn_stats_kept += 1
 
         optimized['model'] = model_state
 
-        print(f"✅ Model weights: {len(model_state)} keys")
-        print(f"   • BN stats kept: {bn_stats_kept}")
-        if removed_aux > 0:
-            print(f"   • Removed aux_head: {removed_aux} keys")
+        # ✅ Detailed output
+        print(f"\n✅ Optimization summary:")
+        print(f"   Total output keys: {len(model_state)}")
+        print(f"   BN stats kept: {bn_stats_kept} ({'✅ GOOD' if bn_stats_kept > 0 else '❌ MISSING'})")
+        
+        if use_fp16:
+            print(f"   Weights→FP16: {weights_converted}")
+            print(f"   BN stats→FP32: {bn_stats_kept} (kept for stability)")
+        
+        if aux_removed > 0:
+            print(f"   Aux removed: {aux_removed} keys")
+        
+        # ✅ Verify BN stats preservation
+        output_bn_keys = [k for k in model_state.keys() 
+                          if 'running_mean' in k or 'running_var' in k]
+        if len(input_bn_keys) > 0 and len(output_bn_keys) == 0:
+            print(f"\n❌ ERROR: Lost all BN stats during optimization!")
+            print(f"   Input had {len(input_bn_keys)}, output has 0")
+        elif len(output_bn_keys) < len(input_bn_keys):
+            print(f"\n⚠️  WARNING: Some BN stats lost")
+            print(f"   Input: {len(input_bn_keys)}, Output: {len(output_bn_keys)}")
 
     # 2. Keep metadata
     for key in ['epoch', 'best_miou', 'metrics']:
@@ -138,7 +164,8 @@ def optimize_checkpoint_size(input_path, output_path,
         optimized['optimizer'] = ckpt['optimizer']
         print("✅ Kept optimizer state")
     else:
-        print("✅ Removed optimizer state")
+        if 'optimizer' in ckpt:
+            print("✅ Removed optimizer state")
 
     # 4. Remove training-only components
     removed = []
@@ -172,7 +199,20 @@ def optimize_checkpoint_size(input_path, output_path,
 
     print("="*70)
 
+    # ✅ Final verification
+    print("\n🔍 Verifying output checkpoint...")
+    verify_ckpt = torch.load(output_path, map_location='cpu', weights_only=False)
+    verify_bn = [k for k in verify_ckpt['model'].keys() 
+                 if 'running_mean' in k or 'running_var' in k]
+    print(f"   Output BN stats: {len(verify_bn)} keys")
+    
+    if len(verify_bn) > 0:
+        print(f"   ✅ SUCCESS: BN stats preserved!")
+    else:
+        print(f"   ❌ WARNING: No BN stats in output!")
+
     return new_size, original_size
+
 
 
 def main():
