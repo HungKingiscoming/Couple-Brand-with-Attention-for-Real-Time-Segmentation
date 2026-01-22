@@ -284,53 +284,66 @@ class GCNetHead(nn.Module):
                  in_channels=None, c1_channels=None, c2_channels=None, **kwargs):
         super().__init__()
         
-        # ✅ FILTER valid decoder args only
+        # Channels
+        self.in_channels = in_channels or backbone_channels*4  # 128
+        self.c2_channels = c2_channels or backbone_channels*2  # 64
+        self.c1_channels = c1_channels or backbone_channels    # 32
+        
+        # ✅ DECODER
         decoder_args = {
-            'in_channels': in_channels or backbone_channels*4,
-            'c2_channels': c2_channels or backbone_channels*2,
-            'c1_channels': c1_channels or backbone_channels,
+            'in_channels': self.in_channels,
+            'c2_channels': self.c2_channels,
+            'c1_channels': self.c1_channels,
             'decoder_channels': decoder_channels,
             'norm_cfg': kwargs.get('norm_cfg'),
             'act_cfg': kwargs.get('act_cfg'),
             'dropout_ratio': kwargs.get('dropout_ratio'),
             'use_gated_fusion': kwargs.get('use_gated_fusion', True)
         }
+        self.decoder = EnhancedDecoder(**decoder_args)
         
-        self.decoder = EnhancedDecoder(**decoder_args)  # ✅ No invalid args!
+        # ✅ PROJECTION layers cho fake features (training mode)
+        self.c2_fake_proj = nn.Conv2d(self.in_channels, self.c2_channels, 1, bias=False)
+        self.c1_fake_proj = nn.Conv2d(self.c2_channels, self.c1_channels, 1, bias=False)
         
+        # Seg head
         self.conv_seg = nn.Sequential(
             nn.Dropout2d(kwargs.get('dropout_ratio', 0.1)),
             nn.Conv2d(decoder_channels//2, num_classes, 1)
         )
     
     def forward(self, feats: Union[Dict[str, Tensor], Tuple[Any, ...]]) -> Tensor:
-        """✅ Handle EXACTLY GCNetWithEnhance outputs"""
+        """✅ FIXED: Handle Dict và Tuple correctly"""
         
-        # CASE 1: Dict từ inference {'c1', 'c2', 'c5', ...}
+        # ✅ CASE 1: Dict (inference/eval mode)
         if isinstance(feats, dict):
-            c1, c2, c5 = feats['c1'], feats['c2'], feats['c5']
+            c1 = feats['c1']  # (B, 32, H/2, W/2)
+            c2 = feats['c2']  # (B, 64, H/4, W/4)
+            c5 = feats['c5']  # (B, 128, H/8, W/8)
         
-        # CASE 2: Training tuple GCNetWithEnhance (c4_tensor, c5_enh_tensor)
+        # ✅ CASE 2: Tuple training (c4, c5_enhanced)
         elif isinstance(feats, tuple) and len(feats) == 2:
-            # TẠO fake c1,c2 từ c4 (H/8) bằng upsample + proj
-            c4, c5 = feats  # c4 & c5 đều H/8, 128ch
-            B, C4, H8, W8 = c4.shape
+            c4, c5 = feats  # Both H/8, 128ch
             
-            # Fake c2 (H/4): upsample c4
+            # Fake c2 (H/4)
             c2 = F.interpolate(c4, scale_factor=2, mode='bilinear', align_corners=False)
-            c2 = nn.Conv2d(C4, C4//2, 1, bias=False)(c2)  # 128→64
+            c2 = self.c2_fake_proj(c2)  # ✅ Use registered layer
             
-            # Fake c1 (H/2): upsample c2  
+            # Fake c1 (H/2)
             c1 = F.interpolate(c2, scale_factor=2, mode='bilinear', align_corners=False)
-            c1 = nn.Conv2d(C4//2, C4//4, 1, bias=False)(c1)  # 64→32
+            c1 = self.c1_fake_proj(c1)  # ✅ Use registered layer
             
-        # CASE 3: Full tuple (c1,c2,c5)
+        # ✅ CASE 3: Full tuple (c1, c2, c5)
         elif isinstance(feats, tuple) and len(feats) >= 3:
-            c1, c2, c5 = feats[:3]
+            c1, c2, c5 = feats[0], feats[1], feats[2]
         
         else:
-            raise ValueError(f"Unsupported feats: {type(feats)}")
+            raise ValueError(
+                f"Unsupported feats type: {type(feats)}, "
+                f"len={len(feats) if isinstance(feats, tuple) else 'N/A'}"
+            )
         
-        # Decoder + seg head
+        # Decoder + segmentation
         dec_feat = self.decoder(c5, c2, c1)
         return self.conv_seg(dec_feat)
+
