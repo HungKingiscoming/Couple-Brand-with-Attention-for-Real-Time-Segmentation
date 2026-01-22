@@ -226,7 +226,13 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
         state_dict = checkpoint['model']
     else:
         state_dict = checkpoint
-    
+    c2_key = 'decode_head.decoder.c2_proj.conv.weight'
+    c2_channels = channels * 2  # default
+    if c2_key in state_dict:
+        detected_c2 = state_dict[c2_key].shape[1]
+        if detected_c2 != c2_channels:
+            print(f"⚠️  Auto-detected c2_channels: {detected_c2} (default: {c2_channels})")
+            c2_channels = detected_c2
     # Detect từ stem.0.conv.weight
     first_key = 'backbone.backbone.stem.0.conv.weight'
     if first_key in state_dict:
@@ -259,7 +265,7 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     head_cfg = {
         'in_channels': channels * 4,
         'c1_channels': channels,
-        'c2_channels': channels * 2,
+        'c2_channels': c2_channels,
         'decoder_channels': 128,
         'num_classes': num_classes,
         'dropout_ratio': 0.1,
