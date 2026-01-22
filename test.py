@@ -220,10 +220,25 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     """Load model với option auto-deploy"""
     print(f"\n📦 Loading model from: {checkpoint_path}")
 
+    # ✅ AUTO-DETECT CHANNELS
+    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    if 'model' in checkpoint:
+        state_dict = checkpoint['model']
+    else:
+        state_dict = checkpoint
+    
+    # Detect từ stem.0.conv.weight
+    first_key = 'backbone.backbone.stem.0.conv.weight'
+    if first_key in state_dict:
+        detected_ch = state_dict[first_key].shape[0]
+        if detected_ch != channels:
+            print(f"⚠️  Auto-detected channels: {detected_ch} (arg: {channels})")
+            channels = detected_ch
+
     # Build model
     backbone_cfg = {
         'in_channels': 3,
-        'channels': 32,
+        'channels': channels,  # ← Dùng detected channels
         'ppm_channels': 128,
         'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
         'dwsa_stages': ['stage5', 'stage6'],
@@ -238,7 +253,7 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
         'ms_branch_ratio': 8,
         'ms_alpha': 0.1,
         'align_corners': False,
-        'deploy': False  # Load as training mode first
+        'deploy': False
     }
 
     head_cfg = {
@@ -259,20 +274,14 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     head = GCNetHead(**head_cfg)
     model = Segmentor(backbone, head, aux_head=None)
 
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    # ✅ LOAD với strict=False
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    
     if missing:
         print(f"⚠️  Missing {len(missing)} keys (BN stats will be recalculated)")
     if unexpected:
         print(f"⚠️  Unexpected {len(unexpected)} keys")
-
     
-    if 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    else:
-        state_dict = checkpoint
-
-    model.load_state_dict(state_dict, strict=False)
     print(f"✅ Model loaded successfully!")
 
     # Print checkpoint info
@@ -289,6 +298,7 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     model.eval()
 
     return model
+
 
 
 # ============================================
