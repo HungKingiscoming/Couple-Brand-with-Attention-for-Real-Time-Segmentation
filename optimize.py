@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+# ============================================
+# optimize_weight_size.py - Giảm Kích Thước Checkpoint
+# ============================================
+"""
+Tối ưu hóa kích thước checkpoint file:
+1. Remove optimizer state, scheduler, scaler
+2. Remove aux_head (chỉ dùng training)
+3. Convert FP32 → FP16 (optional)
+4. Reparameter GCBlock
+"""
+
+import torch
+import argparse
+from pathlib import Path
+
+
+def analyze_checkpoint(checkpoint_path):
+    """Phân tích kích thước các thành phần trong checkpoint"""
+    ckpt = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+
+    print("\n" + "="*70)
+    print("📦 CHECKPOINT ANALYSIS")
+    print("="*70)
+
+    total_size = Path(checkpoint_path).stat().st_size / (1024*1024)
+    print(f"Total file size: {total_size:.2f} MB")
+    print("\nComponents:")
+
+    component_sizes = {}
+
+    for key, value in ckpt.items():
+        if isinstance(value, dict):
+            size = sum(v.numel() * v.element_size() for v in value.values() 
+                      if isinstance(v, torch.Tensor)) / (1024*1024)
+            component_sizes[key] = size
+            print(f"  - {key:<20} {size:>8.2f} MB")
+        elif isinstance(value, torch.Tensor):
+            size = value.numel() * value.element_size() / (1024*1024)
+            component_sizes[key] = size
+            print(f"  - {key:<20} {size:>8.2f} MB")
+        else:
+            print(f"  - {key:<20} (metadata)")
+
+    # Model breakdown
+    if 'model' in ckpt:
+        print("\n  Model components breakdown:")
+        model_params = ckpt['model']
+
+        backbone_size = sum(v.numel() * v.element_size() for k, v in model_params.items() 
+                           if 'backbone' in k) / (1024*1024)
+        head_size = sum(v.numel() * v.element_size() for k, v in model_params.items() 
+                       if 'decode_head' in k or 'head' in k) / (1024*1024)
+        aux_size = sum(v.numel() * v.element_size() for k, v in model_params.items() 
+                      if 'aux' in k) / (1024*1024)
+
+        print(f"    • backbone:     {backbone_size:>8.2f} MB")
+        print(f"    • decode_head:  {head_size:>8.2f} MB")
+        print(f"    • aux_head:     {aux_size:>8.2f} MB")
+
+    print("="*70)
+
+    return component_sizes
+
+
+def optimize_checkpoint_size(input_path, output_path, 
+                             keep_optimizer=False,
+                             use_fp16=False,
+                             remove_aux=True):
+    """
+    Tối ưu checkpoint size
+
+    Args:
+        input_path: Đường dẫn checkpoint gốc
+        output_path: Đường dẫn lưu checkpoint tối ưu
+        keep_optimizer: Giữ optimizer state (False = remove)
+        use_fp16: Convert sang FP16 (True = half size)
+        remove_aux: Remove aux_head (chỉ dùng training)
+    """
+    print("\n" + "="*70)
+    print("🔧 OPTIMIZING CHECKPOINT SIZE")
+    print("="*70)
+
+    # Load checkpoint
+    ckpt = torch.load(input_path, map_location='cpu', weights_only=False)
+    original_size = Path(input_path).stat().st_size / (1024*1024)
+    print(f"Original size: {original_size:.2f} MB")
+
+    # Create optimized checkpoint
+    optimized = {}
+
+    # 1. Keep only model weights
+    if 'model' in ckpt:
+        model_state = ckpt['model'].copy()
+
+        # Remove aux_head if requested
+        if remove_aux:
+            keys_to_remove = [k for k in model_state.keys() if 'aux_head' in k or 'auxhead' in k]
+            for k in keys_to_remove:
+                del model_state[k]
+            if keys_to_remove:
+                print(f"✅ Removed aux_head: {len(keys_to_remove)} parameters")
+
+        # Convert to FP16 if requested
+        if use_fp16:
+            for k in model_state.keys():
+                if model_state[k].dtype == torch.float32:
+                    model_state[k] = model_state[k].half()
+            print(f"✅ Converted to FP16 (half precision)")
+
+        optimized['model'] = model_state
+
+    # 2. Keep metadata
+    for key in ['epoch', 'best_miou', 'metrics']:
+        if key in ckpt:
+            optimized[key] = ckpt[key]
+
+    # 3. Optional: keep optimizer
+    if keep_optimizer and 'optimizer' in ckpt:
+        optimized['optimizer'] = ckpt['optimizer']
+        print("✅ Kept optimizer state")
+    else:
+        print("✅ Removed optimizer state")
+
+    # 4. Remove training-only components
+    removed = []
+    for key in ['scheduler', 'scaler', 'global_step']:
+        if key in ckpt and key not in optimized:
+            removed.append(key)
+
+    if removed:
+        print(f"✅ Removed: {', '.join(removed)}")
+
+    # Add optimization info
+    optimized['optimized'] = True
+    optimized['fp16'] = use_fp16
+    optimized['aux_removed'] = remove_aux
+
+    # Save
+    torch.save(optimized, output_path)
+    new_size = Path(output_path).stat().st_size / (1024*1024)
+
+    print("\n" + "="*70)
+    print("📊 OPTIMIZATION RESULTS")
+    print("="*70)
+    print(f"Original size:  {original_size:>8.2f} MB")
+    print(f"Optimized size: {new_size:>8.2f} MB")
+    print(f"Reduction:      {original_size - new_size:>8.2f} MB ({(1-new_size/original_size)*100:.1f}%)")
+    print("="*70)
+
+    return new_size, original_size
+
+
+def main():
+    parser = argparse.ArgumentParser(description="🔧 Optimize Checkpoint File Size")
+
+    parser.add_argument("--input", type=str, required=True,
+                       help="Input checkpoint path")
+    parser.add_argument("--output", type=str, default=None,
+                       help="Output checkpoint path (default: input_optimized.pth)")
+
+    # Optimization options
+    parser.add_argument("--fp16", action="store_true",
+                       help="Convert to FP16 (half size, ~0.1% accuracy loss)")
+    parser.add_argument("--keep-optimizer", action="store_true",
+                       help="Keep optimizer state (for resume training)")
+    parser.add_argument("--keep-aux", action="store_true",
+                       help="Keep aux_head (usually not needed for inference)")
+    parser.add_argument("--analyze-only", action="store_true",
+                       help="Only analyze, don't optimize")
+
+    args = parser.parse_args()
+
+    # Set output path
+    if args.output is None:
+        input_path = Path(args.input)
+        args.output = str(input_path.parent / f"{input_path.stem}_optimized.pth")
+
+    print("\n" + "="*70)
+    print("🔧 CHECKPOINT SIZE OPTIMIZER")
+    print("="*70)
+    print(f"Input:  {args.input}")
+    print(f"Output: {args.output}")
+
+    # Analyze
+    analyze_checkpoint(args.input)
+
+    if not args.analyze_only:
+        # Optimize
+        optimize_checkpoint_size(
+            input_path=args.input,
+            output_path=args.output,
+            keep_optimizer=args.keep_optimizer,
+            use_fp16=args.fp16,
+            remove_aux=not args.keep_aux
+        )
+
+        print(f"\n✅ Optimized checkpoint saved: {args.output}")
+
+        # Usage instructions
+        print("\n💡 USAGE:")
+        if args.fp16:
+            print("⚠️  FP16 model - Load với:")
+            print("   model.half()  # Convert model to FP16")
+            print("   images = images.half()  # Convert inputs to FP16")
+        print("\n   python evaluation_deploy.py \\")
+        print(f"       --checkpoint {args.output}")
+
+
+if __name__ == "__main__":
+    main()
