@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""
+Model vs Checkpoint Diagnostic Tool
+Compare model structure with checkpoint keys to find mismatches
+"""
+
+import torch
+import argparse
+from collections import defaultdict
+
+
+def analyze_checkpoint(ckpt_path):
+    """Analyze checkpoint structure"""
+    print(f"\n{'='*70}")
+    print("📦 CHECKPOINT STRUCTURE")
+    print(f"{'='*70}\n")
+    
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    
+    if 'model' in ckpt:
+        state_dict = ckpt['model']
+    else:
+        state_dict = ckpt
+    
+    # Group keys by component
+    components = defaultdict(list)
+    
+    for key in state_dict.keys():
+        if key.startswith('backbone.'):
+            components['backbone'].append(key)
+        elif key.startswith('decode_head.'):
+            # Further breakdown
+            if 'decoder' in key:
+                components['decode_head.decoder'].append(key)
+            elif 'fake_proj' in key:
+                components['decode_head.fake_proj'].append(key)
+            else:
+                components['decode_head.other'].append(key)
+        elif key.startswith('aux_head.'):
+            components['aux_head'].append(key)
+        else:
+            components['other'].append(key)
+    
+    print("Components in checkpoint:")
+    for comp, keys in sorted(components.items()):
+        print(f"  {comp:<30} {len(keys):>4} keys")
+        if comp == 'decode_head.fake_proj' or comp == 'decode_head.decoder':
+            for k in keys[:10]:
+                print(f"    - {k}")
+            if len(keys) > 10:
+                print(f"    ... and {len(keys)-10} more")
+    
+    # Look for specific keys
+    print(f"\n{'='*70}")
+    print("🔍 SEARCHING FOR SPECIFIC KEYS")
+    print(f"{'='*70}\n")
+    
+    search_patterns = ['fake_proj', 'c1_proj', 'c2_proj', 'decoder.convs']
+    
+    for pattern in search_patterns:
+        matching = [k for k in state_dict.keys() if pattern in k]
+        if matching:
+            print(f"{pattern}:")
+            for k in matching[:5]:
+                shape = state_dict[k].shape if hasattr(state_dict[k], 'shape') else 'N/A'
+                print(f"  - {k:<60} {shape}")
+            if len(matching) > 5:
+                print(f"  ... and {len(matching)-5} more")
+        else:
+            print(f"{pattern}: NOT FOUND")
+        print()
+    
+    return state_dict
+
+
+def build_model_structure():
+    """Build model and show its structure"""
+    print(f"\n{'='*70}")
+    print("🏗️  BUILDING MODEL STRUCTURE")
+    print(f"{'='*70}\n")
+    
+    try:
+        from model.backbone.model import GCNetWithEnhance
+        from model.head.segmentation_head import GCNetHead
+        
+        # Build with default config
+        backbone = GCNetWithEnhance(
+            in_channels=3,
+            channels=32,
+            ppm_channels=128,
+            num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
+            dwsa_stages=['stage5', 'stage6'],
+            deploy=False
+        )
+        
+        head = GCNetHead(
+            in_channels=128,
+            c1_channels=32,
+            c2_channels=32,
+            decoder_channels=128,
+            num_classes=19,
+            dropout_ratio=0.1,
+            use_gated_fusion=True,
+        )
+        
+        print("✅ Model built successfully\n")
+        
+        # Show head structure
+        print("decode_head attributes:")
+        for name, module in head.named_children():
+            print(f"  - {name}: {type(module).__name__}")
+        
+        print("\ndecode_head parameters:")
+        param_groups = defaultdict(list)
+        for name, param in head.named_parameters():
+            prefix = name.split('.')[0]
+            param_groups[prefix].append(name)
+        
+        for prefix, params in sorted(param_groups.items()):
+            print(f"\n  {prefix}:")
+            for p in params[:5]:
+                print(f"    - {p}")
+            if len(params) > 5:
+                print(f"    ... and {len(params)-5} more")
+        
+        # Check for fake_proj
+        print(f"\n{'='*70}")
+        print("🔍 CHECKING FOR FAKE_PROJ")
+        print(f"{'='*70}\n")
+        
+        has_fake_proj = any('fake_proj' in name for name, _ in head.named_modules())
+        if has_fake_proj:
+            print("✅ Model HAS fake_proj layers")
+            fake_modules = [(n, m) for n, m in head.named_modules() if 'fake_proj' in n]
+            for name, module in fake_modules:
+                print(f"  - {name}: {type(module).__name__}")
+        else:
+            print("❌ Model DOES NOT have fake_proj layers")
+            print("   This is the architecture mismatch!")
+        
+        return head
+        
+    except Exception as e:
+        print(f"❌ Failed to build model: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def compare(ckpt_path):
+    """Compare checkpoint with model"""
+    state_dict = analyze_checkpoint(ckpt_path)
+    model = build_model_structure()
+    
+    if model is None:
+        return
+    
+    print(f"\n{'='*70}")
+    print("🔍 MISMATCH ANALYSIS")
+    print(f"{'='*70}\n")
+    
+    # Get checkpoint head keys
+    ckpt_head_keys = [k for k in state_dict.keys() if k.startswith('decode_head.')]
+    
+    # Get model head keys
+    model_keys = ['decode_head.' + k for k, _ in model.named_parameters()]
+    
+    # Find mismatches
+    ckpt_only = set(ckpt_head_keys) - set(model_keys)
+    model_only = set(model_keys) - set(ckpt_head_keys)
+    
+    print(f"Keys in CHECKPOINT but not in MODEL ({len(ckpt_only)}):")
+    for k in sorted(ckpt_only)[:10]:
+        print(f"  - {k}")
+    if len(ckpt_only) > 10:
+        print(f"  ... and {len(ckpt_only)-10} more")
+    
+    print(f"\nKeys in MODEL but not in CHECKPOINT ({len(model_only)}):")
+    for k in sorted(model_only)[:10]:
+        print(f"  - {k}")
+    if len(model_only) > 10:
+        print(f"  ... and {len(model_only)-10} more")
+    
+    # Summary
+    print(f"\n{'='*70}")
+    print("📊 SUMMARY")
+    print(f"{'='*70}")
+    print(f"Checkpoint head keys:  {len(ckpt_head_keys)}")
+    print(f"Model head keys:       {len(model_keys)}")
+    print(f"Missing in model:      {len(ckpt_only)}")
+    print(f"Missing in checkpoint: {len(model_only)}")
+    
+    if ckpt_only:
+        fake_proj_missing = [k for k in ckpt_only if 'fake_proj' in k]
+        if fake_proj_missing:
+            print(f"\n⚠️  CRITICAL: {len(fake_proj_missing)} fake_proj keys in checkpoint but not in model!")
+            print("   This is why your model gets 0.40% mIOU")
+            print("   You need to either:")
+            print("   1. Find the old code with fake_proj layers")
+            print("   2. Retrain with your current code")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Model vs Checkpoint Diagnostic")
+    parser.add_argument("--checkpoint", "-c", required=True,
+                       help="Path to checkpoint file")
+    
+    args = parser.parse_args()
+    
+    compare(args.checkpoint)
+
+
+if __name__ == "__main__":
+    main()
