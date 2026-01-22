@@ -515,7 +515,7 @@ def main():
 
     # Create dataloader
     print(f"\n📂 Loading validation dataset...")
-    _, val_loader = create_dataloaders(
+    _, val_loader, _r = create_dataloaders(
         train_txt=args.val_txt,  # dummy
         val_txt=args.val_txt,
         batch_size=args.batch_size,
