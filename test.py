@@ -230,34 +230,52 @@ def visualize_predictions(images, masks, predictions, save_path, num_samples=5):
 # ============================================
 
 def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_deploy=True):
-    """Load model với option auto-deploy"""
+    """Load model với auto-detect channels"""
     print(f"\n📦 Loading model from: {checkpoint_path}")
 
-    # ✅ AUTO-DETECT CHANNELS
+    # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     if 'model' in checkpoint:
         state_dict = checkpoint['model']
     else:
         state_dict = checkpoint
-    c2_key = 'decode_head.decoder.c2_proj.conv.weight'
-    c2_channels = channels * 2  # default
-    if c2_key in state_dict:
-        detected_c2 = state_dict[c2_key].shape[1]
-        if detected_c2 != c2_channels:
-            print(f"⚠️  Auto-detected c2_channels: {detected_c2} (default: {c2_channels})")
-            c2_channels = detected_c2
-    # Detect từ stem.0.conv.weight
-    first_key = 'backbone.backbone.stem.0.conv.weight'
-    if first_key in state_dict:
-        detected_ch = state_dict[first_key].shape[0]
-        if detected_ch != channels:
-            print(f"⚠️  Auto-detected channels: {detected_ch} (arg: {channels})")
-            channels = detected_ch
+    
+    # Auto-detect channels
+    c2_proj_key = 'decode_head.decoder.c2_proj.conv.weight'
+    if c2_proj_key in state_dict:
+        c2_ch = state_dict[c2_proj_key].shape[1]
+        detected_channels = c2_ch // 2
+        print(f"🔍 Detected channels: {detected_channels}")
+        channels = detected_channels
+    
+    # ✅ CHECK NORM TYPE từ checkpoint
+    bn_keys = [k for k in state_dict.keys() if '.bn.' in k or 'running_mean' in k]
+    gn_keys = [k for k in state_dict.keys() if '.gn.' in k]
+    
+    if len(gn_keys) > 0:
+        norm_cfg = dict(type='GN', num_groups=8, requires_grad=True)
+        print(f"🔍 Detected GroupNorm (num_groups=8)")
+    elif len(bn_keys) > 0:
+        norm_cfg = dict(type='BN', requires_grad=True)
+        print(f"🔍 Detected BatchNorm")
+    else:
+        # Fallback: check first conv norm
+        norm_key = next((k for k in state_dict.keys() if 'stem.0' in k and ('gn.' in k or 'bn.' in k)), None)
+        if norm_key and '.gn.' in norm_key:
+            norm_cfg = dict(type='GN', num_groups=8, requires_grad=True)
+            print(f"🔍 Inferred GroupNorm from keys")
+        else:
+            norm_cfg = dict(type='BN', requires_grad=True)
+            print(f"⚠️  Using default BatchNorm")
 
+    print(f"✅ Building model with:")
+    print(f"   channels={channels}")
+    print(f"   norm_cfg={norm_cfg}")
+    
     # Build model
     backbone_cfg = {
         'in_channels': 3,
-        'channels': channels,  # ← Dùng detected channels
+        'channels': channels,
         'ppm_channels': 128,
         'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
         'dwsa_stages': ['stage5', 'stage6'],
@@ -272,18 +290,19 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
         'ms_branch_ratio': 8,
         'ms_alpha': 0.1,
         'align_corners': False,
+        'norm_cfg': norm_cfg,  # ← USE DETECTED
         'deploy': False
     }
 
     head_cfg = {
         'in_channels': channels * 4,
         'c1_channels': channels,
-        'c2_channels': c2_channels,
+        'c2_channels': channels,
         'decoder_channels': 128,
         'num_classes': num_classes,
         'dropout_ratio': 0.1,
         'use_gated_fusion': True,
-        'norm_cfg': dict(type='BN', requires_grad=True),
+        'norm_cfg': norm_cfg,  # ← USE DETECTED
         'act_cfg': dict(type='ReLU', inplace=False),
         'align_corners': False,
     }
@@ -293,17 +312,25 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
     head = GCNetHead(**head_cfg)
     model = Segmentor(backbone, head, aux_head=None)
 
-    # ✅ LOAD với strict=False
+    # Load state dict
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     
     if missing:
-        print(f"⚠️  Missing {len(missing)} keys (BN stats will be recalculated)")
-    if unexpected:
-        print(f"⚠️  Unexpected {len(unexpected)} keys")
+        # Check if missing keys are only BN stats (normal for GN)
+        bn_missing = [k for k in missing if 'running_mean' in k or 'running_var' in k or 'num_batches_tracked' in k]
+        other_missing = [k for k in missing if k not in bn_missing]
+        
+        if len(other_missing) > 0:
+            print(f"⚠️  Missing {len(other_missing)} NON-BN keys:")
+            for k in other_missing[:5]:
+                print(f"   - {k}")
+        
+        if len(bn_missing) > 0 and norm_cfg['type'] == 'GN':
+            print(f"✅ Missing {len(bn_missing)} BN stats is OK (using GroupNorm)")
     
     print(f"✅ Model loaded successfully!")
 
-    # Print checkpoint info
+    # Metadata
     if 'epoch' in checkpoint:
         print(f"   Epoch: {checkpoint['epoch']}")
     if 'best_miou' in checkpoint:
