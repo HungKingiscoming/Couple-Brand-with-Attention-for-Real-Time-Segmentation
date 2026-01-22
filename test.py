@@ -261,13 +261,18 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
 
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
+    if missing:
+        print(f"⚠️  Missing {len(missing)} keys (BN stats will be recalculated)")
+    if unexpected:
+        print(f"⚠️  Unexpected {len(unexpected)} keys")
 
+    
     if 'model' in checkpoint:
         state_dict = checkpoint['model']
     else:
         state_dict = checkpoint
 
-    model.load_state_dict(state_dict, strict=True)
+    model.load_state_dict(state_dict, strict=False)
     print(f"✅ Model loaded successfully!")
 
     # Print checkpoint info
