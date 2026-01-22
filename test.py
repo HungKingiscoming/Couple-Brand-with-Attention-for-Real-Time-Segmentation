@@ -301,8 +301,8 @@ def load_model(checkpoint_path, num_classes, channels=32, device='cuda', auto_de
 
     head_cfg = {
         'in_channels': channels * 4,
-        'c1_channels': c1_channels_ckpt,
-        'c2_channels': c2_channels_ckpt,
+        'c1_channels': channels,
+        'c2_channels': c2_channels,
         'decoder_channels': 128,
         'num_classes': num_classes,
         'dropout_ratio': 0.1,
