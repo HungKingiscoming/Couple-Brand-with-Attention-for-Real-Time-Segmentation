@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from model.backcbone.model.norm import evaluate_with_bn_warmup, fix_checkpoint_add_bn_stats
+
 from components.components import (
     ConvModule,
     BaseModule,
