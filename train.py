@@ -551,7 +551,45 @@ class Trainer:
     
         self.loss_phase = phase
         print(f"Ã°Å¸â€œâ€° Loss phase: {phase} (CE={self.ce_weight}, Dice={self.dice_weight})")
-    
+    # Thêm vào class Trainer (sau __init__):
+    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
+        """✅ Load checkpoint - Compatible với optimized saves"""
+        print(f"📂 Loading checkpoint: {checkpoint_path}")
+        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+        
+        # Load model weights
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # Load optimizer/scheduler (optional)
+        if load_optimizer:
+            if 'optimizer' in checkpoint:
+                try:
+                    self.optimizer.load_state_dict(checkpoint['optimizer'])
+                    print("✅ Optimizer loaded")
+                except ValueError:
+                    print("⚠️  Optimizer incompatible, skipped")
+            
+            if self.scheduler and 'scheduler' in checkpoint:
+                try:
+                    self.scheduler.load_state_dict(checkpoint['scheduler'])
+                    print("✅ Scheduler loaded")
+                except ValueError:
+                    print("⚠️  Scheduler skipped")
+        
+        # Resume training state
+        if not reset_epoch:
+            self.start_epoch = checkpoint.get('epoch', 0) - 1
+            self.global_step = checkpoint.get('global_step', 0)
+            self.best_miou = checkpoint.get('best_miou', 0.0)
+            print(f"✅ Resumed from epoch {self.start_epoch + 1}")
+        
+        if reset_best_metric:
+            self.best_miou = 0.0
+            print("🔄 Best mIoU reset to 0")
+        
+        print(f"✅ Checkpoint loaded successfully!")
+
     def _print_config(self, loss_cfg):
         print(f"\n{'='*70}")
         print("TRAINER CONFIGURATION")
