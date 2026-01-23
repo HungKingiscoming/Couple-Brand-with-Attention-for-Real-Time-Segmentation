@@ -781,16 +781,17 @@ class Trainer:
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
-        checkpoint = {
-            'epoch': epoch,
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler': self.scaler.state_dict(),
-            'best_miou': self.best_miou,
-            'metrics': metrics,
-            'global_step': self.global_step
-        }
+        save_checkpoint_with_correct_norm(
+        model=self.model,
+        optimizer=self.optimizer,
+        scheduler=self.scheduler,
+        scaler=self.scaler,
+        epoch=epoch,
+        metrics=metrics,
+        save_path=self.save_dir / "last.pth",
+        global_step=self.global_step,
+        best_miou=self.best_miou
+    )
         
         torch.save(checkpoint, self.save_dir / "last.pth")
         
