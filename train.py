@@ -488,7 +488,7 @@ def main():
         num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w),
         pin_memory=True,
-        dataset_type=args.dataset_type
+        dataset_type=args.dataset_type,
         compute_class_weights=False
     )
     
