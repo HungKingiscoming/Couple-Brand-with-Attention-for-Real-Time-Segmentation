@@ -778,25 +778,32 @@ class Trainer:
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
+        """✅ REFERENCE-READY checkpoint"""
+        model_state = self.model.state_dict()
+        
+        # Verify trước save
+        bn_keys = [k for k in model_state if 'running' in k.lower()]
+        assert len(bn_keys) == 0, f"❌ BN stats detected: {bn_keys[:3]}"
+        
         checkpoint = {
-            'epoch': epoch,
-            'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler': self.scaler.state_dict(),
+            'epoch': epoch + 1,
             'best_miou': self.best_miou,
-            'metrics': metrics,
-            'global_step': self.global_step
+            'model_state_dict': model_state,  # Clean name
+            'norm_type': 'GroupNorm',
+            'input_size': (512, 1024),
+            'classes': self.args.num_classes,
         }
         
-        torch.save(checkpoint, self.save_dir / "last.pth")
+        # Save 2 files
+        ckpt_path = self.save_dir / f"ckpt_epoch_{epoch+1:03d}.pth"
+        model_path = self.save_dir / f"model_epoch_{epoch+1:03d}.pth"
         
-        if is_best:
-            torch.save(checkpoint, self.save_dir / "best.pth")
-            print(f" Best model saved! mIoU: {metrics['miou']:.4f}")
+        torch.save(checkpoint, ckpt_path)
+        torch.save(model_state, model_path)  # Pure model cho reference
         
-        if (epoch + 1) % self.args.save_interval == 0:
-            torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
+        size_ckpt = ckpt_path.stat().st_size / 1e6
+        size_model = model_path.stat().st_size / 1e6
+        print(f"💾 Saved | CKPT: {size_ckpt:.1f}MB | MODEL: {size_model:.1f}MB")
 
     def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
