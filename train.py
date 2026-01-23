@@ -496,7 +496,7 @@ def main():
     backbone = GCNetWithEnhance(**cfg['backbone']).to(device)
     
     cfg['head'].update({'in_channels': 128, 'c1_channels': 32, 'c2_channels': 32, 'num_classes': args.num_classes})
-    cfg['auxhead'].update({'in_channels': 128, 'num_classes': args.num_classes})
+    cfg['auxhead'].update({'in_channels': 64, 'num_classes': args.num_classes})
     
     model = Segmentor(
         backbone=backbone,
