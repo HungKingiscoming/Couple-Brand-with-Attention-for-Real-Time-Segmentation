@@ -3,42 +3,49 @@ import torch.nn as nn
 
 
 def replace_bn_with_gn(model, ch_per_group=8, eps=1e-5):
-    """✅ NO clamp: Natural scaling theo channels"""
-    gn_count = bn_count = 0
+    """✅ PRODUCTION READY - Your logic + fixes"""
+    bn_count = gn_count = 0
     
     def convert(m):
-        nonlocal gn_count, bn_count
+        nonlocal bn_count, gn_count
         
         for name, child in m.named_children():
             if isinstance(child, (nn.BatchNorm2d, nn.SyncBatchNorm)):
                 bn_count += 1
                 C = child.num_features
                 
-                # ✅ PURE DYNAMIC: KHÔNG clamp!
-                num_groups = C // ch_per_group  # 32→4, 64→8, 128→16
+                num_groups = max(1, C // ch_per_group)
                 
-                # Ensure divisible (rare case)
+                # ✅ Ensure divisible (optimized)
+                original_g = num_groups
                 while num_groups > 0 and C % num_groups != 0:
                     num_groups -= 1
                 
-                if num_groups == 0: num_groups = 1  # LayerNorm fallback
-                
                 gn = nn.GroupNorm(num_groups, C, eps=eps)
-                gn.weight.data.copy_(child.weight.data)
-                gn.bias.data.copy_(child.bias.data)
+                
+                # ✅ SAFE copy (check exists)
+                if hasattr(child, 'weight') and child.weight is not None:
+                    gn.weight.data.copy_(child.weight.data)
+                if hasattr(child, 'bias') and child.bias is not None:
+                    gn.bias.data.copy_(child.bias.data)
                 
                 setattr(m, name, gn)
                 gn_count += 1
                 
                 ratio = C // num_groups
-                print(f"✅ BN{C} → GN{num_groups} ({ratio}ch/group)")
+                print(f"✅ BN{C} → GN{num_groups} ({ratio}ch)")
             
             else:
                 convert(child)
     
     convert(model)
-    print(f"\n✅ Natural GN: {bn_count}→{gn_count}")
-    return gn_count
+    
+    # ✅ FINAL VERIFY
+    bn_left = sum(1 for m in model.modules() if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)))
+    assert bn_left == 0, f"❌ {bn_left} BN left!"
+    
+    print(f"\n🎯 SUCCESS: {bn_count}→{gn_count} GN | 0 BN remaining")
+    return model 
 
 
 def init_weights(module):
