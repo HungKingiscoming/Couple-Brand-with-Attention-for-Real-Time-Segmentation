@@ -445,8 +445,15 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train_txt", required=True)
     parser.add_argument("--val_txt", required=True)
+    parser.add_argument("--dataset_type", type=str, default="normal", 
+                        choices=["normal", "foggy"])
     parser.add_argument("--pretrained_weights", type=str, default=None)
     parser.add_argument("--freeze_backbone", action="store_true")
+    parser.add_argument("--use_discriminative_lr", action="store_true", default=False)
+    parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
+    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--log_interval", type=int, default=50)
+    parser.add_argument("--freeze_epochs", type=int, default=0)
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--accumulation_steps", type=int, default=4)
@@ -481,6 +488,7 @@ def main():
         num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w),
         pin_memory=True,
+        dataset_type=args.dataset_type
         compute_class_weights=False
     )
     
@@ -502,13 +510,20 @@ def main():
     if args.pretrained_weights:
         load_pretrained_gcnet_core(model, args.pretrained_weights)
     
-    if args.freeze_backbone:
+    if args.freeze_backbone or args.freeze_epochs > 0:
         freeze_backbone(model)
     
     count_trainable_params(model)
     
     # Optimizer
-    optimizer = setup_discriminative_lr(model, args.lr, 0.1, args.weight_decay)
+    if args.use_discriminative_lr:
+        optimizer = setup_discriminative_lr(
+            model, args.lr, args.backbone_lr_factor, args.weight_decay
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
     
     # Scheduler
     total_steps = len(train_loader) * args.epochs
@@ -520,6 +535,12 @@ def main():
     trainer = Trainer(model, optimizer, scheduler, device, args, class_weights)
     
     for epoch in range(args.epochs):
+        # ✅ Unfreeze sau freeze_epochs
+        if epoch == args.freeze_epochs and args.freeze_epochs > 0:
+            print(f"\n🔓 Unfreezing backbone at epoch {epoch+1}")
+            for param in model.backbone.parameters():
+                param.requires_grad = True
+        
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics = trainer.validate(val_loader, epoch)
         
@@ -529,7 +550,9 @@ def main():
         if is_best:
             trainer.best_miou = val_metrics['miou']
         
-        trainer.save_checkpoint(epoch, val_metrics, is_best)
+        # ✅ SỬ DỤNG save_interval
+        if (epoch + 1) % args.save_interval == 0 or is_best:
+            trainer.save_checkpoint(epoch, val_metrics, is_best)
     
     print(f"Training done! Best mIoU: {trainer.best_miou:.4f}")
 
