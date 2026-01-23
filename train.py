@@ -41,7 +41,7 @@ from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
-    print(f"Ã°Å¸â€œÂ¥ Loading pretrained weights from: {ckpt_path}")
+    print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
@@ -87,20 +87,20 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     rate = 100 * loaded / total if total > 0 else 0.0
 
     print(f"\n{'='*70}")
-    print("Ã°Å¸â€œÅ  WEIGHT LOADING SUMMARY")
+    print("WEIGHT LOADING SUMMARY")
     print(f"{'='*70}")
     print(f"Loaded:   {loaded:>5} / {total} params ({rate:.1f}%)")
     print(f"Skipped:  {len(skipped):>5} params from checkpoint")
     print(f"{'='*70}")
 
     if rate < 50:
-        print("Ã¢Å¡ Ã¯Â¸Â  WARNING: Less than 50% params loaded!")
-        print(f"   First 5 skipped keys: {skipped[:5]}")
+        print("WARNING: Less than 50% params loaded!")
+        print(f"First 5 skipped keys: {skipped[:5]}")
 
     missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
 
     if missing:
-        print(f"\nÃ¢Å¡ Ã¯Â¸Â  Missing keys in model ({len(missing)}):")
+        print(f"\nMissing keys in model ({len(missing)}):")
         for key in missing[:10]:
             print(f"   - {key}")
         if len(missing) > 10:
@@ -195,20 +195,17 @@ def setup_memory_efficient_training():
 def freeze_backbone(model):
     for param in model.backbone.parameters():
         param.requires_grad = False
-    print("Ã°Å¸â€â€™ Backbone FROZEN")
+    print("Backbone FROZEN")
 def print_backbone_structure(model):
-    """In ra cÃ¡ÂºÂ¥u trÃƒÂºc backbone Ã„â€˜Ã¡Â»Æ’ debug"""
     print(f"\n{'='*70}")
-    print("Ã°Å¸â€Â BACKBONE STRUCTURE")
+    print("BACKBONE STRUCTURE")
     print(f"{'='*70}")
     
-    for name, module in model.backbone.named_children():
-        print(f"Ã¢â€Å“Ã¢â€â‚¬ {name}: {type(module).__name__}")
-        
+    for name, module in model.backbone.named_children():        
         # If ModuleList
         if isinstance(module, nn.ModuleList):
             for i, submodule in enumerate(module):
-                print(f"Ã¢â€â€š  Ã¢â€â€Ã¢â€â‚¬ [{i}]: {type(submodule).__name__}")
+                print(f"‚¬ [{i}]: {type(submodule).__name__}")
     
     print(f"{'='*70}\n")
 
@@ -263,7 +260,7 @@ def unfreeze_backbone_progressive(model, stage_names):
         
         # If still not found, skip
         if module is None:
-            print(f"Ã¢Å¡ Ã¯Â¸Â  Module '{stage_name}' not found")
+            print(f"Module '{stage_name}' not found")
             continue
         
         # Unfreeze parameters
@@ -280,34 +277,34 @@ def unfreeze_backbone_progressive(model, stage_names):
 
     # Summary
     if unfrozen_modules:
-        print(f"\nÃ°Å¸â€â€œ Total: {len(unfrozen_modules)} modules, {unfrozen_params:,} params unfrozen")
+        print(f"\nTotal: {len(unfrozen_modules)} modules, {unfrozen_params:,} params unfrozen")
     else:
-        print(f"\nÃ¢Å¡ Ã¯Â¸Â  WARNING: No modules were unfrozen!")
+        print(f"\nWARNING: No modules were unfrozen!")
     
     return unfrozen_params
 def print_available_modules(model):
     """Debug helper - print all available modules in backbone"""
     print(f"\n{'='*70}")
-    print("Ã°Å¸â€œâ€¹ AVAILABLE BACKBONE MODULES")
+    print("AVAILABLE BACKBONE MODULES")
     print(f"{'='*70}")
     
-    print("\n1Ã¯Â¸ÂÃ¢Æ’Â£ At model.backbone level:")
+    print("\n At model.backbone level:")
     for name, module in model.backbone.named_children():
         if module is not None:
             param_count = sum(p.numel() for p in module.parameters())
-            print(f"   Ã¢â€Å“Ã¢â€â‚¬ {name}: {type(module).__name__} ({param_count:,} params)")
+            print(f"‚¬ {name}: {type(module).__name__} ({param_count:,} params)")
     
-    print("\n2Ã¯Â¸ÂÃ¢Æ’Â£ At model.backbone.backbone level (GCNetCore):")
+    print("\nAt model.backbone.backbone level (GCNetCore):")
     if hasattr(model.backbone, 'backbone'):
         for name, module in model.backbone.backbone.named_children():
             if isinstance(module, nn.ModuleList):
-                print(f"   Ã¢â€Å“Ã¢â€â‚¬ {name}: ModuleList[{len(module)}]")
+                print(f"‚¬ {name}: ModuleList[{len(module)}]")
                 for i, submodule in enumerate(module):
                     param_count = sum(p.numel() for p in submodule.parameters())
-                    print(f"   Ã¢â€â€š  Ã¢â€â€Ã¢â€â‚¬ [{i}]: {type(submodule).__name__} ({param_count:,} params)")
+                    print(f"‚¬ [{i}]: {type(submodule).__name__} ({param_count:,} params)")
             elif module is not None:
                 param_count = sum(p.numel() for p in module.parameters())
-                print(f"   Ã¢â€Å“Ã¢â€â‚¬ {name}: {type(module).__name__} ({param_count:,} params)")
+                print(f"‚¬ {name}: {type(module).__name__} ({param_count:,} params)")
     
     print(f"{'='*70}\n")
 
@@ -350,7 +347,7 @@ def count_trainable_params(model):
         aux_trainable = sum(p.numel() for p in aux_attr.parameters() if p.requires_grad)
     
     print("=" * 70)
-    print("ðŸ“Š PARAMETER STATISTICS")
+    print("PARAMETER STATISTICS")
     print("=" * 70)
     print(f"Total:        {total:15,} | 100%")
     print(f"Trainable:    {trainable:15,} | {100*trainable/total:.1f}%")
@@ -383,7 +380,7 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
     
     if len(backbone_params) == 0:
         optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
-        print(f"Ã¢Å¡â„¢Ã¯Â¸Â  Optimizer: AdamW (lr={base_lr}) - head only")
+        print(f"Optimizer: AdamW (lr={base_lr}) - head only")
     else:
         backbone_lr = base_lr * backbone_lr_factor
         param_groups = [
@@ -392,9 +389,9 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
         ]
         optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
         
-        print(f"Ã¢Å¡â„¢Ã¯Â¸Â  Optimizer: AdamW (Discriminative LR)")
-        print(f"   Ã¢â€Å“Ã¢â€â‚¬ Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
-        print(f"   Ã¢â€â€Ã¢â€â‚¬ Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
+        print(f"Optimizer: AdamW (Discriminative LR)")
+        print(f"‚¬ Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
+        print(f"‚¬ Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
     
     return optimizer
 
@@ -417,7 +414,7 @@ def check_gradients(model, threshold=10.0):
     total_norm = total_norm ** 0.5
     
     if max_grad > threshold:
-        print(f"Ã¢Å¡ Ã¯Â¸Â  Large gradient detected: {max_grad_name[:50]}... = {max_grad:.2f}")
+        print(f"Large gradient detected: {max_grad_name[:50]}... = {max_grad:.2f}")
     
     return max_grad, total_norm
 
@@ -557,14 +554,14 @@ class Trainer:
     
     def _print_config(self, loss_cfg):
         print(f"\n{'='*70}")
-        print("Ã¢Å¡â„¢Ã¯Â¸Â  TRAINER CONFIGURATION")
+        print("TRAINER CONFIGURATION")
         print(f"{'='*70}")
-        print(f"Ã°Å¸â€œÂ¦ Batch size: {self.args.batch_size}")
-        print(f"Ã°Å¸â€Â Gradient accumulation: {self.args.accumulation_steps}")
-        print(f"Ã°Å¸â€œÅ  Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
-        print(f"Ã¢Å¡Â¡ Mixed precision: {self.args.use_amp}")
-        print(f"Ã¢Å“â€šÃ¯Â¸Â  Gradient clipping: {self.args.grad_clip}")
-        print(f"Ã°Å¸â€œâ€° Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
+        print(f"Batch size: {self.args.batch_size}")
+        print(f"Gradient accumulation: {self.args.accumulation_steps}")
+        print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
+        print(f"Mixed precision: {self.args.use_amp}")
+        print(f"Gradient clipping: {self.args.grad_clip}")
+        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -630,7 +627,7 @@ class Trainer:
     
             # FIX 1: Check NaN BEFORE backward
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nÃ¢Å¡ Ã¯Â¸Â  NaN/Inf loss at epoch {epoch}, batch {batch_idx}")
+                print(f"\n Inf loss at epoch {epoch}, batch {batch_idx}")
                 print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
@@ -687,7 +684,7 @@ class Trainer:
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
         
-        print(f"\nÃ°Å¸â€œÅ  Epoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
+        print(f"\nEpoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
         
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
@@ -796,7 +793,7 @@ class Trainer:
         
         if is_best:
             torch.save(checkpoint, self.save_dir / "best.pth")
-            print(f"Ã¢Å“â€¦ Best model saved! mIoU: {metrics['miou']:.4f}")
+            print(f" Best model saved! mIoU: {metrics['miou']:.4f}")
         
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
@@ -810,15 +807,15 @@ class Trainer:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
             except ValueError as e:
-                print(f"Ã¢Å¡ Ã¯Â¸Â  Optimizer state not loaded: {e}")
+                print(f" Optimizer state not loaded: {e}")
         else:
-            print("Ã¢Å¡ Ã¯Â¸Â  Skipping optimizer state loading.")
+            print("Skipping optimizer state loading.")
 
         if 'scaler' in checkpoint and checkpoint['scaler'] is not None and load_optimizer:
             try:
                 self.scaler.load_state_dict(checkpoint['scaler'])
             except Exception as e:
-                print(f"Ã¢Å¡ Ã¯Â¸Â  AMP scaler state not loaded: {e}")
+                print(f" AMP scaler state not loaded: {e}")
 
         if reset_epoch:
             self.start_epoch = 0
@@ -827,7 +824,7 @@ class Trainer:
                 self.best_miou = 0.0
             else:
                 self.best_miou = checkpoint.get('best_miou', 0.0)
-            print(f"Ã¢Å“â€¦ Weights loaded from epoch {checkpoint['epoch']}, starting from epoch 0")
+            print(f"Weights loaded from epoch {checkpoint['epoch']}, starting from epoch 0")
         else:
             self.start_epoch = checkpoint['epoch'] + 1
             self.best_miou = checkpoint.get('best_miou', 0.0)
@@ -836,8 +833,8 @@ class Trainer:
                 try:
                     self.scheduler.load_state_dict(checkpoint['scheduler'])
                 except Exception as e:
-                    print(f"Ã¢Å¡ Ã¯Â¸Â  Scheduler state not loaded: {e}")
-            print(f"Ã¢Å“â€¦ Checkpoint loaded, resuming from epoch {self.start_epoch}")
+                    print(f"Scheduler state not loaded: {e}")
+            print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
 def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
@@ -889,23 +886,23 @@ def model_soup(checkpoint_paths, device='cpu'):
     
     first_ckpt = torch.load(checkpoint_paths[0], map_location=device, weights_only=False)
     avg_state_dict = first_ckpt['model'].copy()
-    print(f"Ã¢Å“â€œ {checkpoint_paths[0]}")
+    print(f"{checkpoint_paths[0]}")
     
     # FIX: Convert keys() to list BEFORE iterating
     all_keys = list(avg_state_dict.keys())
     
     for ckpt_path in checkpoint_paths[1:]:
-        print(f"Ã¢Å“â€œ {ckpt_path}")
+        print(f"{ckpt_path}")
         ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
         state_dict = ckpt['model']
         for key in all_keys:  # Ã¢â€ Â Use list, not dict_keys
             avg_state_dict[key] += state_dict[key]
     
     # Divide by number of models
-    for key in all_keys:  # Ã¢â€ Â Use list here too
+    for key in all_keys: 
         avg_state_dict[key] /= len(checkpoint_paths)
     
-    print("Ã¢Å“â€œ Soup created!")
+    print("Soup created!")
     print("=" * 70)
     return avg_state_dict
 
@@ -984,30 +981,30 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print(f"Ã°Å¸Å¡â‚¬ GCNetWithEnhance Training - FIXED VERSION")
+    print(f"‚¬ GCNetWithEnhance Training - FIXED VERSION")
     print(f"{'='*70}")
-    print(f"Ã°Å¸â€œÂ± Device: {device}")
-    print(f"Ã°Å¸â€“Â¼Ã¯Â¸Â  Image size: {args.img_h}x{args.img_w}")
-    print(f"Ã°Å¸â€œÅ  Epochs: {args.epochs}")
-    print(f"Ã¢Å¡Â¡ Scheduler: {args.scheduler}")
-    print(f"Ã¢Å“â€šÃ¯Â¸Â  Gradient clipping: {args.grad_clip}")  # Ã¢â€ Â SHOW
-    print(f"Ã¢Ââ€žÃ¯Â¸Â  Freeze backbone: {args.freeze_backbone}")
+    print(f" Device: {device}")
+    print(f" Image size: {args.img_h}x{args.img_w}")
+    print(f"Epochs: {args.epochs}")
+    print(f"Scheduler: {args.scheduler}")
+    print(f"Gradient clipping: {args.grad_clip}")  # Ã¢â€ Â SHOW
+    print(f"Freeze backbone: {args.freeze_backbone}")
     if args.unfreeze_schedule:
-        print(f"Ã°Å¸â€œâ€¦ Unfreeze schedule: {args.unfreeze_schedule}")
-    print(f"Ã°Å¸â€â‚¬ Discriminative LR: {args.use_discriminative_lr} (factor={args.backbone_lr_factor})")
+        print(f" Unfreeze schedule: {args.unfreeze_schedule}")
+    print(f"‚¬ Discriminative LR: {args.use_discriminative_lr} (factor={args.backbone_lr_factor})")
     print(f"{'='*70}\n")
     
     # Config
     cfg = ModelConfig.get_base_config()
     args.loss_config = cfg['loss']
     
-    print(f"Ã°Å¸â€Â§ Model Config:")
-    print(f"   Ã¢â€Å“Ã¢â€â‚¬ DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
-    print(f"   Ã¢â€Å“Ã¢â€â‚¬ DWSA drop: {cfg['backbone']['dwsa_drop']}")
-    print(f"   Ã¢â€â€Ã¢â€â‚¬ MS alpha: {cfg['backbone']['ms_alpha']}\n")
+    print(f"Model Config:")
+    print(f"DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
+    print(f"DWSA drop: {cfg['backbone']['dwsa_drop']}")
+    print(f"MS alpha: {cfg['backbone']['ms_alpha']}\n")
     
     # Dataloaders
-    print(f"Ã°Å¸â€œâ€š Creating dataloaders...")
+    print(f"Creating dataloaders...")
     train_loader, val_loader, class_weights = create_dataloaders(
         train_txt=args.train_txt,
         val_txt=args.val_txt,
@@ -1018,11 +1015,11 @@ def main():
         compute_class_weights=args.use_class_weights,
         dataset_type=args.dataset_type
     )
-    print(f"Ã¢Å“â€¦ Dataloaders created\n")
+    print(f" Dataloaders created\n")
     
     # Model
     print(f"{'='*70}")
-    print("Ã°Å¸Ââ€”Ã¯Â¸Â  BUILDING MODEL")
+    print("BUILDING MODEL")
     print(f"{'='*70}\n")
     
     backbone = GCNetWithEnhance(**cfg['backbone']).to(device)
@@ -1045,23 +1042,23 @@ def main():
     model = Segmentor(
         backbone=backbone,
         head=GCNetHead(**head_cfg),
-        aux_head=GCNetAuxHead(**aux_head_cfg),  # Ã¢Å“â€¦ Ã„â€˜ÃƒÂºng: aux_head
+        aux_head=GCNetAuxHead(**aux_head_cfg),  
     )
     
-    print("\nÃ°Å¸â€Â§ Applying Optimizations...")
-    print("   Ã¢â€Å“Ã¢â€â‚¬ Converting BN Ã¢â€ â€™ GN")
+    print("\nApplying Optimizations...")
+    print("Converting BN Ã¢â€ â€™ GN")
     model = replace_bn_with_gn(model)
     
-    print("   Ã¢â€Å“Ã¢â€â‚¬ Kaiming Init")
+    print("Kaiming Init")
     model.apply(init_weights)
     
-    print("   Ã¢â€â€Ã¢â€â‚¬ Health Check")
+    print("Health Check")
     check_model_health(model)
     print()
     
     # Transfer Learning
     print(f"{'='*70}")
-    print("Ã°Å¸â€â€ž TRANSFER LEARNING SETUP")
+    print("TRANSFER LEARNING SETUP")
     print(f"{'='*70}\n")
     
     if args.pretrained_weights:
@@ -1072,7 +1069,7 @@ def main():
         print()
     
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Ã°Å¸â€œÅ  Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     count_trainable_params(model)
     
     # Test forward
@@ -1081,12 +1078,12 @@ def main():
         sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         try:
             outputs = model.forward_train(sample)
-            print(f"Ã¢Å“â€¦ Forward pass successful!")
+            print(f"Forward pass successful!")
             print(f"   Main:  {outputs['main'].shape}")
             if 'aux' in outputs:
                 print(f"   Aux:   {outputs['aux'].shape}\n")
         except Exception as e:
-            print(f"Ã¢ÂÅ’ Forward pass FAILED: {e}\n")
+            print(f" Forward pass FAILED: {e}\n")
             return
     
     # Optimizer
@@ -1104,7 +1101,7 @@ def main():
             weight_decay=args.weight_decay,
             betas=(0.9, 0.999)
         )
-        print(f"Ã¢Å¡â„¢Ã¯Â¸Â  Optimizer: AdamW (lr={args.lr})")
+        print(f"Optimizer: AdamW (lr={args.lr})")
     
     # Scheduler
     if args.scheduler == 'onecycle':
@@ -1133,14 +1130,14 @@ def main():
             div_factor=25,
             final_div_factor=100000,
         )
-        print(f"Ã¢Å“â€¦ OneCycleLR (total_steps={total_steps})")
+        print(f"OneCycleLR (total_steps={total_steps})")
     elif args.scheduler == 'poly':
-        print(f"Ã¢Å“â€¦ Polynomial LR decay")
+        print(f" Polynomial LR decay")
         def poly_lr_lambda(epoch):
             return (1 - epoch / args.epochs) ** 0.9
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
     else:
-        print(f"Ã¢Å“â€¦ Cosine Annealing LR")
+        print(f"Cosine Annealing LR")
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6
         )
@@ -1166,7 +1163,7 @@ def main():
     
     # Training loop
     print(f"\n{'='*70}")
-    print("Ã°Å¸Å¡â‚¬ STARTING TRAINING")
+    print(" STARTING TRAINING")
     print(f"{'='*70}\n")
     
     unfreeze_epochs = []
@@ -1187,7 +1184,7 @@ def main():
 
     if args.use_swa and args.epochs > swa_start:
         print(f"{'='*70}")
-        print("Ã°Å¸â€œÅ  STOCHASTIC WEIGHT AVERAGING (SWA) ENABLED")
+        print("STOCHASTIC WEIGHT AVERAGING (SWA) ENABLED")
         print(f"{'='*70}")
         print(f"SWA Start Epoch: {swa_start}")
         print(f"SWA LR: {args.swa_lr:.2e}")
@@ -1219,9 +1216,8 @@ def main():
                 unfreeze_backbone_progressive(model, targets)
                 trainer.set_loss_phase('ce_only')
                 
-                # FIX: Print LR cÃ¡Â»Â§a tÃ¡Â»Â«ng group sau unfreeze
                 print(f"\n{'='*70}")
-                print(f"Ã°Å¸â€œÅ  Learning Rates after unfreezing:")
+                print(f"Learning Rates after unfreezing:")
                 print(f"{'='*70}")
                 for i, group in enumerate(optimizer.param_groups):
                     name = group.get('name', f'group_{i}')
@@ -1248,12 +1244,11 @@ def main():
                 scheduler.step()
     
         # ===== VALIDATION =====
-        # DÃƒÂ¹ng multi-scale cho cÃƒÂ¡c epoch cuÃ¡Â»â€˜i nÃ¡ÂºÂ¿u muÃ¡Â»â€˜n auto
         use_ms = (epoch >= args.epochs - 5) or args.use_multiscale_val
         val_metrics = trainer.validate(val_loader, epoch, use_multiscale=use_ms)
         
         print(f"\n{'='*70}")
-        print(f"Ã°Å¸â€œÅ  Epoch {epoch+1}/{args.epochs}")
+        print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
         print(f"Train - Loss: {train_metrics['loss']:.4f} | "
               f"CE: {train_metrics['ce']:.4f} | "
@@ -1283,7 +1278,7 @@ def main():
     # ===== SWA FINALIZATION =====
     if swa_model is not None:
         print(f"\n{'='*70}")
-        print("Ã°Å¸â€Â§ FINALIZING SWA MODEL")
+        print(" FINALIZING SWA MODEL")
         print(f"{'='*70}")
     
         # Update BN statistics
@@ -1296,10 +1291,10 @@ def main():
             'model': swa_model.module.state_dict(),
             'epoch': args.epochs,
         }, swa_path)
-        print(f"Ã¢Å“â€¦ SWA model saved: {swa_path}")
+        print(f"SWA model saved: {swa_path}")
     
         # Validate SWA model
-        print("\nÃ°Å¸Â§Âª Validating SWA model with multi-scale...")
+        print("\nValidating SWA model with multi-scale...")
         trainer.model = swa_model.module
         swa_metrics = trainer.validate(val_loader, args.epochs, use_multiscale=True)
     
@@ -1310,7 +1305,7 @@ def main():
     # ===== MODEL SOUP =====
     if args.use_model_soup:
         print(f"\n{'='*70}")
-        print("Ã°Å¸ÂÂ² CREATING MODEL SOUP FROM BEST CHECKPOINTS")
+        print(" CREATING MODEL SOUP FROM BEST CHECKPOINTS")
         print(f"{'='*70}")
     
         checkpoint_dir = Path(args.save_dir)
@@ -1336,20 +1331,20 @@ def main():
             # Save soup
             soup_path = checkpoint_dir / "model_soup.pth"
             torch.save({'model': soup_weights}, soup_path)
-            print(f"Ã¢Å“â€¦ Model soup saved: {soup_path}")
+            print(f"Model soup saved: {soup_path}")
     
             # Validate soup
-            print("\nÃ°Å¸Â§Âª Validating Model Soup with multi-scale...")
+            print("\n Validating Model Soup with multi-scale...")
             model.load_state_dict(soup_weights)
             trainer.model = model
             soup_metrics = trainer.validate(val_loader, args.epochs, use_multiscale=True)
     
-            print(f"\nÃ°Å¸â€œÅ  Model Soup Results:")
+            print(f"\n Model Soup Results:")
             print(f"   mIoU: {soup_metrics['miou']:.4f}")
             print(f"   Acc:  {soup_metrics['accuracy']:.4f}")
             print(f"{'='*70}\n")
         else:
-            print(f"Ã¢Å¡ Ã¯Â¸Â  Not enough checkpoints for soup (need Ã¢â€°Â¥2, found {len(best_ckpts)})")
+            print(f" Not enough checkpoints for soup (need Ã¢â€°Â¥2, found {len(best_ckpts)})")
     
 
 if __name__ == "__main__":
