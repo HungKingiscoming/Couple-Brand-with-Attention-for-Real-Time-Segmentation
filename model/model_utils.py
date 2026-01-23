@@ -2,42 +2,47 @@ import torch
 import torch.nn as nn
 
 
-def replace_bn_with_gn(module, num_groups=32):
-    """
-    Recursively replaces all BatchNorm2d layers with GroupNorm.
+def replace_bn_with_gn(model, num_groups=32, eps=1e-5):
+    """✅ RECURSIVE: Convert ALL BN → GN including nested modules"""
+    gn_count = 0
+    bn_count = 0
     
-    This is CRITICAL for training with batch_size < 16.
-    BatchNorm becomes unreliable when batch size is small.
-    GroupNorm works perfectly even with batch_size=1.
-    
-    Args:
-        module: PyTorch module (model)
-        num_groups: Number of groups for GroupNorm (default 32)
-    
-    Returns:
-        Module with GroupNorm instead of BatchNorm
-    
-    Example:
-        >>> model = replace_bn_with_gn(model)
-        >>> print(model)  # Should not have BatchNorm2d anymore
-    """
-    # If the module itself is BatchNorm, replace it
-    if isinstance(module, nn.BatchNorm2d):
-        num_channels = module.num_features
+    def _convert_bn_to_gn_recursive(m):
+        nonlocal gn_count, bn_count
         
-        # Ensure num_groups divides num_channels evenly
-        current_groups = num_groups
-        while num_channels % current_groups != 0:
-            current_groups //= 2
-        
-        # Create GroupNorm with same number of channels
-        return nn.GroupNorm(current_groups, num_channels)
+        for child_name, child in m.named_children():
+            if isinstance(child, (nn.BatchNorm2d, nn.SyncBatchNorm)):
+                bn_count += 1
+                
+                # Create replacement GN
+                gn = nn.GroupNorm(num_groups, child.num_features, eps=eps)
+                
+                # Copy trained params (if any)
+                if child.weight is not None:
+                    gn.weight.data.copy_(child.weight.data)
+                if child.bias is not None:
+                    gn.bias.data.copy_(child.bias.data)
+                
+                # Replace in parent
+                setattr(m, child_name, gn)
+                gn_count += 1
+                
+                print(f"✅ Replaced {child_name}: BN{child.num_features} → GN{g.num_groups}")
+            
+            else:
+                # Recurse vào nested modules (SPP, DWSABlock, etc.)
+                _convert_bn_to_gn_recursive(child)
     
-    # Otherwise, recursively iterate over children
-    for name, child in module.named_children():
-        module.add_module(name, replace_bn_with_gn(child, num_groups))
+    _convert_bn_to_gn_recursive(model)
     
-    return module
+    print(f"🔄 BN→GN Summary: {bn_count} BatchNorm → {gn_count} GroupNorm")
+    if bn_count != gn_count:
+        print("⚠️  WARNING: Incomplete conversion!")
+    
+    # Verify NO BN left
+    remaining_bn = sum(1 for m in model.modules() if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)))
+    print(f"✅ Final check: {remaining_bn} BatchNorm remaining")
+    assert remaining_bn == 0, f"❌ Still {remaining_bn} BatchNorm left!"
 
 
 def init_weights(module):
