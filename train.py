@@ -1053,7 +1053,7 @@ def main():
     )
     
     print("\nApplying Optimizations...")
-    print("Converting BN Ã¢â€ â€™ GN")
+    print("Converting GN")
     model = replace_bn_with_gn(model)
     
     print("Kaiming Init")
