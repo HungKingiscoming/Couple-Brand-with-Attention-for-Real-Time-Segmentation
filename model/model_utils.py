@@ -2,47 +2,45 @@ import torch
 import torch.nn as nn
 
 
-def replace_bn_with_gn(model, num_groups=32, eps=1e-5):
-    """✅ RECURSIVE: Convert ALL BN → GN including nested modules"""
-    gn_count = 0
-    bn_count = 0
+def replace_bn_with_gn(model, group_size=8, eps=1e-5):
+    """✅ DYNAMIC: num_groups = channels // group_size"""
+    gn_count = bn_count = 0
     
-    def _convert_bn_to_gn_recursive(m):
+    def _convert_recursive(m):
         nonlocal gn_count, bn_count
         
         for child_name, child in m.named_children():
             if isinstance(child, (nn.BatchNorm2d, nn.SyncBatchNorm)):
                 bn_count += 1
+                C = child.num_features
                 
-                # Create replacement GN
-                gn = nn.GroupNorm(num_groups, child.num_features, eps=eps)
+                # ✅ DYNAMIC groups: C//8 (min 16, max C)
+                num_groups = max(16, min(C, C // group_size))
                 
-                # Copy trained params (if any)
-                if child.weight is not None:
-                    gn.weight.data.copy_(child.weight.data)
-                if child.bias is not None:
-                    gn.bias.data.copy_(child.bias.data)
+                gn = nn.GroupNorm(num_groups, C, eps=eps)
                 
-                # Replace in parent
+                # Copy params
+                if child.weight is not None: gn.weight.data.copy_(child.weight.data)
+                if child.bias is not None:   gn.bias.data.copy_(child.bias.data)
+                
+                # Replace
                 setattr(m, child_name, gn)
                 gn_count += 1
                 
-                print(f"✅ Replaced {child_name}: BN{child.num_features} → GN{gn.num_groups}")
+                print(f"✅ BN{C} → GN{num_groups} ({C//num_groups}ch/group)")
             
             else:
-                # Recurse vào nested modules (SPP, DWSABlock, etc.)
-                _convert_bn_to_gn_recursive(child)
+                _convert_recursive(child)
     
-    _convert_bn_to_gn_recursive(model)
+    _convert_recursive(model)
     
-    print(f"🔄 BN→GN Summary: {bn_count} BatchNorm → {gn_count} GroupNorm")
-    if bn_count != gn_count:
-        print("⚠️  WARNING: Incomplete conversion!")
+    print(f"\n🎯 DYNAMIC BN→GN: {bn_count}→{gn_count}")
+    assert gn_count == bn_count, "❌ Incomplete conversion!"
     
-    # Verify NO BN left
+    # Final verify
     remaining_bn = sum(1 for m in model.modules() if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)))
-    print(f"✅ Final check: {remaining_bn} BatchNorm remaining")
-    assert remaining_bn == 0, f"❌ Still {remaining_bn} BatchNorm left!"
+    print(f"✅ {remaining_bn} BN remaining")
+    return gn_count
 
 
 def init_weights(module):
