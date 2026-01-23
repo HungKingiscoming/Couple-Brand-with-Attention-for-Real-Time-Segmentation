@@ -1054,7 +1054,7 @@ def main():
     
     print("\nApplying Optimizations...")
     print("Converting BN Ã¢â€ â€™ GN")
-    model = replace_bn_with_gn(model)
+    model = replace_bn_with_gn(model, group_size=8)
     
     print("Kaiming Init")
     model.apply(init_weights)
