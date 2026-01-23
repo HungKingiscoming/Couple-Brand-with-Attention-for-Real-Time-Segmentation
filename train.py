@@ -778,70 +778,34 @@ class Trainer:
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
-        """✅ REFERENCE-READY checkpoint"""
-        model_state = self.model.state_dict()
-        
-        # Verify trước save
-        bn_keys = [k for k in model_state if 'running' in k.lower()]
-        assert len(bn_keys) == 0, f"❌ BN stats detected: {bn_keys[:3]}"
-        
-        checkpoint = {
+    """✅ Chỉ lưu 3 files: last, best, latest_epoch"""
+    model_state = self.model.state_dict()
+    
+    # 1. ALWAYS overwrite 'last.pth'
+    torch.save({
+        'epoch': epoch + 1,
+        'best_miou': self.best_miou,
+        'model_state_dict': model_state,
+        'norm_type': 'GroupNorm',
+    }, self.save_dir / "last.pth")
+    
+    if is_best:
+        # 2. Update 'best.pth' 
+        torch.save({
             'epoch': epoch + 1,
-            'best_miou': self.best_miou,
-            'model_state_dict': model_state,  # Clean name
-            'norm_type': 'GroupNorm',
-            'input_size': (512, 1024),
-            'classes': self.args.num_classes,
-        }
-        
-        # Save 2 files
-        ckpt_path = self.save_dir / f"ckpt_epoch_{epoch+1:03d}.pth"
-        model_path = self.save_dir / f"model_epoch_{epoch+1:03d}.pth"
-        
-        torch.save(checkpoint, ckpt_path)
-        torch.save(model_state, model_path)  # Pure model cho reference
-        
-        size_ckpt = ckpt_path.stat().st_size / 1e6
-        size_model = model_path.stat().st_size / 1e6
-        print(f"💾 Saved | CKPT: {size_ckpt:.1f}MB | MODEL: {size_model:.1f}MB")
+            'best_miou': metrics['miou'],
+            'model_state_dict': model_state,
+        }, self.save_dir / "best.pth")
+        print(f"⭐ BEST mIoU: {metrics['miou']:.4f} → best.pth")
+    
+    # 3. Epoch interval: Chỉ lưu epoch 5,10,15,20... 
+    if (epoch + 1) % 5 == 0:  # args.save_interval = 5
+        torch.save(model_state, self.save_dir / f"epoch_{(epoch+1):03d}.pth")
+        print(f"💾 Epoch {(epoch+1):03d}.pth saved")
+    
+    # 4. Pure model file (deploy)
+    torch.save(model_state, self.save_dir / "model_deploy.pth")
 
-    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-
-        self.model.load_state_dict(checkpoint['model'])
-
-        if load_optimizer and checkpoint.get('optimizer') is not None:
-            try:
-                self.optimizer.load_state_dict(checkpoint['optimizer'])
-            except ValueError as e:
-                print(f" Optimizer state not loaded: {e}")
-        else:
-            print("Skipping optimizer state loading.")
-
-        if 'scaler' in checkpoint and checkpoint['scaler'] is not None and load_optimizer:
-            try:
-                self.scaler.load_state_dict(checkpoint['scaler'])
-            except Exception as e:
-                print(f" AMP scaler state not loaded: {e}")
-
-        if reset_epoch:
-            self.start_epoch = 0
-            self.global_step = 0
-            if reset_best_metric:
-                self.best_miou = 0.0
-            else:
-                self.best_miou = checkpoint.get('best_miou', 0.0)
-            print(f"Weights loaded from epoch {checkpoint['epoch']}, starting from epoch 0")
-        else:
-            self.start_epoch = checkpoint['epoch'] + 1
-            self.best_miou = checkpoint.get('best_miou', 0.0)
-            self.global_step = checkpoint.get('global_step', 0)
-            if self.scheduler and checkpoint.get('scheduler') and load_optimizer:
-                try:
-                    self.scheduler.load_state_dict(checkpoint['scheduler'])
-                except Exception as e:
-                    print(f"Scheduler state not loaded: {e}")
-            print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
 def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
