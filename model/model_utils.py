@@ -27,7 +27,7 @@ def replace_bn_with_gn(model, num_groups=32, eps=1e-5):
                 setattr(m, child_name, gn)
                 gn_count += 1
                 
-                print(f"✅ Replaced {child_name}: BN{child.num_features} → GN{g.num_groups}")
+                print(f"✅ Replaced {child_name}: BN{child.num_features} → GN{gn.num_groups}")
             
             else:
                 # Recurse vào nested modules (SPP, DWSABlock, etc.)
