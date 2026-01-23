@@ -1051,7 +1051,9 @@ def main():
     
     print("Kaiming Init")
     model.apply(init_weights)
-    
+    if args.pretrained_weights:
+        load_rate = load_pretrained_gcnet_core(model, args.pretrained_weights)
+        print(f"✅ Pretrained loaded: {load_rate:.1f}%")
     print("Health Check")
     check_model_health(model)
     print()
