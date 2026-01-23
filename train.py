@@ -778,33 +778,32 @@ class Trainer:
         return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
-    """✅ Chỉ lưu 3 files: last, best, latest_epoch"""
-    model_state = self.model.state_dict()
-    
-    # 1. ALWAYS overwrite 'last.pth'
-    torch.save({
-        'epoch': epoch + 1,
-        'best_miou': self.best_miou,
-        'model_state_dict': model_state,
-        'norm_type': 'GroupNorm',
-    }, self.save_dir / "last.pth")
-    
-    if is_best:
-        # 2. Update 'best.pth' 
+        model_state = self.model.state_dict()
+        
+        # 1. ALWAYS overwrite 'last.pth'
         torch.save({
             'epoch': epoch + 1,
-            'best_miou': metrics['miou'],
+            'best_miou': self.best_miou,
             'model_state_dict': model_state,
-        }, self.save_dir / "best.pth")
-        print(f"⭐ BEST mIoU: {metrics['miou']:.4f} → best.pth")
-    
-    # 3. Epoch interval: Chỉ lưu epoch 5,10,15,20... 
-    if (epoch + 1) % 5 == 0:  # args.save_interval = 5
-        torch.save(model_state, self.save_dir / f"epoch_{(epoch+1):03d}.pth")
-        print(f"💾 Epoch {(epoch+1):03d}.pth saved")
-    
-    # 4. Pure model file (deploy)
-    torch.save(model_state, self.save_dir / "model_deploy.pth")
+            'norm_type': 'GroupNorm',
+        }, self.save_dir / "last.pth")
+        
+        if is_best:
+            # 2. Update 'best.pth' 
+            torch.save({
+                'epoch': epoch + 1,
+                'best_miou': metrics['miou'],
+                'model_state_dict': model_state,
+            }, self.save_dir / "best.pth")
+            print(f"⭐ BEST mIoU: {metrics['miou']:.4f} → best.pth")
+        
+        # 3. Epoch interval: Chỉ lưu epoch 5,10,15,20... 
+        if (epoch + 1) % 5 == 0:  # args.save_interval = 5
+            torch.save(model_state, self.save_dir / f"epoch_{(epoch+1):03d}.pth")
+            print(f"💾 Epoch {(epoch+1):03d}.pth saved")
+        
+        # 4. Pure model file (deploy)
+        torch.save(model_state, self.save_dir / "model_deploy.pth")
 
 
 
