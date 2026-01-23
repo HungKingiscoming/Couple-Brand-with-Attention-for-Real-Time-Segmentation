@@ -2,56 +2,42 @@ import torch
 import torch.nn as nn
 
 
-def replace_bn_with_gn_dynamic(model, group_size=8, eps=1e-5):
-    """✅ FIXED: Always divisible! channels % num_groups == 0"""
+def replace_bn_with_gn(model, ch_per_group=8, eps=1e-5):
+    """✅ NO clamp: Natural scaling theo channels"""
     gn_count = bn_count = 0
     
-    def _convert_recursive(m):
+    def convert(m):
         nonlocal gn_count, bn_count
         
-        for child_name, child in m.named_children():
+        for name, child in m.named_children():
             if isinstance(child, (nn.BatchNorm2d, nn.SyncBatchNorm)):
                 bn_count += 1
                 C = child.num_features
                 
-                # ✅ DYNAMIC + DIVISIBLE
-                candidate_groups = max(1, C // group_size)
-                num_groups = C // candidate_groups  # Round để chia hết
+                # ✅ PURE DYNAMIC: KHÔNG clamp!
+                num_groups = C // ch_per_group  # 32→4, 64→8, 128→16
                 
-                # Fallback: power-of-2 hoặc safe divisors
-                if C % num_groups != 0:
-                    # Tìm largest divisor <= candidate_groups
-                    for g in range(candidate_groups, 0, -1):
-                        if C % g == 0:
-                            num_groups = g
-                            break
-                    else:
-                        num_groups = 1  # LayerNorm fallback
+                # Ensure divisible (rare case)
+                while num_groups > 0 and C % num_groups != 0:
+                    num_groups -= 1
+                
+                if num_groups == 0: num_groups = 1  # LayerNorm fallback
                 
                 gn = nn.GroupNorm(num_groups, C, eps=eps)
+                gn.weight.data.copy_(child.weight.data)
+                gn.bias.data.copy_(child.bias.data)
                 
-                # Copy weights
-                if child.weight is not None: gn.weight.data.copy_(child.weight)
-                if child.bias is not None:   gn.bias.data.copy_(child.bias)
-                
-                setattr(m, child_name, gn)
+                setattr(m, name, gn)
                 gn_count += 1
                 
-                ch_per_group = C // num_groups
-                print(f"✅ BN{C} → GN{num_groups} ({ch_per_group}ch/group)")
+                ratio = C // num_groups
+                print(f"✅ BN{C} → GN{num_groups} ({ratio}ch/group)")
             
             else:
-                _convert_recursive(child)
+                convert(child)
     
-    _convert_recursive(model)
-    print(f"\n🎯 FIXED BN→GN: {bn_count}→{gn_count} | 100% divisible!")
-    
-    # Verify
-    for m in model.modules():
-        if isinstance(m, nn.GroupNorm):
-            assert m.num_channels % m.num_groups == 0, "❌ Non-divisible GN!"
-    
-    print("✅ All GN divisible → NO ERRORS!")
+    convert(model)
+    print(f"\n✅ Natural GN: {bn_count}→{gn_count}")
     return gn_count
 
 
