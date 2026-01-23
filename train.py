@@ -19,7 +19,7 @@ import gc
 import warnings
 import torch_optimizer 
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
-
+from model.backcbone.model.norm import evaluate_with_bn_warmup, fix_checkpoint_add_bn_stats
 warnings.filterwarnings('ignore')
 
 # ============================================
