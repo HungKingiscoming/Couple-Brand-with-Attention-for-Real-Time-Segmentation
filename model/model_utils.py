@@ -2,50 +2,43 @@ import torch
 import torch.nn as nn
 
 
-def replace_bn_with_gn(model, ch_per_group=8, eps=1e-5):
-    """✅ PRODUCTION READY - Your logic + fixes"""
-    bn_count = gn_count = 0
+def replace_bn_with_gn(module, num_groups=32):
+    """
+    Recursively replaces all BatchNorm2d layers with GroupNorm.
     
-    def convert(m):
-        nonlocal bn_count, gn_count
+    This is CRITICAL for training with batch_size < 16.
+    BatchNorm becomes unreliable when batch size is small.
+    GroupNorm works perfectly even with batch_size=1.
+    
+    Args:
+        module: PyTorch module (model)
+        num_groups: Number of groups for GroupNorm (default 32)
+    
+    Returns:
+        Module with GroupNorm instead of BatchNorm
+    
+    Example:
+        >>> model = replace_bn_with_gn(model)
+        >>> print(model)  # Should not have BatchNorm2d anymore
+    """
+    # If the module itself is BatchNorm, replace it
+    if isinstance(module, nn.BatchNorm2d):
+        num_channels = module.num_features
         
-        for name, child in m.named_children():
-            if isinstance(child, (nn.BatchNorm2d, nn.SyncBatchNorm)):
-                bn_count += 1
-                C = child.num_features
-                
-                num_groups = max(1, C // ch_per_group)
-                
-                # ✅ Ensure divisible (optimized)
-                original_g = num_groups
-                while num_groups > 0 and C % num_groups != 0:
-                    num_groups -= 1
-                
-                gn = nn.GroupNorm(num_groups, C, eps=eps)
-                
-                # ✅ SAFE copy (check exists)
-                if hasattr(child, 'weight') and child.weight is not None:
-                    gn.weight.data.copy_(child.weight.data)
-                if hasattr(child, 'bias') and child.bias is not None:
-                    gn.bias.data.copy_(child.bias.data)
-                
-                setattr(m, name, gn)
-                gn_count += 1
-                
-                ratio = C // num_groups
-                print(f"✅ BN{C} → GN{num_groups} ({ratio}ch)")
-            
-            else:
-                convert(child)
+        # Ensure num_groups divides num_channels evenly
+        current_groups = num_groups
+        while num_channels % current_groups != 0:
+            current_groups //= 2
+        
+        # Create GroupNorm with same number of channels
+        return nn.GroupNorm(current_groups, num_channels)
     
-    convert(model)
+    # Otherwise, recursively iterate over children
+    for name, child in module.named_children():
+        module.add_module(name, replace_bn_with_gn(child, num_groups))
     
-    # ✅ FINAL VERIFY
-    bn_left = sum(1 for m in model.modules() if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)))
-    assert bn_left == 0, f"❌ {bn_left} BN left!"
-    
-    print(f"\n🎯 SUCCESS: {bn_count}→{gn_count} GN | 0 BN remaining")
-    return model 
+    return module
+
 
 
 def init_weights(module):
