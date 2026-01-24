@@ -207,10 +207,11 @@ def build_model(num_classes=19, device='cuda'):
     }
     
     # Build backbone
-    backbone = GCNetWithEnhance(**cfg['backbone']).to(device)
+    backbone = GCNetWithEnhance(**cfg['backbone'])
     
     # Detect channels - FIX: Use eval mode and batch_size=2
     backbone.eval()
+    backbone = backbone.to(device)
     with torch.no_grad():
         sample = torch.randn(2, 3, 512, 1024).to(device)
         feats = backbone(sample)
@@ -224,6 +225,9 @@ def build_model(num_classes=19, device='cuda'):
             detected_channels = {k: v.shape[1] for k, v in feats.items()}
         else:
             detected_channels = {'c5': feats.shape[1]}
+    
+    # Move backbone back to CPU before building full model
+    backbone = backbone.cpu()
     
     # Build heads
     head = GCNetHead(
@@ -251,7 +255,12 @@ def build_model(num_classes=19, device='cuda'):
     
     # Build model
     model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
+    
+    # Replace BN with GN BEFORE moving to device
     model = replace_bn_with_gn(model)
+    
+    # Move to device AFTER replace
+    model = model.to(device)
     
     return model
 
