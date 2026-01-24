@@ -47,52 +47,16 @@ class MetricsCalculator:
     
     def reset(self):
         self.confusion_matrix = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
-        self.total_dice = 0.0
-        self.total_samples = 0
     
     def update(self, pred, target):
-        """Update confusion matrix and dice score"""
-        # Confusion matrix for mIoU and accuracy
+        """Update confusion matrix"""
         mask = (target >= 0) & (target < self.num_classes)
         label = self.num_classes * target[mask].astype('int') + pred[mask]
         count = np.bincount(label, minlength=self.num_classes**2)
         self.confusion_matrix += count.reshape(self.num_classes, self.num_classes)
-        
-        # Dice score
-        dice_score = self.compute_dice_per_sample(pred, target)
-        self.total_dice += dice_score
-        self.total_samples += 1
-    
-    def compute_dice_per_sample(self, pred, target):
-        """Compute dice score for a single sample - FIXED"""
-        # Filter out ignore_index
-        valid_mask = (target != self.ignore_index)
-        pred_valid = pred[valid_mask]
-        target_valid = target[valid_mask]
-        
-        if len(target_valid) == 0:
-            return 0.0
-        
-        dice_scores = []
-        
-        for cls in range(self.num_classes):
-            pred_mask = (pred_valid == cls)
-            target_mask = (target_valid == cls)
-            
-            intersection = np.logical_and(pred_mask, target_mask).sum()
-            
-            # Dice formula: 2*intersection / (|A| + |B|)
-            dice_denominator = pred_mask.sum() + target_mask.sum()
-            
-            # Only compute if class appears in prediction OR target
-            if dice_denominator > 0:
-                dice = (2.0 * intersection) / (dice_denominator + 1e-8)
-                dice_scores.append(dice)
-        
-        return np.mean(dice_scores) if dice_scores else 0.0
     
     def get_metrics(self):
-        """Compute final metrics"""
+        """Compute final metrics from confusion matrix"""
         # Per-class IoU
         intersection = np.diag(self.confusion_matrix)
         union = self.confusion_matrix.sum(1) + self.confusion_matrix.sum(0) - intersection
@@ -105,14 +69,21 @@ class MetricsCalculator:
         # Pixel Accuracy
         acc = intersection.sum() / (self.confusion_matrix.sum() + 1e-10)
         
-        # Mean Dice
-        mean_dice = self.total_dice / max(self.total_samples, 1)
+        # Dice Score - FIXED: Compute from confusion matrix
+        # Dice = 2 * TP / (2*TP + FP + FN)
+        # = 2 * intersection / (pred_total + target_total)
+        pred_total = self.confusion_matrix.sum(0)  # Sum over rows (predictions)
+        target_total = self.confusion_matrix.sum(1)  # Sum over columns (targets)
+        
+        dice_per_class = (2.0 * intersection) / (pred_total + target_total + 1e-10)
+        mean_dice = np.mean(dice_per_class[valid_classes])
         
         return {
             'miou': miou,
             'accuracy': acc,
             'dice': mean_dice,
             'per_class_iou': iou,
+            'per_class_dice': dice_per_class,
             'confusion_matrix': self.confusion_matrix
         }
 
@@ -375,9 +346,9 @@ def main():
         'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
     ]
     
-    for i, (name, iou) in enumerate(zip(class_names, metrics['per_class_iou'])):
+    for i, (name, iou, dice) in enumerate(zip(class_names, metrics['per_class_iou'], metrics['per_class_dice'])):
         if i < args.num_classes:
-            print(f"  {i:2d}. {name:15s}: {iou:.4f} ({iou*100:.2f}%)")
+            print(f"  {i:2d}. {name:15s}: IoU={iou:.4f} ({iou*100:.2f}%)  |  Dice={dice:.4f} ({dice*100:.2f}%)")
     print("=" * 70)
     
     # Save results
