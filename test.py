@@ -209,9 +209,10 @@ def build_model(num_classes=19, device='cuda'):
     # Build backbone
     backbone = GCNetWithEnhance(**cfg['backbone']).to(device)
     
-    # Detect channels
+    # Detect channels - FIX: Use eval mode and batch_size=2
+    backbone.eval()
     with torch.no_grad():
-        sample = torch.randn(1, 3, 512, 1024).to(device)
+        sample = torch.randn(2, 3, 512, 1024).to(device)
         feats = backbone(sample)
         
         if isinstance(feats, tuple):
