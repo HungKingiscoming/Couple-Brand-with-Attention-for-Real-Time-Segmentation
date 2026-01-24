@@ -64,21 +64,30 @@ class MetricsCalculator:
         self.total_samples += 1
     
     def compute_dice_per_sample(self, pred, target):
-        """Compute dice score for a single sample"""
+        """Compute dice score for a single sample - FIXED"""
+        # Filter out ignore_index
+        valid_mask = (target != self.ignore_index)
+        pred_valid = pred[valid_mask]
+        target_valid = target[valid_mask]
+        
+        if len(target_valid) == 0:
+            return 0.0
+        
         dice_scores = []
         
         for cls in range(self.num_classes):
-            pred_mask = (pred == cls)
-            target_mask = (target == cls)
+            pred_mask = (pred_valid == cls)
+            target_mask = (target_valid == cls)
             
             intersection = np.logical_and(pred_mask, target_mask).sum()
-            union = pred_mask.sum() + target_mask.sum()
             
-            if union == 0:
-                continue  # Skip classes not present
+            # Dice formula: 2*intersection / (|A| + |B|)
+            dice_denominator = pred_mask.sum() + target_mask.sum()
             
-            dice = (2.0 * intersection) / (union + 1e-8)
-            dice_scores.append(dice)
+            # Only compute if class appears in prediction OR target
+            if dice_denominator > 0:
+                dice = (2.0 * intersection) / (dice_denominator + 1e-8)
+                dice_scores.append(dice)
         
         return np.mean(dice_scores) if dice_scores else 0.0
     
