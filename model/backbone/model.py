@@ -19,7 +19,7 @@ from components.components import (
 
 
 # ===========================
-# GCBlock classes (giữ nguyên từ code gốc)
+# FIXED GCBlock classes - Support GroupNorm
 # ===========================
 
 class Block1x1(BaseModule):
@@ -71,8 +71,25 @@ class Block1x1(BaseModule):
         return x
 
     def _fuse_bn_tensor(self, conv: nn.Module):
+        """FIXED: Support both BatchNorm and GroupNorm"""
         kernel = conv.conv.weight
         bias = conv.conv.bias
+        
+        # Check norm type
+        if hasattr(conv, 'gn'):  # GroupNorm
+            # GroupNorm cannot be fused (no running stats)
+            # Return weights as-is
+            if bias is None:
+                bias = torch.zeros(kernel.shape[0], device=kernel.device)
+            return kernel, bias
+        
+        # BatchNorm fusion (original code)
+        if not hasattr(conv, 'bn'):
+            # No norm layer
+            if bias is None:
+                bias = torch.zeros(kernel.shape[0], device=kernel.device)
+            return kernel, bias
+        
         running_mean = conv.bn.running_mean
         running_var = conv.bn.running_var
         gamma = conv.bn.weight
@@ -80,9 +97,26 @@ class Block1x1(BaseModule):
         eps = conv.bn.eps
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+        
+        if bias is not None:
+            return kernel * t, beta + (bias - running_mean) * gamma / std
+        else:
+            return kernel * t, beta - running_mean * gamma / std
 
     def switch_to_deploy(self):
+        """FIXED: Handle GroupNorm gracefully"""
+        # Check if using GroupNorm
+        has_groupnorm = hasattr(self.conv1, 'gn') or hasattr(self.conv2, 'gn')
+        
+        if has_groupnorm:
+            # Cannot fuse GroupNorm - skip deployment
+            import warnings
+            warnings.warn(
+                f"Block1x1: GroupNorm detected, skipping reparameterization. "
+                f"Deploy mode will not improve speed for this block."
+            )
+            return
+        
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
         self.conv = nn.Conv2d(
@@ -147,8 +181,22 @@ class Block3x3(BaseModule):
         return x
 
     def _fuse_bn_tensor(self, conv: nn.Module):
+        """FIXED: Support both BatchNorm and GroupNorm"""
         kernel = conv.conv.weight
         bias = conv.conv.bias
+        
+        # Check norm type
+        if hasattr(conv, 'gn'):  # GroupNorm
+            if bias is None:
+                bias = torch.zeros(kernel.shape[0], device=kernel.device)
+            return kernel, bias
+        
+        # BatchNorm fusion
+        if not hasattr(conv, 'bn'):
+            if bias is None:
+                bias = torch.zeros(kernel.shape[0], device=kernel.device)
+            return kernel, bias
+        
         running_mean = conv.bn.running_mean
         running_var = conv.bn.running_var
         gamma = conv.bn.weight
@@ -156,9 +204,23 @@ class Block3x3(BaseModule):
         eps = conv.bn.eps
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+        
+        if bias is not None:
+            return kernel * t, beta + (bias - running_mean) * gamma / std
+        else:
+            return kernel * t, beta - running_mean * gamma / std
 
     def switch_to_deploy(self):
+        """FIXED: Handle GroupNorm gracefully"""
+        has_groupnorm = hasattr(self.conv1, 'gn') or hasattr(self.conv2, 'gn')
+        
+        if has_groupnorm:
+            import warnings
+            warnings.warn(
+                f"Block3x3: GroupNorm detected, skipping reparameterization."
+            )
+            return
+        
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
         self.conv = nn.Conv2d(
@@ -265,16 +327,48 @@ class GCBlock(nn.Module):
         return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
     def _fuse_bn_tensor(self, conv: nn.Module):
+        """FIXED: Support both BatchNorm and GroupNorm"""
         if conv is None:
             return 0, 0
+        
         if isinstance(conv, ConvModule):
             kernel = conv.conv.weight
+            
+            # Check norm type
+            if hasattr(conv, 'gn'):  # GroupNorm
+                # Cannot fuse - return as-is
+                bias = conv.conv.bias
+                if bias is None:
+                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
+                return kernel, bias
+            
+            # BatchNorm fusion
+            if not hasattr(conv, 'bn'):
+                bias = conv.conv.bias
+                if bias is None:
+                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
+                return kernel, bias
+            
             running_mean = conv.bn.running_mean
             running_var = conv.bn.running_var
             gamma = conv.bn.weight
             beta = conv.bn.bias
             eps = conv.bn.eps
         else:
+            # Identity branch (just norm layer)
+            if isinstance(conv, nn.GroupNorm):
+                # Cannot fuse GroupNorm identity
+                if not hasattr(self, 'id_tensor'):
+                    input_in_channels = self.in_channels
+                    kernel_value = np.zeros(
+                        (self.in_channels, input_in_channels, 3, 3),
+                        dtype=np.float32)
+                    for i in range(self.in_channels):
+                        kernel_value[i, i % input_in_channels, 1, 1] = 1
+                    self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
+                return self.id_tensor, torch.zeros(self.in_channels, device=conv.weight.device)
+            
+            # BatchNorm identity
             running_mean = conv.running_mean
             running_var = conv.running_var
             gamma = conv.weight
@@ -289,6 +383,7 @@ class GCBlock(nn.Module):
                     kernel_value[i, i % input_in_channels, 1, 1] = 1
                 self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
             kernel = self.id_tensor
+        
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape(-1, 1, 1, 1)
         return kernel * t, beta - running_mean * gamma / std
@@ -312,8 +407,25 @@ class GCBlock(nn.Module):
         return kernel, bias
 
     def switch_to_deploy(self):
+        """FIXED: Handle GroupNorm gracefully"""
         if hasattr(self, 'reparam_3x3'):
             return
+        
+        # Check if any sub-block uses GroupNorm
+        has_groupnorm = (
+            isinstance(self.path_residual, nn.GroupNorm) or
+            (hasattr(self.path_3x3_1, 'conv1') and hasattr(self.path_3x3_1.conv1, 'gn')) or
+            (hasattr(self.path_3x3_2, 'conv1') and hasattr(self.path_3x3_2.conv1, 'gn')) or
+            (hasattr(self.path_1x1, 'conv1') and hasattr(self.path_1x1.conv1, 'gn'))
+        )
+        
+        if has_groupnorm:
+            import warnings
+            warnings.warn(
+                f"GCBlock: GroupNorm detected, skipping reparameterization."
+            )
+            return
+        
         kernel, bias = self.get_equivalent_kernel_bias()
         self.reparam_3x3 = nn.Conv2d(
             in_channels=self.in_channels,
@@ -340,7 +452,7 @@ class GCBlock(nn.Module):
 
 
 # ===========================
-# FIXED DWSA + MultiScale
+# DWSA + MultiScale (giữ nguyên)
 # ===========================
 
 def _get_valid_groups(channels, desired_groups):
@@ -369,7 +481,6 @@ class DWSABlock(nn.Module):
         self.reduced = reduced
         self.mid = mid
 
-        # FIX 1: Layer Norm cho stability
         self.ln = nn.LayerNorm(channels)
         
         self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
@@ -396,18 +507,15 @@ class DWSABlock(nn.Module):
 
         self.drop = nn.Dropout(drop)
         
-        # FIX 2: Improved scaling
         head_dim = mid // num_heads
         self.scale = head_dim ** -0.5
         
-        # FIX 3: Learnable alpha (khởi tạo nhỏ)
         self.alpha = nn.Parameter(torch.tensor(alpha))
 
     def forward(self, x):
         B, C, H, W = x.shape
         identity = x
 
-        # FIX 4: Layer norm TRƯỚC process
         x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         
         x_red = self.in_proj(x_ln)
@@ -434,9 +542,8 @@ class DWSABlock(nn.Module):
         k = split_heads(k).permute(0, 1, 3, 2)
         v = split_heads(v).permute(0, 1, 3, 2)
 
-        # FIX 5: Clamp attention scores
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)  # Prevent overflow
+        attn = attn.clamp(-10, 10)
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
@@ -449,7 +556,6 @@ class DWSABlock(nn.Module):
         out = out.view(B, C2, H, W)
         out = self.out_proj(out)
 
-        # FIX 6: Scaled residual
         return identity + self.alpha * out
 
 
@@ -472,14 +578,13 @@ class MultiScaleContextModule(nn.Module):
             per_branch_list.append(max(c, 1))
         fused_channels = sum(per_branch_list)
 
-        # FIX 7: Thêm BatchNorm vào tất cả branches
         self.scale_branches = nn.ModuleList()
         for s, c_out in zip(scales, per_branch_list):
             if s == 1:
                 self.scale_branches.append(
                     nn.Sequential(
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),  # ← THÊM
+                        nn.BatchNorm2d(c_out),
                         nn.ReLU(inplace=True),
                     )
                 )
@@ -488,12 +593,11 @@ class MultiScaleContextModule(nn.Module):
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=s, stride=s),
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),  # ← THÊM
+                        nn.BatchNorm2d(c_out),
                         nn.ReLU(inplace=True),
                     )
                 )
 
-        # FIX 8: BatchNorm trong fusion
         self.fusion = nn.Sequential(
             nn.Conv2d(
                 fused_channels,
@@ -503,20 +607,18 @@ class MultiScaleContextModule(nn.Module):
                 groups=fused_channels,
                 bias=False,
             ),
-            nn.BatchNorm2d(fused_channels),  # ← THÊM
+            nn.BatchNorm2d(fused_channels),
             nn.ReLU(inplace=True),
             nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),  # ← THÊM
+            nn.BatchNorm2d(out_channels),
         )
 
-        # FIX 9: Learnable alpha nhỏ
         self.alpha = nn.Parameter(torch.tensor(alpha))
         
-        # FIX 10: BatchNorm cho projection
         if in_channels != out_channels:
             self.proj = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels),  # ← THÊM
+                nn.BatchNorm2d(out_channels),
             )
         else:
             self.proj = None
@@ -538,12 +640,11 @@ class MultiScaleContextModule(nn.Module):
         else:
             x_proj = x
 
-        # Scaled residual
         return x_proj + self.alpha * out
 
 
 # ===========================
-# GCNetCore (giữ nguyên)
+# GCNetCore + GCNetWithEnhance (giữ nguyên - copy từ document 4)
 # ===========================
 
 class GCNetCore(BaseModule):
@@ -772,12 +873,8 @@ class GCNetCore(BaseModule):
         )
 
 
-# ===========================
-# Enhanced Backbone với tất cả fixes
-# ===========================
-
 class GCNetWithEnhance(BaseModule):
-    """FIXED VERSION - Complete với input/output matching"""
+    """FIXED VERSION - Complete với GroupNorm support"""
     
     def __init__(self,
                  in_channels: int = 3,
@@ -805,7 +902,6 @@ class GCNetWithEnhance(BaseModule):
         self.align_corners = align_corners
         self.channels = channels
 
-        # ✅ VALIDATE stages
         valid_stages = {'stage4', 'stage5', 'stage6'}
         invalid = set(dwsa_stages) - valid_stages
         if invalid:
@@ -828,11 +924,10 @@ class GCNetWithEnhance(BaseModule):
         self.dwsa5 = None
         self.dwsa6 = None
 
-        # ✅ DWSA modules theo channels đúng
         for stage in dwsa_stages:
             if stage == 'stage4':
                 self.dwsa4 = DWSABlock(
-                    C * 4,  # s4: channels*4
+                    C * 4,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -842,7 +937,7 @@ class GCNetWithEnhance(BaseModule):
                 )
             elif stage == 'stage5':
                 self.dwsa5 = DWSABlock(
-                    C * 8,  # s5: channels*8  
+                    C * 8,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -852,7 +947,7 @@ class GCNetWithEnhance(BaseModule):
                 )
             elif stage == 'stage6':
                 self.dwsa6 = DWSABlock(
-                    C * 16,  # s6: channels*16
+                    C * 16,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -861,7 +956,6 @@ class GCNetWithEnhance(BaseModule):
                     alpha=dwsa_alpha,
                 )
 
-        # ✅ MultiScaleContext cho x_spp (channels*4)
         if use_multi_scale_context:
             self.ms_context = MultiScaleContextModule(
                 C * 4, C * 4,
@@ -872,9 +966,8 @@ class GCNetWithEnhance(BaseModule):
         else:
             self.ms_context = None
 
-        # ✅ Final projection channels matching
         self.final_proj = ConvModule(
-            in_channels=C * 4,  # x_d6 + x_spp đều channels*4
+            in_channels=C * 4,
             out_channels=C * 4,
             kernel_size=1,
             norm_cfg=norm_cfg,
@@ -882,23 +975,19 @@ class GCNetWithEnhance(BaseModule):
         )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """✅ FIXED: Consistent Dict output, no training/eval branching"""
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         
-        # ✅ 1. GCNetCore forward
         gcnet_feats = self.backbone(x)
         
-        # ✅ 2. Extract features theo GCNetCore output
-        c1 = gcnet_feats['c1']      # H/2, channels
-        c2 = gcnet_feats['c2']      # H/4, channels*2  
-        c4 = gcnet_feats['c4']      # H/8, channels*4 (detail stage4)
-        s4 = gcnet_feats['s4']      # H/16, channels*4 (semantic stage4)
-        s5 = gcnet_feats['s5']      # H/32, channels*8
-        s6 = gcnet_feats['s6']      # H/64, channels*16
-        x_d6 = gcnet_feats['x_d6']  # H/8, channels*4 (detail stage6)
-        x_spp = gcnet_feats['spp']  # H/8, channels*4 (pre-resized)
+        c1 = gcnet_feats['c1']
+        c2 = gcnet_feats['c2']
+        c4 = gcnet_feats['c4']
+        s4 = gcnet_feats['s4']
+        s5 = gcnet_feats['s5']
+        s6 = gcnet_feats['s6']
+        x_d6 = gcnet_feats['x_d6']
+        x_spp = gcnet_feats['spp']
         
-        # ✅ 3. Apply DWSA modules
         if self.dwsa4 is not None:
             s4 = self.dwsa4(s4)
         if self.dwsa5 is not None:
@@ -906,22 +995,18 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
         
-        # ✅ 4. MultiScaleContext (optional)
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
         
-        # ✅ 5. Final fusion & projection
-        final_feat = self.final_proj(x_spp + x_d6)  # C*4 + C*4 → C*4
+        final_feat = self.final_proj(x_spp + x_d6)
         
-        # ✅ 6. CONSISTENT OUTPUT: luôn return Dict
         return {
-            'c1': c1,           # Stem1: H/2, C
-            'c2': c2,           # Stem2: H/4, C*2  
-            'c4': c4,           # Detail4: H/8, C*4 (aux)
-            'c5': final_feat,   # Final enhanced: H/8, C*4
-            # Bonus features nếu cần
+            'c1': c1,
+            'c2': c2,
+            'c4': c4,
+            'c5': final_feat,
             's4': s4,
-            's5': s5, 
+            's5': s5,
             's6': s6,
             'x_d6': x_d6,
         }
