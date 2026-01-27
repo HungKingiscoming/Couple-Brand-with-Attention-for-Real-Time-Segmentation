@@ -560,7 +560,6 @@ def load_model_from_checkpoint(checkpoint_path, num_classes, device, deploy=Fals
     """Load a single model from checkpoint"""
     print(f"📥 Loading: {checkpoint_path}")
     
-    model = build_model(num_classes=num_classes, device=device, deploy=deploy)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if 'model' in checkpoint:
@@ -570,9 +569,32 @@ def load_model_from_checkpoint(checkpoint_path, num_classes, device, deploy=Fals
     else:
         state_dict = checkpoint
     
-    model.load_state_dict(state_dict, strict=True)
+    # 🔍 AUTO-DETECT: Check if checkpoint is in deploy mode
+    is_checkpoint_deployed = any('reparam_3x3' in k for k in state_dict.keys())
     
-    if deploy:
+    if is_checkpoint_deployed:
+        print("🔧 Checkpoint is in DEPLOY mode")
+        # Build model in deploy mode
+        model = build_model(num_classes=num_classes, device=device, deploy=True)
+    else:
+        print("🔧 Checkpoint is in TRAINING mode")
+        # Always build model in TRAINING mode first (to match checkpoint)
+        model = build_model(num_classes=num_classes, device=device, deploy=False)
+    
+    # Load state dict
+    try:
+        model.load_state_dict(state_dict, strict=True)
+        print(f"✅ Loaded successfully")
+    except RuntimeError as e:
+        print(f"❌ Failed to load with strict=True")
+        print(f"    Error: {str(e)[:200]}...")
+        print("    Trying with strict=False...")
+        model.load_state_dict(state_dict, strict=False)
+        print("⚠️  Loaded with strict=False (some weights may be missing)")
+    
+    # If checkpoint was training mode but user wants deploy, convert NOW
+    if not is_checkpoint_deployed and deploy:
+        print("🔄 Converting to deploy mode...")
         model = switch_to_deploy(model)
     
     return model
