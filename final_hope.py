@@ -1,8 +1,14 @@
 # ============================================
-# ENHANCED EVALUATION SCRIPT - +1-2% mIoU Improvement
-# Features: TTA, Sliding Window, Boundary Refinement
+# COMPLETE EVALUATION SCRIPT
+# Features:
+# - TTA (Test-Time Augmentation)
+# - Multi-Model Ensemble
+# - Deploy Mode (Reparameterization)
+# - Performance Metrics (GFLOPs, FPS, Latency)
+# - Sliding Window, Boundary Refinement
 # ============================================
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,7 +29,7 @@ from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn
 
 # ============================================
-# SEGMENTOR (same as train.py)
+# SEGMENTOR
 # ============================================
 class Segmentor(nn.Module):
     def __init__(self, backbone, head, aux_head=None):
@@ -35,6 +41,79 @@ class Segmentor(nn.Module):
     def forward(self, x):
         feats = self.backbone(x)
         return self.decode_head(feats)
+
+# ============================================
+# PERFORMANCE METRICS
+# ============================================
+def count_parameters(model):
+    """Count total and trainable parameters"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+def calculate_flops(model, input_size=(1, 3, 512, 1024), device='cuda'):
+    """Calculate GFLOPs using thop library"""
+    try:
+        from thop import profile, clever_format
+        
+        model.eval()
+        dummy_input = torch.randn(input_size).to(device)
+        
+        with torch.no_grad():
+            flops, params = profile(model, inputs=(dummy_input,), verbose=False)
+        
+        flops, params = clever_format([flops, params], "%.3f")
+        return flops, params
+    except ImportError:
+        print("⚠️  'thop' not installed. Install with: pip install thop")
+        return "N/A", "N/A"
+
+def measure_inference_time(model, input_size=(1, 3, 512, 1024), 
+                          num_warmup=10, num_iterations=100, device='cuda'):
+    """Measure FPS and Latency"""
+    model.eval()
+    dummy_input = torch.randn(input_size).to(device)
+    
+    # Warmup
+    print(f"🔥 Warming up ({num_warmup} iterations)...")
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(dummy_input)
+    
+    # Synchronize GPU
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    
+    # Measure
+    print(f"⏱️  Measuring inference time ({num_iterations} iterations)...")
+    times = []
+    
+    with torch.no_grad():
+        for _ in tqdm(range(num_iterations), desc="Timing"):
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            
+            start = time.time()
+            _ = model(dummy_input)
+            
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            
+            end = time.time()
+            times.append(end - start)
+    
+    times = np.array(times)
+    avg_time = np.mean(times)
+    std_time = np.std(times)
+    fps = 1.0 / avg_time
+    latency_ms = avg_time * 1000
+    
+    return {
+        'fps': fps,
+        'latency_ms': latency_ms,
+        'latency_std_ms': std_time * 1000,
+        'avg_time_s': avg_time,
+    }
 
 # ============================================
 # METRICS COMPUTATION
@@ -82,7 +161,7 @@ class MetricsCalculator:
         }
 
 # ============================================
-# 🆕 ENHANCED INFERENCE - TTA + SLIDING WINDOW
+# ENHANCED INFERENCE ENGINE
 # ============================================
 class EnhancedInference:
     """
@@ -203,40 +282,138 @@ class EnhancedInference:
         boundary_mask = entropy > threshold
         
         # Apply Gaussian smoothing to boundary regions
-        from torchvision.transforms import GaussianBlur
-        blur = GaussianBlur(kernel_size=5, sigma=1.0)
-        prob_smoothed = blur(prob)
+        kernel_size = 5
+        sigma = 1.0
+        
+        # Create Gaussian kernel
+        kernel = self._gaussian_kernel(kernel_size, sigma).to(self.device)
+        
+        # Apply smoothing
+        prob_smoothed = F.conv2d(
+            prob, 
+            kernel.repeat(self.num_classes, 1, 1, 1),
+            padding=kernel_size // 2,
+            groups=self.num_classes
+        )
         
         # Blend: use smoothed prediction for boundaries, original for confident regions
         prob_refined = torch.where(boundary_mask, prob_smoothed, prob)
         
         return prob_refined.argmax(1).cpu().numpy()
+    
+    def _gaussian_kernel(self, kernel_size, sigma):
+        """Generate Gaussian kernel"""
+        x = torch.arange(kernel_size).float() - kernel_size // 2
+        gauss = torch.exp(-x.pow(2.0) / (2 * sigma ** 2))
+        kernel = gauss.unsqueeze(0) * gauss.unsqueeze(1)
+        kernel = kernel / kernel.sum()
+        return kernel.unsqueeze(0).unsqueeze(0)
 
 # ============================================
-# EVALUATION FUNCTION - ENHANCED
+# MULTI-MODEL ENSEMBLE
+# ============================================
+class MultiModelEnsemble:
+    """Ensemble multiple models for better predictions"""
+    
+    def __init__(self, models, fusion='mean', weights=None):
+        """
+        Args:
+            models: List of models
+            fusion: 'mean', 'weighted', 'max', or 'voting'
+            weights: List of weights for weighted fusion (must sum to 1.0)
+        """
+        self.models = models
+        self.fusion = fusion
+        
+        if fusion == 'weighted':
+            if weights is None:
+                self.weights = [1.0 / len(models)] * len(models)
+            else:
+                assert len(weights) == len(models), "Weights must match number of models"
+                assert abs(sum(weights) - 1.0) < 1e-6, "Weights must sum to 1.0"
+                self.weights = weights
+        
+        print(f"🔗 Ensemble: {len(models)} models, fusion='{fusion}'")
+        if fusion == 'weighted':
+            print(f"   Weights: {self.weights}")
+    
+    @torch.no_grad()
+    def predict(self, img, target_size, num_classes):
+        """Ensemble prediction"""
+        H, W = target_size
+        outputs = []
+        
+        # Get predictions from all models
+        for i, model in enumerate(self.models):
+            model.eval()
+            logits = model(img)
+            logits = F.interpolate(logits, size=(H, W), mode='bilinear', align_corners=False)
+            outputs.append(F.softmax(logits, dim=1))
+        
+        # Stack outputs
+        outputs = torch.stack(outputs, dim=0)  # [num_models, B, C, H, W]
+        
+        # Fusion strategy
+        if self.fusion == 'mean':
+            fused = outputs.mean(dim=0)
+        
+        elif self.fusion == 'weighted':
+            weights = torch.tensor(self.weights, device=img.device).view(-1, 1, 1, 1, 1)
+            fused = (outputs * weights).sum(dim=0)
+        
+        elif self.fusion == 'max':
+            fused = outputs.max(dim=0)[0]
+        
+        elif self.fusion == 'voting':
+            preds = outputs.argmax(dim=2)  # [num_models, B, H, W]
+            fused = torch.mode(preds, dim=0)[0]  # [B, H, W]
+            # Convert back to prob format
+            B, H, W = fused.shape
+            fused_prob = torch.zeros(B, num_classes, H, W, device=img.device)
+            fused_prob.scatter_(1, fused.unsqueeze(1), 1.0)
+            fused = fused_prob
+        
+        else:
+            raise ValueError(f"Unknown fusion: {self.fusion}")
+        
+        return fused.argmax(1).cpu().numpy()
+
+# ============================================
+# EVALUATION FUNCTION
 # ============================================
 @torch.no_grad()
-def evaluate_model(model, dataloader, num_classes, ignore_index=255, 
-                   inference_mode='tta', device='cuda'):
+def evaluate_model(model_or_models, dataloader, num_classes, ignore_index=255, 
+                   inference_mode='normal', device='cuda', 
+                   ensemble_fusion='mean', ensemble_weights=None):
     """
     Enhanced evaluation with multiple inference modes
     
     Args:
-        inference_mode: 'normal' | 'tta' | 'sliding' | 'boundary' | 'ensemble'
+        model_or_models: Single model or list of models for ensemble
+        inference_mode: 'normal' | 'tta' | 'sliding' | 'boundary' | 'ensemble_infer'
+        ensemble_fusion: 'mean' | 'weighted' | 'max' | 'voting' (for multi-model ensemble)
     """
-    model.eval()
+    # Check if multi-model ensemble
+    is_multi_model = isinstance(model_or_models, list)
+    
+    if is_multi_model:
+        ensemble_engine = MultiModelEnsemble(model_or_models, ensemble_fusion, ensemble_weights)
+        desc = f"Evaluating (Multi-Model Ensemble: {len(model_or_models)} models)"
+    else:
+        model = model_or_models
+        inference_engine = EnhancedInference(model, num_classes, device)
+        
+        mode_desc = {
+            'normal': 'Standard',
+            'tta': 'TTA (8 augmentations)',
+            'sliding': 'Sliding Window',
+            'boundary': 'Boundary Refinement',
+            'ensemble_infer': 'Full Ensemble (TTA+Sliding)'
+        }
+        desc = f"Evaluating ({mode_desc.get(inference_mode, 'Custom')})"
+    
     metrics_calc = MetricsCalculator(num_classes, ignore_index, device)
-    inference_engine = EnhancedInference(model, num_classes, device)
-    
-    mode_desc = {
-        'normal': 'Standard',
-        'tta': 'TTA (8 augmentations)',
-        'sliding': 'Sliding Window',
-        'boundary': 'Boundary Refinement',
-        'ensemble': 'Full Ensemble (TTA+Sliding)'
-    }
-    
-    pbar = tqdm(dataloader, desc=f"Evaluating ({mode_desc.get(inference_mode, 'Custom')})")
+    pbar = tqdm(dataloader, desc=desc)
     
     for imgs, masks in pbar:
         imgs = imgs.to(device, non_blocking=True)
@@ -247,8 +424,12 @@ def evaluate_model(model, dataloader, num_classes, ignore_index=255,
         
         H, W = masks.shape[-2:]
         
-        # Select inference mode
-        if inference_mode == 'tta':
+        # Multi-model ensemble
+        if is_multi_model:
+            pred = ensemble_engine.predict(imgs, target_size=(H, W), num_classes=num_classes)
+        
+        # Single model with advanced inference
+        elif inference_mode == 'tta':
             pred = inference_engine.predict_tta(imgs, target_size=(H, W))
         
         elif inference_mode == 'sliding':
@@ -257,12 +438,12 @@ def evaluate_model(model, dataloader, num_classes, ignore_index=255,
         elif inference_mode == 'boundary':
             pred = inference_engine.predict_with_boundary_refinement(imgs, target_size=(H, W))
         
-        elif inference_mode == 'ensemble':
+        elif inference_mode == 'ensemble_infer':
             # Combine TTA and Sliding Window
             pred_tta = inference_engine.predict_tta(imgs, target_size=(H, W))
             pred_sliding = inference_engine.predict_sliding_window(imgs, target_size=(H, W))
             # Majority voting
-            pred = np.where(pred_tta == pred_sliding, pred_tta, pred_tta)  # Prefer TTA if conflict
+            pred = np.where(pred_tta == pred_sliding, pred_tta, pred_tta)
         
         else:  # normal
             logits = model(imgs)
@@ -286,7 +467,7 @@ def evaluate_model(model, dataloader, num_classes, ignore_index=255,
 # ============================================
 # MODEL BUILDING
 # ============================================
-def build_model(num_classes=19, device='cuda'):
+def build_model(num_classes=19, device='cuda', deploy=False):
     """Build model with same config as train.py"""
     cfg = {
         'backbone': {
@@ -306,7 +487,7 @@ def build_model(num_classes=19, device='cuda'):
             'ms_branch_ratio': 8,
             'ms_alpha': 0.1,
             'align_corners': False,
-            'deploy': False
+            'deploy': deploy
         }
     }
     
@@ -362,86 +543,25 @@ def build_model(num_classes=19, device='cuda'):
     
     return model
 
-# ============================================
-# MAIN EVALUATION
-# ============================================
-def main():
-    parser = argparse.ArgumentParser(description="🎯 Enhanced Model Evaluation - +1-2% mIoU Improvement")
+def switch_to_deploy(model):
+    """Convert model to deploy mode (reparameterization)"""
+    print("\n🔧 Switching to deploy mode (reparameterization)...")
     
-    # Model & Checkpoint
-    parser.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
-    parser.add_argument("--num_classes", type=int, default=19)
-    parser.add_argument("--ignore_index", type=int, default=255)
+    count = 0
+    for module in model.modules():
+        if hasattr(module, 'switch_to_deploy'):
+            module.switch_to_deploy()
+            count += 1
     
-    # Dataset
-    parser.add_argument("--val_txt", required=True, help="Path to validation txt file")
-    parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
-    parser.add_argument("--batch_size", type=int, default=4, help="Smaller batch for TTA")
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--img_h", type=int, default=512)
-    parser.add_argument("--img_w", type=int, default=1024)
+    print(f"✅ Converted {count} modules to deploy mode")
+    return model
+
+def load_model_from_checkpoint(checkpoint_path, num_classes, device, deploy=False):
+    """Load a single model from checkpoint"""
+    print(f"📥 Loading: {checkpoint_path}")
     
-    # 🆕 Enhanced Inference Settings
-    parser.add_argument("--inference_mode", type=str, default="tta",
-                       choices=['normal', 'tta', 'sliding', 'boundary', 'ensemble'],
-                       help="""Inference mode:
-                       - normal: Standard inference
-                       - tta: Test-Time Augmentation (8 transforms) [+0.5-1.0% mIoU]
-                       - sliding: Sliding window inference [+0.2-0.5% mIoU]
-                       - boundary: Boundary refinement [+0.1-0.3% mIoU]
-                       - ensemble: TTA + Sliding [+0.8-1.5% mIoU]
-                       """)
-    
-    parser.add_argument("--save_results", type=str, default=None,
-                       help="Path to save evaluation results (JSON)")
-    
-    args = parser.parse_args()
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    print(f"\n{'='*70}")
-    print("🚀 ENHANCED MODEL EVALUATION - TTA + Advanced Inference")
-    print(f"{'='*70}")
-    print(f"📁 Checkpoint: {args.checkpoint}")
-    print(f"📊 Dataset: {args.val_txt}")
-    print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
-    print(f"🔢 Batch size: {args.batch_size}")
-    print(f"🎯 Inference Mode: {args.inference_mode.upper()}")
-    print(f"💻 Device: {device}")
-    print(f"{'='*70}\n")
-    
-    # Expected improvement info
-    improvements = {
-        'normal': 'Baseline (no improvement)',
-        'tta': 'Expected: +0.5-1.0% mIoU',
-        'sliding': 'Expected: +0.2-0.5% mIoU',
-        'boundary': 'Expected: +0.1-0.3% mIoU',
-        'ensemble': 'Expected: +0.8-1.5% mIoU (slower)'
-    }
-    print(f"📈 {improvements[args.inference_mode]}\n")
-    
-    # Create dataloader
-    print("📦 Loading dataset...")
-    _, val_loader, _ = create_dataloaders(
-        train_txt=args.val_txt,
-        val_txt=args.val_txt,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        img_size=(args.img_h, args.img_w),
-        pin_memory=True,
-        compute_class_weights=False,
-        dataset_type=args.dataset_type
-    )
-    print(f"✅ Loaded {len(val_loader.dataset)} samples\n")
-    
-    # Build model
-    print("🏗️  Building model...")
-    model = build_model(num_classes=args.num_classes, device=device)
-    print("✅ Model built\n")
-    
-    # Load checkpoint
-    print(f"📥 Loading checkpoint: {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    model = build_model(num_classes=num_classes, device=device, deploy=deploy)
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if 'model' in checkpoint:
         state_dict = checkpoint['model']
@@ -451,58 +571,236 @@ def main():
         state_dict = checkpoint
     
     model.load_state_dict(state_dict, strict=True)
-    print("✅ Checkpoint loaded\n")
     
-    # Evaluate
-    print("🚀 Starting evaluation...\n")
-    metrics = evaluate_model(
-        model=model,
-        dataloader=val_loader,
-        num_classes=args.num_classes,
-        ignore_index=args.ignore_index,
-        inference_mode=args.inference_mode,
-        device=device
+    if deploy:
+        model = switch_to_deploy(model)
+    
+    return model
+
+# ============================================
+# MAIN
+# ============================================
+def main():
+    parser = argparse.ArgumentParser(
+        description="🎯 Complete Evaluation: TTA + Ensemble + Deploy + Speed",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Standard evaluation
+  python evaluate_complete.py --checkpoint model.pth --val_txt val.txt
+  
+  # TTA (Test-Time Augmentation)
+  python evaluate_complete.py --checkpoint model.pth --val_txt val.txt --inference_mode tta
+  
+  # Multi-model ensemble
+  python evaluate_complete.py --ensemble model1.pth model2.pth model3.pth --val_txt val.txt
+  
+  # Deploy mode + Speed test
+  python evaluate_complete.py --checkpoint model.pth --val_txt val.txt --deploy --measure_speed
+  
+  # Full power: Ensemble + TTA + Deploy
+  python evaluate_complete.py --ensemble model1.pth model2.pth --val_txt val.txt --inference_mode tta --deploy
+        """
     )
     
-    # Print results
+    # Model Loading
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--checkpoint", help="Single model checkpoint")
+    group.add_argument("--ensemble", nargs='+', help="Multiple checkpoints for ensemble")
+    
+    parser.add_argument("--num_classes", type=int, default=19)
+    parser.add_argument("--ignore_index", type=int, default=255)
+    
+    # Dataset
+    parser.add_argument("--val_txt", required=True)
+    parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
+    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--img_h", type=int, default=512)
+    parser.add_argument("--img_w", type=int, default=1024)
+    
+    # Inference Mode
+    parser.add_argument("--inference_mode", default="normal",
+                       choices=['normal', 'tta', 'sliding', 'boundary', 'ensemble_infer'],
+                       help="""
+                       - normal: Standard [baseline]
+                       - tta: Test-Time Aug [+0.5-1.0%% mIoU]
+                       - sliding: Sliding window [+0.2-0.5%% mIoU]
+                       - boundary: Boundary refine [+0.1-0.3%% mIoU]
+                       - ensemble_infer: TTA+Sliding [+0.8-1.5%% mIoU]
+                       """)
+    
+    # Ensemble Settings (for multi-model)
+    parser.add_argument("--ensemble_fusion", default="mean",
+                       choices=['mean', 'weighted', 'max', 'voting'])
+    parser.add_argument("--ensemble_weights", type=float, nargs='+',
+                       help="Weights for weighted fusion (must sum to 1.0)")
+    
+    # Deploy & Speed
+    parser.add_argument("--deploy", action="store_true")
+    parser.add_argument("--measure_speed", action="store_true")
+    parser.add_argument("--num_warmup", type=int, default=10)
+    parser.add_argument("--num_iterations", type=int, default=100)
+    parser.add_argument("--skip_accuracy", action="store_true")
+    
+    # Output
+    parser.add_argument("--save_results", type=str, default=None)
+    
+    args = parser.parse_args()
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Header
     print(f"\n{'='*70}")
-    print(f"📊 EVALUATION RESULTS - Mode: {args.inference_mode.upper()}")
+    print("🚀 COMPLETE MODEL EVALUATION")
     print(f"{'='*70}")
-    print(f"🎯 Mean IoU (mIoU):    {metrics['miou']:.4f} ({metrics['miou']*100:.2f}%)")
-    print(f"🎲 Dice Score:         {metrics['dice']:.4f} ({metrics['dice']*100:.2f}%)")
-    print(f"✅ Pixel Accuracy:     {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
+    
+    # Load models
+    if args.ensemble:
+        print(f"🔗 Loading {len(args.ensemble)} models for ensemble...")
+        models = []
+        for ckpt in args.ensemble:
+            model = load_model_from_checkpoint(ckpt, args.num_classes, device, args.deploy)
+            models.append(model)
+        model_or_models = models
+        print(f"✅ Ensemble loaded: {len(models)} models\n")
+    else:
+        print("📦 Loading single model...")
+        model_or_models = load_model_from_checkpoint(
+            args.checkpoint, args.num_classes, device, args.deploy
+        )
+        print("✅ Model loaded\n")
+    
+    # Print config
+    print(f"📊 Dataset: {args.val_txt}")
+    print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
+    print(f"🎯 Inference mode: {args.inference_mode.upper()}")
+    if args.ensemble:
+        print(f"🔗 Ensemble fusion: {args.ensemble_fusion}")
+    print(f"🚀 Deploy mode: {'✅ ON' if args.deploy else '❌ OFF'}")
+    print(f"⚡ Speed test: {'✅ ON' if args.measure_speed else '❌ OFF'}")
     print(f"{'='*70}\n")
     
-    # Per-class IoU
-    print("📋 Per-Class IoU:")
-    print("-" * 70)
-    class_names = [
-        'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
-        'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
-        'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
-    ]
+    # Count parameters (for single model only)
+    performance_metrics = {}
+    if not args.ensemble:
+        total_params, trainable_params = count_parameters(model_or_models)
+        print(f"📊 Model Statistics:")
+        print(f"   Total params: {total_params:,} ({total_params/1e6:.2f}M)")
+        print(f"   Trainable: {trainable_params:,} ({trainable_params/1e6:.2f}M)\n")
+        
+        # Measure speed
+        if args.measure_speed:
+            print(f"{'='*70}")
+            print("⚡ PERFORMANCE MEASUREMENT")
+            print(f"{'='*70}\n")
+            
+            # GFLOPs
+            flops, params = calculate_flops(
+                model_or_models,
+                input_size=(1, 3, args.img_h, args.img_w),
+                device=device
+            )
+            print(f"📊 GFLOPs: {flops}")
+            print(f"📊 Params: {params}\n")
+            
+            # FPS & Latency
+            timing = measure_inference_time(
+                model_or_models,
+                input_size=(1, 3, args.img_h, args.img_w),
+                num_warmup=args.num_warmup,
+                num_iterations=args.num_iterations,
+                device=device
+            )
+            
+            print(f"\n{'='*70}")
+            print("⏱️  INFERENCE SPEED")
+            print(f"{'='*70}")
+            print(f"🚀 FPS: {timing['fps']:.2f}")
+            print(f"⏱️  Latency: {timing['latency_ms']:.2f} ms (±{timing['latency_std_ms']:.2f} ms)")
+            print(f"{'='*70}\n")
+            
+            performance_metrics = {
+                'gflops': flops,
+                'params': params,
+                'fps': timing['fps'],
+                'latency_ms': timing['latency_ms'],
+            }
     
-    for i, (name, iou, dice) in enumerate(zip(class_names, metrics['per_class_iou'], metrics['per_class_dice'])):
-        if i < args.num_classes:
-            print(f"  {i:2d}. {name:15s}: IoU={iou:.4f} ({iou*100:.2f}%)  |  Dice={dice:.4f} ({dice*100:.2f}%)")
-    print("=" * 70)
+    accuracy_metrics = {}
     
-    # Save results
-    if args.save_results:
-        results = {
-            'checkpoint': args.checkpoint,
-            'dataset': args.val_txt,
-            'num_samples': len(val_loader.dataset),
-            'inference_mode': args.inference_mode,
-            'metrics': {
-                'miou': float(metrics['miou']),
-                'dice': float(metrics['dice']),
-                'accuracy': float(metrics['accuracy']),
-            },
+    # Evaluate accuracy
+    if not args.skip_accuracy:
+        print("📦 Loading dataset...")
+        _, val_loader, _ = create_dataloaders(
+            train_txt=args.val_txt,
+            val_txt=args.val_txt,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            img_size=(args.img_h, args.img_w),
+            pin_memory=True,
+            compute_class_weights=False,
+            dataset_type=args.dataset_type
+        )
+        print(f"✅ Loaded {len(val_loader.dataset)} samples\n")
+        
+        print("🚀 Starting evaluation...\n")
+        metrics = evaluate_model(
+            model_or_models=model_or_models,
+            dataloader=val_loader,
+            num_classes=args.num_classes,
+            ignore_index=args.ignore_index,
+            inference_mode=args.inference_mode,
+            device=device,
+            ensemble_fusion=args.ensemble_fusion,
+            ensemble_weights=args.ensemble_weights,
+        )
+        
+        # Print results
+        print(f"\n{'='*70}")
+        print(f"📊 ACCURACY RESULTS")
+        print(f"{'='*70}")
+        print(f"🎯 Mean IoU (mIoU):    {metrics['miou']:.4f} ({metrics['miou']*100:.2f}%)")
+        print(f"🎲 Dice Score:         {metrics['dice']:.4f} ({metrics['dice']*100:.2f}%)")
+        print(f"✅ Pixel Accuracy:     {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
+        print(f"{'='*70}\n")
+        
+        # Per-class
+        print("📋 Per-Class IoU:")
+        print("-" * 70)
+        class_names = [
+            'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
+            'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
+            'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
+        ]
+        
+        for i, (name, iou, dice) in enumerate(zip(class_names, metrics['per_class_iou'], metrics['per_class_dice'])):
+            if i < args.num_classes:
+                print(f"  {i:2d}. {name:15s}: IoU={iou:.4f} ({iou*100:.2f}%)  |  Dice={dice:.4f} ({dice*100:.2f}%)")
+        print("=" * 70)
+        
+        accuracy_metrics = {
+            'miou': float(metrics['miou']),
+            'dice': float(metrics['dice']),
+            'accuracy': float(metrics['accuracy']),
             'per_class_iou': {
                 class_names[i]: float(metrics['per_class_iou'][i])
                 for i in range(min(len(class_names), args.num_classes))
             }
+        }
+    
+    # Save results
+    if args.save_results:
+        results = {
+            'checkpoint': args.checkpoint if args.checkpoint else args.ensemble,
+            'is_ensemble': bool(args.ensemble),
+            'num_models': len(args.ensemble) if args.ensemble else 1,
+            'dataset': args.val_txt if not args.skip_accuracy else "N/A",
+            'inference_mode': args.inference_mode,
+            'ensemble_fusion': args.ensemble_fusion if args.ensemble else None,
+            'deploy_mode': args.deploy,
+            'performance': performance_metrics,
+            'accuracy': accuracy_metrics,
         }
         
         save_path = Path(args.save_results)
@@ -514,10 +812,6 @@ def main():
         print(f"\n💾 Results saved to: {save_path}")
     
     print("\n✅ Evaluation completed!\n")
-    
-    # Comparison tip
-    if args.inference_mode != 'normal':
-        print("💡 Tip: Run with --inference_mode normal to compare baseline vs enhanced")
-    
+
 if __name__ == "__main__":
     main()
