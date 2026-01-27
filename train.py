@@ -43,7 +43,15 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False, allow_norm_mismatch=True):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = ckpt.get('state_dict', ckpt)
+    if 'model' in ckpt:
+        state = ckpt['model']
+        print("📦 Checkpoint format: {'model': ...}")
+    elif 'state_dict' in ckpt:
+        state = ckpt['state_dict']
+        print("📦 Checkpoint format: {'state_dict': ...}")
+    else:
+        state = ckpt
+        print("📦 Checkpoint format: raw state_dict")
 
     model_state = model.backbone.state_dict()
     compatible = {}
