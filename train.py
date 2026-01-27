@@ -97,7 +97,16 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
         print("WARNING: Less than 50% params loaded!")
         print(f"First 5 skipped keys: {skipped[:5]}")
 
-    missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
+    strict_mode = not args.allow_mismatch if 'args' in locals() else False
+    try:
+        missing, unexpected = model.backbone.load_state_dict(compatible, strict=strict_mode)
+    except RuntimeError as e:
+        if "size mismatch" in str(e) or "missing keys" in str(e):
+            print(f"⚠️  Norm layer mismatch detected (BN ↔ GN)")
+            print(f"   Loading with strict=False...")
+            missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
+        else:
+            raise e
 
     if missing:
         print(f"\Missing keys in model ({len(missing)}):")
@@ -925,7 +934,10 @@ def main():
     parser.add_argument("--use_discriminative_lr", action="store_true", default=True)
     parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
     parser.add_argument("--use_class_weights", action="store_true")
-    
+    parser.add_argument("--no_replace_bn", action="store_true", default=False,
+                       help="Keep BatchNorm (không thay bằng GroupNorm)")
+    parser.add_argument("--allow_mismatch", action="store_true", default=False,
+                       help="Allow norm layer mismatch when loading weights")
     # Dataset
     parser.add_argument("--train_txt", required=True)
     parser.add_argument("--val_txt", required=True)
@@ -1050,7 +1062,12 @@ def main():
     
     print("\nApplying Optimizations...")
     print("Converting BN â†’ GN")
-    model = replace_bn_with_gn(model)
+    if args.no_replace_bn:
+        print("⚡ KEEPING BatchNorm (Deploy-Ready Mode)")
+        print("   ✅ Model can use deploy mode for 20-30% speedup")
+    else:
+        print("🔄 Converting BN → GN")
+        model = replace_bn_with_gn(model)
     
     print(" Kaiming Init")
     model.apply(init_weights)
@@ -1065,7 +1082,11 @@ def main():
     print(f"{'='*70}\n")
     
     if args.pretrained_weights:
-        load_pretrained_gcnet_core(model, args.pretrained_weights)
+        load_pretrained_gcnet_core(
+            model, 
+            args.pretrained_weights,
+            allow_norm_mismatch=args.allow_mismatch
+        )
     
     if args.freeze_backbone:
         freeze_backbone(model)
