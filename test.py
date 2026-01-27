@@ -1,7 +1,11 @@
 # ============================================
-# EVALUATION SCRIPT - Compute mIoU, Dice, Accuracy
+# ENHANCED EVALUATION SCRIPT
+# - Compute mIoU, Dice, Accuracy
+# - Support Deploy Mode (Reparameterization)
+# - Measure GFLOPs, FPS, Latency
 # ============================================
 import os
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,6 +38,79 @@ class Segmentor(nn.Module):
     def forward(self, x):
         feats = self.backbone(x)
         return self.decode_head(feats)
+
+# ============================================
+# PERFORMANCE METRICS
+# ============================================
+def count_parameters(model):
+    """Count total and trainable parameters"""
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable
+
+def calculate_flops(model, input_size=(1, 3, 512, 1024), device='cuda'):
+    """Calculate GFLOPs using thop library"""
+    try:
+        from thop import profile, clever_format
+        
+        model.eval()
+        dummy_input = torch.randn(input_size).to(device)
+        
+        with torch.no_grad():
+            flops, params = profile(model, inputs=(dummy_input,), verbose=False)
+        
+        flops, params = clever_format([flops, params], "%.3f")
+        return flops, params
+    except ImportError:
+        print("⚠️  'thop' not installed. Install with: pip install thop")
+        return "N/A", "N/A"
+
+def measure_inference_time(model, input_size=(1, 3, 512, 1024), 
+                          num_warmup=10, num_iterations=100, device='cuda'):
+    """Measure FPS and Latency"""
+    model.eval()
+    dummy_input = torch.randn(input_size).to(device)
+    
+    # Warmup
+    print(f"🔥 Warming up ({num_warmup} iterations)...")
+    with torch.no_grad():
+        for _ in range(num_warmup):
+            _ = model(dummy_input)
+    
+    # Synchronize GPU
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    
+    # Measure
+    print(f"⏱️  Measuring inference time ({num_iterations} iterations)...")
+    times = []
+    
+    with torch.no_grad():
+        for _ in tqdm(range(num_iterations), desc="Timing"):
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            
+            start = time.time()
+            _ = model(dummy_input)
+            
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            
+            end = time.time()
+            times.append(end - start)
+    
+    times = np.array(times)
+    avg_time = np.mean(times)
+    std_time = np.std(times)
+    fps = 1.0 / avg_time
+    latency_ms = avg_time * 1000
+    
+    return {
+        'fps': fps,
+        'latency_ms': latency_ms,
+        'latency_std_ms': std_time * 1000,
+        'avg_time_s': avg_time,
+    }
 
 # ============================================
 # METRICS COMPUTATION
@@ -69,11 +146,9 @@ class MetricsCalculator:
         # Pixel Accuracy
         acc = intersection.sum() / (self.confusion_matrix.sum() + 1e-10)
         
-        # Dice Score - FIXED: Compute from confusion matrix
-        # Dice = 2 * TP / (2*TP + FP + FN)
-        # = 2 * intersection / (pred_total + target_total)
-        pred_total = self.confusion_matrix.sum(0)  # Sum over rows (predictions)
-        target_total = self.confusion_matrix.sum(1)  # Sum over columns (targets)
+        # Dice Score
+        pred_total = self.confusion_matrix.sum(0)
+        target_total = self.confusion_matrix.sum(1)
         
         dice_per_class = (2.0 * intersection) / (pred_total + target_total + 1e-10)
         mean_dice = np.mean(dice_per_class[valid_classes])
@@ -162,7 +237,7 @@ def evaluate_model(model, dataloader, num_classes, ignore_index=255,
 # ============================================
 # MODEL BUILDING
 # ============================================
-def build_model(num_classes=19, device='cuda'):
+def build_model(num_classes=19, device='cuda', deploy=False):
     """Build model with same config as train.py"""
     cfg = {
         'backbone': {
@@ -182,14 +257,14 @@ def build_model(num_classes=19, device='cuda'):
             'ms_branch_ratio': 8,
             'ms_alpha': 0.1,
             'align_corners': False,
-            'deploy': False
+            'deploy': deploy  # 🔥 Enable deploy mode
         }
     }
     
     # Build backbone
     backbone = GCNetWithEnhance(**cfg['backbone'])
     
-    # Detect channels - FIX: Use eval mode and batch_size=2
+    # Detect channels
     backbone.eval()
     backbone = backbone.to(device)
     with torch.no_grad():
@@ -244,11 +319,24 @@ def build_model(num_classes=19, device='cuda'):
     
     return model
 
+def switch_to_deploy(model):
+    """Convert model to deploy mode (reparameterization)"""
+    print("\n🔧 Switching to deploy mode (reparameterization)...")
+    
+    count = 0
+    for module in model.modules():
+        if hasattr(module, 'switch_to_deploy'):
+            module.switch_to_deploy()
+            count += 1
+    
+    print(f"✅ Converted {count} modules to deploy mode")
+    return model
+
 # ============================================
 # MAIN EVALUATION
 # ============================================
 def main():
-    parser = argparse.ArgumentParser(description="🎯 Model Evaluation - Compute mIoU, Dice, Accuracy")
+    parser = argparse.ArgumentParser(description="🎯 Enhanced Model Evaluation")
     
     # Model & Checkpoint
     parser.add_argument("--checkpoint", required=True, help="Path to checkpoint file")
@@ -266,6 +354,18 @@ def main():
     # Evaluation settings
     parser.add_argument("--use_multiscale", action="store_true", 
                        help="Use multi-scale testing (0.75, 1.0, 1.25)")
+    parser.add_argument("--deploy", action="store_true",
+                       help="Enable deploy mode (reparameterization)")
+    parser.add_argument("--skip_accuracy", action="store_true",
+                       help="Skip accuracy evaluation (only measure speed)")
+    
+    # Performance measurement
+    parser.add_argument("--measure_speed", action="store_true",
+                       help="Measure GFLOPs, FPS, Latency")
+    parser.add_argument("--num_warmup", type=int, default=10)
+    parser.add_argument("--num_iterations", type=int, default=100)
+    
+    # Output
     parser.add_argument("--save_results", type=str, default=None,
                        help="Path to save evaluation results (JSON)")
     
@@ -274,33 +374,21 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     print(f"\n{'='*70}")
-    print("🎯 MODEL EVALUATION")
+    print("🎯 ENHANCED MODEL EVALUATION")
     print(f"{'='*70}")
     print(f"📁 Checkpoint: {args.checkpoint}")
     print(f"📊 Dataset: {args.val_txt}")
     print(f"🖼️  Image size: {args.img_h}x{args.img_w}")
     print(f"🔢 Batch size: {args.batch_size}")
     print(f"📐 Multi-scale: {args.use_multiscale}")
+    print(f"🚀 Deploy mode: {args.deploy}")
+    print(f"⚡ Measure speed: {args.measure_speed}")
     print(f"🎯 Device: {device}")
     print(f"{'='*70}\n")
     
-    # Create dataloader
-    print("📦 Loading dataset...")
-    _, val_loader, _ = create_dataloaders(
-        train_txt=args.val_txt,  # Use same file for both (we only need val)
-        val_txt=args.val_txt,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        img_size=(args.img_h, args.img_w),
-        pin_memory=True,
-        compute_class_weights=False,
-        dataset_type=args.dataset_type
-    )
-    print(f"✅ Loaded {len(val_loader.dataset)} samples\n")
-    
     # Build model
     print("🏗️  Building model...")
-    model = build_model(num_classes=args.num_classes, device=device)
+    model = build_model(num_classes=args.num_classes, device=device, deploy=args.deploy)
     print("✅ Model built\n")
     
     # Load checkpoint
@@ -317,56 +405,134 @@ def main():
     model.load_state_dict(state_dict, strict=True)
     print("✅ Checkpoint loaded\n")
     
-    # Evaluate
-    print("🚀 Starting evaluation...\n")
-    metrics = evaluate_model(
-        model=model,
-        dataloader=val_loader,
-        num_classes=args.num_classes,
-        ignore_index=args.ignore_index,
-        use_multiscale=args.use_multiscale,
-        device=device
-    )
+    # Switch to deploy mode if requested
+    if args.deploy:
+        model = switch_to_deploy(model)
     
-    # Print results
-    print(f"\n{'='*70}")
-    print("📊 EVALUATION RESULTS")
-    print(f"{'='*70}")
-    print(f"🎯 Mean IoU (mIoU):    {metrics['miou']:.4f} ({metrics['miou']*100:.2f}%)")
-    print(f"🎲 Dice Score:         {metrics['dice']:.4f} ({metrics['dice']*100:.2f}%)")
-    print(f"✅ Pixel Accuracy:     {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
-    print(f"{'='*70}\n")
+    # Count parameters
+    total_params, trainable_params = count_parameters(model)
+    print(f"\n📊 Model Statistics:")
+    print(f"   Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
+    print(f"   Trainable parameters: {trainable_params:,} ({trainable_params/1e6:.2f}M)")
     
-    # Per-class IoU
-    print("📋 Per-Class IoU:")
-    print("-" * 70)
-    class_names = [
-        'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
-        'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
-        'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
-    ]
+    performance_metrics = {}
     
-    for i, (name, iou, dice) in enumerate(zip(class_names, metrics['per_class_iou'], metrics['per_class_dice'])):
-        if i < args.num_classes:
-            print(f"  {i:2d}. {name:15s}: IoU={iou:.4f} ({iou*100:.2f}%)  |  Dice={dice:.4f} ({dice*100:.2f}%)")
-    print("=" * 70)
+    # Measure speed if requested
+    if args.measure_speed:
+        print(f"\n{'='*70}")
+        print("⚡ PERFORMANCE MEASUREMENT")
+        print(f"{'='*70}")
+        
+        # Calculate FLOPs
+        flops, params = calculate_flops(
+            model, 
+            input_size=(1, 3, args.img_h, args.img_w),
+            device=device
+        )
+        print(f"📊 GFLOPs: {flops}")
+        print(f"📊 Params: {params}")
+        
+        # Measure inference time
+        timing = measure_inference_time(
+            model,
+            input_size=(1, 3, args.img_h, args.img_w),
+            num_warmup=args.num_warmup,
+            num_iterations=args.num_iterations,
+            device=device
+        )
+        
+        print(f"\n{'='*70}")
+        print("⏱️  INFERENCE SPEED")
+        print(f"{'='*70}")
+        print(f"🚀 FPS: {timing['fps']:.2f}")
+        print(f"⏱️  Latency: {timing['latency_ms']:.2f} ms (±{timing['latency_std_ms']:.2f} ms)")
+        print(f"{'='*70}\n")
+        
+        performance_metrics = {
+            'gflops': flops,
+            'params': params,
+            'fps': timing['fps'],
+            'latency_ms': timing['latency_ms'],
+            'latency_std_ms': timing['latency_std_ms'],
+        }
+    
+    accuracy_metrics = {}
+    
+    # Evaluate accuracy if not skipped
+    if not args.skip_accuracy:
+        # Create dataloader
+        print("📦 Loading dataset...")
+        _, val_loader, _ = create_dataloaders(
+            train_txt=args.val_txt,
+            val_txt=args.val_txt,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            img_size=(args.img_h, args.img_w),
+            pin_memory=True,
+            compute_class_weights=False,
+            dataset_type=args.dataset_type
+        )
+        print(f"✅ Loaded {len(val_loader.dataset)} samples\n")
+        
+        # Evaluate
+        print("🚀 Starting evaluation...\n")
+        metrics = evaluate_model(
+            model=model,
+            dataloader=val_loader,
+            num_classes=args.num_classes,
+            ignore_index=args.ignore_index,
+            use_multiscale=args.use_multiscale,
+            device=device
+        )
+        
+        # Print results
+        print(f"\n{'='*70}")
+        print("📊 ACCURACY RESULTS")
+        print(f"{'='*70}")
+        print(f"🎯 Mean IoU (mIoU):    {metrics['miou']:.4f} ({metrics['miou']*100:.2f}%)")
+        print(f"🎲 Dice Score:         {metrics['dice']:.4f} ({metrics['dice']*100:.2f}%)")
+        print(f"✅ Pixel Accuracy:     {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
+        print(f"{'='*70}\n")
+        
+        # Per-class IoU
+        print("📋 Per-Class IoU:")
+        print("-" * 70)
+        class_names = [
+            'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
+            'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
+            'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
+        ]
+        
+        for i, (name, iou, dice) in enumerate(zip(class_names, metrics['per_class_iou'], metrics['per_class_dice'])):
+            if i < args.num_classes:
+                print(f"  {i:2d}. {name:15s}: IoU={iou:.4f} ({iou*100:.2f}%)  |  Dice={dice:.4f} ({dice*100:.2f}%)")
+        print("=" * 70)
+        
+        accuracy_metrics = {
+            'miou': float(metrics['miou']),
+            'dice': float(metrics['dice']),
+            'accuracy': float(metrics['accuracy']),
+            'per_class_iou': {
+                class_names[i]: float(metrics['per_class_iou'][i])
+                for i in range(min(len(class_names), args.num_classes))
+            }
+        }
     
     # Save results
     if args.save_results:
         results = {
             'checkpoint': args.checkpoint,
-            'dataset': args.val_txt,
-            'num_samples': len(val_loader.dataset),
+            'dataset': args.val_txt if not args.skip_accuracy else "N/A",
+            'num_samples': len(val_loader.dataset) if not args.skip_accuracy else 0,
             'multiscale': args.use_multiscale,
-            'metrics': {
-                'miou': float(metrics['miou']),
-                'dice': float(metrics['dice']),
-                'accuracy': float(metrics['accuracy']),
+            'deploy_mode': args.deploy,
+            'model_stats': {
+                'total_params': int(total_params),
+                'total_params_M': float(total_params / 1e6),
+                'trainable_params': int(trainable_params),
             },
-            'per_class_iou': {
-                class_names[i]: float(metrics['per_class_iou'][i])
-                for i in range(min(len(class_names), args.num_classes))
-            }
+            'performance': performance_metrics,
+            'accuracy': accuracy_metrics,
         }
         
         save_path = Path(args.save_results)
@@ -377,7 +543,26 @@ def main():
         
         print(f"\n💾 Results saved to: {save_path}")
     
-    print("\n✅ Evaluation completed!\n")
+    # Final summary
+    print(f"\n{'='*70}")
+    print("📊 EVALUATION SUMMARY")
+    print(f"{'='*70}")
+    print(f"Deploy Mode: {'✅ ON' if args.deploy else '❌ OFF'}")
+    
+    if performance_metrics:
+        print(f"\n⚡ Performance:")
+        print(f"   GFLOPs: {performance_metrics.get('gflops', 'N/A')}")
+        print(f"   FPS: {performance_metrics.get('fps', 'N/A'):.2f}")
+        print(f"   Latency: {performance_metrics.get('latency_ms', 'N/A'):.2f} ms")
+    
+    if accuracy_metrics:
+        print(f"\n🎯 Accuracy:")
+        print(f"   mIoU: {accuracy_metrics.get('miou', 'N/A'):.4f}")
+        print(f"   Dice: {accuracy_metrics.get('dice', 'N/A'):.4f}")
+        print(f"   Pixel Acc: {accuracy_metrics.get('accuracy', 'N/A'):.4f}")
+    
+    print(f"{'='*70}\n")
+    print("✅ Evaluation completed!\n")
 
 if __name__ == "__main__":
     main()
