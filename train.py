@@ -658,11 +658,30 @@ class Trainer:
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 
-                # FIX 3: Monitor gradients
+                # ⭐ CHECK NaN/Inf FIRST
+                has_nan_inf = False
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            has_nan_inf = True
+                            break
+                
+                if has_nan_inf:
+                    print("\n🚨 NaN/Inf gradient - SKIPPING step")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+                
+                # Monitor gradients
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
                 
-                # FIX 4: ALWAYS apply gradient clipping
+                # ⭐ SKIP if gradient too large (BEFORE clipping)
+                if max_grad > 1000:
+                    print(f"\n🚨 EXTREME gradient {max_grad:.2f} - SKIPPING step")
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
+                
+                # Apply gradient clipping
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 
@@ -673,6 +692,7 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
+                max_grad_epoch = max(max_grad_epoch, max_grad)
             
             total_loss += loss.item() * self.args.accumulation_steps
             total_ce += ce_loss.item()
