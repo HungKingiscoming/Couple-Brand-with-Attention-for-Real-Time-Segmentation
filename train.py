@@ -453,7 +453,7 @@ class ModelConfig:
                 'channels': 32,
                 'ppm_channels': 128,
                 'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
-                'dwsa_stages': ['stage5', 'stage6'],
+                'dwsa_stages': ['stage4',','stage5', 'stage6'],
                 'dwsa_num_heads': 4,
                 'dwsa_reduction': 4,
                 'dwsa_qk_sharing': True,
@@ -958,9 +958,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--accumulation_steps", type=int, default=4)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=2.0)  # â† INCREASED from 1.0
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--weight_decay", type=float, default=1e-3)
+    parser.add_argument("--grad_clip", type=float, default=0.5) 
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
