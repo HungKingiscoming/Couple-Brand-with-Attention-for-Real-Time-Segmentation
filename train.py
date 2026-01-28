@@ -453,7 +453,7 @@ class ModelConfig:
                 'channels': 32,
                 'ppm_channels': 128,
                 'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
-                'dwsa_stages': ['stage4', 'stage6'],
+                'dwsa_stages': ['stage4','stage5', 'stage6'],
                 'dwsa_num_heads': 4,
                 'dwsa_reduction': 4,
                 'dwsa_qk_sharing': True,
