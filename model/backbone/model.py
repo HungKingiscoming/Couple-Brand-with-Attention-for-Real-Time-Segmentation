@@ -236,219 +236,46 @@ class Block3x3(BaseModule):
 
 
 class GCBlock(nn.Module):
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 kernel_size: Union[int, Tuple[int]] = 3,
-                 stride: Union[int, Tuple[int]] = 1,
-                 padding: Union[int, Tuple[int]] = 1,
-                 padding_mode: Optional[str] = 'zeros',
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                 act: bool = True,
-                 deploy: bool = False):
+    def __init__(self, in_channels, out_channels, stride=1, act=True):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.kernel_size = kernel_size
-        self.stride = stride
-        self.padding = padding
-        self.deploy = deploy
-
-        assert kernel_size == 3
-        assert padding == 1
-
-        padding_11 = padding - kernel_size // 2
-
-        if act:
-            self.relu = build_activation_layer(act_cfg)
+        
+        if stride == 1 and in_channels == out_channels:
+            # Depthwise separable conv + residual
+            self.conv = nn.Sequential(
+                # Depthwise
+                nn.Conv2d(in_channels, in_channels, 3, stride=1, padding=1, 
+                         groups=in_channels, bias=False),
+                nn.BatchNorm2d(in_channels),
+                nn.ReLU(inplace=True),
+                # Pointwise
+                nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+            self.shortcut = nn.Identity()
         else:
-            self.relu = nn.Identity()
-
-        if deploy:
-            self.reparam_3x3 = nn.Conv2d(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                bias=True,
-                padding_mode=padding_mode)
-        else:
-            if (out_channels == in_channels) and stride == 1:
-                self.path_residual = build_norm_layer(norm_cfg, num_features=in_channels)[1]
+            # Strided or channel-changing block
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_channels, in_channels, 3, stride=stride, padding=1,
+                         groups=in_channels, bias=False),
+                nn.BatchNorm2d(in_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+            
+            if stride != 1 or in_channels != out_channels:
+                self.shortcut = nn.Sequential(
+                    nn.AvgPool2d(stride, stride) if stride > 1 else nn.Identity(),
+                    nn.Conv2d(in_channels, out_channels, 1, bias=False),
+                    nn.BatchNorm2d(out_channels)
+                )
             else:
-                self.path_residual = None
-
-            self.path_3x3_1 = Block3x3(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                stride=stride,
-                padding=padding,
-                bias=False,
-                norm_cfg=norm_cfg,
-            )
-            self.path_3x3_2 = Block3x3(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                stride=stride,
-                padding=padding,
-                bias=False,
-                norm_cfg=norm_cfg,
-            )
-            self.path_1x1 = Block1x1(
-                in_channels=in_channels,
-                out_channels=out_channels,
-                stride=stride,
-                padding=padding_11,
-                bias=False,
-                norm_cfg=norm_cfg,
-            )
-
-    def forward(self, inputs: Tensor) -> Tensor:
-        if hasattr(self, 'reparam_3x3'):
-            return self.relu(self.reparam_3x3(inputs))
-
-        if self.path_residual is None:
-            id_out = 0
-        else:
-            id_out = self.path_residual(inputs)
-
-        return self.relu(
-            self.path_3x3_1(inputs)
-            + self.path_3x3_2(inputs)
-            + self.path_1x1(inputs)
-            + id_out
-        )
-
-    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
-        if kernel1x1 is None:
-            return 0
-        return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
-
-    def _fuse_bn_tensor(self, conv: nn.Module):
-        """FIXED: Support both BatchNorm and GroupNorm"""
-        if conv is None:
-            return 0, 0
+                self.shortcut = nn.Identity()
         
-        if isinstance(conv, ConvModule):
-            kernel = conv.conv.weight
-            
-            # Check norm type
-            if hasattr(conv, 'gn'):  # GroupNorm
-                # Cannot fuse - return as-is
-                bias = conv.conv.bias
-                if bias is None:
-                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
-                return kernel, bias
-            
-            # BatchNorm fusion
-            if not hasattr(conv, 'bn'):
-                bias = conv.conv.bias
-                if bias is None:
-                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
-                return kernel, bias
-            
-            running_mean = conv.bn.running_mean
-            running_var = conv.bn.running_var
-            gamma = conv.bn.weight
-            beta = conv.bn.bias
-            eps = conv.bn.eps
-        else:
-            # Identity branch (just norm layer)
-            if isinstance(conv, nn.GroupNorm):
-                # Cannot fuse GroupNorm identity
-                if not hasattr(self, 'id_tensor'):
-                    input_in_channels = self.in_channels
-                    kernel_value = np.zeros(
-                        (self.in_channels, input_in_channels, 3, 3),
-                        dtype=np.float32)
-                    for i in range(self.in_channels):
-                        kernel_value[i, i % input_in_channels, 1, 1] = 1
-                    self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
-                return self.id_tensor, torch.zeros(self.in_channels, device=conv.weight.device)
-            
-            # BatchNorm identity
-            running_mean = conv.running_mean
-            running_var = conv.running_var
-            gamma = conv.weight
-            beta = conv.bias
-            eps = conv.eps
-            if not hasattr(self, 'id_tensor'):
-                input_in_channels = self.in_channels
-                kernel_value = np.zeros(
-                    (self.in_channels, input_in_channels, 3, 3),
-                    dtype=np.float32)
-                for i in range(self.in_channels):
-                    kernel_value[i, i % input_in_channels, 1, 1] = 1
-                self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
-            kernel = self.id_tensor
-        
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta - running_mean * gamma / std
-
-    def get_equivalent_kernel_bias(self):
-        self.path_3x3_1.switch_to_deploy()
-        kernel3x3_1, bias3x3_1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
-        self.path_3x3_2.switch_to_deploy()
-        kernel3x3_2, bias3x3_2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
-        self.path_1x1.switch_to_deploy()
-        kernel1x1, bias1x1 = self.path_1x1.conv.weight.data, self.path_1x1.conv.bias.data
-        kernelid, biasid = self._fuse_bn_tensor(self.path_residual)
-
-        kernel = (
-            kernel3x3_1
-            + kernel3x3_2
-            + self._pad_1x1_to_3x3_tensor(kernel1x1)
-            + kernelid
-        )
-        bias = bias3x3_1 + bias3x3_2 + bias1x1 + biasid
-        return kernel, bias
-
-    def switch_to_deploy(self):
-        """FIXED: Handle GroupNorm gracefully"""
-        if hasattr(self, 'reparam_3x3'):
-            return
-        
-        # Check if any sub-block uses GroupNorm
-        has_groupnorm = (
-            isinstance(self.path_residual, nn.GroupNorm) or
-            (hasattr(self.path_3x3_1, 'conv1') and hasattr(self.path_3x3_1.conv1, 'gn')) or
-            (hasattr(self.path_3x3_2, 'conv1') and hasattr(self.path_3x3_2.conv1, 'gn')) or
-            (hasattr(self.path_1x1, 'conv1') and hasattr(self.path_1x1.conv1, 'gn'))
-        )
-        
-        if has_groupnorm:
-            import warnings
-            warnings.warn(
-                f"GCBlock: GroupNorm detected, skipping reparameterization."
-            )
-            return
-        
-        kernel, bias = self.get_equivalent_kernel_bias()
-        self.reparam_3x3 = nn.Conv2d(
-            in_channels=self.in_channels,
-            out_channels=self.out_channels,
-            kernel_size=self.kernel_size,
-            stride=self.stride,
-            padding=self.padding,
-            bias=True)
-        self.reparam_3x3.weight.data = kernel
-        self.reparam_3x3.bias.data = bias
-        for p in self.parameters():
-            p.detach_()
-        if hasattr(self, 'path_3x3_1'):
-            self.__delattr__('path_3x3_1')
-        if hasattr(self, 'path_3x3_2'):
-            self.__delattr__('path_3x3_2')
-        if hasattr(self, 'path_1x1'):
-            self.__delattr__('path_1x1')
-        if hasattr(self, 'path_residual'):
-            self.__delattr__('path_residual')
-        if hasattr(self, 'id_tensor'):
-            self.__delattr__('id_tensor')
-        self.deploy = True
+        self.act = nn.ReLU(inplace=True) if act else nn.Identity()
+    
+    def forward(self, x):
+        return self.act(self.conv(x) + self.shortcut(x))
 
 
 # ===========================
@@ -467,180 +294,88 @@ def _get_valid_groups(channels, desired_groups):
     return 1
 
 
-class DWSABlock(nn.Module):
-    """FIXED VERSION với stability improvements"""
-    def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
-                 qk_sharing=True, groups=4, alpha=0.1):
+class EfficientAttention(nn.Module):
+    def __init__(self, channels, num_heads=2, reduction=8, alpha=0.1):
         super().__init__()
-        assert channels % reduction == 0
         self.channels = channels
         self.num_heads = num_heads
-
         reduced = channels // reduction
-        mid = max(reduced // 2, num_heads)
         self.reduced = reduced
-        self.mid = mid
-
-        self.ln = nn.LayerNorm(channels)
         
-        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
-        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
-
-        g = _get_valid_groups(reduced, groups)
-        if g != groups:
-            import warnings
-            warnings.warn(
-                f"DWSABlock: adjusted groups from {groups} to {g} for channels={reduced}"
-            )
-
-        self.qk_sharing = qk_sharing
-        if qk_sharing:
-            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
-            self.q_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
-            self.k_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
-        else:
-            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-
-        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
-
-        self.drop = nn.Dropout(drop)
+        # Single shared projection cho Q,K,V
+        self.qkv_proj = nn.Conv2d(channels, reduced * 3, 1, bias=False)
+        self.bn = nn.BatchNorm2d(reduced * 3)
+        self.out_proj = nn.Conv2d(reduced, channels, 1, bias=False)
         
-        head_dim = mid // num_heads
-        self.scale = head_dim ** -0.5
-        
+        self.scale = (reduced // num_heads) ** -0.5
         self.alpha = nn.Parameter(torch.tensor(alpha))
-
+        
     def forward(self, x):
         B, C, H, W = x.shape
-        identity = x
-
-        x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        
-        x_red = self.in_proj(x_ln)
-        B, C2, H, W = x_red.shape
         N = H * W
-        x_flat = x_red.view(B, C2, N)
-
-        if self.qk_sharing:
-            base = self.qk_base(x_flat)
-            q = self.q_head(base)
-            k = self.k_head(base)
-        else:
-            q = self.q_proj(x_flat)
-            k = self.k_proj(x_flat)
-        v = self.v_proj(x_flat)
-
-        def split_heads(t):
-            B, Cmid, N = t.shape
-            head_dim = Cmid // self.num_heads
-            t = t.view(B, self.num_heads, head_dim, N)
-            return t
-
-        q = split_heads(q).permute(0, 1, 3, 2)
-        k = split_heads(k).permute(0, 1, 3, 2)
-        v = split_heads(v).permute(0, 1, 3, 2)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)
-        attn = F.softmax(attn, dim=-1)
-        attn = self.drop(attn)
-
-        out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2).contiguous()
-        B_, Hn, Hd, N_ = out.shape
-        out = out.view(B, self.mid, N_)
-
-        out = self.o_proj(out)
-        out = out.view(B, C2, H, W)
+        identity = x
+        
+        # Single projection for Q,K,V
+        qkv = self.bn(self.qkv_proj(x))
+        qkv = qkv.reshape(B, 3, self.reduced, N)
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        
+        # Multi-head attention
+        q = q.view(B, self.num_heads, -1, N).permute(0, 1, 3, 2)
+        k = k.view(B, self.num_heads, -1, N).permute(0, 1, 3, 2)
+        v = v.view(B, self.num_heads, -1, N).permute(0, 1, 3, 2)
+        
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = F.softmax(attn.clamp(-10, 10), dim=-1)
+        
+        out = (attn @ v).permute(0, 1, 3, 2).reshape(B, self.reduced, H, W)
         out = self.out_proj(out)
-
+        
         return identity + self.alpha * out
 
 
 class MultiScaleContextModule(nn.Module):
-    """FIXED VERSION với BatchNorm"""
-    def __init__(self, in_channels, out_channels, scales=(1, 2), 
-                 branch_ratio=8, alpha=0.1):
+    def __init__(self, channels, scales=(1, 2), alpha=0.1):
         super().__init__()
         self.scales = scales
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-
-        total_branch_channels = in_channels // branch_ratio
-        base = total_branch_channels // len(scales)
-        extra = total_branch_channels % len(scales)
-
-        per_branch_list = []
-        for i in range(len(scales)):
-            c = base + (1 if i < extra else 0)
-            per_branch_list.append(max(c, 1))
-        fused_channels = sum(per_branch_list)
-
-        self.scale_branches = nn.ModuleList()
-        for s, c_out in zip(scales, per_branch_list):
+        
+        # Giảm branch channels
+        branch_ch = channels // (len(scales) * 2)
+        self.branches = nn.ModuleList()
+        
+        for s in scales:
             if s == 1:
-                self.scale_branches.append(
-                    nn.Sequential(
-                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
-                    )
-                )
+                self.branches.append(nn.Conv2d(channels, branch_ch, 1, bias=False))
             else:
-                self.scale_branches.append(
-                    nn.Sequential(
-                        nn.AvgPool2d(kernel_size=s, stride=s),
-                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
-                    )
-                )
-
+                self.branches.append(nn.Sequential(
+                    nn.AvgPool2d(s, s),
+                    nn.Conv2d(channels, branch_ch, 1, bias=False)
+                ))
+        
+        # Depthwise separable fusion
+        fused_ch = branch_ch * len(scales)
         self.fusion = nn.Sequential(
-            nn.Conv2d(
-                fused_channels,
-                fused_channels,
-                kernel_size=3,
-                padding=1,
-                groups=fused_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(fused_channels),
+            nn.Conv2d(fused_ch, fused_ch, 3, padding=1, groups=fused_ch, bias=False),
+            nn.BatchNorm2d(fused_ch),
             nn.ReLU(inplace=True),
-            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.Conv2d(fused_ch, channels, 1, bias=False),
+            nn.BatchNorm2d(channels),
         )
-
+        
         self.alpha = nn.Parameter(torch.tensor(alpha))
         
-        if in_channels != out_channels:
-            self.proj = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-        else:
-            self.proj = None
-
     def forward(self, x):
         B, C, H, W = x.shape
         outs = []
-        for s, branch in zip(self.scales, self.scale_branches):
+        
+        for s, branch in zip(self.scales, self.branches):
             o = branch(x)
             if o.shape[-2:] != (H, W):
-                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=False)
+                o = F.interpolate(o, (H, W), mode='bilinear', align_corners=False)
             outs.append(o)
-
-        fused = torch.cat(outs, dim=1)
-        out = self.fusion(fused)
-
-        if self.proj is not None:
-            x_proj = self.proj(x)
-        else:
-            x_proj = x
-
-        return x_proj + self.alpha * out
+        
+        fused = self.fusion(torch.cat(outs, dim=1))
+        return x + self.alpha * fused
 
 
 # ===========================
@@ -926,7 +661,7 @@ class GCNetWithEnhance(BaseModule):
 
         for stage in dwsa_stages:
             if stage == 'stage4':
-                self.dwsa4 = DWSABlock(
+                self.dwsa4 = EfficientAttention(
                     C * 4,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
@@ -936,7 +671,7 @@ class GCNetWithEnhance(BaseModule):
                     alpha=dwsa_alpha,
                 )
             elif stage == 'stage5':
-                self.dwsa5 = DWSABlock(
+                self.dwsa5 = EfficientAttention(
                     C * 8,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
@@ -946,7 +681,7 @@ class GCNetWithEnhance(BaseModule):
                     alpha=dwsa_alpha,
                 )
             elif stage == 'stage6':
-                self.dwsa6 = DWSABlock(
+                self.dwsa6 = EfficientAttention(
                     C * 16,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
