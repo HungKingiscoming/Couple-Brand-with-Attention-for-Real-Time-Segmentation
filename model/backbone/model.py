@@ -8,7 +8,6 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from components.components import (
-    ConvModule,
     BaseModule,
     build_norm_layer,
     build_activation_layer,
@@ -17,32 +16,157 @@ from components.components import (
     OptConfigType,
 )
 
+def build_norm_layer(norm_cfg, num_features):
+    """
+    Build normalization layer from config
+    
+    Args:
+        norm_cfg: dict with 'type' key ('BN', 'GN', 'SyncBN')
+        num_features: number of channels
+    
+    Returns:
+        tuple: (name, norm_layer)
+    """
+    if norm_cfg is None:
+        return None, nn.Identity()
+    
+    norm_type = norm_cfg.get('type', 'BN')
+    requires_grad = norm_cfg.get('requires_grad', True)
+    
+    if norm_type == 'BN':
+        norm_layer = nn.BatchNorm2d(num_features)
+    elif norm_type == 'SyncBN':
+        norm_layer = nn.SyncBatchNorm(num_features)
+    elif norm_type == 'GN':
+        num_groups = norm_cfg.get('num_groups', 32)
+        # Ensure num_groups divides num_features
+        while num_features % num_groups != 0 and num_groups > 1:
+            num_groups //= 2
+        norm_layer = nn.GroupNorm(num_groups, num_features)
+    else:
+        raise ValueError(f"Unsupported norm type: {norm_type}")
+    
+    # Set requires_grad
+    for param in norm_layer.parameters():
+        param.requires_grad = requires_grad
+    
+    return norm_type, norm_layer
 
+def build_activation_layer(act_cfg):
+    """
+    Build activation layer from config
+    
+    Args:
+        act_cfg: dict with 'type' key ('ReLU', 'LeakyReLU', etc.)
+    
+    Returns:
+        nn.Module: activation layer
+    """
+    if act_cfg is None:
+        return nn.Identity()
+    
+    act_type = act_cfg.get('type', 'ReLU')
+    inplace = act_cfg.get('inplace', True)
+    
+    if act_type == 'ReLU':
+        return nn.ReLU(inplace=inplace)
+    elif act_type == 'LeakyReLU':
+        negative_slope = act_cfg.get('negative_slope', 0.01)
+        return nn.LeakyReLU(negative_slope, inplace=inplace)
+    elif act_type == 'PReLU':
+        return nn.PReLU()
+    elif act_type == 'GELU':
+        return nn.GELU()
+    else:
+        raise ValueError(f"Unsupported activation type: {act_type}")
+
+
+class ConvModule(nn.Module):
+    """
+    Conv-Norm-Act module
+    Compatible với norm_cfg và act_cfg
+    """
+    def __init__(self,
+                 in_channels,
+                 out_channels,
+                 kernel_size,
+                 stride=1,
+                 padding=0,
+                 dilation=1,
+                 groups=1,
+                 bias=True,
+                 norm_cfg=None,
+                 act_cfg=None):
+        super().__init__()
+        
+        # Conv
+        self.conv = nn.Conv2d(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            bias=bias
+        )
+        
+        # Norm
+        if norm_cfg is not None:
+            norm_name, norm_layer = build_norm_layer(norm_cfg, out_channels)
+            self.add_module(norm_name.lower(), norm_layer)  # 'bn' or 'gn'
+            self.norm_name = norm_name.lower()
+        else:
+            self.norm_name = None
+        
+        # Activation
+        if act_cfg is not None:
+            self.activate = build_activation_layer(act_cfg)
+        else:
+            self.activate = None
+    
+    def forward(self, x):
+        x = self.conv(x)
+        
+        if self.norm_name is not None:
+            norm = getattr(self, self.norm_name)
+            x = norm(x)
+        
+        if self.activate is not None:
+            x = self.activate(x)
+        
+        return x
 # ===========================
 # FIXED GCBlock classes - Support GroupNorm
 # ===========================
 
-class Block1x1(BaseModule):
+class Block1x1(nn.Module):
+    """1x1 conv block with double 1x1 structure"""
     def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 stride: Union[int, Tuple[int]] = 1,
-                 padding: Union[int, Tuple[int]] = 0,
-                 bias: bool = True,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 deploy: bool = False):
+                 in_channels,
+                 out_channels,
+                 stride=1,
+                 padding=0,
+                 bias=True,
+                 norm_cfg=None,
+                 deploy=False):
         super().__init__()
+        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
         self.padding = padding
         self.bias = bias
         self.deploy = deploy
-
-        if self.deploy:
+        
+        if norm_cfg is None:
+            norm_cfg = dict(type='BN', requires_grad=True)
+        
+        if deploy:
             self.conv = nn.Conv2d(
                 in_channels, out_channels, kernel_size=1,
-                stride=stride, padding=padding, bias=True)
+                stride=stride, padding=padding, bias=True
+            )
         else:
             self.conv1 = ConvModule(
                 in_channels=in_channels,
@@ -52,7 +176,8 @@ class Block1x1(BaseModule):
                 padding=padding,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None)
+                act_cfg=None
+            )
             self.conv2 = ConvModule(
                 in_channels=out_channels,
                 out_channels=out_channels,
@@ -61,98 +186,87 @@ class Block1x1(BaseModule):
                 padding=padding,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None)
-
+                act_cfg=None
+            )
+    
     def forward(self, x):
         if self.deploy:
             return self.conv(x)
         x = self.conv1(x)
         x = self.conv2(x)
         return x
-
-    def _fuse_bn_tensor(self, conv: nn.Module):
-        """FIXED: Support both BatchNorm and GroupNorm"""
+    
+    def _fuse_bn_tensor(self, conv):
+        """Fuse conv + bn"""
         kernel = conv.conv.weight
         bias = conv.conv.bias
         
-        # Check norm type
-        if hasattr(conv, 'gn'):  # GroupNorm
-            # GroupNorm cannot be fused (no running stats)
-            # Return weights as-is
-            if bias is None:
-                bias = torch.zeros(kernel.shape[0], device=kernel.device)
-            return kernel, bias
-        
-        # BatchNorm fusion (original code)
-        if not hasattr(conv, 'bn'):
-            # No norm layer
-            if bias is None:
-                bias = torch.zeros(kernel.shape[0], device=kernel.device)
-            return kernel, bias
-        
-        running_mean = conv.bn.running_mean
-        running_var = conv.bn.running_var
-        gamma = conv.bn.weight
-        beta = conv.bn.bias
-        eps = conv.bn.eps
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        
-        if bias is not None:
-            return kernel * t, beta + (bias - running_mean) * gamma / std
+        if hasattr(conv, 'bn'):
+            running_mean = conv.bn.running_mean
+            running_var = conv.bn.running_var
+            gamma = conv.bn.weight
+            beta = conv.bn.bias
+            eps = conv.bn.eps
+            std = (running_var + eps).sqrt()
+            t = (gamma / std).reshape(-1, 1, 1, 1)
+            
+            if bias is not None:
+                return kernel * t, beta + (bias - running_mean) * gamma / std
+            else:
+                return kernel * t, beta - running_mean * gamma / std
         else:
-            return kernel * t, beta - running_mean * gamma / std
-
+            if bias is None:
+                bias = torch.zeros(kernel.shape[0], device=kernel.device)
+            return kernel, bias
+    
     def switch_to_deploy(self):
-        """FIXED: Handle GroupNorm gracefully"""
-        # Check if using GroupNorm
-        has_groupnorm = hasattr(self.conv1, 'gn') or hasattr(self.conv2, 'gn')
-        
-        if has_groupnorm:
-            # Cannot fuse GroupNorm - skip deployment
-            import warnings
-            warnings.warn(
-                f"Block1x1: GroupNorm detected, skipping reparameterization. "
-                f"Deploy mode will not improve speed for this block."
-            )
-            return
-        
+        """Convert to deploy mode"""
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
+        
         self.conv = nn.Conv2d(
             self.in_channels, self.out_channels,
             kernel_size=1, stride=self.stride,
-            padding=self.padding, bias=True)
+            padding=self.padding, bias=True
+        )
         self.conv.weight.data = torch.einsum(
-            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1
+        )
         self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
+        
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
 
 
-class Block3x3(BaseModule):
+class Block3x3(nn.Module):
+    """3x3 conv block with 3x3 → 1x1 structure"""
     def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 stride: Union[int, Tuple[int]] = 1,
-                 padding: Union[int, Tuple[int]] = 0,
-                 bias: bool = True,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 deploy: bool = False):
+                 in_channels,
+                 out_channels,
+                 stride=1,
+                 padding=1,
+                 bias=True,
+                 norm_cfg=None,
+                 deploy=False):
         super().__init__()
+        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
         self.padding = padding
         self.bias = bias
         self.deploy = deploy
-
-        if self.deploy:
+        
+        if norm_cfg is None:
+            norm_cfg = dict(type='BN', requires_grad=True)
+        
+        if deploy:
             self.conv = nn.Conv2d(
                 in_channels, out_channels,
                 kernel_size=3, stride=stride,
-                padding=padding, bias=True)
+                padding=padding, bias=True
+            )
         else:
             self.conv1 = ConvModule(
                 in_channels=in_channels,
@@ -162,7 +276,8 @@ class Block3x3(BaseModule):
                 padding=padding,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None)
+                act_cfg=None
+            )
             self.conv2 = ConvModule(
                 in_channels=out_channels,
                 out_channels=out_channels,
@@ -171,111 +286,299 @@ class Block3x3(BaseModule):
                 padding=0,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None)
-
+                act_cfg=None
+            )
+    
     def forward(self, x):
         if self.deploy:
             return self.conv(x)
         x = self.conv1(x)
         x = self.conv2(x)
         return x
-
-    def _fuse_bn_tensor(self, conv: nn.Module):
-        """FIXED: Support both BatchNorm and GroupNorm"""
+    
+    def _fuse_bn_tensor(self, conv):
+        """Fuse conv + bn"""
         kernel = conv.conv.weight
         bias = conv.conv.bias
         
-        # Check norm type
-        if hasattr(conv, 'gn'):  # GroupNorm
-            if bias is None:
-                bias = torch.zeros(kernel.shape[0], device=kernel.device)
-            return kernel, bias
-        
-        # BatchNorm fusion
-        if not hasattr(conv, 'bn'):
-            if bias is None:
-                bias = torch.zeros(kernel.shape[0], device=kernel.device)
-            return kernel, bias
-        
-        running_mean = conv.bn.running_mean
-        running_var = conv.bn.running_var
-        gamma = conv.bn.weight
-        beta = conv.bn.bias
-        eps = conv.bn.eps
-        std = (running_var + eps).sqrt()
-        t = (gamma / std).reshape(-1, 1, 1, 1)
-        
-        if bias is not None:
-            return kernel * t, beta + (bias - running_mean) * gamma / std
+        if hasattr(conv, 'bn'):
+            running_mean = conv.bn.running_mean
+            running_var = conv.bn.running_var
+            gamma = conv.bn.weight
+            beta = conv.bn.bias
+            eps = conv.bn.eps
+            std = (running_var + eps).sqrt()
+            t = (gamma / std).reshape(-1, 1, 1, 1)
+            
+            if bias is not None:
+                return kernel * t, beta + (bias - running_mean) * gamma / std
+            else:
+                return kernel * t, beta - running_mean * gamma / std
         else:
-            return kernel * t, beta - running_mean * gamma / std
-
+            if bias is None:
+                bias = torch.zeros(kernel.shape[0], device=kernel.device)
+            return kernel, bias
+    
     def switch_to_deploy(self):
-        """FIXED: Handle GroupNorm gracefully"""
-        has_groupnorm = hasattr(self.conv1, 'gn') or hasattr(self.conv2, 'gn')
-        
-        if has_groupnorm:
-            import warnings
-            warnings.warn(
-                f"Block3x3: GroupNorm detected, skipping reparameterization."
-            )
-            return
-        
+        """Convert to deploy mode"""
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
+        
         self.conv = nn.Conv2d(
             self.in_channels, self.out_channels,
             kernel_size=3, stride=self.stride,
-            padding=self.padding, bias=True)
+            padding=self.padding, bias=True
+        )
         self.conv.weight.data = torch.einsum(
-            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1
+        )
         self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
+        
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
 
 
 class GCBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1, act=True):
+    """
+    ✅ FIXED VERSION - Accepts norm_cfg and act_cfg parameters
+    
+    GCBlock with reparameterization support (optional deploy mode)
+    """
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int]] = 3,
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[int, Tuple[int]] = 1,
+                 padding_mode: Optional[str] = 'zeros',
+                 norm_cfg: dict = None,
+                 act_cfg: dict = None,
+                 act: bool = True,
+                 deploy: bool = False):
         super().__init__()
         
-        if stride == 1 and in_channels == out_channels:
-            # Depthwise separable conv + residual
-            self.conv = nn.Sequential(
-                # Depthwise
-                nn.Conv2d(in_channels, in_channels, 3, stride=1, padding=1, 
-                         groups=in_channels, bias=False),
-                nn.BatchNorm2d(in_channels),
-                nn.ReLU(inplace=True),
-                # Pointwise
-                nn.Conv2d(in_channels, out_channels, 1, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-            self.shortcut = nn.Identity()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.deploy = deploy
+        
+        # Default configs if None
+        if norm_cfg is None:
+            norm_cfg = dict(type='BN', requires_grad=True)
+        if act_cfg is None:
+            act_cfg = dict(type='ReLU', inplace=True)
+        
+        assert kernel_size == 3
+        assert padding == 1
+        
+        padding_11 = padding - kernel_size // 2
+        
+        # Activation
+        if act:
+            self.relu = build_activation_layer(act_cfg)
         else:
-            # Strided or channel-changing block
-            self.conv = nn.Sequential(
-                nn.Conv2d(in_channels, in_channels, 3, stride=stride, padding=1,
-                         groups=in_channels, bias=False),
-                nn.BatchNorm2d(in_channels),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(in_channels, out_channels, 1, bias=False),
-                nn.BatchNorm2d(out_channels),
+            self.relu = nn.Identity()
+        
+        if deploy:
+            # Deployed mode: single fused conv
+            self.reparam_3x3 = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=True,
+                padding_mode=padding_mode
+            )
+        else:
+            # Training mode: multi-path
+            
+            # Residual path (identity)
+            if (out_channels == in_channels) and stride == 1:
+                _, self.path_residual = build_norm_layer(norm_cfg, in_channels)
+            else:
+                self.path_residual = None
+            
+            # Path 1: 3x3 → 1x1
+            self.path_3x3_1 = Block3x3(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                padding=padding,
+                bias=False,
+                norm_cfg=norm_cfg,
             )
             
-            if stride != 1 or in_channels != out_channels:
-                self.shortcut = nn.Sequential(
-                    nn.AvgPool2d(stride, stride) if stride > 1 else nn.Identity(),
-                    nn.Conv2d(in_channels, out_channels, 1, bias=False),
-                    nn.BatchNorm2d(out_channels)
-                )
-            else:
-                self.shortcut = nn.Identity()
-        
-        self.act = nn.ReLU(inplace=True) if act else nn.Identity()
+            # Path 2: 3x3 → 1x1
+            self.path_3x3_2 = Block3x3(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                padding=padding,
+                bias=False,
+                norm_cfg=norm_cfg,
+            )
+            
+            # Path 3: 1x1 → 1x1
+            self.path_1x1 = Block1x1(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                padding=padding_11,
+                bias=False,
+                norm_cfg=norm_cfg,
+            )
     
     def forward(self, x):
-        return self.act(self.conv(x) + self.shortcut(x))
+        if hasattr(self, 'reparam_3x3'):
+            return self.relu(self.reparam_3x3(x))
+        
+        # Multi-path forward
+        if self.path_residual is None:
+            id_out = 0
+        else:
+            id_out = self.path_residual(x)
+        
+        return self.relu(
+            self.path_3x3_1(x) + 
+            self.path_3x3_2(x) + 
+            self.path_1x1(x) + 
+            id_out
+        )
+    
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        return F.pad(kernel1x1, [1, 1, 1, 1])
+    
+    def _fuse_bn_tensor(self, conv):
+        """Fuse conv + bn into single conv"""
+        if conv is None:
+            return 0, 0
+        
+        if isinstance(conv, ConvModule):
+            kernel = conv.conv.weight
+            
+            # Check if has BatchNorm
+            if hasattr(conv, 'bn'):
+                running_mean = conv.bn.running_mean
+                running_var = conv.bn.running_var
+                gamma = conv.bn.weight
+                beta = conv.bn.bias
+                eps = conv.bn.eps
+            elif hasattr(conv, 'gn'):
+                # GroupNorm cannot be fused easily, return as-is
+                bias = conv.conv.bias
+                if bias is None:
+                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
+                return kernel, bias
+            else:
+                # No norm layer
+                bias = conv.conv.bias
+                if bias is None:
+                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
+                return kernel, bias
+            
+            std = (running_var + eps).sqrt()
+            t = (gamma / std).reshape(-1, 1, 1, 1)
+            return kernel * t, beta - running_mean * gamma / std
+        
+        else:
+            # Identity branch (just norm layer)
+            if isinstance(conv, nn.GroupNorm):
+                # Create identity kernel for GroupNorm
+                if not hasattr(self, 'id_tensor'):
+                    kernel_value = np.zeros(
+                        (self.in_channels, self.in_channels, 3, 3),
+                        dtype=np.float32
+                    )
+                    for i in range(self.in_channels):
+                        kernel_value[i, i, 1, 1] = 1
+                    self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
+                return self.id_tensor, torch.zeros(self.in_channels, device=conv.weight.device)
+            
+            # BatchNorm identity
+            running_mean = conv.running_mean
+            running_var = conv.running_var
+            gamma = conv.weight
+            beta = conv.bias
+            eps = conv.eps
+            
+            if not hasattr(self, 'id_tensor'):
+                kernel_value = np.zeros(
+                    (self.in_channels, self.in_channels, 3, 3),
+                    dtype=np.float32
+                )
+                for i in range(self.in_channels):
+                    kernel_value[i, i, 1, 1] = 1
+                self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
+            
+            kernel = self.id_tensor
+            std = (running_var + eps).sqrt()
+            t = (gamma / std).reshape(-1, 1, 1, 1)
+            return kernel * t, beta - running_mean * gamma / std
+    
+    def get_equivalent_kernel_bias(self):
+        """Get equivalent kernel and bias for deployment"""
+        self.path_3x3_1.switch_to_deploy()
+        kernel3x3_1 = self.path_3x3_1.conv.weight.data
+        bias3x3_1 = self.path_3x3_1.conv.bias.data
+        
+        self.path_3x3_2.switch_to_deploy()
+        kernel3x3_2 = self.path_3x3_2.conv.weight.data
+        bias3x3_2 = self.path_3x3_2.conv.bias.data
+        
+        self.path_1x1.switch_to_deploy()
+        kernel1x1 = self.path_1x1.conv.weight.data
+        bias1x1 = self.path_1x1.conv.bias.data
+        
+        kernelid, biasid = self._fuse_bn_tensor(self.path_residual)
+        
+        kernel = (
+            kernel3x3_1 + 
+            kernel3x3_2 + 
+            self._pad_1x1_to_3x3_tensor(kernel1x1) + 
+            kernelid
+        )
+        bias = bias3x3_1 + bias3x3_2 + bias1x1 + biasid
+        
+        return kernel, bias
+    
+    def switch_to_deploy(self):
+        """Convert to deploy mode (optional)"""
+        if hasattr(self, 'reparam_3x3'):
+            return
+        
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.reparam_3x3 = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            bias=True
+        )
+        self.reparam_3x3.weight.data = kernel
+        self.reparam_3x3.bias.data = bias
+        
+        # Delete training components
+        for p in self.parameters():
+            p.detach_()
+        if hasattr(self, 'path_3x3_1'):
+            self.__delattr__('path_3x3_1')
+        if hasattr(self, 'path_3x3_2'):
+            self.__delattr__('path_3x3_2')
+        if hasattr(self, 'path_1x1'):
+            self.__delattr__('path_1x1')
+        if hasattr(self, 'path_residual'):
+            self.__delattr__('path_residual')
+        if hasattr(self, 'id_tensor'):
+            self.__delattr__('id_tensor')
+        
+        self.deploy = True
 
 
 # ===========================
