@@ -9,8 +9,6 @@ from torch import Tensor
 
 from components.components import (
     BaseModule,
-    build_norm_layer,
-    build_activation_layer,
     resize,
     DAPPM,
     OptConfigType,
@@ -756,7 +754,88 @@ class DWSABlock(EfficientAttention):
             alpha=alpha
         )
 
+class MultiScaleContextModule(nn.Module):
+    """FIXED VERSION với BatchNorm"""
+    def __init__(self, in_channels, out_channels, scales=(1, 2), 
+                 branch_ratio=8, alpha=0.1):
+        super().__init__()
+        self.scales = scales
+        self.in_channels = in_channels
+        self.out_channels = out_channels
 
+        total_branch_channels = in_channels // branch_ratio
+        base = total_branch_channels // len(scales)
+        extra = total_branch_channels % len(scales)
+
+        per_branch_list = []
+        for i in range(len(scales)):
+            c = base + (1 if i < extra else 0)
+            per_branch_list.append(max(c, 1))
+        fused_channels = sum(per_branch_list)
+
+        self.scale_branches = nn.ModuleList()
+        for s, c_out in zip(scales, per_branch_list):
+            if s == 1:
+                self.scale_branches.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
+                        nn.BatchNorm2d(c_out),
+                        nn.ReLU(inplace=True),
+                    )
+                )
+            else:
+                self.scale_branches.append(
+                    nn.Sequential(
+                        nn.AvgPool2d(kernel_size=s, stride=s),
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
+                        nn.BatchNorm2d(c_out),
+                        nn.ReLU(inplace=True),
+                    )
+                )
+
+        self.fusion = nn.Sequential(
+            nn.Conv2d(
+                fused_channels,
+                fused_channels,
+                kernel_size=3,
+                padding=1,
+                groups=fused_channels,
+                bias=False,
+            ),
+            nn.BatchNorm2d(fused_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+
+        self.alpha = nn.Parameter(torch.tensor(alpha))
+        
+        if in_channels != out_channels:
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.proj = None
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        outs = []
+        for s, branch in zip(self.scales, self.scale_branches):
+            o = branch(x)
+            if o.shape[-2:] != (H, W):
+                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=False)
+            outs.append(o)
+
+        fused = torch.cat(outs, dim=1)
+        out = self.fusion(fused)
+
+        if self.proj is not None:
+            x_proj = self.proj(x)
+        else:
+            x_proj = x
+
+        return x_proj + self.alpha * out
 # ===========================
 # GCNetCore + GCNetWithEnhance (giữ nguyên - copy từ document 4)
 # ===========================
