@@ -30,8 +30,7 @@ from model.backbone.model import (
     GCNetWithEnhance,
     GCNetCore,
     GCBlock,
-    EfficientAttention,
-    MultiScaleContextModule,
+    EfficientAttention
 )
 from model.head.segmentation_head import (
     GCNetHead,
