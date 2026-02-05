@@ -16,6 +16,8 @@ from components.components import (
     OptConfigType,
 )
 
+
+
 def build_norm_layer(norm_cfg, num_features):
     """
     Build normalization layer from config
@@ -598,87 +600,161 @@ def _get_valid_groups(channels, desired_groups):
 
 
 class EfficientAttention(nn.Module):
-    def __init__(self, channels, num_heads=2, reduction=8, alpha=0.1):
+    """
+    ✅ FIXED VERSION - Compatible với DWSABlock parameters
+    
+    Accepts all original DWSABlock parameters but implements lightweight version:
+    - channels: input channels
+    - num_heads: number of attention heads
+    - drop: dropout ratio
+    - reduction: channel reduction ratio
+    - qk_sharing: whether to share QK (ignored, always efficient)
+    - groups: group convolution groups
+    - alpha: residual weight
+    """
+    def __init__(self, 
+                 channels, 
+                 num_heads=2, 
+                 drop=0.0, 
+                 reduction=4,
+                 qk_sharing=True,      # ✅ Accept but ignore (always efficient)
+                 groups=4,              # ✅ Accept for compatibility
+                 alpha=0.1):
         super().__init__()
+        
+        assert channels % reduction == 0, f"channels {channels} must be divisible by reduction {reduction}"
+        
         self.channels = channels
         self.num_heads = num_heads
+        self.reduction = reduction
+        self.qk_sharing = qk_sharing  # Store but don't use differently
+        
         reduced = channels // reduction
         self.reduced = reduced
         
-        # Single shared projection cho Q,K,V
-        self.qkv_proj = nn.Conv2d(channels, reduced * 3, 1, bias=False)
-        self.bn = nn.BatchNorm2d(reduced * 3)
-        self.out_proj = nn.Conv2d(reduced, channels, 1, bias=False)
+        # Validate groups
+        g = _get_valid_groups(reduced, groups)
+        if g != groups:
+            import warnings
+            warnings.warn(
+                f"EfficientAttention: adjusted groups from {groups} to {g} for channels={reduced}"
+            )
+        self.groups = g
         
-        self.scale = (reduced // num_heads) ** -0.5
+        # Input projection
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
+        self.bn_in = nn.BatchNorm2d(reduced)
+        
+        # Output projection
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
+        self.bn_out = nn.BatchNorm2d(channels)
+        
+        # QKV projection (shared or separate based on qk_sharing flag)
+        if qk_sharing:
+            # Shared QK base
+            self.qk_base = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
+                                     groups=g, bias=False)
+            self.q_head = nn.Conv1d(reduced // 2, reduced // 2, kernel_size=1, bias=True)
+            self.k_head = nn.Conv1d(reduced // 2, reduced // 2, kernel_size=1, bias=True)
+        else:
+            # Separate Q, K projections
+            self.q_proj = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
+                                   groups=g, bias=True)
+            self.k_proj = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
+                                   groups=g, bias=True)
+        
+        # V projection
+        self.v_proj = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
+                               groups=g, bias=True)
+        
+        # Output projection for attention
+        self.o_proj = nn.Conv1d(reduced // 2, reduced, kernel_size=1, 
+                               groups=g, bias=True)
+        
+        # Dropout
+        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
+        
+        # Attention scale
+        head_dim = (reduced // 2) // num_heads
+        self.scale = head_dim ** -0.5
+        
+        # Residual weight
         self.alpha = nn.Parameter(torch.tensor(alpha))
-        
+    
     def forward(self, x):
         B, C, H, W = x.shape
-        N = H * W
         identity = x
         
-        # Single projection for Q,K,V
-        qkv = self.bn(self.qkv_proj(x))
-        qkv = qkv.reshape(B, 3, self.reduced, N)
-        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]
+        # Input projection
+        x_red = self.bn_in(self.in_proj(x))  # (B, reduced, H, W)
+        B, C2, H, W = x_red.shape
+        N = H * W
+        x_flat = x_red.view(B, C2, N)  # (B, reduced, N)
         
-        # Multi-head attention
-        q = q.view(B, self.num_heads, -1, N).permute(0, 1, 3, 2)
-        k = k.view(B, self.num_heads, -1, N).permute(0, 1, 3, 2)
-        v = v.view(B, self.num_heads, -1, N).permute(0, 1, 3, 2)
+        # Generate Q, K, V
+        if self.qk_sharing:
+            base = self.qk_base(x_flat)  # (B, reduced//2, N)
+            q = self.q_head(base)        # (B, reduced//2, N)
+            k = self.k_head(base)        # (B, reduced//2, N)
+        else:
+            q = self.q_proj(x_flat)      # (B, reduced//2, N)
+            k = self.k_proj(x_flat)      # (B, reduced//2, N)
         
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = F.softmax(attn.clamp(-10, 10), dim=-1)
+        v = self.v_proj(x_flat)          # (B, reduced//2, N)
         
-        out = (attn @ v).permute(0, 1, 3, 2).reshape(B, self.reduced, H, W)
-        out = self.out_proj(out)
+        # Reshape for multi-head attention
+        def split_heads(t):
+            # t: (B, C_mid, N)
+            B, C_mid, N = t.shape
+            head_dim = C_mid // self.num_heads
+            t = t.view(B, self.num_heads, head_dim, N)
+            return t.permute(0, 1, 3, 2)  # (B, num_heads, N, head_dim)
         
+        q = split_heads(q)  # (B, num_heads, N, head_dim)
+        k = split_heads(k)  # (B, num_heads, N, head_dim)
+        v = split_heads(v)  # (B, num_heads, N, head_dim)
+        
+        # Attention
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
+        attn = attn.clamp(-10, 10)  # Stability
+        attn = F.softmax(attn, dim=-1)
+        attn = self.drop(attn)
+        
+        # Apply attention to V
+        out = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
+        
+        # Merge heads
+        out = out.permute(0, 1, 3, 2).contiguous()  # (B, num_heads, head_dim, N)
+        B_, Hn, Hd, N_ = out.shape
+        out = out.view(B, self.reduced // 2, N_)  # (B, reduced//2, N)
+        
+        # Output projection
+        out = self.o_proj(out)  # (B, reduced, N)
+        out = out.view(B, C2, H, W)  # (B, reduced, H, W)
+        
+        # Final projection
+        out = self.bn_out(self.out_proj(out))  # (B, channels, H, W)
+        
+        # Residual connection
         return identity + self.alpha * out
 
-
-class MultiScaleContextModule(nn.Module):
-    def __init__(self, channels, scales=(1, 2), alpha=0.1):
-        super().__init__()
-        self.scales = scales
-        
-        # Giảm branch channels
-        branch_ch = channels // (len(scales) * 2)
-        self.branches = nn.ModuleList()
-        
-        for s in scales:
-            if s == 1:
-                self.branches.append(nn.Conv2d(channels, branch_ch, 1, bias=False))
-            else:
-                self.branches.append(nn.Sequential(
-                    nn.AvgPool2d(s, s),
-                    nn.Conv2d(channels, branch_ch, 1, bias=False)
-                ))
-        
-        # Depthwise separable fusion
-        fused_ch = branch_ch * len(scales)
-        self.fusion = nn.Sequential(
-            nn.Conv2d(fused_ch, fused_ch, 3, padding=1, groups=fused_ch, bias=False),
-            nn.BatchNorm2d(fused_ch),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fused_ch, channels, 1, bias=False),
-            nn.BatchNorm2d(channels),
+class DWSABlock(EfficientAttention):
+    """
+    ✅ ALIAS - For backward compatibility
+    
+    DWSABlock = EfficientAttention with same signature
+    """
+    def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
+                 qk_sharing=True, groups=4, alpha=0.1):
+        super().__init__(
+            channels=channels,
+            num_heads=num_heads,
+            drop=drop,
+            reduction=reduction,
+            qk_sharing=qk_sharing,
+            groups=groups,
+            alpha=alpha
         )
-        
-        self.alpha = nn.Parameter(torch.tensor(alpha))
-        
-    def forward(self, x):
-        B, C, H, W = x.shape
-        outs = []
-        
-        for s, branch in zip(self.scales, self.branches):
-            o = branch(x)
-            if o.shape[-2:] != (H, W):
-                o = F.interpolate(o, (H, W), mode='bilinear', align_corners=False)
-            outs.append(o)
-        
-        fused = self.fusion(torch.cat(outs, dim=1))
-        return x + self.alpha * fused
 
 
 # ===========================
