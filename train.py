@@ -668,6 +668,7 @@ class Trainer:
                 
                 if has_nan_inf:
                     print("\n🚨 NaN/Inf gradient - SKIPPING step")
+                    self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
                 
@@ -678,6 +679,7 @@ class Trainer:
                 # ⭐ SKIP if gradient too large (BEFORE clipping)
                 if max_grad > 1000:
                     print(f"\n🚨 EXTREME gradient {max_grad:.2f} - SKIPPING step")
+                    if max_grad > 1000:
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
                 
