@@ -680,7 +680,7 @@ class Trainer:
                 if max_grad > 1000:
                     print(f"\n🚨 EXTREME gradient {max_grad:.2f} - SKIPPING step")
                     if max_grad > 1000:
-                    self.optimizer.zero_grad(set_to_none=True)
+                        self.optimizer.zero_grad(set_to_none=True)
                     continue
                 
                 # Apply gradient clipping
