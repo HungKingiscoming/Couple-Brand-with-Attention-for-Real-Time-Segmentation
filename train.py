@@ -231,26 +231,30 @@ def print_backbone_structure(model):
 
 def unfreeze_backbone_progressive(model, stage_names):
     """
-    Unfreeze specific stages - FIXED to work with nested GCNetCore
+    Unfreeze specific stages - WITH DEBUG
     """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
     unfrozen_params = 0
     unfrozen_modules = []
+    
+    print(f"\n{'='*70}")
+    print(f"🔓 UNFREEZING: {stage_names}")
+    print(f"{'='*70}")
 
     for stage_name in stage_names:
         module = None
         found_path = None
         
-        # Strategy 1: Direct lookup at model.backbone level
+        # Strategy 1: Direct lookup
         if hasattr(model.backbone, stage_name):
             attr = getattr(model.backbone, stage_name)
             if attr is not None:
                 module = attr
                 found_path = f"backbone.{stage_name}"
         
-        # Strategy 2: Lookup at model.backbone.backbone level (GCNetCore)
+        # Strategy 2: Nested lookup
         if module is None and hasattr(model.backbone, 'backbone'):
             if hasattr(model.backbone.backbone, stage_name):
                 attr = getattr(model.backbone.backbone, stage_name)
@@ -258,13 +262,12 @@ def unfreeze_backbone_progressive(model, stage_names):
                     module = attr
                     found_path = f"backbone.backbone.{stage_name}"
         
-        # Strategy 3: Parse dotted names like 'semantic_branch_layers.0'
+        # Strategy 3: Parse dotted names
         if module is None and '.' in stage_name:
             parts = stage_name.split('.')
-            base_name = parts[0]  # e.g., 'semantic_branch_layers'
+            base_name = parts[0]
             index = parts[1] if len(parts) > 1 else None
             
-            # Try model.backbone.backbone.<base_name>[index]
             if hasattr(model.backbone.backbone, base_name):
                 base_module = getattr(model.backbone.backbone, base_name)
                 
@@ -272,34 +275,54 @@ def unfreeze_backbone_progressive(model, stage_names):
                     try:
                         module = base_module[int(index)]
                         found_path = f"backbone.backbone.{stage_name}"
-                    except (IndexError, TypeError):
-                        pass
+                    except (IndexError, TypeError) as e:
+                        print(f"  ❌ Error accessing {base_name}[{index}]: {e}")
                 else:
                     module = base_module
                     found_path = f"backbone.backbone.{base_name}"
         
-        # If still not found, skip
         if module is None:
-            print(f"âš ï¸  Module '{stage_name}' not found")
+            print(f"  ❌ Module '{stage_name}' NOT FOUND")
+            
+            # Debug: print available modules
+            print(f"\n  Available modules at backbone.backbone:")
+            if hasattr(model.backbone, 'backbone'):
+                for name, mod in model.backbone.backbone.named_children():
+                    if isinstance(mod, nn.ModuleList):
+                        print(f"    {name}: ModuleList[{len(mod)}]")
+                    else:
+                        print(f"    {name}: {type(mod).__name__}")
             continue
         
-        # Unfreeze parameters
+        # Unfreeze ALL parameters (weights + biases)
         param_count = 0
-        for p in module.parameters():
-            if not p.requires_grad:
-                p.requires_grad = True
-                unfrozen_params += 1
-                param_count += 1
+        weight_count = 0
+        bias_count = 0
+        
+        for name, param in module.named_parameters():
+            if not param.requires_grad:
+                param.requires_grad = True
+                param_count += param.numel()
+                
+                if 'weight' in name:
+                    weight_count += param.numel()
+                elif 'bias' in name:
+                    bias_count += param.numel()
         
         if param_count > 0:
             unfrozen_modules.append((found_path, param_count))
-            print(f"Unfrozen: {found_path} ({param_count:,} params)")
+            print(f"  ✅ {found_path}:")
+            print(f"     Total params: {param_count:,}")
+            print(f"     Weights:      {weight_count:,}")
+            print(f"     Biases:       {bias_count:,}")
+            unfrozen_params += param_count
 
-    # Summary
+    print(f"{'='*70}")
     if unfrozen_modules:
-        print(f"\nTotal: {len(unfrozen_modules)} modules, {unfrozen_params:,} params unfrozen")
+        print(f"✅ Total unfrozen: {len(unfrozen_modules)} modules, {unfrozen_params:,} params")
     else:
-        print(f"\nWARNING: No modules were unfrozen!")
+        print(f"❌ WARNING: No modules were unfrozen!")
+    print(f"{'='*70}\n")
     
     return unfrozen_params
 def print_available_modules(model):
@@ -1270,14 +1293,22 @@ def main():
             if targets:
                 unfreeze_backbone_progressive(model, targets)
                 trainer.set_loss_phase('ce_only')
-                
-                # FIX: Print LR cá»§a tá»«ng group sau unfreeze
+                print(f"\n{'='*70}")
+                print(f"🔥 GRADIENT WARMUP ACTIVATED")
+                print(f"{'='*70}")
+                print(f"Reducing LR by 100x for {args.ce_only_epochs_after_unfreeze} epochs")
                 print(f"\n{'='*70}")
                 print(f" Learning Rates after unfreezing:")
                 print(f"{'='*70}")
                 for i, group in enumerate(optimizer.param_groups):
+                    original_lr = group['lr']
+                    trainer.warmup_original_lrs.append(original_lr)
+                    group['lr'] = original_lr * 0.01
                     name = group.get('name', f'group_{i}')
                     print(f"   {name}: {group['lr']:.2e}")
+                trainer.warmup_end_epoch = epoch + args.ce_only_epochs_after_unfreeze
+                trainer.warmup_active = True
+                print(f"Warmup will end at epoch {trainer.warmup_end_epoch}")
                 print(f"{'='*70}\n")
 
         # Switch back to full loss
