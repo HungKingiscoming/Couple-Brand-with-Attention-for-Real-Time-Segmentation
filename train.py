@@ -1302,6 +1302,8 @@ def main():
                 print(f"{'='*70}")
                 for i, group in enumerate(optimizer.param_groups):
                     original_lr = group['lr']
+                    if not hasattr(trainer, 'warmup_original_lrs'):
+                        trainer.warmup_original_lrs = []                     
                     trainer.warmup_original_lrs.append(original_lr)
                     group['lr'] = original_lr * 0.01
                     name = group.get('name', f'group_{i}')
