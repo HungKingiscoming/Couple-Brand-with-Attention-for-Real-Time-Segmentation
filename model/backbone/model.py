@@ -598,18 +598,6 @@ def _get_valid_groups(channels, desired_groups):
 
 
 class EfficientAttention(nn.Module):
-    """
-    ✅ FIXED VERSION - Compatible với DWSABlock parameters
-    
-    Accepts all original DWSABlock parameters but implements lightweight version:
-    - channels: input channels
-    - num_heads: number of attention heads
-    - drop: dropout ratio
-    - reduction: channel reduction ratio
-    - qk_sharing: whether to share QK (ignored, always efficient)
-    - groups: group convolution groups
-    - alpha: residual weight
-    """
     def __init__(self, 
                  channels, 
                  num_heads=2, 
@@ -617,7 +605,7 @@ class EfficientAttention(nn.Module):
                  reduction=4,
                  qk_sharing=True,      # ✅ Accept but ignore (always efficient)
                  groups=4,              # ✅ Accept for compatibility
-                 alpha=0.1):
+                 alpha=0.001):
         super().__init__()
         
         assert channels % reduction == 0, f"channels {channels} must be divisible by reduction {reduction}"
@@ -684,56 +672,70 @@ class EfficientAttention(nn.Module):
         identity = x
         
         # Input projection
-        x_red = self.bn_in(self.in_proj(x))  # (B, reduced, H, W)
+        x_red = self.bn_in(self.in_proj(x))
         B, C2, H, W = x_red.shape
         N = H * W
-        x_flat = x_red.view(B, C2, N)  # (B, reduced, N)
+        x_flat = x_red.view(B, C2, N)
         
         # Generate Q, K, V
         if self.qk_sharing:
-            base = self.qk_base(x_flat)  # (B, reduced//2, N)
-            q = self.q_head(base)        # (B, reduced//2, N)
-            k = self.k_head(base)        # (B, reduced//2, N)
+            base = self.qk_base(x_flat)
+            q = self.q_head(base)
+            k = self.k_head(base)
         else:
-            q = self.q_proj(x_flat)      # (B, reduced//2, N)
-            k = self.k_proj(x_flat)      # (B, reduced//2, N)
+            q = self.q_proj(x_flat)
+            k = self.k_proj(x_flat)
+        v = self.v_proj(x_flat)
         
-        v = self.v_proj(x_flat)          # (B, reduced//2, N)
+        # ✅ ADD: Normalize Q, K để tránh overflow
+        q = F.normalize(q, dim=1, eps=1e-6)
+        k = F.normalize(k, dim=1, eps=1e-6)
         
-        # Reshape for multi-head attention
+        # Reshape for multi-head
         def split_heads(t):
-            # t: (B, C_mid, N)
             B, C_mid, N = t.shape
             head_dim = C_mid // self.num_heads
             t = t.view(B, self.num_heads, head_dim, N)
-            return t.permute(0, 1, 3, 2)  # (B, num_heads, N, head_dim)
+            return t.permute(0, 1, 3, 2)
         
-        q = split_heads(q)  # (B, num_heads, N, head_dim)
-        k = split_heads(k)  # (B, num_heads, N, head_dim)
-        v = split_heads(v)  # (B, num_heads, N, head_dim)
+        q = split_heads(q)
+        k = split_heads(k)
+        v = split_heads(v)
         
-        # Attention
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, num_heads, N, N)
-        attn = attn.clamp(-10, 10)  # Stability
+        # Attention computation
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        
+        # ✅ ENHANCED: More aggressive clamping
+        attn = attn.clamp(-5, 5)  # ← Giảm từ 10 xuống 5
+        
+        # ✅ ADD: Check and fix NaN BEFORE softmax
+        if torch.isnan(attn).any() or torch.isinf(attn).any():
+            attn = torch.nan_to_num(attn, nan=0.0, posinf=5.0, neginf=-5.0)
+        
         attn = F.softmax(attn, dim=-1)
+        
+        # ✅ ADD: Stabilize attention weights
+        attn = attn + 1e-8  # Prevent zero gradients
+        
         attn = self.drop(attn)
         
-        # Apply attention to V
-        out = torch.matmul(attn, v)  # (B, num_heads, N, head_dim)
+        # Apply attention
+        out = torch.matmul(attn, v)
         
         # Merge heads
-        out = out.permute(0, 1, 3, 2).contiguous()  # (B, num_heads, head_dim, N)
+        out = out.permute(0, 1, 3, 2).contiguous()
         B_, Hn, Hd, N_ = out.shape
-        out = out.view(B, self.reduced // 2, N_)  # (B, reduced//2, N)
+        out = out.view(B, self.reduced // 2, N_)
         
         # Output projection
-        out = self.o_proj(out)  # (B, reduced, N)
-        out = out.view(B, C2, H, W)  # (B, reduced, H, W)
+        out = self.o_proj(out)
+        out = out.view(B, C2, H, W)
+        out = self.bn_out(self.out_proj(out))
         
-        # Final projection
-        out = self.bn_out(self.out_proj(out))  # (B, channels, H, W)
+        # ✅ ADD: Clamp output BEFORE residual
+        out = out.clamp(-10, 10)
         
-        # Residual connection
+        # Residual connection với alpha nhỏ
         return identity + self.alpha * out
 
 class DWSABlock(EfficientAttention):
@@ -743,7 +745,7 @@ class DWSABlock(EfficientAttention):
     DWSABlock = EfficientAttention with same signature
     """
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
-                 qk_sharing=True, groups=4, alpha=0.1):
+                 qk_sharing=True, groups=4, alpha=0.001):
         super().__init__(
             channels=channels,
             num_heads=num_heads,
@@ -757,7 +759,7 @@ class DWSABlock(EfficientAttention):
 class MultiScaleContextModule(nn.Module):
     """FIXED VERSION với BatchNorm"""
     def __init__(self, in_channels, out_channels, scales=(1, 2), 
-                 branch_ratio=8, alpha=0.1):
+                 branch_ratio=8, alpha=0.001):
         super().__init__()
         self.scales = scales
         self.in_channels = in_channels
@@ -809,7 +811,8 @@ class MultiScaleContextModule(nn.Module):
         )
 
         self.alpha = nn.Parameter(torch.tensor(alpha))
-        
+        self.target_alpha = alpha
+        self._init_weights()
         if in_channels != out_channels:
             self.proj = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
@@ -817,7 +820,17 @@ class MultiScaleContextModule(nn.Module):
             )
         else:
             self.proj = None
-
+    def _init_weights(self):
+        """Khởi tạo weights cho attention layers"""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv1d, nn.Conv2d)):
+                # Xavier for attention
+                nn.init.xavier_uniform_(m.weight, gain=0.1)  # ← gain=0.1
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
     def forward(self, x):
         B, C, H, W = x.shape
         outs = []
