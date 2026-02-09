@@ -666,7 +666,18 @@ class EfficientAttention(nn.Module):
         
         # Residual weight
         self.alpha = nn.Parameter(torch.tensor(alpha))
-    
+        self.target_alpha = alpha          
+        self._init_weights()
+    def _init_weights(self):
+        """Initialize weights for attention layers"""
+        for m in self.modules():
+            if isinstance(m, (nn.Conv1d, nn.Conv2d)):
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
     def forward(self, x):
         B, C, H, W = x.shape
         identity = x
