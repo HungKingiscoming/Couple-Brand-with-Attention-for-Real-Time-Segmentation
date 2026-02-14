@@ -1068,7 +1068,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-3)
     parser.add_argument("--grad_clip", type=float, default=0.5) 
-    parser.add_argument("--aux_weight", type=float, default=1.0)
+    parser.add_argument("--aux_weight", type=float, default=0.2)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     
     # Data
