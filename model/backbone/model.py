@@ -340,11 +340,6 @@ class Block3x3(nn.Module):
 
 
 class GCBlock(nn.Module):
-    """
-    ✅ FIXED VERSION - Accepts norm_cfg and act_cfg parameters
-    
-    GCBlock with reparameterization support (optional deploy mode)
-    """
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
@@ -355,6 +350,7 @@ class GCBlock(nn.Module):
                  norm_cfg: dict = None,
                  act_cfg: dict = None,
                  act: bool = True,
+                 path_scale: float = 0.25,  # ✅ Thêm type hint
                  deploy: bool = False):
         super().__init__()
         
@@ -364,6 +360,7 @@ class GCBlock(nn.Module):
         self.stride = stride
         self.padding = padding
         self.deploy = deploy
+        self.path_scale = path_scale  # ✅ LƯU path_scale
         
         # Default configs if None
         if norm_cfg is None:
@@ -395,6 +392,9 @@ class GCBlock(nn.Module):
             )
         else:
             # Training mode: multi-path
+            
+            # ✅ THÊM: BatchNorm sau khi merge paths
+            _, self.merge_bn = build_norm_layer(norm_cfg, out_channels)
             
             # Residual path (identity)
             if (out_channels == in_channels) and stride == 1:
@@ -436,18 +436,24 @@ class GCBlock(nn.Module):
         if hasattr(self, 'reparam_3x3'):
             return self.relu(self.reparam_3x3(x))
         
-        # Multi-path forward
+        # ✅ TÍNH id_out TRƯỚC
         if self.path_residual is None:
             id_out = 0
         else:
             id_out = self.path_residual(x)
         
-        return self.relu(
-            self.path_3x3_1(x) + 
-            self.path_3x3_2(x) + 
-            self.path_1x1(x) + 
-            id_out
+        # ✅ SAU ĐÓ mới tính out (với id_out đã tồn tại)
+        out = (
+            self.path_3x3_1(x) * self.path_scale +
+            self.path_3x3_2(x) * self.path_scale +
+            self.path_1x1(x) * self.path_scale +
+            (id_out * self.path_scale if isinstance(id_out, torch.Tensor) else 0)
         )
+        
+        # ✅ THÊM: Normalize sau khi merge
+        out = self.merge_bn(out)
+        
+        return self.relu(out)
     
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
@@ -938,7 +944,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[2][0] - 2)],
                 GCBlock(channels * 4, channels * 4, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
             )
         )
         self.semantic_branch_layers.append(
@@ -949,7 +955,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[3][0] - 2)],
                 GCBlock(channels * 8, channels * 8, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
             )
         )
         self.semantic_branch_layers.append(
@@ -960,7 +966,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[4][0] - 2)],
                 GCBlock(channels * 16, channels * 16, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
             )
         )
 
@@ -971,7 +977,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[2][1] - 1)],
                 GCBlock(channels * 2, channels * 2, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
             )
         )
         self.detail_branch_layers.append(
@@ -980,7 +986,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[3][1] - 1)],
                 GCBlock(channels * 2, channels * 2, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
             )
         )
         self.detail_branch_layers.append(
@@ -991,7 +997,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[4][1] - 2)],
                 GCBlock(channels * 4, channels * 4, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
             )
         )
 
