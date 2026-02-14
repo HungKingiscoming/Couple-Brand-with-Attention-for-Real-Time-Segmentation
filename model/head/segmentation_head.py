@@ -302,6 +302,8 @@ class GCNetHead(nn.Module):
             nn.Dropout2d(kwargs.get('dropout_ratio', 0.1)),
             nn.Conv2d(decoder_channels//2, num_classes, 1)
         )
+        self.fake_c2_proj = nn.Conv2d(in_channels, in_channels//2, 1, bias=False)
+        self.fake_c1_proj = nn.Conv2d(in_channels//2, in_channels//4, 1, bias=False)
     
     def forward(self, feats: Union[Dict[str, Tensor], Tuple[Any, ...]]) -> Tensor:
         """✅ Handle EXACTLY GCNetWithEnhance outputs"""
@@ -312,17 +314,14 @@ class GCNetHead(nn.Module):
         
         # CASE 2: Training tuple GCNetWithEnhance (c4_tensor, c5_enh_tensor)
         elif isinstance(feats, tuple) and len(feats) == 2:
-            # TẠO fake c1,c2 từ c4 (H/8) bằng upsample + proj
-            c4, c5 = feats  # c4 & c5 đều H/8, 128ch
+            c4, c5 = feats 
             B, C4, H8, W8 = c4.shape
             
-            # Fake c2 (H/4): upsample c4
             c2 = F.interpolate(c4, scale_factor=2, mode='bilinear', align_corners=False)
-            c2 = nn.Conv2d(C4, C4//2, 1, bias=False)(c2)  # 128→64
-            
-            # Fake c1 (H/2): upsample c2  
+            c2 = self.fake_c2_proj(c2)
+             
             c1 = F.interpolate(c2, scale_factor=2, mode='bilinear', align_corners=False)
-            c1 = nn.Conv2d(C4//2, C4//4, 1, bias=False)(c1)  # 64→32
+            c1 = self.fake_c1_proj(c1)
             
         # CASE 3: Full tuple (c1,c2,c5)
         elif isinstance(feats, tuple) and len(feats) >= 3:
