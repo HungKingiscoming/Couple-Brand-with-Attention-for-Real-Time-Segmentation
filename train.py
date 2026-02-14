@@ -1189,7 +1189,7 @@ def main():
     # Data
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
-    
+    parser.add_argument("--dwconv_init_scale", type=float, default=0.01)
     # System
     parser.add_argument("--use_amp", action="store_true", default=True)
     parser.add_argument("--num_workers", type=int, default=4)
@@ -1276,6 +1276,7 @@ def main():
         'c1_channels': detected_channels.get('c1', 32),
         'c2_channels': detected_channels.get('c2', 64),
         'num_classes': args.num_classes,
+        'dwconv_init_scale': args.dwconv_init_scale,
     })
     head_cfg = cfg['head']
     aux_head_cfg = cfg['auxhead']
