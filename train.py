@@ -40,66 +40,199 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
-def attach_gradient_hooks(model, target_keyword="semantic_branch_layers.2"):
+
+
+class GradientMonitor:
     """
-    Attach hook để log gradient trực tiếp tại module gây explode.
+    Advanced gradient monitoring with smart triggering
     """
-
-    print(f"\n📌 Attaching gradient hooks for: {target_keyword}")
-
-    for name, param in model.named_parameters():
-        if target_keyword in name:
-
-            def hook_fn(grad, layer_name=name):
-                grad_norm = grad.norm().item()
-                if grad_norm > 50:
-                    print(f"\n🚨 EXPLODING GRADIENT at {layer_name}")
-                    print(f"   Gradient Norm = {grad_norm:.2f}")
-
-            param.register_hook(hook_fn)
-
-def log_gradient_by_module(model, topk=10):
-    """
-    Log gradient norm theo từng module lớn để tìm nguyên nhân explode gradient.
-    """
-
-    print("\n" + "="*70)
-    print("🔍 GRADIENT DEBUGGING REPORT")
-    print("="*70)
-
-    grad_stats = []
-
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-
-        grad_norm = param.grad.data.norm(2).item()
-        param_norm = param.data.norm(2).item()
-
-        # Detect NaN/Inf
-        if torch.isnan(param.grad).any():
-            print(f"🚨 NaN Gradient detected at: {name}")
-        if torch.isinf(param.grad).any():
-            print(f"🚨 Inf Gradient detected at: {name}")
-
-        grad_stats.append((name, grad_norm, param_norm))
-
-    # Sort by largest gradient
-    grad_stats.sort(key=lambda x: x[1], reverse=True)
-
-    print("\n🔥 TOP Gradient Explosion Layers:")
-    print("-"*70)
-
-    for i, (name, gnorm, pnorm) in enumerate(grad_stats[:topk]):
-        ratio = gnorm / (pnorm + 1e-8)
-
-        print(f"[{i+1}] {name}")
-        print(f"     Grad Norm : {gnorm:.4f}")
-        print(f"     Param Norm: {pnorm:.4f}")
-        print(f"     Ratio     : {ratio:.4f}")
-        print("-"*70)
-
-    print("="*70)
+    def __init__(self, model, log_interval=100, explosion_threshold=50.0):
+        self.model = model
+        self.log_interval = log_interval
+        self.explosion_threshold = explosion_threshold
+        
+        # Statistics
+        self.batch_count = 0
+        self.explosion_count = 0
+        self.gradient_history = defaultdict(list)
+        
+        # Layer-wise tracking
+        self.layer_max_grads = {}
+        
+        # Attach hooks
+        self._attach_hooks()
+    
+    def _attach_hooks(self):
+        """Attach gradient hooks to ALL parameters"""
+        print(f"\n📌 Attaching gradient hooks to {sum(1 for _ in self.model.parameters())} parameters")
+        
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                param.register_hook(lambda grad, n=name: self._hook_fn(grad, n))
+    
+    def _hook_fn(self, grad, layer_name):
+        """Hook function called during backward pass"""
+        if grad is None:
+            return
+        
+        grad_norm = grad.norm().item()
+        
+        # Track max gradient per layer
+        if layer_name not in self.layer_max_grads:
+            self.layer_max_grads[layer_name] = 0.0
+        self.layer_max_grads[layer_name] = max(self.layer_max_grads[layer_name], grad_norm)
+        
+        # Immediate alert for explosion
+        if grad_norm > self.explosion_threshold:
+            self.explosion_count += 1
+            print(f"\n🚨 GRADIENT EXPLOSION #{self.explosion_count}")
+            print(f"   Layer: {layer_name}")
+            print(f"   Grad Norm: {grad_norm:.2f}")
+            print(f"   Batch: {self.batch_count}")
+            
+            # Print grad statistics
+            print(f"   Grad Stats:")
+            print(f"      Mean: {grad.mean().item():.6f}")
+            print(f"      Std:  {grad.std().item():.6f}")
+            print(f"      Min:  {grad.min().item():.6f}")
+            print(f"      Max:  {grad.max().item():.6f}")
+            
+            # Check for NaN/Inf
+            if torch.isnan(grad).any():
+                print(f"   ⚠️ Contains NaN!")
+            if torch.isinf(grad).any():
+                print(f"   ⚠️ Contains Inf!")
+    
+    def log_batch(self):
+        """Log gradient summary for current batch"""
+        self.batch_count += 1
+        
+        # Only log at intervals OR if explosion detected
+        should_log = (
+            self.batch_count % self.log_interval == 0 or
+            self.explosion_count > 0
+        )
+        
+        if not should_log:
+            return None
+        
+        grad_stats = []
+        
+        for name, param in self.model.named_parameters():
+            if param.grad is None:
+                continue
+            
+            grad_norm = param.grad.norm().item()
+            param_norm = param.norm().item()
+            
+            # Detect anomalies
+            has_nan = torch.isnan(param.grad).any().item()
+            has_inf = torch.isinf(param.grad).any().item()
+            
+            grad_stats.append({
+                'name': name,
+                'grad_norm': grad_norm,
+                'param_norm': param_norm,
+                'ratio': grad_norm / (param_norm + 1e-8),
+                'has_nan': has_nan,
+                'has_inf': has_inf,
+            })
+        
+        # Sort by gradient norm
+        grad_stats.sort(key=lambda x: x['grad_norm'], reverse=True)
+        
+        # Print report
+        self._print_report(grad_stats)
+        
+        # Reset explosion count after logging
+        self.explosion_count = 0
+        
+        return grad_stats
+    
+    def _print_report(self, grad_stats, topk=10):
+        """Print formatted gradient report"""
+        print(f"\n{'='*80}")
+        print(f"🔍 GRADIENT REPORT - Batch {self.batch_count}")
+        print(f"{'='*80}")
+        
+        # Summary statistics
+        all_norms = [s['grad_norm'] for s in grad_stats]
+        if all_norms:
+            print(f"\n📊 Summary:")
+            print(f"   Total params with grad: {len(all_norms)}")
+            print(f"   Max gradient:  {max(all_norms):.4f}")
+            print(f"   Mean gradient: {np.mean(all_norms):.4f}")
+            print(f"   Median gradient: {np.median(all_norms):.4f}")
+            print(f"   95th percentile: {np.percentile(all_norms, 95):.4f}")
+        
+        # Anomalies
+        nan_params = [s for s in grad_stats if s['has_nan']]
+        inf_params = [s for s in grad_stats if s['has_inf']]
+        
+        if nan_params:
+            print(f"\n⚠️ NaN detected in {len(nan_params)} parameters:")
+            for s in nan_params[:5]:
+                print(f"   - {s['name']}")
+        
+        if inf_params:
+            print(f"\n⚠️ Inf detected in {len(inf_params)} parameters:")
+            for s in inf_params[:5]:
+                print(f"   - {s['name']}")
+        
+        # Top gradients
+        print(f"\n🔥 TOP {topk} Largest Gradients:")
+        print(f"{'-'*80}")
+        print(f"{'Rank':<6} {'Grad Norm':<12} {'Param Norm':<12} {'Ratio':<10} {'Layer Name'}")
+        print(f"{'-'*80}")
+        
+        for i, s in enumerate(grad_stats[:topk], 1):
+            name_short = s['name'][-50:] if len(s['name']) > 50 else s['name']
+            print(f"{i:<6} {s['grad_norm']:<12.4f} {s['param_norm']:<12.4f} "
+                  f"{s['ratio']:<10.4f} {name_short}")
+        
+        print(f"{'='*80}\n")
+    
+    def get_layer_summary(self):
+        """Get summary of max gradients by layer prefix"""
+        layer_summary = defaultdict(lambda: {'max': 0.0, 'count': 0})
+        
+        for name, max_grad in self.layer_max_grads.items():
+            # Extract layer prefix (e.g., 'backbone.semantic_branch_layers.2')
+            parts = name.split('.')
+            if len(parts) >= 3:
+                layer_key = '.'.join(parts[:3])
+            else:
+                layer_key = parts[0] if parts else 'unknown'
+            
+            layer_summary[layer_key]['max'] = max(layer_summary[layer_key]['max'], max_grad)
+            layer_summary[layer_key]['count'] += 1
+        
+        # Sort by max gradient
+        sorted_layers = sorted(
+            layer_summary.items(),
+            key=lambda x: x[1]['max'],
+            reverse=True
+        )
+        
+        print(f"\n{'='*80}")
+        print(f"📈 LAYER-WISE GRADIENT SUMMARY")
+        print(f"{'='*80}")
+        print(f"{'Layer':<40} {'Max Grad':<15} {'Param Count'}")
+        print(f"{'-'*80}")
+        
+        for layer_name, stats in sorted_layers[:15]:
+            print(f"{layer_name:<40} {stats['max']:<15.4f} {stats['count']}")
+        
+        print(f"{'='*80}\n")
+        
+        return sorted_layers
+    
+    def reset_stats(self):
+        """Reset all statistics"""
+        self.batch_count = 0
+        self.explosion_count = 0
+        self.gradient_history.clear()
+        self.layer_max_grads.clear()
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False, allow_norm_mismatch=True):
     print(f"Loading pretrained weights from: {ckpt_path}")
@@ -617,7 +750,11 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         self.class_weights = class_weights.to(device) if class_weights is not None else None
-
+        self.grad_monitor = GradientMonitor(
+            model=model,
+            log_interval=args.grad_log_interval if hasattr(args, 'grad_log_interval') else 100,
+            explosion_threshold=50.0
+        )
         loss_cfg = args.loss_config
         self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
@@ -731,18 +868,14 @@ class Trainer:
     
             # FIX 1: Check NaN BEFORE backward
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nInf loss at epoch {epoch}, batch {batch_idx}")
-                print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
+                print(f"\n❌ NaN/Inf loss at batch {batch_idx}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
             
             self.scaler.scale(loss).backward()
-            if batch_idx % 20 == 0:
-                log_gradient_by_module(self.model, topk=8)
+            self.grad_monitor.log_batch()
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                
-                # ⭐ CHECK NaN/Inf FIRST
                 has_nan_inf = False
                 for param in self.model.parameters():
                     if param.grad is not None:
@@ -751,35 +884,21 @@ class Trainer:
                             break
                 
                 if has_nan_inf:
-                    print("\n🚨 NaN/Inf gradient - SKIPPING step")
+                    print("\n NaN/Inf gradient - SKIPPING step")
                     self.scaler.update()
                     self.optimizer.zero_grad(set_to_none=True)
                     continue
-                
-                # Monitor gradients
-                max_grad, total_norm = check_gradients(self.model, threshold=10.0)
-                max_grad_epoch = max(max_grad_epoch, max_grad)
-                
-                # ⭐ SKIP if gradient too large (BEFORE clipping)
-                if max_grad > 1000:
-                    print(f"\n🚨 EXTREME gradient {max_grad:.2f} - SKIPPING step")
-                    if max_grad > 1000:
-                        self.scaler.update()
-                        self.optimizer.zero_grad(set_to_none=True)
-                    continue
-                
-                # Apply gradient clipping
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(),
                         max_norm=self.args.grad_clip
                     )
-                
+                    if total_norm > self.args.grad_clip:
+                        print(f"\n✂️ Gradient clipped: {total_norm:.2f} → {self.args.grad_clip}")                
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-                max_grad_epoch = max(max_grad_epoch, max_grad)
             
             total_loss += loss.item() * self.args.accumulation_steps
             total_ce += ce_loss.item()
@@ -794,24 +913,17 @@ class Trainer:
                 'max_grad': f'{max_grad:.2f}'  # â† Monitor
             })
             
-            if batch_idx % 50 == 0:
-                clear_gpu_memory()
-            
-            if batch_idx % self.args.log_interval == 0:
-                self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
-                self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
-                self.writer.add_scalar('train/lr', current_lr, self.global_step)
-                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # â† Log
-    
+        # ✅ EPOCH SUMMARY
+        print(f"\n📊 Epoch {epoch+1} Gradient Summary:")
+        self.grad_monitor.get_layer_summary()
+        
+        # Scheduler step
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
-    
+        
         avg_loss = total_loss / len(loader)
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
-        
-        print(f"\nðŸ“Š Epoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
         
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
@@ -1060,7 +1172,10 @@ def main():
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--reset_best_metric", action="store_true")
-    
+    parser.add_argument("--grad_log_interval", type=int, default=100,
+                   help="Log gradients every N batches (default: 100)")
+    parser.add_argument("--grad_explosion_threshold", type=float, default=50.0,
+                   help="Threshold for gradient explosion alert")
     # Training
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -1359,7 +1474,6 @@ def main():
 
             if targets:
                 unfreeze_backbone_progressive(model, targets)
-                attach_gradient_hooks(model, "semantic_branch_layers.2")
                 trainer.set_loss_phase('ce_only')
                 print(f"\n{'='*70}")
                 print(f"🔥 GRADIENT WARMUP ACTIVATED")
