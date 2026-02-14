@@ -19,7 +19,7 @@ import gc
 import warnings
 import torch_optimizer 
 from torch.optim.swa_utils import AveragedModel, SWALR, update_bn
-
+from collections import defaultdict
 warnings.filterwarnings('ignore')
 
 # ============================================
