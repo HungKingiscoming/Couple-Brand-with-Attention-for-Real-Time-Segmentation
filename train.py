@@ -1191,7 +1191,7 @@ def main():
     parser.add_argument("--img_w", type=int, default=1024)
     parser.add_argument("--dwconv_init_scale", type=float, default=0.01)
     # System
-    parser.add_argument("--use_amp", action="store_true", default=True)
+    parser.add_argument("--use_amp", action="store_true", default=False)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None)
