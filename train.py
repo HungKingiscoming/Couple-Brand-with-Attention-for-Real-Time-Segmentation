@@ -40,6 +40,67 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
+def attach_gradient_hooks(model, target_keyword="semantic_branch_layers.2"):
+    """
+    Attach hook để log gradient trực tiếp tại module gây explode.
+    """
+
+    print(f"\n📌 Attaching gradient hooks for: {target_keyword}")
+
+    for name, param in model.named_parameters():
+        if target_keyword in name:
+
+            def hook_fn(grad, layer_name=name):
+                grad_norm = grad.norm().item()
+                if grad_norm > 50:
+                    print(f"\n🚨 EXPLODING GRADIENT at {layer_name}")
+                    print(f"   Gradient Norm = {grad_norm:.2f}")
+
+            param.register_hook(hook_fn)
+
+def log_gradient_by_module(model, topk=10):
+    """
+    Log gradient norm theo từng module lớn để tìm nguyên nhân explode gradient.
+    """
+
+    print("\n" + "="*70)
+    print("🔍 GRADIENT DEBUGGING REPORT")
+    print("="*70)
+
+    grad_stats = []
+
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+
+        grad_norm = param.grad.data.norm(2).item()
+        param_norm = param.data.norm(2).item()
+
+        # Detect NaN/Inf
+        if torch.isnan(param.grad).any():
+            print(f"🚨 NaN Gradient detected at: {name}")
+        if torch.isinf(param.grad).any():
+            print(f"🚨 Inf Gradient detected at: {name}")
+
+        grad_stats.append((name, grad_norm, param_norm))
+
+    # Sort by largest gradient
+    grad_stats.sort(key=lambda x: x[1], reverse=True)
+
+    print("\n🔥 TOP Gradient Explosion Layers:")
+    print("-"*70)
+
+    for i, (name, gnorm, pnorm) in enumerate(grad_stats[:topk]):
+        ratio = gnorm / (pnorm + 1e-8)
+
+        print(f"[{i+1}] {name}")
+        print(f"     Grad Norm : {gnorm:.4f}")
+        print(f"     Param Norm: {pnorm:.4f}")
+        print(f"     Ratio     : {ratio:.4f}")
+        print("-"*70)
+
+    print("="*70)
+
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False, allow_norm_mismatch=True):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -676,8 +737,8 @@ class Trainer:
                 continue
             
             self.scaler.scale(loss).backward()
-            
-            # FIX 2: ALWAYS clip gradients (khÃ´ng phá»¥ thuá»™c accumulation)
+            if batch_idx % 20 == 0:
+                log_gradient_by_module(self.model, topk=8)
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 
@@ -1298,6 +1359,7 @@ def main():
 
             if targets:
                 unfreeze_backbone_progressive(model, targets)
+                attach_gradient_hooks(model, "semantic_branch_layers.2")
                 trainer.set_loss_phase('ce_only')
                 print(f"\n{'='*70}")
                 print(f"🔥 GRADIENT WARMUP ACTIVATED")
