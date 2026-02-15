@@ -193,11 +193,9 @@ class EnhancedDecoder(nn.Module):
         )
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
 
-    def forward(self, feats: Dict[str, Tensor]) -> Tensor:
+    def forward(self, feats: Union[Tuple[Tensor, Tensor, Tensor], Dict]):
         """✅ FLEXIBLE: Accept Dict hoặc positional args"""
-        if isinstance(feats, dict):
-            c5, c2, c1 = feats['c5'], feats['c2'], feats['c1']
-        else:
+        if isinstance(feats, (tuple, list)) and len(feats) == 3:
             c5, c2, c1 = feats
 
         # Stage 1: H/8→H/4 + c2 fusion
