@@ -892,9 +892,7 @@ class Trainer:
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(),
                         max_norm=self.args.grad_clip
-                    )
-                    if total_norm > self.args.grad_clip:
-                        print(f"\n✂️ Gradient clipped: {total_norm:.2f} → {self.args.grad_clip}")                
+                    )                                        
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
