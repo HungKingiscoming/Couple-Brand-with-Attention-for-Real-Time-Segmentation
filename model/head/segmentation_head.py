@@ -503,4 +503,11 @@ class GCNetHead(nn.Module):
         
         # Decode
         dec_feat = self.decoder((c5, c2, c1))
-        return self.conv_seg(dec_feat)
+        logits = self.conv_seg(dec_feat)  # (B, 19, H/2, W/2)
+        logits = F.interpolate(
+            logits,
+            scale_factor=2,
+            mode='bilinear',
+            align_corners=False
+        )
+        return logits
