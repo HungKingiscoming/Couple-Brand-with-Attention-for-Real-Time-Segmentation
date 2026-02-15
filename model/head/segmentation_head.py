@@ -412,7 +412,12 @@ class GCNetAuxHead(nn.Module):
     
     def forward(self, x: Union[Dict[str, Tensor], Tensor]) -> Tensor:
         if isinstance(x, dict):
-            x = x.get('c4', x['c4'])
+            if 'c4' not in x:
+                raise KeyError(
+                    f"Expected 'c4' key for aux head. Got: {x.keys()}"
+                )
+            x = x['c4']
+        
         x = self.conv1(x)
         return self.conv_seg(x)
 
@@ -479,18 +484,30 @@ class GCNetHead(nn.Module):
                     nn.init.constant_(m.bias, 0)
     
     def forward(self, feats: Union[Dict[str, Tensor], Tuple[Any, ...]]) -> Tensor:
-        # CASE 1: Dict from inference
         if isinstance(feats, dict):
-            c1, c2, c5 = feats['c1'], feats['c2'], feats['c5']
-        if isinstance(feats, dict):
-            c1 = feats['c1']  # Real feature từ detail branch
-            c2 = feats['c2']  # Real feature từ detail branch
-            c5 = feats['out'] # Real feature từ semantic branch
-        elif isinstance(feats, tuple) and len(feats) >= 3:
-            c1, c2, c5 = feats[:3]
-        
+            # ✅ Validate required keys
+            required = {'c1', 'c2'}
+            if not required.issubset(feats.keys()):
+                raise KeyError(
+                    f"Backbone must return {required}. Got: {feats.keys()}"
+                )
+            
+            c1 = feats['c1']  # Real from detail branch
+            c2 = feats['c2']  # Real from detail branch
+            
+            # Try 'c5' first (new), fallback to 'out' (old)
+            if 'c5' in feats:
+                c5 = feats['c5']
+            elif 'out' in feats:
+                c5 = feats['out']
+            else:
+                raise KeyError(
+                    f"Backbone must return 'c5' or 'out'. Got: {feats.keys()}"
+                )
         else:
-            raise ValueError(f"Unsupported feats type: {type(feats)}")
+            raise TypeError(
+                f"Expected dict from GCNetWithEnhance. Got {type(feats)}"
+            )
         
         # Decode
         dec_feat = self.decoder((c5, c2, c1))
