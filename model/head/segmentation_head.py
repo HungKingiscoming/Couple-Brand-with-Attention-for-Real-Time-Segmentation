@@ -201,12 +201,10 @@ class EnhancedDecoder(nn.Module):
         act_cfg: dict = dict(type='ReLU', inplace=False),
         dropout_ratio: float = 0.1,
         use_gated_fusion: bool = True,
-        dwconv_init_scale: float = 0.01  # ✅ Control DWConv init
     ):
         super().__init__()
         self.use_gated_fusion = use_gated_fusion
-        self.dwconv_init_scale = dwconv_init_scale
-
+        
         # ================== Stage 1: H/8 → H/4 ==================
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine1 = nn.Sequential(
@@ -295,14 +293,12 @@ class EnhancedDecoder(nn.Module):
                 kernel_size=3, 
                 norm_cfg=norm_cfg, 
                 act_cfg=act_cfg,
-                init_scale=dwconv_init_scale  # ✅ Custom init
             ),
             DWConvModule(
                 decoder_channels // 2, 
                 kernel_size=3, 
                 norm_cfg=norm_cfg, 
-                act_cfg=None,  # ✅ No act in last DWConv
-                init_scale=dwconv_init_scale
+                act_cfg=None, 
             ),
         )
         
@@ -326,7 +322,6 @@ class EnhancedDecoder(nn.Module):
         (DWConv handles its own initialization)
         """
         for m in self.modules():
-            # Skip DWConvModule (it initializes itself)
             if isinstance(m, DWConvModule):
                 continue
             
@@ -451,7 +446,6 @@ class GCNetHead(nn.Module):
             'act_cfg': kwargs.get('act_cfg', dict(type='ReLU', inplace=False)),
             'dropout_ratio': kwargs.get('dropout_ratio', 0.1),
             'use_gated_fusion': kwargs.get('use_gated_fusion', True),
-            'dwconv_init_scale': kwargs.get('dwconv_init_scale', 0.01)  # ✅ Expose init scale
         }
         
         self.decoder = EnhancedDecoder(**decoder_args)
