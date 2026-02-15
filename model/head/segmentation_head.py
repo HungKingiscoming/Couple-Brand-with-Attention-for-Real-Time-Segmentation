@@ -502,5 +502,5 @@ class GCNetHead(nn.Module):
             raise ValueError(f"Unsupported feats type: {type(feats)}")
         
         # Decode
-        dec_feat = self.decoder(c5, c2, c1)
+        dec_feat = self.decoder((c5, c2, c1))
         return self.conv_seg(dec_feat)
