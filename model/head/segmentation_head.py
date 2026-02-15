@@ -482,19 +482,10 @@ class GCNetHead(nn.Module):
         # CASE 1: Dict from inference
         if isinstance(feats, dict):
             c1, c2, c5 = feats['c1'], feats['c2'], feats['c5']
-        
-        # CASE 2: Tuple (c4, c5) from training
-        elif isinstance(feats, tuple) and len(feats) == 2:
-            c4, c5 = feats
-            
-            # ✅ Fake c2, c1 with BN
-            c2 = F.interpolate(c4, scale_factor=2, mode='bilinear', align_corners=False)
-            c2 = self.fake_c2_proj(c2)
-            
-            c1 = F.interpolate(c2, scale_factor=2, mode='bilinear', align_corners=False)
-            c1 = self.fake_c1_proj(c1)
-        
-        # CASE 3: Full tuple (c1, c2, c5)
+        if isinstance(feats, dict):
+            c1 = feats['c1']  # Real feature từ detail branch
+            c2 = feats['c2']  # Real feature từ detail branch
+            c5 = feats['out'] # Real feature từ semantic branch
         elif isinstance(feats, tuple) and len(feats) >= 3:
             c1, c2, c5 = feats[:3]
         
