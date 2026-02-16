@@ -393,8 +393,6 @@ class GCBlock(nn.Module):
         else:
             # Training mode: multi-path
             
-            # ✅ THÊM: BatchNorm sau khi merge paths
-            _, self.merge_bn = build_norm_layer(norm_cfg, out_channels)
             
             # Residual path (identity)
             if (out_channels == in_channels) and stride == 1:
@@ -450,8 +448,6 @@ class GCBlock(nn.Module):
             (id_out * self.path_scale if isinstance(id_out, torch.Tensor) else 0)
         )
         
-        # ✅ THÊM: Normalize sau khi merge
-        out = self.merge_bn(out)
         
         return self.relu(out)
     
