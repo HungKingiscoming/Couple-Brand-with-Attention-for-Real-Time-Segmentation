@@ -392,7 +392,7 @@ class GCBlock(nn.Module):
             )
         else:
             # Training mode: multi-path
-            
+            _, self.merge_bn = build_norm_layer(norm_cfg, out_channels)
             
             # Residual path (identity)
             if (out_channels == in_channels) and stride == 1:
@@ -447,7 +447,7 @@ class GCBlock(nn.Module):
             self.path_1x1(x) * self.path_scale +
             (id_out * self.path_scale if isinstance(id_out, torch.Tensor) else 0)
         )
-        
+        out = self.merge_bn(out)
         
         return self.relu(out)
     
@@ -607,7 +607,7 @@ class EfficientAttention(nn.Module):
                  reduction=4,
                  qk_sharing=True,      # ✅ Accept but ignore (always efficient)
                  groups=4,              # ✅ Accept for compatibility
-                 alpha=0.001):
+                 alpha=0.1):
         super().__init__()
         
         assert channels % reduction == 0, f"channels {channels} must be divisible by reduction {reduction}"
@@ -758,7 +758,7 @@ class DWSABlock(EfficientAttention):
     DWSABlock = EfficientAttention with same signature
     """
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
-                 qk_sharing=True, groups=4, alpha=0.001):
+                 qk_sharing=True, groups=4, alpha=0.1):
         super().__init__(
             channels=channels,
             num_heads=num_heads,
