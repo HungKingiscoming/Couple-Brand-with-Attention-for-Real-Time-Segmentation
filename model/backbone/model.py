@@ -874,7 +874,7 @@ class GCNetCore(BaseModule):
                  num_blocks_per_stage: List[int] = [4, 4, [5, 4], [5, 4], [2, 2]],
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
@@ -1113,7 +1113,7 @@ class GCNetWithEnhance(BaseModule):
                  ms_alpha: float = 0.1,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
