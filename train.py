@@ -409,7 +409,9 @@ class ModelConfig:
                 "use_multi_scale_context": True,
                 "ms_alpha": 0.1,  
                 "align_corners": False,
-                "deploy": False
+                "deploy": False,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False},
             },
             "head": {
                 "in_channels": 64,
