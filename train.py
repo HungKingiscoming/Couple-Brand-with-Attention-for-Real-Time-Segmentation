@@ -1,4 +1,3 @@
-
 import os
 import torch
 import torch.nn as nn
@@ -1097,16 +1096,54 @@ def main():
 
             if targets:
                 unfreeze_backbone_progressive(model, targets)
+                if args.use_discriminative_lr:
+                    optimizer = setup_discriminative_lr(
+                        model,
+                        base_lr=args.lr,                        # ← args.lr gốc
+                        backbone_lr_factor=args.backbone_lr_factor,
+                        weight_decay=args.weight_decay
+                    )
+                else:
+                    optimizer = optim.AdamW(
+                        filter(lambda p: p.requires_grad, model.parameters()),
+                        lr=args.lr,                              # ← args.lr gốc
+                        weight_decay=args.weight_decay
+                    )
+                
+                trainer.optimizer = optimizer
+                remaining_epochs = args.epochs - epoch
+                if args.scheduler == 'cosine':
+                    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+                        optimizer,
+                        T_max=remaining_epochs,
+                        eta_min=1e-6
+                    )
+                elif args.scheduler == 'onecycle':
+                    n_groups = len(optimizer.param_groups)
+                    if n_groups == 1:
+                        max_lrs = args.lr
+                    else:
+                        max_lrs = [args.lr * args.backbone_lr_factor, args.lr]
+                    
+                    scheduler = optim.lr_scheduler.OneCycleLR(
+                        optimizer,
+                        max_lr=max_lrs,
+                        total_steps=remaining_epochs * len(train_loader),
+                        pct_start=0.05,
+                        anneal_strategy='cos',
+                        div_factor=10,
+                        final_div_factor=100,
+                    )
+                
+                trainer.scheduler = scheduler   
+                
                 trainer.set_loss_phase('ce_only')
                 
-                # FIX: Print LR cá»§a tá»«ng group sau unfreeze
-                print(f"\n{'='*70}")
-                print(f" Learning Rates after unfreezing:")
-                print(f"{'='*70}")
-                for i, group in enumerate(optimizer.param_groups):
-                    name = group.get('name', f'group_{i}')
-                    print(f"   {name}: {group['lr']:.2e}")
-                print(f"{'='*70}\n")
+                print(f"\n✅ Optimizer recreated with {len(optimizer.param_groups)} groups")
+                for i, g in enumerate(optimizer.param_groups):
+                    name = g.get('name', f'group_{i}')
+                    n_params = len(g['params'])
+                    print(f"   {name}: lr={g['lr']:.2e}, params={n_params}")
 
         # Switch back to full loss
         if unfreeze_epochs:
