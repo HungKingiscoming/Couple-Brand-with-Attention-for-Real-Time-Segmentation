@@ -795,7 +795,7 @@ class MultiScaleContextModule(nn.Module):
                     nn.Sequential(
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
                         nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
+                        nn.ReLU(inplace=False),
                     )
                 )
             else:
@@ -804,7 +804,7 @@ class MultiScaleContextModule(nn.Module):
                         nn.AvgPool2d(kernel_size=s, stride=s),
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
                         nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
+                        nn.ReLU(inplace=False),
                     )
                 )
 
@@ -818,7 +818,7 @@ class MultiScaleContextModule(nn.Module):
                 bias=False,
             ),
             nn.BatchNorm2d(fused_channels),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
         )
