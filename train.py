@@ -340,27 +340,32 @@ def count_trainable_params(model):
 
 
 def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
-    backbone_params = [p for n, p in model.named_parameters() 
-                      if 'backbone' in n and p.requires_grad]
-    head_params = [p for n, p in model.named_parameters() 
-                  if 'backbone' not in n and p.requires_grad]
+    backbone_params = []
+    head_params = []
+    
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # ✅ Backbone core = backbone.backbone.*
+        # ✅ Enhancement = backbone.dwsa*, backbone.ms_context, backbone.final_proj
+        # ✅ Head = decode_head.*, aux_head.*
+        if n.startswith('backbone.'):      # Tất cả trong backbone module
+            backbone_params.append(p)
+        else:                              # decode_head, aux_head
+            head_params.append(p)
+    
+    print(f"\n[Discriminative LR]")
+    print(f"  Backbone params: {len(backbone_params)} (lr={base_lr * backbone_lr_factor:.2e})")
+    print(f"  Head params:     {len(head_params)} (lr={base_lr:.2e})")
     
     if len(backbone_params) == 0:
-        optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
-        print(f" Optimizer: AdamW (lr={base_lr}) - head only")
-    else:
-        backbone_lr = base_lr * backbone_lr_factor
-        param_groups = [
-            {'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
-            {'params': head_params, 'lr': base_lr, 'name': 'head'}
-        ]
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
-        
-        print(f"Optimizer: AdamW (Discriminative LR)")
-        print(f"Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
-        print(f"Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
+        print(f"  ⚠️  WARNING: No backbone params! Backbone still frozen?")
+        return torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
     
-    return optimizer
+    return torch.optim.AdamW([
+        {'params': backbone_params, 'lr': base_lr * backbone_lr_factor, 'name': 'backbone'},
+        {'params': head_params,     'lr': base_lr,                       'name': 'head'}
+    ], weight_decay=weight_decay)
 
 
 # FIX: Monitor gradients
