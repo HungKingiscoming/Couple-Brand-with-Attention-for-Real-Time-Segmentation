@@ -1103,6 +1103,9 @@ def main():
 
             if targets:
                 unfreeze_backbone_progressive(model, targets)
+                del optimizer
+                torch.cuda.empty_cache()
+                gc.collect()
                 if args.use_discriminative_lr:
                     optimizer = setup_discriminative_lr(
                         model,
