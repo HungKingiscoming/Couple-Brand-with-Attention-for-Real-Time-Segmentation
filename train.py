@@ -1402,7 +1402,16 @@ def main():
                         div_factor=10,
                         final_div_factor=100,
                     )
-                
+                elif args.scheduler == 'poly':
+                    def poly_lr_lambda(epoch_offset):
+                        # epoch_offset chạy từ 0 đến remaining_epochs
+                        return (1 - epoch_offset / remaining_epochs) ** 0.9
+        
+                scheduler = optim.lr_scheduler.LambdaLR(
+                    optimizer, 
+                    lr_lambda=poly_lr_lambda
+                )
+                print(f"✅ Poly scheduler recreated (T_max={remaining_epochs})")
                 trainer.scheduler = scheduler   
                 
                 trainer.set_loss_phase('ce_only')
