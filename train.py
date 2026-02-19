@@ -974,7 +974,7 @@ class Trainer:
             'model': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
             'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler': self.scaler.state_dict(),
+            'scaler': self.scaler.state_dict() if self.scaler is not None else None,
             'best_miou': self.best_miou,
             'metrics': metrics,
             'global_step': self.global_step
