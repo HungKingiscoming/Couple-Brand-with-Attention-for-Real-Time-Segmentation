@@ -1098,7 +1098,7 @@ def main():
     parser.add_argument("--log_interval", type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--freeze_epochs", type=int, default=10)
-    parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
+    parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=0)
     
     # ✨ NEW: Norm layer control
     parser.add_argument('--keep-bn', action='store_true',
