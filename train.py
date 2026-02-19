@@ -818,7 +818,10 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
             
-            self.scaler.scale(loss).backward()
+            if self.scaler is not None:
+                self.scaler.scale(loss).backward()
+            else:
+                loss.backward()
             
             
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
