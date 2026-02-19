@@ -1324,13 +1324,12 @@ def main():
             raise ValueError(f"Unfreeze epochs must be < total epochs")
 
     for epoch in range(trainer.start_epoch, args.epochs):
-
-        # Phase 1: Freeze backbone
         if epoch < args.freeze_epochs:
             freeze_backbone(model)
             trainer.set_loss_phase('full')
-
-        # Phase 2+: Progressive unfreezing
+        elif epoch == args.freeze_epochs:  # ✅ THÊM: Freeze lại 1 lần cuối
+            freeze_backbone(model)
+            print("🔒 Backbone frozen for the last time before unfreezing")
         if epoch in unfreeze_epochs:
             k = len([e for e in unfreeze_epochs if e <= epoch])
 
@@ -1349,6 +1348,10 @@ def main():
                 print(f"🔓 UNFREEZE CHECK - Epoch {epoch}")
                 print(f"{'='*70}")
                 unfreeze_backbone_progressive(model, targets)
+                print(f"\n🔍 VERIFICATION: DWSA Parameters")
+                for name, param in model.named_parameters():
+                    if 'dwsa' in name:
+                        print(f"   {name[:70]:<70} requires_grad={param.requires_grad}")
                 trainable_backbone = sum(
                     p.numel() for n, p in model.named_parameters() 
                     if n.startswith('backbone.') and p.requires_grad
