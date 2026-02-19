@@ -882,7 +882,7 @@ class Trainer:
             
             print(f"\n📊 Weight Updates (smallest changes):")
             for name, change in sorted_updates[:5]:
-                print(f"   {name[:60]:<60} Δ={change:.8f}")
+                print(f"{name:60s} Δ={delta:.3e}")
         
         # Save current state
         self.prev_model_state = {
