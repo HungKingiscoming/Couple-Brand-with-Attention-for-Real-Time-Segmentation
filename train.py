@@ -104,7 +104,220 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
 
     return rate
 
+# ============================================
+# DEBUG UTILITIES
+# ============================================
 
+def analyze_layer_updates(model, prev_state=None):
+    """
+    Kiểm tra xem weights có thực sự update không
+    """
+    updates = {}
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+            
+        # Calculate weight change
+        if prev_state and name in prev_state:
+            diff = (param.data - prev_state[name]).abs().mean().item()
+            updates[name] = diff
+        else:
+            updates[name] = 0.0
+    
+    return updates
+
+def log_layer_statistics(model, epoch):
+    """
+    In ra thống kê chi tiết về từng layer
+    """
+    print(f"\n{'='*70}")
+    print(f"LAYER STATISTICS - Epoch {epoch}")
+    print(f"{'='*70}")
+    
+    backbone_stats = {}
+    head_stats = {}
+    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        # Weight statistics
+        weight_mean = param.data.abs().mean().item()
+        weight_std = param.data.std().item()
+        
+        # Gradient statistics
+        if param.grad is not None:
+            grad_mean = param.grad.abs().mean().item()
+            grad_std = param.grad.std().item()
+        else:
+            grad_mean = grad_std = 0.0
+        
+        stats = {
+            'weight_mean': weight_mean,
+            'weight_std': weight_std,
+            'grad_mean': grad_mean,
+            'grad_std': grad_std,
+        }
+        
+        if name.startswith('backbone.'):
+            backbone_stats[name] = stats
+        else:
+            head_stats[name] = stats
+    
+    # Print backbone stats (only unfrozen layers)
+    if backbone_stats:
+        print("\n🔵 BACKBONE (Unfrozen Layers):")
+        for name, stats in list(backbone_stats.items())[:10]:  # First 10
+            print(f"  {name[:60]:<60} | "
+                  f"W: {stats['weight_mean']:.4f}±{stats['weight_std']:.4f} | "
+                  f"G: {stats['grad_mean']:.6f}±{stats['grad_std']:.6f}")
+        
+        if len(backbone_stats) > 10:
+            print(f"  ... and {len(backbone_stats)-10} more layers")
+    
+    # Print head stats (first 5)
+    if head_stats:
+        print("\n🟢 HEAD (Sample Layers):")
+        for name, stats in list(head_stats.items())[:5]:
+            print(f"  {name[:60]:<60} | "
+                  f"W: {stats['weight_mean']:.4f}±{stats['weight_std']:.4f} | "
+                  f"G: {stats['grad_mean']:.6f}±{stats['grad_std']:.6f}")
+    
+    print(f"{'='*70}\n")
+
+
+def check_learning_progress(model, optimizer, train_loss_history, val_miou_history):
+    """
+    Phát hiện các vấn đề trong quá trình học
+    """
+    print(f"\n{'='*70}")
+    print("LEARNING PROGRESS ANALYSIS")
+    print(f"{'='*70}")
+    
+    # 1. Check learning rate
+    print("\n📊 Learning Rates:")
+    for i, pg in enumerate(optimizer.param_groups):
+        name = pg.get('name', f'group_{i}')
+        n_params = len(pg['params'])
+        lr = pg['lr']
+        print(f"   {name}: lr={lr:.2e}, params={n_params}")
+    
+    # 2. Check loss trend (last 10 epochs)
+    if len(train_loss_history) >= 10:
+        recent_loss = train_loss_history[-10:]
+        loss_change = recent_loss[-1] - recent_loss[0]
+        loss_std = np.std(recent_loss)
+        
+        print(f"\n📉 Train Loss (last 10 epochs):")
+        print(f"   Start: {recent_loss[0]:.4f} → End: {recent_loss[-1]:.4f}")
+        print(f"   Change: {loss_change:+.4f}")
+        print(f"   Std: {loss_std:.4f}")
+        
+        if abs(loss_change) < 0.01:
+            print(f"   ⚠️  WARNING: Loss barely changing!")
+    
+    # 3. Check mIoU trend
+    if len(val_miou_history) >= 10:
+        recent_miou = val_miou_history[-10:]
+        miou_change = recent_miou[-1] - recent_miou[0]
+        miou_std = np.std(recent_miou)
+        
+        print(f"\n📈 Val mIoU (last 10 epochs):")
+        print(f"   Start: {recent_miou[0]:.4f} → End: {recent_miou[-1]:.4f}")
+        print(f"   Change: {miou_change:+.4f}")
+        print(f"   Std: {miou_std:.4f}")
+        
+        if abs(miou_change) < 0.01:
+            print(f"   ⚠️  WARNING: mIoU stuck! (change < 0.01)")
+    
+    # 4. Check gradient flow
+    total_grad_norm = 0.0
+    zero_grad_params = 0
+    small_grad_params = 0
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            total_grad_norm += grad_norm ** 2
+            
+            if grad_norm == 0:
+                zero_grad_params += 1
+            elif grad_norm < 1e-7:
+                small_grad_params += 1
+    
+    total_grad_norm = total_grad_norm ** 0.5
+    
+    print(f"\n⚡ Gradient Flow:")
+    print(f"   Total norm: {total_grad_norm:.4f}")
+    print(f"   Zero gradients: {zero_grad_params} params")
+    print(f"   Very small (<1e-7): {small_grad_params} params")
+    
+    if zero_grad_params > 10:
+        print(f"   ⚠️  WARNING: Many params with zero gradients!")
+    
+    print(f"{'='*70}\n")
+
+
+def diagnose_unfreeze_issue(model, epoch, unfreeze_epoch):
+    """
+    Chẩn đoán vấn đề sau khi unfreeze
+    """
+    epochs_since_unfreeze = epoch - unfreeze_epoch
+    
+    if epochs_since_unfreeze == 0:
+        return  # Chỉ chạy sau unfreeze
+    
+    print(f"\n{'='*70}")
+    print(f"UNFREEZE DIAGNOSIS - {epochs_since_unfreeze} epochs after unfreeze")
+    print(f"{'='*70}")
+    
+    # Check which layers are trainable
+    backbone_trainable = []
+    for name, param in model.named_parameters():
+        if name.startswith('backbone.') and param.requires_grad:
+            backbone_trainable.append(name)
+    
+    print(f"\n✅ Trainable backbone layers: {len(backbone_trainable)}")
+    if len(backbone_trainable) <= 5:
+        for name in backbone_trainable:
+            print(f"   - {name}")
+    else:
+        for name in backbone_trainable[:3]:
+            print(f"   - {name}")
+        print(f"   ... and {len(backbone_trainable)-3} more")
+    
+    # Check gradient magnitudes
+    backbone_grads = []
+    head_grads = []
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            if name.startswith('backbone.'):
+                backbone_grads.append(grad_norm)
+            else:
+                head_grads.append(grad_norm)
+    
+    if backbone_grads:
+        print(f"\n📊 Gradient Magnitudes:")
+        print(f"   Backbone: mean={np.mean(backbone_grads):.6f}, "
+              f"max={np.max(backbone_grads):.6f}, "
+              f"min={np.min(backbone_grads):.6f}")
+        
+        if head_grads:
+            print(f"   Head:     mean={np.mean(head_grads):.6f}, "
+                  f"max={np.max(head_grads):.6f}, "
+                  f"min={np.min(head_grads):.6f}")
+            
+            ratio = np.mean(backbone_grads) / (np.mean(head_grads) + 1e-10)
+            print(f"   Ratio (backbone/head): {ratio:.4f}")
+            
+            if ratio < 0.01:
+                print(f"   ⚠️  WARNING: Backbone gradients MUCH smaller than head!")
+                print(f"   → Backbone may not be learning effectively")
+    
+    print(f"{'='*70}\n")
 # ============================================
 # LOSS FUNCTIONS
 # ============================================
@@ -483,7 +696,10 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         self.class_weights = class_weights.to(device) if class_weights is not None else None
-
+        self.train_loss_history = []
+        self.val_miou_history = []
+        self.prev_model_state = None
+        self.last_unfreeze_epoch = None
         loss_cfg = args.loss_config
         self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
@@ -541,7 +757,8 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-        
+        if epoch % 5 == 0:
+            log_layer_statistics(self.model, epoch)
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
@@ -555,7 +772,6 @@ class Trainer:
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-    
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
                 logits = outputs["main"]
@@ -595,7 +811,7 @@ class Trainer:
     
                 loss = loss / self.args.accumulation_steps
     
-            # FIX 1: Check NaN BEFORE backward
+            
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\n NaN/Inf loss at epoch {epoch}, batch {batch_idx}")
                 print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
@@ -604,7 +820,7 @@ class Trainer:
             
             self.scaler.scale(loss).backward()
             
-            # FIX 2: ALWAYS clip gradients (khÃ´ng phá»¥ thuá»™c accumulation)
+            
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 
@@ -657,6 +873,23 @@ class Trainer:
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
         
+        self.train_loss_history.append(avg_loss)
+        if self.prev_model_state is not None:
+            updates = analyze_layer_updates(self.model, self.prev_model_state)
+            
+            # Find layers with smallest updates
+            sorted_updates = sorted(updates.items(), key=lambda x: x[1])
+            
+            print(f"\n📊 Weight Updates (smallest changes):")
+            for name, change in sorted_updates[:5]:
+                print(f"   {name[:60]:<60} Δ={change:.8f}")
+        
+        # Save current state
+        self.prev_model_state = {
+            name: param.data.clone() 
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
         print(f"\nEpoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
         
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
@@ -665,7 +898,6 @@ class Trainer:
     def validate(self, loader, epoch):
         self.model.eval()
         total_loss = 0.0
-        
         num_classes = self.args.num_classes
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
@@ -714,7 +946,17 @@ class Trainer:
         union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
         iou = intersection / (union + 1e-10)
         miou = np.nanmean(iou)
-        
+        self.val_miou_history.append(miou)
+        if epoch % 5 == 0 and len(self.train_loss_history) >= 10:
+            check_learning_progress(
+                self.model, 
+                self.optimizer, 
+                self.train_loss_history, 
+                self.val_miou_history
+            )
+
+        if self.last_unfreeze_epoch is not None:
+            diagnose_unfreeze_issue(self.model, epoch, self.last_unfreeze_epoch)
         acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
         avg_loss = total_loss / len(loader)
         
@@ -1102,7 +1344,23 @@ def main():
                 targets = []
 
             if targets:
+                trainer.last_unfreeze_epoch = epoch
+                print(f"\n{'='*70}")
+                print(f"🔓 UNFREEZE CHECK - Epoch {epoch}")
+                print(f"{'='*70}")
                 unfreeze_backbone_progressive(model, targets)
+                trainable_backbone = sum(
+                    p.numel() for n, p in model.named_parameters() 
+                    if n.startswith('backbone.') and p.requires_grad
+                )
+                trainable_head = sum(
+                    p.numel() for n, p in model.named_parameters() 
+                    if not n.startswith('backbone.') and p.requires_grad
+                )
+                print(f"Trainable backbone params: {trainable_backbone:,}")
+                print(f"Trainable head params:     {trainable_head:,}")
+                if trainable_head > 0:
+                    print(f"Ratio (backbone/head):     {trainable_backbone/trainable_head:.2f}")
                 del optimizer
                 torch.cuda.empty_cache()
                 gc.collect()
