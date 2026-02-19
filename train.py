@@ -825,13 +825,12 @@ class Trainer:
             
             
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
-                self.scaler.unscale_(self.optimizer)
+                if self.scaler is not None:
+                    self.scaler.unscale_(self.optimizer)
                 
-                # FIX 3: Monitor gradients
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
                 
-                # FIX 4: ALWAYS apply gradient clipping
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), 
