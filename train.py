@@ -717,7 +717,7 @@ class Trainer:
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'
         
-        self.scaler = GradScaler() if args.amp else None
+        self.scaler = GradScaler() if args.use_amp else None
         
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
