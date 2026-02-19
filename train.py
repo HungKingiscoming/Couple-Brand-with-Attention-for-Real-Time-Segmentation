@@ -717,7 +717,7 @@ class Trainer:
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'
         
-        self.scaler = GradScaler(enabled=args.use_amp)
+        self.scaler = GradScaler() if args.amp else None
         
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -835,8 +835,12 @@ class Trainer:
                         max_norm=self.args.grad_clip
                     )
                 
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
+                if self.scaler is not None:
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    self.optimizer.step()
+            
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
             
