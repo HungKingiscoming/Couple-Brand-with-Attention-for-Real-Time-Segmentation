@@ -403,15 +403,15 @@ class ModelConfig:
                 "channels": 32,
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
-                "dwsa_stages": ['stage5', 'stage6'],
+                "dwsa_stages": ['stage4','stage5', 'stage6'],
                 "dwsa_num_heads": 4,
                 "dwsa_reduction": 4,
                 "dwsa_qk_sharing": True,
                 "dwsa_groups": 4,
-                "dwsa_drop": 0.1,  # â† Dropout
-                "dwsa_alpha": 0.1,  # â† Learnable residual weight
+                "dwsa_drop": 0.1,  
+                "dwsa_alpha": 0.1, 
                 "use_multi_scale_context": True,
-                "ms_alpha": 0.1,  # â† MS residual weight
+                "ms_alpha": 0.1, 
                 "align_corners": False,
                 "deploy": False
             },
@@ -931,8 +931,8 @@ def main():
     )
     
     print("\nApplying Optimizations...")
-    print("Converting BN â†’ GN")
-    model = replace_bn_with_gn(model)
+    # print("Converting BN â†’ GN")
+    # model = replace_bn_with_gn(model)
     
     print("Kaiming Init")
     model.apply(init_weights)
