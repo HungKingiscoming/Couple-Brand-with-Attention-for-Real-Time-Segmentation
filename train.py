@@ -1340,9 +1340,9 @@ def main():
             k = len([e for e in unfreeze_epochs if e <= epoch])
 
             if k == 1:
-                targets = ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa6']
+                targets = ['semantic_branch_layers.2', 'detail_branch_layers.2']
             elif k == 2:
-                targets = ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
+                targets = ['semantic_branch_layers.1', 'detail_branch_layers.1']
             elif k == 3:
                 targets = ['semantic_branch_layers.0', 'detail_branch_layers.0', 'stem']
             else:
