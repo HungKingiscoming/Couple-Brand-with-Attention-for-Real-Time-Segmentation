@@ -8,165 +8,41 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from components.components import (
+    ConvModule,
     BaseModule,
+    build_norm_layer,
+    build_activation_layer,
     resize,
     DAPPM,
     OptConfigType,
 )
 
 
-
-def build_norm_layer(norm_cfg, num_features):
-    """
-    Build normalization layer from config
-    
-    Args:
-        norm_cfg: dict with 'type' key ('BN', 'GN', 'SyncBN')
-        num_features: number of channels
-    
-    Returns:
-        tuple: (name, norm_layer)
-    """
-    if norm_cfg is None:
-        return None, nn.Identity()
-    
-    norm_type = norm_cfg.get('type', 'BN')
-    requires_grad = norm_cfg.get('requires_grad', True)
-    
-    if norm_type == 'BN':
-        norm_layer = nn.BatchNorm2d(num_features)
-    elif norm_type == 'SyncBN':
-        norm_layer = nn.SyncBatchNorm(num_features)
-    elif norm_type == 'GN':
-        num_groups = norm_cfg.get('num_groups', 32)
-        # Ensure num_groups divides num_features
-        while num_features % num_groups != 0 and num_groups > 1:
-            num_groups //= 2
-        norm_layer = nn.GroupNorm(num_groups, num_features)
-    else:
-        raise ValueError(f"Unsupported norm type: {norm_type}")
-    
-    # Set requires_grad
-    for param in norm_layer.parameters():
-        param.requires_grad = requires_grad
-    
-    return norm_type, norm_layer
-
-def build_activation_layer(act_cfg):
-    """
-    Build activation layer from config
-    
-    Args:
-        act_cfg: dict with 'type' key ('ReLU', 'LeakyReLU', etc.)
-    
-    Returns:
-        nn.Module: activation layer
-    """
-    if act_cfg is None:
-        return nn.Identity()
-    
-    act_type = act_cfg.get('type', 'ReLU')
-    inplace = act_cfg.get('inplace', True)
-    
-    if act_type == 'ReLU':
-        return nn.ReLU(inplace=inplace)
-    elif act_type == 'LeakyReLU':
-        negative_slope = act_cfg.get('negative_slope', 0.01)
-        return nn.LeakyReLU(negative_slope, inplace=inplace)
-    elif act_type == 'PReLU':
-        return nn.PReLU()
-    elif act_type == 'GELU':
-        return nn.GELU()
-    else:
-        raise ValueError(f"Unsupported activation type: {act_type}")
-
-
-class ConvModule(nn.Module):
-    """
-    Conv-Norm-Act module
-    Compatible với norm_cfg và act_cfg
-    """
-    def __init__(self,
-                 in_channels,
-                 out_channels,
-                 kernel_size,
-                 stride=1,
-                 padding=0,
-                 dilation=1,
-                 groups=1,
-                 bias=True,
-                 norm_cfg=None,
-                 act_cfg=None):
-        super().__init__()
-        
-        # Conv
-        self.conv = nn.Conv2d(
-            in_channels=in_channels,
-            out_channels=out_channels,
-            kernel_size=kernel_size,
-            stride=stride,
-            padding=padding,
-            dilation=dilation,
-            groups=groups,
-            bias=bias
-        )
-        
-        # Norm
-        if norm_cfg is not None:
-            norm_name, norm_layer = build_norm_layer(norm_cfg, out_channels)
-            self.add_module(norm_name.lower(), norm_layer)  # 'bn' or 'gn'
-            self.norm_name = norm_name.lower()
-        else:
-            self.norm_name = None
-        
-        # Activation
-        if act_cfg is not None:
-            self.activate = build_activation_layer(act_cfg)
-        else:
-            self.activate = None
-    
-    def forward(self, x):
-        x = self.conv(x)
-        
-        if self.norm_name is not None:
-            norm = getattr(self, self.norm_name)
-            x = norm(x)
-        
-        if self.activate is not None:
-            x = self.activate(x)
-        
-        return x
 # ===========================
-# FIXED GCBlock classes - Support GroupNorm
+# GCBlock classes (giá»¯ nguyÃªn tá»« code gá»‘c)
 # ===========================
 
-class Block1x1(nn.Module):
-    """1x1 conv block with double 1x1 structure"""
+class Block1x1(BaseModule):
     def __init__(self,
-                 in_channels,
-                 out_channels,
-                 stride=1,
-                 padding=0,
-                 bias=True,
-                 norm_cfg=None,
-                 deploy=False):
+                 in_channels: int,
+                 out_channels: int,
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[int, Tuple[int]] = 0,
+                 bias: bool = True,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 deploy: bool = False):
         super().__init__()
-        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
         self.padding = padding
         self.bias = bias
         self.deploy = deploy
-        
-        if norm_cfg is None:
-            norm_cfg = dict(type='BN', requires_grad=True)
-        
-        if deploy:
+
+        if self.deploy:
             self.conv = nn.Conv2d(
                 in_channels, out_channels, kernel_size=1,
-                stride=stride, padding=padding, bias=True
-            )
+                stride=stride, padding=padding, bias=True)
         else:
             self.conv1 = ConvModule(
                 in_channels=in_channels,
@@ -176,8 +52,7 @@ class Block1x1(nn.Module):
                 padding=padding,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None
-            )
+                act_cfg=None)
             self.conv2 = ConvModule(
                 in_channels=out_channels,
                 out_channels=out_channels,
@@ -186,87 +61,64 @@ class Block1x1(nn.Module):
                 padding=padding,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None
-            )
-    
+                act_cfg=None)
+
     def forward(self, x):
         if self.deploy:
             return self.conv(x)
         x = self.conv1(x)
         x = self.conv2(x)
         return x
-    
-    def _fuse_bn_tensor(self, conv):
-        """Fuse conv + bn"""
+
+    def _fuse_bn_tensor(self, conv: nn.Module):
         kernel = conv.conv.weight
         bias = conv.conv.bias
-        
-        if hasattr(conv, 'bn'):
-            running_mean = conv.bn.running_mean
-            running_var = conv.bn.running_var
-            gamma = conv.bn.weight
-            beta = conv.bn.bias
-            eps = conv.bn.eps
-            std = (running_var + eps).sqrt()
-            t = (gamma / std).reshape(-1, 1, 1, 1)
-            
-            if bias is not None:
-                return kernel * t, beta + (bias - running_mean) * gamma / std
-            else:
-                return kernel * t, beta - running_mean * gamma / std
-        else:
-            if bias is None:
-                bias = torch.zeros(kernel.shape[0], device=kernel.device)
-            return kernel, bias
-    
+        running_mean = conv.bn.running_mean
+        running_var = conv.bn.running_var
+        gamma = conv.bn.weight
+        beta = conv.bn.bias
+        eps = conv.bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+
     def switch_to_deploy(self):
-        """Convert to deploy mode"""
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
-        
         self.conv = nn.Conv2d(
             self.in_channels, self.out_channels,
             kernel_size=1, stride=self.stride,
-            padding=self.padding, bias=True
-        )
+            padding=self.padding, bias=True)
         self.conv.weight.data = torch.einsum(
-            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1
-        )
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
         self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
-        
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
 
 
-class Block3x3(nn.Module):
-    """3x3 conv block with 3x3 → 1x1 structure"""
+class Block3x3(BaseModule):
     def __init__(self,
-                 in_channels,
-                 out_channels,
-                 stride=1,
-                 padding=1,
-                 bias=True,
-                 norm_cfg=None,
-                 deploy=False):
+                 in_channels: int,
+                 out_channels: int,
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[int, Tuple[int]] = 0,
+                 bias: bool = True,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 deploy: bool = False):
         super().__init__()
-        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.stride = stride
         self.padding = padding
         self.bias = bias
         self.deploy = deploy
-        
-        if norm_cfg is None:
-            norm_cfg = dict(type='BN', requires_grad=True)
-        
-        if deploy:
+
+        if self.deploy:
             self.conv = nn.Conv2d(
                 in_channels, out_channels,
                 kernel_size=3, stride=stride,
-                padding=padding, bias=True
-            )
+                padding=padding, bias=True)
         else:
             self.conv1 = ConvModule(
                 in_channels=in_channels,
@@ -276,8 +128,7 @@ class Block3x3(nn.Module):
                 padding=padding,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None
-            )
+                act_cfg=None)
             self.conv2 = ConvModule(
                 in_channels=out_channels,
                 out_channels=out_channels,
@@ -286,54 +137,37 @@ class Block3x3(nn.Module):
                 padding=0,
                 bias=bias,
                 norm_cfg=norm_cfg,
-                act_cfg=None
-            )
-    
+                act_cfg=None)
+
     def forward(self, x):
         if self.deploy:
             return self.conv(x)
         x = self.conv1(x)
         x = self.conv2(x)
         return x
-    
-    def _fuse_bn_tensor(self, conv):
-        """Fuse conv + bn"""
+
+    def _fuse_bn_tensor(self, conv: nn.Module):
         kernel = conv.conv.weight
         bias = conv.conv.bias
-        
-        if hasattr(conv, 'bn'):
-            running_mean = conv.bn.running_mean
-            running_var = conv.bn.running_var
-            gamma = conv.bn.weight
-            beta = conv.bn.bias
-            eps = conv.bn.eps
-            std = (running_var + eps).sqrt()
-            t = (gamma / std).reshape(-1, 1, 1, 1)
-            
-            if bias is not None:
-                return kernel * t, beta + (bias - running_mean) * gamma / std
-            else:
-                return kernel * t, beta - running_mean * gamma / std
-        else:
-            if bias is None:
-                bias = torch.zeros(kernel.shape[0], device=kernel.device)
-            return kernel, bias
-    
+        running_mean = conv.bn.running_mean
+        running_var = conv.bn.running_var
+        gamma = conv.bn.weight
+        beta = conv.bn.bias
+        eps = conv.bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+
     def switch_to_deploy(self):
-        """Convert to deploy mode"""
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
-        
         self.conv = nn.Conv2d(
             self.in_channels, self.out_channels,
             kernel_size=3, stride=self.stride,
-            padding=self.padding, bias=True
-        )
+            padding=self.padding, bias=True)
         self.conv.weight.data = torch.einsum(
-            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1
-        )
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
         self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
-        
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
@@ -347,40 +181,29 @@ class GCBlock(nn.Module):
                  stride: Union[int, Tuple[int]] = 1,
                  padding: Union[int, Tuple[int]] = 1,
                  padding_mode: Optional[str] = 'zeros',
-                 norm_cfg: dict = None,
-                 act_cfg: dict = None,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
                  act: bool = True,
-                 path_scale: float = 0.25,  # ✅ Thêm type hint
                  deploy: bool = False):
         super().__init__()
-        
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
         self.deploy = deploy
-        self.path_scale = path_scale  # ✅ LƯU path_scale
-        
-        # Default configs if None
-        if norm_cfg is None:
-            norm_cfg = dict(type='BN', requires_grad=True)
-        if act_cfg is None:
-            act_cfg = dict(type='ReLU', inplace=True)
-        
+
         assert kernel_size == 3
         assert padding == 1
-        
+
         padding_11 = padding - kernel_size // 2
-        
-        # Activation
+
         if act:
             self.relu = build_activation_layer(act_cfg)
         else:
             self.relu = nn.Identity()
-        
+
         if deploy:
-            # Deployed mode: single fused conv
             self.reparam_3x3 = nn.Conv2d(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -388,19 +211,13 @@ class GCBlock(nn.Module):
                 stride=stride,
                 padding=padding,
                 bias=True,
-                padding_mode=padding_mode
-            )
+                padding_mode=padding_mode)
         else:
-            # Training mode: multi-path
-            _, self.merge_bn = build_norm_layer(norm_cfg, out_channels)
-            
-            # Residual path (identity)
             if (out_channels == in_channels) and stride == 1:
-                _, self.path_residual = build_norm_layer(norm_cfg, in_channels)
+                self.path_residual = build_norm_layer(norm_cfg, num_features=in_channels)[1]
             else:
                 self.path_residual = None
-            
-            # Path 1: 3x3 → 1x1
+
             self.path_3x3_1 = Block3x3(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -409,8 +226,6 @@ class GCBlock(nn.Module):
                 bias=False,
                 norm_cfg=norm_cfg,
             )
-            
-            # Path 2: 3x3 → 1x1
             self.path_3x3_2 = Block3x3(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -419,8 +234,6 @@ class GCBlock(nn.Module):
                 bias=False,
                 norm_cfg=norm_cfg,
             )
-            
-            # Path 3: 1x1 → 1x1
             self.path_1x1 = Block1x1(
                 in_channels=in_channels,
                 out_channels=out_channels,
@@ -429,131 +242,78 @@ class GCBlock(nn.Module):
                 bias=False,
                 norm_cfg=norm_cfg,
             )
-    
-    def forward(self, x):
+
+    def forward(self, inputs: Tensor) -> Tensor:
         if hasattr(self, 'reparam_3x3'):
-            return self.relu(self.reparam_3x3(x))
-        
-        # ✅ TÍNH id_out TRƯỚC
+            return self.relu(self.reparam_3x3(inputs))
+
         if self.path_residual is None:
             id_out = 0
         else:
-            id_out = self.path_residual(x)
-        
-        # ✅ SAU ĐÓ mới tính out (với id_out đã tồn tại)
-        out = (
-            self.path_3x3_1(x) * self.path_scale +
-            self.path_3x3_2(x) * self.path_scale +
-            self.path_1x1(x) * self.path_scale +
-            (id_out * self.path_scale if isinstance(id_out, torch.Tensor) else 0)
+            id_out = self.path_residual(inputs)
+
+        return self.relu(
+            self.path_3x3_1(inputs)
+            + self.path_3x3_2(inputs)
+            + self.path_1x1(inputs)
+            + id_out
         )
-        out = self.merge_bn(out)
-        
-        return self.relu(out)
-    
+
     def _pad_1x1_to_3x3_tensor(self, kernel1x1):
         if kernel1x1 is None:
             return 0
-        return F.pad(kernel1x1, [1, 1, 1, 1])
-    
-    def _fuse_bn_tensor(self, conv):
-        """Fuse conv + bn into single conv"""
+        return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
+
+    def _fuse_bn_tensor(self, conv: nn.Module):
         if conv is None:
             return 0, 0
-        
         if isinstance(conv, ConvModule):
             kernel = conv.conv.weight
-            
-            # Check if has BatchNorm
-            if hasattr(conv, 'bn'):
-                running_mean = conv.bn.running_mean
-                running_var = conv.bn.running_var
-                gamma = conv.bn.weight
-                beta = conv.bn.bias
-                eps = conv.bn.eps
-            elif hasattr(conv, 'gn'):
-                # GroupNorm cannot be fused easily, return as-is
-                bias = conv.conv.bias
-                if bias is None:
-                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
-                return kernel, bias
-            else:
-                # No norm layer
-                bias = conv.conv.bias
-                if bias is None:
-                    bias = torch.zeros(kernel.shape[0], device=kernel.device)
-                return kernel, bias
-            
-            std = (running_var + eps).sqrt()
-            t = (gamma / std).reshape(-1, 1, 1, 1)
-            return kernel * t, beta - running_mean * gamma / std
-        
+            running_mean = conv.bn.running_mean
+            running_var = conv.bn.running_var
+            gamma = conv.bn.weight
+            beta = conv.bn.bias
+            eps = conv.bn.eps
         else:
-            # Identity branch (just norm layer)
-            if isinstance(conv, nn.GroupNorm):
-                # Create identity kernel for GroupNorm
-                if not hasattr(self, 'id_tensor'):
-                    kernel_value = np.zeros(
-                        (self.in_channels, self.in_channels, 3, 3),
-                        dtype=np.float32
-                    )
-                    for i in range(self.in_channels):
-                        kernel_value[i, i, 1, 1] = 1
-                    self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
-                return self.id_tensor, torch.zeros(self.in_channels, device=conv.weight.device)
-            
-            # BatchNorm identity
             running_mean = conv.running_mean
             running_var = conv.running_var
             gamma = conv.weight
             beta = conv.bias
             eps = conv.eps
-            
             if not hasattr(self, 'id_tensor'):
+                input_in_channels = self.in_channels
                 kernel_value = np.zeros(
-                    (self.in_channels, self.in_channels, 3, 3),
-                    dtype=np.float32
-                )
+                    (self.in_channels, input_in_channels, 3, 3),
+                    dtype=np.float32)
                 for i in range(self.in_channels):
-                    kernel_value[i, i, 1, 1] = 1
+                    kernel_value[i, i % input_in_channels, 1, 1] = 1
                 self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
-            
             kernel = self.id_tensor
-            std = (running_var + eps).sqrt()
-            t = (gamma / std).reshape(-1, 1, 1, 1)
-            return kernel * t, beta - running_mean * gamma / std
-    
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
     def get_equivalent_kernel_bias(self):
-        """Get equivalent kernel and bias for deployment"""
         self.path_3x3_1.switch_to_deploy()
-        kernel3x3_1 = self.path_3x3_1.conv.weight.data
-        bias3x3_1 = self.path_3x3_1.conv.bias.data
-        
+        kernel3x3_1, bias3x3_1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
         self.path_3x3_2.switch_to_deploy()
-        kernel3x3_2 = self.path_3x3_2.conv.weight.data
-        bias3x3_2 = self.path_3x3_2.conv.bias.data
-        
+        kernel3x3_2, bias3x3_2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
         self.path_1x1.switch_to_deploy()
-        kernel1x1 = self.path_1x1.conv.weight.data
-        bias1x1 = self.path_1x1.conv.bias.data
-        
+        kernel1x1, bias1x1 = self.path_1x1.conv.weight.data, self.path_1x1.conv.bias.data
         kernelid, biasid = self._fuse_bn_tensor(self.path_residual)
-        
+
         kernel = (
-            kernel3x3_1 + 
-            kernel3x3_2 + 
-            self._pad_1x1_to_3x3_tensor(kernel1x1) + 
-            kernelid
+            kernel3x3_1
+            + kernel3x3_2
+            + self._pad_1x1_to_3x3_tensor(kernel1x1)
+            + kernelid
         )
         bias = bias3x3_1 + bias3x3_2 + bias1x1 + biasid
-        
         return kernel, bias
-    
+
     def switch_to_deploy(self):
-        """Convert to deploy mode (optional)"""
         if hasattr(self, 'reparam_3x3'):
             return
-        
         kernel, bias = self.get_equivalent_kernel_bias()
         self.reparam_3x3 = nn.Conv2d(
             in_channels=self.in_channels,
@@ -561,12 +321,9 @@ class GCBlock(nn.Module):
             kernel_size=self.kernel_size,
             stride=self.stride,
             padding=self.padding,
-            bias=True
-        )
+            bias=True)
         self.reparam_3x3.weight.data = kernel
         self.reparam_3x3.bias.data = bias
-        
-        # Delete training components
         for p in self.parameters():
             p.detach_()
         if hasattr(self, 'path_3x3_1'):
@@ -579,16 +336,15 @@ class GCBlock(nn.Module):
             self.__delattr__('path_residual')
         if hasattr(self, 'id_tensor'):
             self.__delattr__('id_tensor')
-        
         self.deploy = True
 
 
 # ===========================
-# DWSA + MultiScale (giữ nguyên)
+# FIXED DWSA + MultiScale
 # ===========================
 
 def _get_valid_groups(channels, desired_groups):
-    """Tìm số group lớn nhất chia hết cho channels."""
+    """TÃ¬m sá»‘ group lá»›n nháº¥t chia háº¿t cho channels."""
     if desired_groups <= 1:
         return 1
     g = min(desired_groups, channels)
@@ -599,98 +355,66 @@ def _get_valid_groups(channels, desired_groups):
     return 1
 
 
-class EfficientAttention(nn.Module):
-    def __init__(self, 
-                 channels, 
-                 num_heads=2, 
-                 drop=0.0, 
-                 reduction=4,
-                 qk_sharing=True,      # ✅ Accept but ignore (always efficient)
-                 groups=4,              # ✅ Accept for compatibility
-                 alpha=0.1):
+class DWSABlock(nn.Module):
+    """FIXED VERSION vá»›i stability improvements"""
+    def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
+                 qk_sharing=True, groups=4, alpha=0.1):
         super().__init__()
-        
-        assert channels % reduction == 0, f"channels {channels} must be divisible by reduction {reduction}"
-        
+        assert channels % reduction == 0
         self.channels = channels
         self.num_heads = num_heads
-        self.reduction = reduction
-        self.qk_sharing = qk_sharing  # Store but don't use differently
-        
+
         reduced = channels // reduction
+        mid = max(reduced // 2, num_heads)
         self.reduced = reduced
+        self.mid = mid
+
+        # FIX 1: Layer Norm cho stability
+        self.ln = nn.LayerNorm(channels)
         
-        # Validate groups
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
+
         g = _get_valid_groups(reduced, groups)
         if g != groups:
             import warnings
             warnings.warn(
-                f"EfficientAttention: adjusted groups from {groups} to {g} for channels={reduced}"
+                f"DWSABlock: adjusted groups from {groups} to {g} for channels={reduced}"
             )
-        self.groups = g
-        
-        # Input projection
-        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
-        self.bn_in = nn.BatchNorm2d(reduced)
-        
-        # Output projection
-        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
-        self.bn_out = nn.BatchNorm2d(channels)
-        
-        # QKV projection (shared or separate based on qk_sharing flag)
+
+        self.qk_sharing = qk_sharing
         if qk_sharing:
-            # Shared QK base
-            self.qk_base = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
-                                     groups=g, bias=False)
-            self.q_head = nn.Conv1d(reduced // 2, reduced // 2, kernel_size=1, bias=True)
-            self.k_head = nn.Conv1d(reduced // 2, reduced // 2, kernel_size=1, bias=True)
+            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
+            self.q_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+            self.k_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
         else:
-            # Separate Q, K projections
-            self.q_proj = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
-                                   groups=g, bias=True)
-            self.k_proj = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
-                                   groups=g, bias=True)
+            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+
+        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
+
+        self.drop = nn.Dropout(drop)
         
-        # V projection
-        self.v_proj = nn.Conv1d(reduced, reduced // 2, kernel_size=1, 
-                               groups=g, bias=True)
-        
-        # Output projection for attention
-        self.o_proj = nn.Conv1d(reduced // 2, reduced, kernel_size=1, 
-                               groups=g, bias=True)
-        
-        # Dropout
-        self.drop = nn.Dropout(drop) if drop > 0 else nn.Identity()
-        
-        # Attention scale
-        head_dim = (reduced // 2) // num_heads
+        # FIX 2: Improved scaling
+        head_dim = mid // num_heads
         self.scale = head_dim ** -0.5
         
-        # Residual weight
+        # FIX 3: Learnable alpha (khá»Ÿi táº¡o nhá»)
         self.alpha = nn.Parameter(torch.tensor(alpha))
-        self.target_alpha = alpha          
-        self._init_weights()
-    def _init_weights(self):
-        """Initialize weights for attention layers"""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.Conv2d)):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
         B, C, H, W = x.shape
         identity = x
+
+        # FIX 4: Layer norm TRÆ¯á»šC process
+        x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         
-        # Input projection
-        x_red = self.bn_in(self.in_proj(x))
+        x_red = self.in_proj(x_ln)
         B, C2, H, W = x_red.shape
         N = H * W
         x_flat = x_red.view(B, C2, N)
-        
-        # Generate Q, K, V
+
         if self.qk_sharing:
             base = self.qk_base(x_flat)
             q = self.q_head(base)
@@ -699,80 +423,40 @@ class EfficientAttention(nn.Module):
             q = self.q_proj(x_flat)
             k = self.k_proj(x_flat)
         v = self.v_proj(x_flat)
-        
-        # ✅ ADD: Normalize Q, K để tránh overflow
-        q = F.normalize(q, dim=1, eps=1e-6)
-        k = F.normalize(k, dim=1, eps=1e-6)
-        
-        # Reshape for multi-head
+
         def split_heads(t):
-            B, C_mid, N = t.shape
-            head_dim = C_mid // self.num_heads
+            B, Cmid, N = t.shape
+            head_dim = Cmid // self.num_heads
             t = t.view(B, self.num_heads, head_dim, N)
-            return t.permute(0, 1, 3, 2)
-        
-        q = split_heads(q)
-        k = split_heads(k)
-        v = split_heads(v)
-        
-        # Attention computation
+            return t
+
+        q = split_heads(q).permute(0, 1, 3, 2)
+        k = split_heads(k).permute(0, 1, 3, 2)
+        v = split_heads(v).permute(0, 1, 3, 2)
+
+        # FIX 5: Clamp attention scores
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        
-        # ✅ ENHANCED: More aggressive clamping
-        attn = attn.clamp(-5, 5)  # ← Giảm từ 10 xuống 5
-        
-        # ✅ ADD: Check and fix NaN BEFORE softmax
-        if torch.isnan(attn).any() or torch.isinf(attn).any():
-            attn = torch.nan_to_num(attn, nan=0.0, posinf=5.0, neginf=-5.0)
-        
+        attn = attn.clamp(-10, 10)  # Prevent overflow
         attn = F.softmax(attn, dim=-1)
-        
-        # ✅ ADD: Stabilize attention weights
-        attn = attn + 1e-8  # Prevent zero gradients
-        
         attn = self.drop(attn)
-        
-        # Apply attention
+
         out = torch.matmul(attn, v)
-        
-        # Merge heads
         out = out.permute(0, 1, 3, 2).contiguous()
         B_, Hn, Hd, N_ = out.shape
-        out = out.view(B, self.reduced // 2, N_)
-        
-        # Output projection
+        out = out.view(B, self.mid, N_)
+
         out = self.o_proj(out)
         out = out.view(B, C2, H, W)
-        out = self.bn_out(self.out_proj(out))
-        
-        # ✅ ADD: Clamp output BEFORE residual
-        out = out.clamp(-10, 10)
-        
-        # Residual connection với alpha nhỏ
+        out = self.out_proj(out)
+
+        # FIX 6: Scaled residual
         return identity + self.alpha * out
 
-class DWSABlock(EfficientAttention):
-    """
-    ✅ ALIAS - For backward compatibility
-    
-    DWSABlock = EfficientAttention with same signature
-    """
-    def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
-                 qk_sharing=True, groups=4, alpha=0.1):
-        super().__init__(
-            channels=channels,
-            num_heads=num_heads,
-            drop=drop,
-            reduction=reduction,
-            qk_sharing=qk_sharing,
-            groups=groups,
-            alpha=alpha
-        )
 
 class MultiScaleContextModule(nn.Module):
-    """FIXED VERSION với BatchNorm"""
+    """FIXED VERSION vá»›i BatchNorm"""
     def __init__(self, in_channels, out_channels, scales=(1, 2), 
-                 branch_ratio=8, alpha=0.001):
+                 branch_ratio=8, alpha=0.1):
         super().__init__()
         self.scales = scales
         self.in_channels = in_channels
@@ -788,14 +472,15 @@ class MultiScaleContextModule(nn.Module):
             per_branch_list.append(max(c, 1))
         fused_channels = sum(per_branch_list)
 
+        # FIX 7: ThÃªm BatchNorm vÃ o táº¥t cáº£ branches
         self.scale_branches = nn.ModuleList()
         for s, c_out in zip(scales, per_branch_list):
             if s == 1:
                 self.scale_branches.append(
                     nn.Sequential(
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=False),
+                        nn.BatchNorm2d(c_out),  # â† THÃŠM
+                        nn.ReLU(inplace=True),
                     )
                 )
             else:
@@ -803,11 +488,12 @@ class MultiScaleContextModule(nn.Module):
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=s, stride=s),
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=False),
+                        nn.BatchNorm2d(c_out),  # â† THÃŠM
+                        nn.ReLU(inplace=True),
                     )
                 )
 
+        # FIX 8: BatchNorm trong fusion
         self.fusion = nn.Sequential(
             nn.Conv2d(
                 fused_channels,
@@ -817,33 +503,24 @@ class MultiScaleContextModule(nn.Module):
                 groups=fused_channels,
                 bias=False,
             ),
-            nn.BatchNorm2d(fused_channels),
-            nn.ReLU(inplace=False),
+            nn.BatchNorm2d(fused_channels),  # â† THÃŠM
+            nn.ReLU(inplace=True),
             nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.BatchNorm2d(out_channels),  # â† THÃŠM
         )
 
+        # FIX 9: Learnable alpha nhá»
         self.alpha = nn.Parameter(torch.tensor(alpha))
-        self.target_alpha = alpha
-        self._init_weights()
+        
+        # FIX 10: BatchNorm cho projection
         if in_channels != out_channels:
             self.proj = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels),
+                nn.BatchNorm2d(out_channels),  # â† THÃŠM
             )
         else:
             self.proj = None
-    def _init_weights(self):
-        """Khởi tạo weights cho attention layers"""
-        for m in self.modules():
-            if isinstance(m, (nn.Conv1d, nn.Conv2d)):
-                # Xavier for attention
-                nn.init.xavier_uniform_(m.weight, gain=0.1)  # ← gain=0.1
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
         B, C, H, W = x.shape
         outs = []
@@ -861,9 +538,12 @@ class MultiScaleContextModule(nn.Module):
         else:
             x_proj = x
 
+        # Scaled residual
         return x_proj + self.alpha * out
+
+
 # ===========================
-# GCNetCore + GCNetWithEnhance (giữ nguyên - copy từ document 4)
+# GCNetCore (giá»¯ nguyÃªn)
 # ===========================
 
 class GCNetCore(BaseModule):
@@ -874,7 +554,7 @@ class GCNetCore(BaseModule):
                  num_blocks_per_stage: List[int] = [4, 4, [5, 4], [5, 4], [2, 2]],
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
@@ -940,7 +620,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[2][0] - 2)],
                 GCBlock(channels * 4, channels * 4, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
             )
         )
         self.semantic_branch_layers.append(
@@ -951,7 +631,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[3][0] - 2)],
                 GCBlock(channels * 8, channels * 8, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
             )
         )
         self.semantic_branch_layers.append(
@@ -962,7 +642,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[4][0] - 2)],
                 GCBlock(channels * 16, channels * 16, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
             )
         )
 
@@ -973,7 +653,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[2][1] - 1)],
                 GCBlock(channels * 2, channels * 2, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
             )
         )
         self.detail_branch_layers.append(
@@ -982,7 +662,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[3][1] - 1)],
                 GCBlock(channels * 2, channels * 2, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
             )
         )
         self.detail_branch_layers.append(
@@ -993,7 +673,7 @@ class GCNetCore(BaseModule):
                           norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[4][1] - 2)],
                 GCBlock(channels * 4, channels * 4, stride=1,
-                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=True, deploy=deploy),
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
             )
         )
 
@@ -1092,8 +772,12 @@ class GCNetCore(BaseModule):
         )
 
 
+# ===========================
+# Enhanced Backbone vá»›i táº¥t cáº£ fixes
+# ===========================
+
 class GCNetWithEnhance(BaseModule):
-    """FIXED VERSION - Complete với GroupNorm support"""
+    """FIXED VERSION - Complete vá»›i gradient clipping"""
     
     def __init__(self,
                  in_channels: int = 3,
@@ -1105,15 +789,15 @@ class GCNetWithEnhance(BaseModule):
                  dwsa_reduction: int = 4,
                  dwsa_qk_sharing: bool = True,
                  dwsa_groups: int = 4,
-                 dwsa_drop: float = 0.1,
-                 dwsa_alpha: float = 0.1,
+                 dwsa_drop: float = 0.1,  # â† Default 0.1 cho regularization
+                 dwsa_alpha: float = 0.1,  # â† Learnable residual weight
                  use_multi_scale_context: bool = True,
                  ms_scales: Tuple[int, ...] = (1, 2),
                  ms_branch_ratio: int = 8,
-                 ms_alpha: float = 0.1,
+                 ms_alpha: float = 0.1,  # â† Learnable residual weight
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
@@ -1145,7 +829,7 @@ class GCNetWithEnhance(BaseModule):
 
         for stage in dwsa_stages:
             if stage == 'stage4':
-                self.dwsa4 = EfficientAttention(
+                self.dwsa4 = DWSABlock(
                     C * 4,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
@@ -1155,7 +839,7 @@ class GCNetWithEnhance(BaseModule):
                     alpha=dwsa_alpha,
                 )
             elif stage == 'stage5':
-                self.dwsa5 = EfficientAttention(
+                self.dwsa5 = DWSABlock(
                     C * 8,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
@@ -1165,7 +849,7 @@ class GCNetWithEnhance(BaseModule):
                     alpha=dwsa_alpha,
                 )
             elif stage == 'stage6':
-                self.dwsa6 = EfficientAttention(
+                self.dwsa6 = DWSABlock(
                     C * 16,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
@@ -1194,38 +878,37 @@ class GCNetWithEnhance(BaseModule):
         )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
-        
-        gcnet_feats = self.backbone(x)
-        
-        c1 = gcnet_feats['c1']
-        c2 = gcnet_feats['c2']
-        c4 = gcnet_feats['c4']
-        s4 = gcnet_feats['s4']
-        s5 = gcnet_feats['s5']
-        s6 = gcnet_feats['s6']
-        x_d6 = gcnet_feats['x_d6']
-        x_spp = gcnet_feats['spp']
-        
+        feats = self.backbone(x)
+
+        c1 = feats['c1']
+        c2 = feats['c2']
+        c4 = feats['c4']
+        x_d6 = feats['x_d6']
+        s4, s5, s6 = feats['s4'], feats['s5'], feats['s6']
+
         if self.dwsa4 is not None:
             s4 = self.dwsa4(s4)
         if self.dwsa5 is not None:
             s5 = self.dwsa5(s5)
         if self.dwsa6 is not None:
             s6 = self.dwsa6(s6)
-        
+
+        x_spp = self.backbone.spp(s6)
+        out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
+        x_spp = resize(
+            x_spp, size=out_size,
+            mode='bilinear',
+            align_corners=self.align_corners)
+
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
-        
-        final_feat = self.final_proj(x_spp + x_d6)
-        
-        return {
-            'c1': c1,
-            'c2': c2,
-            'c4': c4,
-            'c5': final_feat,
-            's4': s4,
-            's5': s5,
-            's6': s6,
-            'x_d6': x_d6,
-        }
+
+        x_spp = self.final_proj(x_spp)
+        c5_enh = x_d6 + x_spp
+
+        return dict(
+            c1=c1,
+            c2=c2,
+            c4=c4,
+            c5=c5_enh,
+        )
