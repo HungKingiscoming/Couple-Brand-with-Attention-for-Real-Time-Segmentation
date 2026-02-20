@@ -192,9 +192,28 @@ def setup_memory_efficient_training():
 
 
 def freeze_backbone(model):
+    """
+    Freeze toàn bộ backbone + khóa BatchNorm running stats
+    """
+    print("🔒 Freezing backbone (with BN locked)...")
+
+    # 1️⃣ Freeze tất cả parameters
     for param in model.backbone.parameters():
         param.requires_grad = False
-    print("’ Backbone FROZEN")
+
+    # 2️⃣ Lock toàn bộ BatchNorm trong backbone
+    bn_count = 0
+    for m in model.backbone.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()  # Stop running_mean / running_var update
+            if m.weight is not None:
+                m.weight.requires_grad = False
+            if m.bias is not None:
+                m.bias.requires_grad = False
+            bn_count += 1
+
+    print(f"   → {bn_count} BatchNorm layers locked")
+    print("✅ Backbone frozen completely\n")
 def print_backbone_structure(model):
     """In ra  backbone debug"""
     print(f"\n{'='*70}")
@@ -212,9 +231,6 @@ def print_backbone_structure(model):
     print(f"{'='*70}\n")
 
 def unfreeze_backbone_progressive(model, stage_names):
-    """
-    Unfreeze specific stages - FIXED to work with nested GCNetCore
-    """
     if isinstance(stage_names, str):
         stage_names = [stage_names]
 
@@ -265,17 +281,28 @@ def unfreeze_backbone_progressive(model, stage_names):
             print(f"Module '{stage_name}' not found")
             continue
         
-        # Unfreeze parameters
         param_count = 0
+        bn_count = 0
+        
         for p in module.parameters():
             if not p.requires_grad:
                 p.requires_grad = True
                 unfrozen_params += 1
                 param_count += 1
         
+        # 🔥 BẬT LẠI BatchNorm trong stage này
+        for m in module.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.train()  # allow running stats update
+                if m.weight is not None:
+                    m.weight.requires_grad = True
+                if m.bias is not None:
+                    m.bias.requires_grad = True
+                bn_count += 1
+        
         if param_count > 0:
             unfrozen_modules.append((found_path, param_count))
-            print(f"Unfrozen: {found_path} ({param_count:,} params)")
+            print(f"Unfrozen: {found_path} ({param_count:,} params, {bn_count} BN layers activated)")
 
     # Summary
     if unfrozen_modules:
