@@ -108,7 +108,36 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
 
     return rate
 
+def build_optimizer(model, args):
+    backbone_params = []
+    head_params = []
 
+    for name, param in model.named_parameters():
+
+        if not param.requires_grad:
+            continue  # bỏ qua param đang freeze
+
+        if "backbone" in name:
+            backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    print(f"Optimizer rebuilt:")
+    print(f"   Head params: {len(head_params)}")
+    print(f"   Backbone params: {len(backbone_params)}")
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": head_params, "lr": args.lr},
+            {
+                "params": backbone_params,
+                "lr": args.lr * args.backbone_lr_factor,
+            },
+        ],
+        weight_decay=1e-4,
+    )
+
+    return optimizer
 # ============================================
 # LOSS FUNCTIONS
 # ============================================
@@ -1113,7 +1142,21 @@ def main():
             if targets:
                 unfreeze_backbone_progressive(model, targets)
                 trainer.set_loss_phase('ce_only')
-                
+                if args.use_discriminative_lr:
+                    optimizer = setup_discriminative_lr(
+                        model,
+                        base_lr=args.lr,
+                        backbone_lr_factor=args.backbone_lr_factor,
+                        weight_decay=args.weight_decay
+                    )
+                else:
+                    optimizer = optim.AdamW(
+                        [p for p in model.parameters() if p.requires_grad],
+                        lr=args.lr,
+                        weight_decay=args.weight_decay
+                    )
+            
+                trainer.optimizer = optimizer
                 print(f"\n{'='*70}")
                 print(f"Learning Rates after unfreezing:")
                 print(f"{'='*70}")
