@@ -489,7 +489,7 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight": 1.0,
-                "dice_weight": 0.5,
+                "dice_weight": 0.3,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
@@ -536,7 +536,7 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         self.class_weights = class_weights.to(device) if class_weights is not None else None
-
+        
         loss_cfg = args.loss_config
         self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
