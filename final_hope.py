@@ -486,7 +486,7 @@ def evaluate_model(model_or_models, dataloader, num_classes, ignore_index=255,
 # ============================================
 # MODEL BUILDING
 # ============================================
-def build_model(num_classes=19, device='cuda', deploy=False):
+def build_model(num_classes=19, device='cuda', deploy=True):
     """Build model with same config as train.py"""
     cfg = {
         'backbone': {
