@@ -557,7 +557,6 @@ def build_model(num_classes=19, device='cuda', deploy=True):
     )
     
     model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
-    model = replace_bn_with_gn(model)
     model = model.to(device)
     
     return model
