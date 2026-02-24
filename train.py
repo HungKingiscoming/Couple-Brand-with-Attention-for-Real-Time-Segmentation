@@ -461,7 +461,7 @@ class ModelConfig:
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
                 "dwsa_stages": ['stage4','stage5', 'stage6'],
                 "dwsa_num_heads": 2,
-                "dwsa_reduction": 6,
+                "dwsa_reduction": 8,
                 "dwsa_qk_sharing": True,
                 "dwsa_groups": 4,
                 "dwsa_drop": 0.1,  
