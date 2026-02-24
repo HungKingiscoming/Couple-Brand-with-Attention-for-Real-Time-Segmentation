@@ -489,7 +489,7 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight": 1.0,
-                "dice_weight": 0.3,
+                "dice_weight": 0.0,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
