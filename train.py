@@ -717,15 +717,13 @@ class Trainer:
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
                 self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # â† Log
     
-        if self.scheduler and self.args.scheduler != 'onecycle':
-            self.scheduler.step()
-    
         avg_loss = total_loss / len(loader)
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
-        
         print(f"\nEpoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
-        
+        torch.cuda.empty_cache()
+        if self.scheduler and self.args.scheduler != 'onecycle':
+            self.scheduler.step()
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
     @torch.no_grad()
