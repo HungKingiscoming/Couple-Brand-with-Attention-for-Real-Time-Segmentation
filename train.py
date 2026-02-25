@@ -1143,63 +1143,73 @@ def main():
             freeze_backbone(model)
             trainer.set_loss_phase('full')
 
-        # Phase 2+: Progressive unfreezing
+        past_epochs = [e for e in unfreeze_epochs if e <= epoch]
+        k = len(past_epochs)
+        
+        targets = []
+        
+        # 🔓 cumulative unfreeze 6 → 5 → 4
+        if k >= 1:
+            targets += ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa6']
+        if k >= 2:
+            targets += ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
+        if k >= 3:
+            targets += ['semantic_branch_layers.0', 'detail_branch_layers.0', 'stem']
+        
+        # 🔥 LUÔN đảm bảo stage đúng trạng thái
+        if targets:
+            unfreeze_backbone_progressive(model, targets)
+        
+        # 🔁 CHỈ rebuild optimizer khi đúng mốc unfreeze
         if epoch in unfreeze_epochs:
-            k = len([e for e in unfreeze_epochs if e <= epoch])
-
-            if k == 1:
-                targets = ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa6']
-            elif k == 2:
-                targets = ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
-            elif k == 3:
-                targets = ['semantic_branch_layers.0', 'detail_branch_layers.0', 'stem']
+        
+            trainer.set_loss_phase('ce_only')
+        
+            if args.use_discriminative_lr:
+                optimizer = setup_discriminative_lr(
+                    model,
+                    base_lr=args.lr,
+                    backbone_lr_factor=args.backbone_lr_factor,
+                    weight_decay=args.weight_decay,
+                    alpha_lr_factor=args.alpha_lr_factor
+                )
             else:
-                targets = []
-
-            if targets:
-                unfreeze_backbone_progressive(model, targets)
-                trainer.set_loss_phase('ce_only')
-                if args.use_discriminative_lr:
-                    optimizer = setup_discriminative_lr(
-                        model,
-                        base_lr=args.lr,
-                        backbone_lr_factor=args.backbone_lr_factor,
-                        weight_decay=args.weight_decay,
-                        alpha_lr_factor=args.alpha_lr_factor
-                    )
-                else:
-                    # basic: put alpha in its own group if present
-                    head_params = []
-                    backbone_params = []
-                    alpha_params = []
-                    for n, p in model.named_parameters():
-                        if not p.requires_grad:
-                            continue
-                        if 'alpha' in n:
-                            alpha_params.append(p)
-                        elif 'backbone' in n:
-                            backbone_params.append(p)
-                        else:
-                            head_params.append(p)
-                    groups = []
-                    if head_params:
-                        groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
-                    if backbone_params:
-                        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
-                    if alpha_params:
-                        groups.append({'params': alpha_params, 'lr': args.lr * args.alpha_lr_factor, 'name': 'alpha'})
-                    optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-                    for g in optimizer.param_groups:
-                        g.setdefault('initial_lr', g['lr'])
-    
-                trainer.optimizer = optimizer
-                print(f"\n{'='*70}")
-                print(f"Learning Rates after unfreezing:")
-                print(f"{'='*70}")
-                for i, group in enumerate(optimizer.param_groups):
-                    name = group.get('name', f'group_{i}')
-                    print(f"   {name}: {group['lr']:.2e}")
-                print(f"{'='*70}\n")
+                head_params = []
+                backbone_params = []
+                alpha_params = []
+        
+                for n, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if 'alpha' in n:
+                        alpha_params.append(p)
+                    elif 'backbone' in n:
+                        backbone_params.append(p)
+                    else:
+                        head_params.append(p)
+        
+                groups = []
+                if head_params:
+                    groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
+                if backbone_params:
+                    groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+                if alpha_params:
+                    groups.append({'params': alpha_params, 'lr': args.lr * args.alpha_lr_factor, 'name': 'alpha'})
+        
+                optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+        
+                for g in optimizer.param_groups:
+                    g.setdefault('initial_lr', g['lr'])
+        
+            trainer.optimizer = optimizer
+        
+            print("\n" + "="*70)
+            print("Learning Rates after unfreezing:")
+            print("="*70)
+            for i, group in enumerate(optimizer.param_groups):
+                name = group.get('name', f'group_{i}')
+                print(f"   {name}: {group['lr']:.2e}")
+            print("="*70 + "\n")
 
         # Switch back to full loss
         if unfreeze_epochs:
