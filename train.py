@@ -399,27 +399,41 @@ def count_trainable_params(model):
     return trainable, frozen
 
 
-def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
-    backbone_params = [p for n, p in model.named_parameters() 
-                      if 'backbone' in n and p.requires_grad]
-    head_params = [p for n, p in model.named_parameters() 
-                  if 'backbone' not in n and p.requires_grad]
-    
-    if len(backbone_params) == 0:
-        optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
-        print(f"âš™ï¸  Optimizer: AdamW (lr={base_lr}) - head only")
-    else:
-        backbone_lr = base_lr * backbone_lr_factor
-        param_groups = [
-            {'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
-            {'params': head_params, 'lr': base_lr, 'name': 'head'}
-        ]
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
-        
-        print(f"Optimizer: AdamW (Discriminative LR)")
-        print(f"Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
-        print(f"Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
-    
+def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4, alpha_lr_factor=0.01):
+    backbone_params = []
+    head_params = []
+    alpha_params = []
+
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # heuristic: parameter name containing 'alpha' (tùy tên model bạn dùng)
+        if 'alpha' in n:
+            alpha_params.append(p)
+        elif 'backbone' in n:
+            backbone_params.append(p)
+        else:
+            head_params.append(p)
+
+    param_groups = []
+    if len(backbone_params) > 0:
+        param_groups.append({'params': backbone_params, 'lr': base_lr * backbone_lr_factor, 'name': 'backbone'})
+    if len(head_params) > 0:
+        param_groups.append({'params': head_params, 'lr': base_lr, 'name': 'head'})
+    if len(alpha_params) > 0:
+        # very small LR for alpha
+        param_groups.append({'params': alpha_params, 'lr': base_lr * alpha_lr_factor, 'name': 'alpha'})
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+    # attach initial_lr for warmup/restore
+    for g in optimizer.param_groups:
+        g.setdefault('initial_lr', g['lr'])
+
+    print(f"Optimizer: AdamW (Discriminative LR)")
+    for g in optimizer.param_groups:
+        print(f"  group '{g.get('name','?')}' lr={g['lr']:.2e} params={len(g['params'])}")
+
     return optimizer
 
 
@@ -887,7 +901,12 @@ def main():
     parser.add_argument("--grad_clip", type=float, default=5.0)  # â† INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
-    
+    parser.add_argument("--alpha_lr_factor", type=float, default=0.01,
+                        help="learning rate factor for learnable alpha params in DWSA (very small)")
+    parser.add_argument("--final_dice_weight", type=float, default=0.5,
+                        help="target dice weight when ramping to full loss")
+    parser.add_argument("--dice_ramp_epochs", type=int, default=5,
+                        help="number of epochs over which to ramp dice from 0->final_dice_weight")
     # Data
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
