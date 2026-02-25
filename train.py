@@ -1166,15 +1166,34 @@ def main():
                         model,
                         base_lr=args.lr,
                         backbone_lr_factor=args.backbone_lr_factor,
-                        weight_decay=args.weight_decay
+                        weight_decay=args.weight_decay,
+                        alpha_lr_factor=args.alpha_lr_factor
                     )
                 else:
-                    optimizer = optim.AdamW(
-                        [p for p in model.parameters() if p.requires_grad],
-                        lr=args.lr,
-                        weight_decay=args.weight_decay
-                    )
-            
+                    # basic: put alpha in its own group if present
+                    head_params = []
+                    backbone_params = []
+                    alpha_params = []
+                    for n, p in model.named_parameters():
+                        if not p.requires_grad:
+                            continue
+                        if 'alpha' in n:
+                            alpha_params.append(p)
+                        elif 'backbone' in n:
+                            backbone_params.append(p)
+                        else:
+                            head_params.append(p)
+                    groups = []
+                    if head_params:
+                        groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
+                    if backbone_params:
+                        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+                    if alpha_params:
+                        groups.append({'params': alpha_params, 'lr': args.lr * args.alpha_lr_factor, 'name': 'alpha'})
+                    optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+                    for g in optimizer.param_groups:
+                        g.setdefault('initial_lr', g['lr'])
+    
                 trainer.optimizer = optimizer
                 print(f"\n{'='*70}")
                 print(f"Learning Rates after unfreezing:")
