@@ -1096,7 +1096,7 @@ def main():
         scheduler = LambdaLR(
             optimizer,
             lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9,
-            last_epoch=start_epoch - 1
+            last_epoch=trainer.start_epoch - 1
         )
     else:
         print(f"Cosine Annealing LR")
