@@ -1154,7 +1154,9 @@ def main():
         if k >= 2:
             targets += ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
         if k >= 3:
-            targets += ['semantic_branch_layers.0', 'detail_branch_layers.0', 'stem']
+            targets += ['semantic_branch_layers.0', 'detail_branch_layers.0', 'dwsa4']
+        if k >= 4:
+            targets += ['stem']
         
         # 🔥 LUÔN đảm bảo stage đúng trạng thái
         if targets:
