@@ -1093,10 +1093,9 @@ def main():
         print(f"Polynomial LR decay")
         def poly_lr_lambda(epoch):
             return (1 - epoch / args.epochs) ** 0.9
-        scheduler = LambdaLR(
+        scheduler = optim.lr_scheduler.LambdaLR(
             optimizer,
-            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9,
-            last_epoch=trainer.start_epoch - 1
+            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
         )
     else:
         print(f"Cosine Annealing LR")
