@@ -944,7 +944,7 @@ def main():
     print(f"Image size: {args.img_h}x{args.img_w}")
     print(f"Epochs: {args.epochs}")
     print(f"Scheduler: {args.scheduler}")
-    print(f"Gradient clipping: {args.grad_clip}")  # â† SHOW
+    print(f"Gradient clipping: {args.grad_clip}")  
     print(f"Freeze backbone: {args.freeze_backbone}")
     if args.unfreeze_schedule:
         print(f"Unfreeze schedule: {args.unfreeze_schedule}")
@@ -955,7 +955,7 @@ def main():
     cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
     
-    print(f"ðŸ”§ Model Config:")
+    print(f" Model Config:")
     print(f"DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
     print(f"DWSA drop: {cfg['backbone']['dwsa_drop']}")
     print(f"MS alpha: {cfg['backbone']['ms_alpha']}\n")
@@ -1165,7 +1165,7 @@ def main():
         # 🔁 CHỈ rebuild optimizer khi đúng mốc unfreeze
         if epoch in unfreeze_epochs:
         
-            trainer.set_loss_phase('ce_only')
+            trainer.set_loss_phase('full')
         
             if args.use_discriminative_lr:
                 optimizer = setup_discriminative_lr(
