@@ -568,7 +568,6 @@ class Trainer:
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'
         
-        self.scaler = GradScaler(enabled=args.use_amp)
         
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -802,7 +801,7 @@ class Trainer:
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
 
-    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
+   def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=False, reset_best_metric=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         self.model.load_state_dict(checkpoint['model'])
@@ -1114,7 +1113,7 @@ def main():
         trainer.load_checkpoint(
             args.resume,
             reset_epoch=False,
-            load_optimizer=True,
+            load_optimizer=False,
             reset_best_metric=False,
         )
     
