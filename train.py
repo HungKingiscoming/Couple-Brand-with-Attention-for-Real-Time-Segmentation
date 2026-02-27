@@ -1136,11 +1136,6 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
-        # Phase 1: Freeze backbone
-        if epoch < args.freeze_epochs:
-            freeze_backbone(model)
-            trainer.set_loss_phase('full')
-
         past_epochs = [e for e in unfreeze_epochs if e <= epoch]
         k = len(past_epochs)
         
