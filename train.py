@@ -1116,9 +1116,9 @@ def main():
         reset_epoch = (args.resume_mode == "transfer")
         trainer.load_checkpoint(
             args.resume,
-            reset_epoch=reset_epoch,
-            load_optimizer=False,
-            reset_best_metric=args.reset_best_metric,
+            reset_epoch=False,
+            load_optimizer=True,
+            reset_best_metric=False,
         )
     
     # Training loop
