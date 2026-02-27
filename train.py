@@ -650,8 +650,12 @@ class Trainer:
                         mode="bilinear",
                         align_corners=False
                     )
-                    aux_ce_loss = self.ce(aux_logits, masks)    
-                    aux_total = aux_ce_loss
+                    aux_ce_loss = self.ce(aux_logits, masks)
+                    if self.dice_weight > 0:
+                        aux_dice_loss = self.dice(aux_logits, masks)
+                    else:
+                        aux_dice_loss = torch.tensor(0.0, device=logits.device)
+                    aux_total = self.ce_weight * aux_ce_loss + self.dice_weight * aux_dice_loss
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_total
     
