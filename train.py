@@ -720,29 +720,21 @@ class Trainer:
             
             self.scaler.scale(loss).backward()
             
-            # FIX 2: ALWAYS clip gradients (khÃ´ng phá»¥ thuá»™c accumulation)
+
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                
-                # FIX 3: Monitor gradients
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
-                
-                # FIX 4: ALWAYS apply gradient clipping
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
-                        max_norm=self.args.grad_clip
-                    )
-                
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
             
-            if self.scheduler and self.args.scheduler == 'onecycle':
-                self.scheduler.step()
-            
+                if self.scheduler and self.args.scheduler == 'onecycle':   # ← VÀO TRONG
+                    self.scheduler.step()
+                        
             total_loss += loss.item() * self.args.accumulation_steps
             total_ce += ce_loss.item()
             total_dice += dice_loss.item()
@@ -783,56 +775,68 @@ class Trainer:
         num_classes = self.args.num_classes
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
-        pbar = tqdm(loader, desc=f"Validation")
+        pbar = tqdm(loader, desc="Validation")
         
         for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs = imgs.to(self.device, non_blocking=True)
+            imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
+    
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)
-                logits = F.interpolate(
+                logits = self.model(imgs)          # (B, C, H/2, W/2) — giữ nguyên
+    
+                # CE: upsample logit lên full resolution
+                logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
-                    mode="bilinear",
+                    mode='bilinear',
                     align_corners=False
                 )
-            
-                ce_loss = self.ce(logits, masks)
+                ce_loss = self.ce(logits_full, masks)
+    
+                # Dice: giữ logit H/2, downsample mask — nhất quán với train_epoch
                 if self.dice_weight > 0:
-                    dice_loss = self.dice(logits, masks)
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),   # cần unsqueeze + float cho interpolate
+                        size=logits.shape[-2:],        # H/2, W/2 — KHÔNG phải logits_full
+                        mode='nearest'
+                    ).squeeze(1).long()               # trả về (B, H/2, W/2) long
+                    dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-            
+    
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-            
+    
             total_loss += loss.item()
-            
-            pred = logits.argmax(1).cpu().numpy()
+    
+            # mIoU dùng logits_full — full resolution để đếm pixel chính xác
+            pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             
-            mask = (target >= 0) & (target < num_classes)
-            label = num_classes * target[mask].astype('int') + pred[mask]
-            count = np.bincount(label, minlength=num_classes**2)
+            mask_valid = (target >= 0) & (target < num_classes)
+            label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
+            count  = np.bincount(label, minlength=num_classes**2)
             confusion_matrix += count.reshape(num_classes, num_classes)
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
             if batch_idx % 20 == 0:
                 clear_gpu_memory()
-
+    
         intersection = np.diag(confusion_matrix)
-        union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
-        iou = intersection / (union + 1e-10)
-        miou = np.nanmean(iou)
-        
-        acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
-        avg_loss = total_loss / len(loader)
-        
-        return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
+        union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
+        iou          = intersection / (union + 1e-10)
+        miou         = np.nanmean(iou)
+        acc          = intersection.sum() / (confusion_matrix.sum() + 1e-10)
+    
+        return {
+            'loss'         : total_loss / len(loader),
+            'miou'         : miou,
+            'accuracy'     : acc,
+            'per_class_iou': iou,
+        }
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
         checkpoint = {
@@ -1222,7 +1226,7 @@ def main():
                     g.setdefault('initial_lr', g['lr'])
         
             trainer.optimizer = optimizer
-        
+            trainer.scheduler  = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
             print("\n" + "="*70)
             print("Learning Rates after unfreezing:")
             print("="*70)
