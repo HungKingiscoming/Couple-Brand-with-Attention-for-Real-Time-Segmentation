@@ -467,10 +467,11 @@ def check_gradients(model, threshold=10.0):
 class ModelConfig:
     @staticmethod
     def get_config():
+        C = 32
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 32,
+                "channels": C,
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
                 "dwsa_stages": ['stage4','stage5', 'stage6'],
@@ -486,7 +487,11 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,
+                # c5 = C*4, c4 = C*2, c2 = C, c1 = C
+                "in_channels":    C * 4,   # 128 — c5
+                "c4_channels":    C * 2,   #  64 — c4 (detail branch stage4)
+                "c2_channels":    C,       #  32 — c2 (stem layer 1)
+                "c1_channels":    C,       #  32 — c1 (stem layer 0)
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -494,8 +499,8 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 128,
-                "channels": 96,
+                "in_channels": C * 2,
+                "channels": 64,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
@@ -840,26 +845,6 @@ class Trainer:
             print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
-def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
-    backbone.eval()
-    with torch.no_grad():
-        sample = torch.randn(1, 3, *img_size).to(device)
-        feats = backbone(sample)
-        
-        channels = {}
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in feats:
-                channels[key] = feats[key].shape[1]
-        
-        print(f"\n{'='*70}")
-        print("BACKBONE CHANNEL DETECTION")
-        print(f"{'='*70}")
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in channels:
-                print(f"   {key}: {channels[key]} channels")
-        print(f"{'='*70}\n")
-        
-        return channels
 
 
 # ============================================
@@ -975,28 +960,19 @@ def main():
     print(f"{'='*70}\n")
     
     backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
+
     
-    detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
-    
-    head_cfg = {
+    head = GCNetHead(
         **cfg["head"],
-        "in_channels": detected_channels['c5'],
-        "c1_channels": detected_channels['c1'],
-        "c2_channels": detected_channels['c2'],
-        "num_classes": args.num_classes,
-    }
-    
-    aux_head_cfg = {
-        **cfg["aux_head"],
-        "in_channels": detected_channels['c4'],
-        "num_classes": args.num_classes,
-    }
-    
-    model = Segmentor(
-        backbone=backbone,
-        head=GCNetHead(**head_cfg),
-        aux_head=GCNetAuxHead(**aux_head_cfg),
+        num_classes=args.num_classes,
     )
+    
+    aux_head = GCNetAuxHead(
+        **cfg["aux_head"],
+        num_classes=args.num_classes,
+    )
+    
+    model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
     
     print("\nApplying Optimizations...")
     # print("Converting BN â†’ GN")
