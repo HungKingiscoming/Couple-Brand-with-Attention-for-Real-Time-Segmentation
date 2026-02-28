@@ -500,7 +500,7 @@ class ModelConfig:
             },
             "aux_head": {
                 "in_channels": C * 2,
-                "channels": 64,
+                "mid_channels": 64,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
