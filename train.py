@@ -108,6 +108,72 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
 
     return rate
 
+def _get_max_lrs(optimizer, base_lr, backbone_lr_factor, alpha_lr_factor):
+    """
+    Tính max_lr cho từng param group theo tên — hỗ trợ N groups bất kỳ.
+    Không dùng n_groups cứng → không crash khi có alpha group.
+    """
+    lrs = []
+    for g in optimizer.param_groups:
+        name = g.get('name', '')
+        if name == 'backbone':
+            lrs.append(base_lr * backbone_lr_factor)
+        elif name == 'alpha':
+            lrs.append(base_lr * alpha_lr_factor)
+        else:                      # head hoặc unnamed
+            lrs.append(base_lr)
+    return lrs[0] if len(lrs) == 1 else lrs  # scalar nếu 1 group
+
+
+def build_scheduler(optimizer, args, train_loader, start_epoch: int = 0):
+    """
+    Tạo scheduler phù hợp với trạng thái training hiện tại.
+    - start_epoch=0   : lần đầu, total_steps = toàn bộ training
+    - start_epoch=E>0 : rebuild sau unfreeze, remaining_steps = còn lại
+                        pct_start=0.02 (warmup ngắn, backbone đã ổn định)
+    """
+    remaining_epochs = args.epochs - start_epoch
+    steps_per_epoch  = len(train_loader)
+    remaining_steps  = remaining_epochs * steps_per_epoch
+    is_initial       = (start_epoch == 0)
+    label = "initial" if is_initial else f"rebuilt @ epoch {start_epoch}"
+
+    if args.scheduler == 'onecycle':
+        pct_start = 0.05 if is_initial else 0.02
+        max_lrs   = _get_max_lrs(
+            optimizer, args.lr, args.backbone_lr_factor, args.alpha_lr_factor
+        )
+        scheduler = optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr          = max_lrs,
+            total_steps     = remaining_steps,
+            pct_start       = pct_start,
+            anneal_strategy = 'cos',
+            cycle_momentum  = True,
+            base_momentum   = 0.85,
+            max_momentum    = 0.95,
+            div_factor      = 25,
+            final_div_factor= 100000,
+        )
+        lrs_list = [max_lrs] if isinstance(max_lrs, float) else max_lrs
+        print(f"OneCycleLR ({label}, steps={remaining_steps})")
+        for g, lr in zip(optimizer.param_groups, lrs_list):
+            print(f"   '{g.get('name','?')}': max_lr={lr:.2e}")
+
+    elif args.scheduler == 'poly':
+        def poly_lambda(step):
+            return max((1 - step / remaining_epochs) ** 0.9, 1e-6)
+        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lambda)
+        print(f"PolyLR ({label}, remaining_epochs={remaining_epochs})")
+
+    else:  # cosine
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=remaining_epochs, eta_min=1e-6
+        )
+        print(f"CosineAnnealingLR ({label}, T_max={remaining_epochs})")
+
+    return scheduler
+
 def build_optimizer(model, args):
     backbone_params = []
     head_params = []
@@ -1086,46 +1152,7 @@ def main():
         print(f"Optimizer: AdamW (lr={args.lr})")
     
     # Scheduler
-    if args.scheduler == 'onecycle':
-        total_steps = len(train_loader) * args.epochs
-        n_groups = len(optimizer.param_groups)
-    
-        if n_groups == 1:
-            max_lrs = args.lr
-        elif n_groups == 2:
-            max_lrs = [
-                args.lr * args.backbone_lr_factor,
-                args.lr,
-            ]
-        else:
-            raise ValueError(f"Unexpected param_groups: {n_groups}")
-    
-        scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lrs,
-            total_steps=total_steps,
-            pct_start=0.05,
-            anneal_strategy='cos',
-            cycle_momentum=True,
-            base_momentum=0.85,
-            max_momentum=0.95,
-            div_factor=25,
-            final_div_factor=100000,
-        )
-        print(f"OneCycleLR (total_steps={total_steps})")
-    elif args.scheduler == 'poly':
-        print(f"Polynomial LR decay")
-        def poly_lr_lambda(epoch):
-            return (1 - epoch / args.epochs) ** 0.9
-        scheduler = optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
-        )
-    else:
-        print(f"Cosine Annealing LR")
-        scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=1e-6
-        )
+    scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=0)
     print_backbone_structure(model)
     # Trainer
     trainer = Trainer(
