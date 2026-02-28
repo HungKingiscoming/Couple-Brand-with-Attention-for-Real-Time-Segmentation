@@ -143,32 +143,74 @@ def build_optimizer(model, args):
 # ============================================
 
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
+    def __init__(
+        self,
+        smooth: float = 1e-5,
+        ignore_index: int = 255,
+        reduction: str = 'mean',
+        log_loss: bool = False,       # dùng -log(dice) thay vì 1-dice — gradient lớn hơn khi dice thấp
+        class_weights: torch.Tensor = None,  # optional per-class weight
+    ):
         super().__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
         self.reduction = reduction
-    
-    def forward(self, logits, targets):
+        self.log_loss = log_loss
+        self.register_buffer(
+            'class_weights',
+            class_weights if class_weights is not None else None
+        )
+
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits : (B, C, H, W) — KHÔNG upsample, dùng resolution gốc H/2
+            targets: (B, H, W)    — đã downsample bằng nearest xuống H/2
+        """
         B, C, H, W = logits.shape
-        
-        valid_mask = (targets != self.ignore_index).float()
-        targets_one_hot = F.one_hot(
-            targets.clamp(0, C - 1), num_classes=C
-        ).permute(0, 3, 1, 2).float()
-        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1)
-        
-        probs = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1)
-        
-        probs_flat = probs.reshape(B, C, -1)
-        targets_flat = targets_one_hot.reshape(B, C, -1)
-        
-        intersection = (probs_flat * targets_flat).sum(dim=2)
-        union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
-        
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1.0 - dice.mean(dim=1)
-        
+
+        # Valid mask — bỏ ignore_index
+        valid_mask = (targets != self.ignore_index)                  # (B, H, W) bool
+
+        # One-hot targets — chỉ tính trên valid pixels
+        targets_clamped = targets.clamp(0, C - 1)
+        targets_one_hot = F.one_hot(targets_clamped, num_classes=C)  # (B, H, W, C)
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  # (B, C, H, W)
+        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1).float()
+
+        # Softmax probs — zero out invalid pixels
+        probs = F.softmax(logits, dim=1)                             # (B, C, H, W)
+        probs = probs * valid_mask.unsqueeze(1).float()
+
+        # Flatten spatial
+        probs_flat   = probs.reshape(B, C, -1)           # (B, C, N)
+        targets_flat = targets_one_hot.reshape(B, C, -1) # (B, C, N)
+
+        # Dice per class per batch
+        intersection = (probs_flat * targets_flat).sum(dim=2)        # (B, C)
+        cardinality  = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)  # (B, C)
+
+        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)  # (B, C)
+
+        if self.log_loss:
+            # -log(dice): gradient explodes khi dice → 0 (khó class)
+            # → model bị ép học hard class mạnh hơn
+            dice_loss = -torch.log(dice_score.clamp(min=self.smooth))
+        else:
+            dice_loss = 1.0 - dice_score  # (B, C)
+
+        # Per-class weighting nếu có
+        if self.class_weights is not None:
+            dice_loss = dice_loss * self.class_weights.unsqueeze(0)  # (B, C)
+
+        # Chỉ tính trung bình trên các class có pixel trong batch
+        # (tránh class không xuất hiện kéo loss về 0)
+        class_present = targets_flat.sum(dim=2) > 0  # (B, C) bool
+        dice_loss = dice_loss * class_present.float()
+
+        n_present = class_present.float().sum(dim=1).clamp(min=1)  # (B,)
+        dice_loss = dice_loss.sum(dim=1) / n_present                # (B,)
+
         return dice_loss.mean()
 
 
@@ -629,37 +671,44 @@ class Trainer:
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-                logits = outputs["main"]
-                logits = F.interpolate(
+                logits = outputs["main"]    # (B, C, H/2, W/2) — giữ nguyên resolution thấp
+            
+                # ── CE: upsample logit lên full resolution ────────────────────
+                logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
-                    mode="bilinear",
+                    mode='bilinear',
                     align_corners=False
                 )
-    
-                ce_loss = self.ce(logits, masks)
-    
+                ce_loss = self.ce(logits_full, masks)
+            
+                # ── Dice: giữ logit H/2, downsample mask xuống cùng size ──────
                 if self.dice_weight > 0:
-                    dice_loss = self.dice(logits, masks)
+                    # nearest-exact: chính xác hơn 'nearest' với kích thước lẻ
+                    # không dùng bilinear vì mask là class label (integer), không nội suy được
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-    
+            
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-    
+            
+                # ── Aux: chỉ CE là đủ, Dice không cần thiết ở aux head ────────
                 if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = outputs["aux"]
                     aux_logits = F.interpolate(
-                        aux_logits,
+                        outputs["aux"],
                         size=masks.shape[-2:],
-                        mode="bilinear",
+                        mode='bilinear',
                         align_corners=False
                     )
                     aux_ce_loss = self.ce(aux_logits, masks)
-
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
-            
                     loss = loss + aux_weight * aux_ce_loss
-    
+            
                 loss = loss / self.args.accumulation_steps
     
             # FIX 1: Check NaN BEFORE backward
