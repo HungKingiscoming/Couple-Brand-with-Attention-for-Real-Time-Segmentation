@@ -1331,7 +1331,7 @@ def main():
         # 🔁 CHỈ rebuild optimizer khi đúng mốc unfreeze
         if epoch in unfreeze_epochs:
         
-            trainer.set_loss_phase('full')
+            trainer.set_loss_phase('ce_only')
         
             if args.use_discriminative_lr:
                 optimizer = setup_discriminative_lr(
