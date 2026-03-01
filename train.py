@@ -103,9 +103,14 @@ def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batc
     for name, param in model.named_parameters():
         if 'alpha' in name:
             grad_norm = param.grad.norm().item() if param.grad is not None else None
-            print(f"  {name[:60]}"
-                  f" | value={param.item():.6f}"
-                  f" | grad={grad_norm}")
+            # ── Fix: alpha giờ là vector, không dùng .item() ──
+            if param.numel() == 1:
+                val_str = f"value={param.item():.6f}"
+            else:
+                val_str = (f"mean={param.mean():.6f} "
+                           f"min={param.min():.6f} "
+                           f"max={param.max():.6f}")
+            print(f"  {name[:60]} | {val_str} | grad={grad_norm}")
 
     # ── 7. BN running stats bất thường ───────────────────────────
     print(f"\n[BATCHNORM — running stats bất thường]")
@@ -516,7 +521,7 @@ def unfreeze_backbone_progressive(model, stage_names):
         # 🔥 BẬT LẠI BatchNorm trong stage này
         for m in module.modules():
             if isinstance(m, nn.BatchNorm2d):
-                m.train()  # allow running stats update
+                m.eval()   
                 if m.weight is not None:
                     m.weight.requires_grad = True
                 if m.bias is not None:
