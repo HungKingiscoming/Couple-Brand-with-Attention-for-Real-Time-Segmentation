@@ -514,36 +514,53 @@ class DWSABlock(nn.Module):
     
         return out
     def forward(self, x):
-        """
-        x: (B, C, H, W)
-        """
-        identity = x
-    
         B, C, H, W = x.shape
-    
-        # --- BN in ---
-        x = self.bn_in(x)
-    
-        # --- in projection ---
-        x = self.in_proj(x)          # (B, mid, H, W)
-    
-        # flatten spatial
-        x_flat = x.flatten(2)        # (B, mid, N)
-    
-        # --- attention ---
-        out = self._attention(x_flat)
-    
-        # reshape back
-        out = out.view(B, self.mid, H, W)
-    
-        # --- out projection ---
+        identity = x
+
+        # FIX 4: Layer norm TRÆ¯á»šC process
+        x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        
+        x_red = self.in_proj(x_ln)
+        B, C2, H, W = x_red.shape
+        N = H * W
+        x_flat = x_red.view(B, C2, N)
+
+        if self.qk_sharing:
+            base = self.qk_base(x_flat)
+            q = self.q_head(base)
+            k = self.k_head(base)
+        else:
+            q = self.q_proj(x_flat)
+            k = self.k_proj(x_flat)
+        v = self.v_proj(x_flat)
+
+        def split_heads(t):
+            B, Cmid, N = t.shape
+            head_dim = Cmid // self.num_heads
+            t = t.view(B, self.num_heads, head_dim, N)
+            return t
+
+        q = split_heads(q).permute(0, 1, 3, 2)
+        k = split_heads(k).permute(0, 1, 3, 2)
+        v = split_heads(v).permute(0, 1, 3, 2)
+
+        # FIX 5: Clamp attention scores
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.clamp(-10, 10)  # Prevent overflow
+        attn = F.softmax(attn, dim=-1)
+        attn = self.drop(attn)
+
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 1, 3, 2).contiguous()
+        B_, Hn, Hd, N_ = out.shape
+        out = out.view(B, self.mid, N_)
+
+        out = self.o_proj(out)
+        out = out.view(B, C2, H, W)
         out = self.out_proj(out)
-        out = self.bn_out(out)
-    
-        # residual with alpha
-        out = identity + self.alpha * out
-    
-        return out
+
+        # FIX 6: Scaled residual
+        return identity + self.alpha * out
 
 
 class MultiScaleContextModule(nn.Module):
