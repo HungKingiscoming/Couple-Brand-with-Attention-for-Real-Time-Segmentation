@@ -447,7 +447,7 @@ class DWSABlock(nn.Module):
 
         self.drop  = nn.Dropout(drop)
         self.scale = (mid // num_heads) ** -0.5
-        self.alpha = nn.Parameter(torch.tensor(alpha))
+        self.alpha = nn.Parameter(torch.ones(channels) * 1e-4)
 
     def _attention(self, x_flat: Tensor) -> Tensor:
         """
@@ -531,9 +531,8 @@ class DWSABlock(nn.Module):
             out_red  = out_flat.view(B, self.reduced, H, W)
 
         # Project back lên channels + BN
-        out = self.bn_out(self.out_proj(out_red))    # (B, C, H, W)
-
-        alpha = self.alpha.clamp(0.0, 1.0)
+        out = self.bn_out(self.out_proj(out_red))
+        alpha = self.alpha.view(1, -1, 1, 1)   # (C,) → (1, C, 1, 1) để broadcast
         return identity + alpha * out
 
 
