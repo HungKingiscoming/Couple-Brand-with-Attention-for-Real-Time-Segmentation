@@ -821,16 +821,6 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-        
-        # ── AMP warmup sau unfreeze ───────────────────────────────────
-        use_amp = (
-            self.args.use_amp and
-            not (hasattr(self, 'amp_warmup_end_epoch') and
-                 epoch < self.amp_warmup_end_epoch)
-        )
-        if not use_amp and self.args.use_amp:
-            print(f"⚠️  AMP disabled (warmup until epoch {self.amp_warmup_end_epoch})")
-    
         # ── Grad clip chặt sau unfreeze ───────────────────────────────
         effective_clip = self.args.grad_clip
         if (hasattr(self, 'tight_clip_end_epoch') and
