@@ -319,55 +319,42 @@ class DiceLoss(nn.Module):
         )
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            logits : (B, C, H, W) — KHÔNG upsample, dùng resolution gốc H/2
-            targets: (B, H, W)    — đã downsample bằng nearest xuống H/2
-        """
         B, C, H, W = logits.shape
-
-        # Valid mask — bỏ ignore_index
-        valid_mask = (targets != self.ignore_index)                  # (B, H, W) bool
-
-        # One-hot targets — chỉ tính trên valid pixels
+    
+        valid_mask = (targets != self.ignore_index)
         targets_clamped = targets.clamp(0, C - 1)
-        targets_one_hot = F.one_hot(targets_clamped, num_classes=C)  # (B, H, W, C)
-        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  # (B, C, H, W)
+        targets_one_hot = F.one_hot(targets_clamped, num_classes=C)
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()
         targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1).float()
-
-        # Softmax probs — zero out invalid pixels
-        probs = F.softmax(logits, dim=1)                             # (B, C, H, W)
+    
+        # ── Fix: ép float32 trước softmax để tránh exp overflow trong fp16 ──
+        with torch.autocast(device_type='cuda', enabled=False):
+            probs = F.softmax(logits.float(), dim=1)
+    
         probs = probs * valid_mask.unsqueeze(1).float()
-
-        # Flatten spatial
-        probs_flat   = probs.reshape(B, C, -1)           # (B, C, N)
-        targets_flat = targets_one_hot.reshape(B, C, -1) # (B, C, N)
-
-        # Dice per class per batch
-        intersection = (probs_flat * targets_flat).sum(dim=2)        # (B, C)
-        cardinality  = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)  # (B, C)
-
-        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)  # (B, C)
-
+    
+        probs_flat   = probs.reshape(B, C, -1)
+        targets_flat = targets_one_hot.reshape(B, C, -1)
+    
+        intersection = (probs_flat * targets_flat).sum(dim=2)
+        cardinality  = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
+    
+        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
+    
         if self.log_loss:
-            # -log(dice): gradient explodes khi dice → 0 (khó class)
-            # → model bị ép học hard class mạnh hơn
             dice_loss = -torch.log(dice_score.clamp(min=self.smooth))
         else:
-            dice_loss = 1.0 - dice_score  # (B, C)
-
-        # Per-class weighting nếu có
+            dice_loss = 1.0 - dice_score
+    
         if self.class_weights is not None:
-            dice_loss = dice_loss * self.class_weights.unsqueeze(0)  # (B, C)
-
-        # Chỉ tính trung bình trên các class có pixel trong batch
-        # (tránh class không xuất hiện kéo loss về 0)
-        class_present = targets_flat.sum(dim=2) > 0  # (B, C) bool
+            dice_loss = dice_loss * self.class_weights.unsqueeze(0)
+    
+        class_present = targets_flat.sum(dim=2) > 0
         dice_loss = dice_loss * class_present.float()
-
-        n_present = class_present.float().sum(dim=1).clamp(min=1)  # (B,)
-        dice_loss = dice_loss.sum(dim=1) / n_present                # (B,)
-
+    
+        n_present = class_present.float().sum(dim=1).clamp(min=1)
+        dice_loss = dice_loss.sum(dim=1) / n_present
+    
         return dice_loss.mean()
 
 
