@@ -449,14 +449,11 @@ class DWSABlock(nn.Module):
         self.scale = (mid // num_heads) ** -0.5
         self.alpha = nn.Parameter(torch.ones(channels) * 1e-4)
 
-    def _attention(self, x_flat: Tensor) -> Tensor:
-        """
-        Core attention computation.
-        Args:
-            x_flat: (B', reduced, N)  — B' = B*nH*nW khi dùng window attention
-        Returns:
-            out   : (B', reduced, N)
-        """
+    def _attention(self, x_flat):
+
+        orig_dtype = x_flat.dtype
+        x_flat = x_flat.float()  # force fp32
+    
         if self.qk_sharing:
             base = self.qk_base(x_flat)
             q = self.q_head(base)
@@ -464,25 +461,26 @@ class DWSABlock(nn.Module):
         else:
             q = self.q_proj(x_flat)
             k = self.k_proj(x_flat)
+    
         v = self.v_proj(x_flat)
-
+    
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
-            return t.view(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
-            # → (B', heads, N, head_dim)
-
+            return t.view(B_, self.num_heads, hd, N).permute(0,1,3,2)
+    
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
-
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)
+    
+        attn = torch.matmul(q, k.transpose(-2,-1)) * self.scale
+        attn = attn.clamp(-10,10)
         attn = F.softmax(attn, dim=-1)
-        attn = self.drop(attn)
-
-        out = torch.matmul(attn, v)                          # (B', heads, N, hd)
-        out = out.permute(0, 1, 3, 2).contiguous()          # (B', heads, hd, N)
+    
+        out = torch.matmul(attn, v)
+        out = out.permute(0,1,3,2).contiguous()
         B_, Hn, Hd, N = out.shape
-        return out.view(B_, self.mid, N)                     # (B', mid, N)
+    
+        out = out.view(B_, self.mid, N)
+        return out.to(orig_dtype)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
