@@ -513,6 +513,37 @@ class DWSABlock(nn.Module):
             out = out.to(orig_dtype)
     
         return out
+    def forward(self, x):
+        """
+        x: (B, C, H, W)
+        """
+        identity = x
+    
+        B, C, H, W = x.shape
+    
+        # --- BN in ---
+        x = self.bn_in(x)
+    
+        # --- in projection ---
+        x = self.in_proj(x)          # (B, mid, H, W)
+    
+        # flatten spatial
+        x_flat = x.flatten(2)        # (B, mid, N)
+    
+        # --- attention ---
+        out = self._attention(x_flat)
+    
+        # reshape back
+        out = out.view(B, self.mid, H, W)
+    
+        # --- out projection ---
+        out = self.out_proj(out)
+        out = self.bn_out(out)
+    
+        # residual with alpha
+        out = identity + self.alpha * out
+    
+        return out
 
 
 class MultiScaleContextModule(nn.Module):
