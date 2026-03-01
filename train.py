@@ -39,6 +39,92 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
+
+def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batch_idx):
+    """
+    Gọi khi phát hiện NaN/Inf để xác định chính xác nguồn gốc.
+    """
+    print(f"\n{'='*70}")
+    print(f"🔍 NaN/Inf DEBUG — Epoch {epoch}, Batch {batch_idx}")
+    print(f"{'='*70}")
+
+    # ── 1. Loss values ────────────────────────────────────────────
+    print(f"\n[LOSS]")
+    print(f"  total : {loss.item():.6f}")
+    print(f"  ce    : {ce_loss.item():.6f}")
+    print(f"  dice  : {dice_loss.item():.6f}")
+
+    # ── 2. Output tensor stats ────────────────────────────────────
+    print(f"\n[OUTPUTS]")
+    for key, tensor in outputs.items():
+        has_nan = torch.isnan(tensor).any().item()
+        has_inf = torch.isinf(tensor).any().item()
+        print(f"  {key:10s} | shape={tuple(tensor.shape)}"
+              f" | min={tensor.min():.4f} max={tensor.max():.4f}"
+              f" | nan={has_nan} inf={has_inf}")
+
+    # ── 3. Mask stats ─────────────────────────────────────────────
+    print(f"\n[MASKS]")
+    print(f"  shape={tuple(masks.shape)}"
+          f" | min={masks.min().item()} max={masks.max().item()}"
+          f" | unique classes={masks.unique().numel()}")
+
+    # ── 4. Tìm chính xác layer nào có NaN/Inf trong parameters ───
+    print(f"\n[PARAMETERS — NaN/Inf]")
+    found_param = False
+    for name, param in model.named_parameters():
+        has_nan = torch.isnan(param).any().item()
+        has_inf = torch.isinf(param).any().item()
+        if has_nan or has_inf:
+            print(f"  ❌ PARAM  {name[:60]}"
+                  f" | nan={has_nan} inf={has_inf}"
+                  f" | min={param.min():.4f} max={param.max():.4f}")
+            found_param = True
+    if not found_param:
+        print("  ✅ Tất cả parameters OK")
+
+    # ── 5. Tìm chính xác layer nào có NaN/Inf trong gradients ────
+    print(f"\n[GRADIENTS — NaN/Inf]")
+    found_grad = False
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            has_nan = torch.isnan(param.grad).any().item()
+            has_inf = torch.isinf(param.grad).any().item()
+            if has_nan or has_inf:
+                print(f"  ❌ GRAD   {name[:60]}"
+                      f" | nan={has_nan} inf={has_inf}"
+                      f" | norm={param.grad.norm():.4f}")
+                found_grad = True
+    if not found_grad:
+        print("  ✅ Tất cả gradients OK")
+
+    # ── 6. Alpha params — suspect chính ──────────────────────────
+    print(f"\n[ALPHA PARAMS — chi tiết]")
+    for name, param in model.named_parameters():
+        if 'alpha' in name:
+            grad_norm = param.grad.norm().item() if param.grad is not None else None
+            print(f"  {name[:60]}"
+                  f" | value={param.item():.6f}"
+                  f" | grad={grad_norm}")
+
+    # ── 7. BN running stats bất thường ───────────────────────────
+    print(f"\n[BATCHNORM — running stats bất thường]")
+    found_bn = False
+    for name, module in model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            if module.running_var is not None:
+                min_var = module.running_var.min().item()
+                if min_var < 1e-6:  # variance gần 0 → chia sẽ explode
+                    print(f"  ⚠️  {name[:60]}"
+                          f" | running_var min={min_var:.2e}"
+                          f" | running_mean range=[{module.running_mean.min():.3f},"
+                          f"{module.running_mean.max():.3f}]")
+                    found_bn = True
+    if not found_bn:
+        print("  ✅ Tất cả BN running stats OK")
+
+    print(f"\n{'='*70}\n")
+
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -775,20 +861,25 @@ class Trainer:
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_ce_loss
             
-                loss = loss / self.args.accumulation_steps
-    
-            # FIX 1: Check NaN BEFORE backward
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\nNaN/Inf loss at epoch {epoch}, batch {batch_idx}")
-                print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
-                self.optimizer.zero_grad(set_to_none=True)
-                continue
-            
-            self.scaler.scale(loss).backward()
-            
-
+                loss = loss / self.args.accumulation_steps            
+            self.scaler.scale(loss).backward()          
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
+                grad_has_problem = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            print(f"\n⚠️  Gradient NaN/Inf TRƯỚC clip:"
+                                  f" {name[:60]} | norm={param.grad.norm():.4f}")
+                            grad_has_problem = True
+                # ── Nếu gradient có vấn đề → debug đầy đủ ─────────────
+                if grad_has_problem:
+                    debug_nan_check(
+                        self.model, loss, ce_loss, dice_loss,
+                        outputs, masks, epoch, batch_idx
+                    )
+                    self.optimizer.zero_grad(set_to_none=True)
+                    continue
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
                 if self.args.grad_clip > 0:
@@ -797,7 +888,9 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-            
+                if torch.isnan(loss) or torch.isinf(loss):
+                    print(f"\n⚠️  Loss NaN/Inf @ epoch {epoch} batch {batch_idx}"
+                          f" | CE={ce_loss.item():.4f} Dice={dice_loss.item():.4f}")
                 if self.scheduler and self.args.scheduler == 'onecycle':   # ← VÀO TRONG
                     self.scheduler.step()
                         
