@@ -449,89 +449,70 @@ class DWSABlock(nn.Module):
         self.scale = (mid // num_heads) ** -0.5
         self.alpha = nn.Parameter(torch.ones(channels) * 1e-4)
 
-    def _attention(self, x_flat):
-
+    def _attention(self, x_flat: Tensor) -> Tensor:
+        """
+        Stable attention:
+          - force fp32 for attention math (avoid fp16 overflow)
+          - normalize x_flat per-channel across sequence to reduce variance spikes
+          - clamp and use torch.nan_to_num BEFORE softmax to eliminate inf/nan
+          - cast back to original dtype at end
+        x_flat: (B', reduced, N)
+        returns: (B', reduced, N)
+        """
+        # save original dtype
         orig_dtype = x_flat.dtype
-        x_flat = x_flat.float()  # force fp32
     
+        # --- 1) operate in fp32 to avoid fp16 overflow ---
+        x_flat = x_flat.float()
+    
+        # --- 2) light normalization per channel across sequence (stabilizes q/k magnitudes) ---
+        # compute mean/std over seq dim (N)
+        mean = x_flat.mean(dim=2, keepdim=True)
+        std = x_flat.std(dim=2, unbiased=False, keepdim=True)
+        x_flat = (x_flat - mean) / (std + 1e-6)
+    
+        # --- 3) Q/K/V projections ---
         if self.qk_sharing:
-            base = self.qk_base(x_flat)
+            base = self.qk_base(x_flat)   # (B', mid, N)
             q = self.q_head(base)
             k = self.k_head(base)
         else:
             q = self.q_proj(x_flat)
             k = self.k_proj(x_flat)
-    
         v = self.v_proj(x_flat)
     
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
-            return t.view(B_, self.num_heads, hd, N).permute(0,1,3,2)
+            # (B_, heads, N, head_dim)
+            return t.view(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
     
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
     
-        attn = torch.matmul(q, k.transpose(-2,-1)) * self.scale
-        attn = attn.clamp(-10,10)
+        # --- 4) safe matmul + scaling ---
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+    
+        # --- 5) clamp + remove NaN/inf BEFORE softmax ---
+        # clamp to reasonable range, then replace inf/nan with large negative so softmax -> ~0
+        attn = attn.clamp(-50.0, 50.0)
+        attn = torch.nan_to_num(attn, nan=-1e9, posinf=1e9, neginf=-1e9)
+    
+        # --- 6) softmax (stable now) ---
         attn = F.softmax(attn, dim=-1)
+        attn = torch.nan_to_num(attn, nan=0.0, posinf=1e9, neginf=-1e9)
     
-        out = torch.matmul(attn, v)
-        out = out.permute(0,1,3,2).contiguous()
+        attn = self.drop(attn)
+    
+        out = torch.matmul(attn, v)                         # (B', heads, N, hd)
+        out = out.permute(0, 1, 3, 2).contiguous()          # (B', heads, hd, N)
         B_, Hn, Hd, N = out.shape
+        out = out.view(B_, self.mid, N)                     # (B', mid, N)
     
-        out = out.view(B_, self.mid, N)
-        return out.to(orig_dtype)
-
-    def forward(self, x: Tensor) -> Tensor:
-        B, C, H, W = x.shape
-        identity = x
-
-        # Normalize + project xuống reduced dim
-        x_norm = self.bn_in(x)
-        x_red  = self.in_proj(x_norm)   # (B, reduced, H, W)
-
-        if self.window_size > 0:
-            # ── Window attention (stage4) ──────────────────────────
-            ws = self.window_size
-
-            # Pad nếu H, W không chia hết cho ws
-            pad_h = (ws - H % ws) % ws
-            pad_w = (ws - W % ws) % ws
-            if pad_h > 0 or pad_w > 0:
-                x_red = F.pad(x_red, (0, pad_w, 0, pad_h))
-            Hp, Wp = x_red.shape[2], x_red.shape[3]
-
-            # Partition → (B*nH*nW, reduced, ws, ws)
-            windows, (nH, nW) = _partition_windows(x_red, ws)
-            Bw, C2, _, _ = windows.shape
-            x_flat = windows.view(Bw, C2, ws * ws)  # (B*nH*nW, reduced, ws²)
-
-            # Attention trong từng window độc lập
-            out_flat = self._attention(x_flat)       # (B*nH*nW, mid, ws²)
-
-            # Project back
-            out_flat = self.o_proj(out_flat)         # (B*nH*nW, reduced, ws²)
-            out_win  = out_flat.view(Bw, C2, ws, ws)
-
-            # Merge windows → (B, reduced, Hp, Wp)
-            out_red = _merge_windows(out_win, nH, nW, B)
-
-            # Crop padding nếu có
-            if pad_h > 0 or pad_w > 0:
-                out_red = out_red[:, :, :H, :W]
-
-        else:
-            # ── Full attention (stage5, stage6) ───────────────────
-            N = H * W
-            x_flat   = x_red.view(B, self.reduced, N)
-            out_flat = self._attention(x_flat)       # (B, mid, N)
-            out_flat = self.o_proj(out_flat)         # (B, reduced, N)
-            out_red  = out_flat.view(B, self.reduced, H, W)
-
-        # Project back lên channels + BN
-        out = self.bn_out(self.out_proj(out_red))
-        alpha = self.alpha.view(1, -1, 1, 1)   # (C,) → (1, C, 1, 1) để broadcast
-        return identity + alpha * out
+        # cast back to original dtype (if using AMP)
+        if orig_dtype != torch.float32:
+            out = out.to(orig_dtype)
+    
+        return out
 
 
 class MultiScaleContextModule(nn.Module):
