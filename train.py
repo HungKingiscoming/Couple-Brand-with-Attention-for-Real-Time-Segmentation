@@ -1026,11 +1026,26 @@ class Trainer:
         if (epoch + 1) % self.args.save_interval == 0:
             torch.save(checkpoint, self.save_dir / f"epoch_{epoch+1}.pth")
 
-    def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
-        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
-
-        self.model.load_state_dict(checkpoint['model'])
-
+    def load_checkpoint(self, checkpoint_path, reset_epoch=True,
+                    load_optimizer=True, reset_best_metric=False):
+        checkpoint = torch.load(checkpoint_path, map_location=self.device,
+                                weights_only=False)
+    
+        # ── strict=False để bỏ qua alpha shape mismatch ──
+        missing, unexpected = self.model.load_state_dict(
+            checkpoint['model'], strict=False
+        )
+    
+        # ── Khởi tạo alpha mới từ scalar cũ trong checkpoint ──
+        old_state = checkpoint['model']
+        for name, param in self.model.named_parameters():
+            if 'alpha' in name:
+                if name in old_state and old_state[name].shape != param.shape:
+                    old_val = old_state[name].item()
+                    with torch.no_grad():
+                        param.fill_(old_val)
+                    print(f"✅ '{name}': scalar {old_val:.6f} → shape {tuple(param.shape)}")
+    
         if load_optimizer and checkpoint.get('optimizer') is not None:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer'])
@@ -1038,31 +1053,28 @@ class Trainer:
                 print(f"Optimizer state not loaded: {e}")
         else:
             print("Skipping optimizer state loading.")
-
-        if 'scaler' in checkpoint and checkpoint['scaler'] is not None and load_optimizer:
+    
+        if 'scaler' in checkpoint and checkpoint['scaler'] and load_optimizer:
             try:
                 self.scaler.load_state_dict(checkpoint['scaler'])
             except Exception as e:
-                print(f"AMP scaler state not loaded: {e}")
-
+                print(f"AMP scaler not loaded: {e}")
+    
         if reset_epoch:
             self.start_epoch = 0
             self.global_step = 0
-            if reset_best_metric:
-                self.best_miou = 0.0
-            else:
-                self.best_miou = checkpoint.get('best_miou', 0.0)
-            print(f"Weights loaded from epoch {checkpoint['epoch']}, starting from epoch 0")
+            self.best_miou   = 0.0 if reset_best_metric else checkpoint.get('best_miou', 0.0)
+            print(f"Weights loaded from epoch {checkpoint['epoch']}, starting epoch 0")
         else:
             self.start_epoch = checkpoint['epoch'] + 1
-            self.best_miou = checkpoint.get('best_miou', 0.0)
+            self.best_miou   = checkpoint.get('best_miou', 0.0)
             self.global_step = checkpoint.get('global_step', 0)
             if self.scheduler and checkpoint.get('scheduler') and load_optimizer:
                 try:
                     self.scheduler.load_state_dict(checkpoint['scheduler'])
                 except Exception as e:
-                    print(f"Scheduler state not loaded: {e}")
-            print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
+                    print(f"Scheduler not loaded: {e}")
+            print(f"Checkpoint loaded — resuming epoch {self.start_epoch}")
 
 
 
