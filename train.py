@@ -844,7 +844,7 @@ class Trainer:
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
     
-            with autocast(device_type='cuda', enabled=use_amp):  # ← dùng use_amp thay vì self.args.use_amp
+            with autocast(device_type='cuda', enabled=self.args.use_amp):  # ← dùng use_amp thay vì self.args.use_amp
                 outputs = self.model.forward_train(imgs)
                 logits = outputs["main"]
             
