@@ -458,24 +458,24 @@ def print_backbone_structure(model):
     
     print(f"{'='*70}\n")
 
-def unfreeze_backbone_progressive(model, stage_names):
+def unfreeze_backbone_progressive(model, stage_names, optimizer=None):
     if isinstance(stage_names, str):
         stage_names = [stage_names]
-
     unfrozen_params = 0
     unfrozen_modules = []
+    newly_unfrozen_params = []  # track để reset optimizer state
 
     for stage_name in stage_names:
         module = None
         found_path = None
-        
+
         # Strategy 1: Direct lookup at model.backbone level
         if hasattr(model.backbone, stage_name):
             attr = getattr(model.backbone, stage_name)
             if attr is not None:
                 module = attr
                 found_path = f"backbone.{stage_name}"
-        
+
         # Strategy 2: Lookup at model.backbone.backbone level (GCNetCore)
         if module is None and hasattr(model.backbone, 'backbone'):
             if hasattr(model.backbone.backbone, stage_name):
@@ -483,17 +483,14 @@ def unfreeze_backbone_progressive(model, stage_names):
                 if attr is not None:
                     module = attr
                     found_path = f"backbone.backbone.{stage_name}"
-        
+
         # Strategy 3: Parse dotted names like 'semantic_branch_layers.0'
         if module is None and '.' in stage_name:
             parts = stage_name.split('.')
-            base_name = parts[0]  # e.g., 'semantic_branch_layers'
+            base_name = parts[0]
             index = parts[1] if len(parts) > 1 else None
-            
-            # Try model.backbone.backbone.<base_name>[index]
             if hasattr(model.backbone.backbone, base_name):
                 base_module = getattr(model.backbone.backbone, base_name)
-                
                 if index is not None and index.isdigit():
                     try:
                         module = base_module[int(index)]
@@ -503,42 +500,55 @@ def unfreeze_backbone_progressive(model, stage_names):
                 else:
                     module = base_module
                     found_path = f"backbone.backbone.{base_name}"
-        
-        # If still not found, skip
+
         if module is None:
             print(f"Module '{stage_name}' not found")
             continue
-        
+
         param_count = 0
         bn_count = 0
-        
+
         for p in module.parameters():
             if not p.requires_grad:
                 p.requires_grad = True
                 unfrozen_params += 1
                 param_count += 1
-        
-        # 🔥 BẬT LẠI BatchNorm trong stage này
+                newly_unfrozen_params.append(p)  # ← track param mới mở
+
+        # BN giữ eval mode — chỉ mở weight/bias
         for m in module.modules():
             if isinstance(m, nn.BatchNorm2d):
-                m.eval()   
+                m.eval()
                 if m.weight is not None:
                     m.weight.requires_grad = True
                 if m.bias is not None:
                     m.bias.requires_grad = True
                 bn_count += 1
-        
+
         if param_count > 0:
             unfrozen_modules.append((found_path, param_count))
             print(f"Unfrozen: {found_path} ({param_count:,} params, {bn_count} BN layers activated)")
 
-    # Summary
+    # ── Reset optimizer state cho params vừa unfreeze ─────────────────────
+    # Lý do: exp_avg/exp_avg_sq từ lúc bị freeze có thể stale hoặc sai
+    # → gây gradient spike ngay batch đầu tiên sau unfreeze
+    if optimizer is not None and newly_unfrozen_params:
+        reset_count = 0
+        for p in newly_unfrozen_params:
+            if p in optimizer.state:
+                optimizer.state[p].clear()
+                reset_count += 1
+        # Hầu hết params mới unfreeze chưa có optimizer state
+        # (vì chưa từng update) → reset_count thường = 0, không sao
+        print(f"Optimizer state reset: {reset_count} params cleared")
+
     if unfrozen_modules:
         print(f"\nTotal: {len(unfrozen_modules)} modules, {unfrozen_params:,} params unfrozen")
     else:
         print(f"\nWARNING: No modules were unfrozen!")
-    
+
     return unfrozen_params
+
 def print_available_modules(model):
     """Debug helper - print all available modules in backbone"""
     print(f"\n{'='*70}")
@@ -812,6 +822,24 @@ class Trainer:
     def train_epoch(self, loader, epoch):
         self.model.train()
         
+        # ── AMP warmup sau unfreeze ───────────────────────────────────
+        use_amp = (
+            self.args.use_amp and
+            not (hasattr(self, 'amp_warmup_end_epoch') and
+                 epoch < self.amp_warmup_end_epoch)
+        )
+        if not use_amp and self.args.use_amp:
+            print(f"⚠️  AMP disabled (warmup until epoch {self.amp_warmup_end_epoch})")
+    
+        # ── Grad clip chặt sau unfreeze ───────────────────────────────
+        effective_clip = self.args.grad_clip
+        if (hasattr(self, 'tight_clip_end_epoch') and
+                epoch < self.tight_clip_end_epoch):
+            effective_clip = min(self.args.grad_clip, 0.5)
+            if not hasattr(self, '_clip_printed'):
+                print(f"⚠️  Tight grad clip: {effective_clip} (until epoch {self.tight_clip_end_epoch})")
+                self._clip_printed = True
+    
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
@@ -826,23 +854,17 @@ class Trainer:
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
     
-            with autocast(device_type='cuda', enabled=self.args.use_amp):
+            with autocast(device_type='cuda', enabled=use_amp):  # ← dùng use_amp thay vì self.args.use_amp
                 outputs = self.model.forward_train(imgs)
-                logits = outputs["main"]    # (B, C, H/2, W/2) — giữ nguyên resolution thấp
+                logits = outputs["main"]
             
-                # ── CE: upsample logit lên full resolution ────────────────────
                 logits_full = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
+                    logits, size=masks.shape[-2:],
+                    mode='bilinear', align_corners=False
                 )
                 ce_loss = self.ce(logits_full, masks)
             
-                # ── Dice: giữ logit H/2, downsample mask xuống cùng size ──────
                 if self.dice_weight > 0:
-                    # nearest-exact: chính xác hơn 'nearest' với kích thước lẻ
-                    # không dùng bilinear vì mask là class label (integer), không nội suy được
                     masks_small = F.interpolate(
                         masks.unsqueeze(1).float(),
                         size=logits.shape[-2:],
@@ -854,21 +876,19 @@ class Trainer:
             
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             
-                # ── Aux: chỉ CE là đủ, Dice không cần thiết ở aux head ────────
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = F.interpolate(
-                        outputs["aux"],
-                        size=masks.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
+                        outputs["aux"], size=masks.shape[-2:],
+                        mode='bilinear', align_corners=False
                     )
                     aux_ce_loss = self.ce(aux_logits, masks)
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_ce_loss
             
-                loss = loss / self.args.accumulation_steps            
+                loss = loss / self.args.accumulation_steps
+    
             self.scaler.scale(loss).backward()
-
+    
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
             
@@ -886,25 +906,27 @@ class Trainer:
                         outputs, masks, epoch, batch_idx
                     )
                     self.optimizer.zero_grad(set_to_none=True)
-                    self.scaler.update()          # ← PHẢI gọi để reset scaler state
+                    self.scaler.update()
                     continue
             
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
             
-                if self.args.grad_clip > 0:
+                if effective_clip > 0:  # ← dùng effective_clip thay vì self.args.grad_clip
                     torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.args.grad_clip
+                        self.model.parameters(), effective_clip
                     )
             
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
+    
                 if torch.isnan(loss) or torch.isinf(loss):
                     print(f"\n⚠️  Loss NaN/Inf @ epoch {epoch} batch {batch_idx}"
                           f" | CE={ce_loss.item():.4f} Dice={dice_loss.item():.4f}")
-                if self.scheduler and self.args.scheduler == 'onecycle':   # ← VÀO TRONG
+    
+                if self.scheduler and self.args.scheduler == 'onecycle':
                     self.scheduler.step()
                         
             total_loss += loss.item() * self.args.accumulation_steps
@@ -917,7 +939,7 @@ class Trainer:
                 'ce': f'{ce_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
                 'lr': f'{current_lr:.6f}',
-                'max_grad': f'{max_grad:.2f}'  # â† Monitor
+                'max_grad': f'{max_grad:.2f}'
             })
             
             if batch_idx % 50 == 0:
@@ -928,7 +950,7 @@ class Trainer:
                 self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
                 self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
-                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # â† Log
+                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)
     
         avg_loss = total_loss / len(loader)
         avg_ce = total_ce / len(loader)
@@ -1327,7 +1349,7 @@ def main():
         
         # 🔥 LUÔN đảm bảo stage đúng trạng thái
         if targets:
-            unfreeze_backbone_progressive(model, targets)
+            unfreeze_backbone_progressive(model, targets, optimizer=trainer.optimizer)
         
         # 🔁 CHỈ rebuild optimizer khi đúng mốc unfreeze
         if epoch in unfreeze_epochs:
@@ -1371,6 +1393,10 @@ def main():
                     g.setdefault('initial_lr', g['lr'])
         
             trainer.optimizer = optimizer
+            trainer.amp_warmup_end_epoch = epoch + 2   # 2 epoch float32
+            trainer.tight_clip_end_epoch = epoch + 3   # 3 epoch clip chặt 0.5
+            if hasattr(trainer, '_clip_printed'):
+                del trainer._clip_printed
             trainer.scheduler  = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
             print("\n" + "="*70)
             print("Learning Rates after unfreezing:")
