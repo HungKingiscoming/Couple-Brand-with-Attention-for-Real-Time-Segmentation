@@ -862,9 +862,11 @@ class Trainer:
                     loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps            
-            self.scaler.scale(loss).backward()          
+            self.scaler.scale(loss).backward()
+
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
+            
                 grad_has_problem = False
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
@@ -872,18 +874,24 @@ class Trainer:
                             print(f"\n⚠️  Gradient NaN/Inf TRƯỚC clip:"
                                   f" {name[:60]} | norm={param.grad.norm():.4f}")
                             grad_has_problem = True
-                # ── Nếu gradient có vấn đề → debug đầy đủ ─────────────
+            
                 if grad_has_problem:
                     debug_nan_check(
                         self.model, loss, ce_loss, dice_loss,
                         outputs, masks, epoch, batch_idx
                     )
                     self.optimizer.zero_grad(set_to_none=True)
+                    self.scaler.update()          # ← PHẢI gọi để reset scaler state
                     continue
+            
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
+            
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.args.grad_clip
+                    )
+            
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
