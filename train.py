@@ -1266,15 +1266,19 @@ def main():
     model = model.to(device)
     with torch.no_grad():
         sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
-        try:
-            outputs = model.forward_train(sample)
-            print(f"Forward pass successful!")
-            print(f"   Main:  {outputs['main'].shape}")
-            if 'aux' in outputs:
-                print(f"   Aux:   {outputs['aux'].shape}\n")
-        except Exception as e:
-            print(f"Forward pass FAILED: {e}\n")
-            return
+    
+        feats = model.backbone(sample)
+    
+        print("\n===== BACKBONE OUTPUT SHAPES =====")
+        if isinstance(feats, (list, tuple)):
+            for i, f in enumerate(feats):
+                print(f"feat[{i}] = {tuple(f.shape)}")
+        else:
+            print("Single output:", feats.shape)
+    
+        print("===================================\n")
+    
+        outputs = model.forward_train(sample)
     
     # Optimizer
     if args.use_discriminative_lr:
