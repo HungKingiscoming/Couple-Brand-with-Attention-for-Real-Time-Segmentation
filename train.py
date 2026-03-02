@@ -1270,13 +1270,8 @@ def main():
         feats = model.backbone(sample)
     
         print("\n===== BACKBONE OUTPUT SHAPES =====")
-        if isinstance(feats, (list, tuple)):
-            for i, f in enumerate(feats):
-                print(f"feat[{i}] = {tuple(f.shape)}")
-        else:
-            feats = model.backbone(sample)
-            print("Single output:", feats.shape)
-    
+        for k, v in feats.items():
+            print(f"{k}: {tuple(v.shape)}")
         print("===================================\n")
     
         outputs = model.forward_train(sample)
