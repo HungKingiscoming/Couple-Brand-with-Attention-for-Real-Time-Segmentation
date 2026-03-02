@@ -1274,6 +1274,7 @@ def main():
             for i, f in enumerate(feats):
                 print(f"feat[{i}] = {tuple(f.shape)}")
         else:
+            feats = model.backbone(sample)
             print("Single output:", feats.shape)
     
         print("===================================\n")
