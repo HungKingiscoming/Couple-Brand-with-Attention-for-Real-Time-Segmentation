@@ -447,7 +447,7 @@ class DWSABlock(nn.Module):
 
         self.drop  = nn.Dropout(drop)
         self.scale = (mid // num_heads) ** -0.5
-        self.alpha = nn.Parameter(torch.ones(channels) * 1e-4)
+        self.register_buffer("alpha", torch.ones(channels) * 0.1)
 
     def _attention(self, x_flat: Tensor) -> Tensor:
         # Force fp32 để tránh softmax overflow trong fp16
@@ -518,7 +518,7 @@ class DWSABlock(nn.Module):
     
         # alpha clamp [0,1] — ngăn positive feedback loop
         alpha = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
-        return identity + alpha * out
+        return identity + self.alpha * out
 
 
 class MultiScaleContextModule(nn.Module):
