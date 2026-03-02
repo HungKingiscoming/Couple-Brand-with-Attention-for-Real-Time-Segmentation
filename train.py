@@ -42,38 +42,28 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 
 
 
-def check_gradients_detailed(model, topk=5):
-    grad_list = []
-    total_norm_sq = 0.0
+def check_gradients_detailed(model, topk=5, verbose=True):
+    grad_info = []
+    total_norm = 0.0
     max_grad = 0.0
 
-    for name, p in model.named_parameters():
-        if p.grad is not None:
-            gnorm = p.grad.norm().item()
-            pnorm = p.norm().item()
-            ratio = gnorm / (pnorm + 1e-12)
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            total_norm += grad_norm ** 2
+            max_grad = max(max_grad, grad_norm)
+            grad_info.append((name, grad_norm))
 
-            grad_list.append((name, gnorm, pnorm, ratio))
-            total_norm_sq += gnorm ** 2
+    total_norm = total_norm ** 0.5
 
-            if gnorm > max_grad:
-                max_grad = gnorm
+    if verbose and topk > 0:
+        grad_info.sort(key=lambda x: x[1], reverse=True)
+        print("\nGRADIENT MONITOR")
+        print(f"Total Grad Norm: {total_norm:.4f}")
+        for i, (name, gnorm) in enumerate(grad_info[:topk]):
+            print(f"[{i+1}] {name[:60]} = {gnorm:.4f}")
 
-    total_norm = total_norm_sq ** 0.5
-
-    grad_list.sort(key=lambda x: x[1], reverse=True)
-
-    print("\nGRADIENT MONITOR")
-    print(f"Total Grad Norm: {total_norm:.2f}\n")
-
-    for i, (name, gnorm, pnorm, ratio) in enumerate(grad_list[:topk]):
-        print(f"[{i+1}] {name}")
-        print(f"     Grad Norm : {gnorm:.4f}")
-        print(f"     Param Norm: {pnorm:.4f}")
-        print(f"     Ratio     : {ratio:.4f}")
-        print("-"*70)
-
-    return max_grad, total_norm
+    return total_norm, max_grad
 def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batch_idx):
 
     print(f"\n{'='*70}")
@@ -896,12 +886,17 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                max_grad, total_norm = check_gradients_detailed(self.model, topk=5)
-                max_grad_epoch = max(max_grad_epoch, max_grad)
-            
-
+                total_norm, max_grad = check_gradients_detailed(
+                    self.model,
+                    topk=0,          # không in
+                    verbose=False
+                )
+                
                 if total_norm > 50:
-                    print("⚠️  Large total grad norm detected!")
+                    print("⚠️ Large gradient detected!")
+                    check_gradients_detailed(self.model, topk=5, verbose=True)
+                
+                max_grad_epoch = max(max_grad_epoch, max_grad)
                 grad_has_problem = False
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
