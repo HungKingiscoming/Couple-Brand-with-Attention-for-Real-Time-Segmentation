@@ -914,7 +914,6 @@ class Trainer:
                     self.scaler.update()          # â† PHáº¢I gá»i Ä‘á»ƒ reset scaler state
                     continue
             
-                max_grad, total_norm = check_gradients_detailed(self.model, topk=5)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
             
                 if self.args.grad_clip > 0:
