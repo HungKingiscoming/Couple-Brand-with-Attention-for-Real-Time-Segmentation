@@ -124,7 +124,7 @@ def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batc
         if 'alpha' in name:
             grad_norm = param.grad.norm().item() if param.grad is not None else None
             print(f"  {name[:60]}"
-                  f" | value={param.item():.6f}"
+                  f" | value={param.detach().mean().item():.6f}"
                   f" | grad={grad_norm}")
 
   
