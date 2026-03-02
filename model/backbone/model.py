@@ -515,11 +515,15 @@ class DWSABlock(nn.Module):
             out_red  = out_flat.view(B, self.reduced, H, W)
     
         out = self.bn_out(self.out_proj(out_red))
-    
-        # alpha clamp [0,1] — ngăn positive feedback loop
-        alpha = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
-        return identity + self.alpha * out
 
+        if identity.shape != out.shape:
+            print("⚠️ DWSA SHAPE MISMATCH")
+            print("identity:", identity.shape)
+            print("out     :", out.shape)
+            raise RuntimeError("DWSA shape mismatch")
+        
+        alpha = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
+        return identity + alpha * out
 
 class MultiScaleContextModule(nn.Module):
     """
@@ -742,9 +746,7 @@ class GCNetCore(BaseModule):
                 kernel_size=3, stride=2, padding=1,
                 norm_cfg=norm_cfg, act_cfg=None))
 
-        # SPP vẫn nằm trong GCNetCore để load weight từ pretrained gốc
-        # nhưng KHÔNG được gọi trong forward() nữa
-        # GCNetWithEnhance sẽ gọi self.backbone.spp() một lần duy nhất
+       
         self.spp = DAPPM(
             in_channels=channels * 16,
             branch_channels=ppm_channels,
