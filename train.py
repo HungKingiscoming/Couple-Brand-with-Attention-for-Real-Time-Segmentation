@@ -40,21 +40,67 @@ from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
 
+
+
+def check_gradients_detailed(model, threshold=10.0, topk=10):
+    """
+    In ra:
+    - total grad norm
+    - top K layers có grad lớn nhất
+    - grad/param ratio
+    """
+    grad_info = []
+    total_norm_sq = 0.0
+
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+
+        grad_norm = param.grad.norm().item()
+        param_norm = param.data.norm().item() + 1e-12
+        ratio = grad_norm / param_norm
+
+        total_norm_sq += grad_norm ** 2
+
+        grad_info.append({
+            "name": name,
+            "grad_norm": grad_norm,
+            "param_norm": param_norm,
+            "ratio": ratio
+        })
+
+    total_norm = total_norm_sq ** 0.5
+
+    # sort theo grad_norm giảm dần
+    grad_info = sorted(grad_info, key=lambda x: x["grad_norm"], reverse=True)
+
+    print("\n" + "="*70)
+    print("GRADIENT MONITOR")
+    print("="*70)
+    print(f"Total Grad Norm: {total_norm:.4f}")
+
+    for i, info in enumerate(grad_info[:topk]):
+        print(f"[{i+1}] {info['name'][:60]}")
+        print(f"     Grad Norm : {info['grad_norm']:.4f}")
+        print(f"     Param Norm: {info['param_norm']:.4f}")
+        print(f"     Ratio     : {info['ratio']:.4f}")
+        print("-"*70)
+
+    print("="*70 + "\n")
+
+    return total_norm
 def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batch_idx):
-    """
-    Gá»i khi phÃ¡t hiá»‡n NaN/Inf Ä‘á»ƒ xÃ¡c Ä‘á»‹nh chÃ­nh xÃ¡c nguá»“n gá»‘c.
-    """
+
     print(f"\n{'='*70}")
-    print(f"ðŸ” NaN/Inf DEBUG â€” Epoch {epoch}, Batch {batch_idx}")
+    print(f"NaN/Inf DEBUG ” Epoch {epoch}, Batch {batch_idx}")
     print(f"{'='*70}")
 
-    # â”€â”€ 1. Loss values â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     print(f"\n[LOSS]")
     print(f"  total : {loss.item():.6f}")
     print(f"  ce    : {ce_loss.item():.6f}")
     print(f"  dice  : {dice_loss.item():.6f}")
 
-    # â”€â”€ 2. Output tensor stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     print(f"\n[OUTPUTS]")
     for key, tensor in outputs.items():
         has_nan = torch.isnan(tensor).any().item()
@@ -63,42 +109,41 @@ def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batc
               f" | min={tensor.min():.4f} max={tensor.max():.4f}"
               f" | nan={has_nan} inf={has_inf}")
 
-    # â”€â”€ 3. Mask stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     print(f"\n[MASKS]")
     print(f"  shape={tuple(masks.shape)}"
           f" | min={masks.min().item()} max={masks.max().item()}"
           f" | unique classes={masks.unique().numel()}")
 
-    # â”€â”€ 4. TÃ¬m chÃ­nh xÃ¡c layer nÃ o cÃ³ NaN/Inf trong parameters â”€â”€â”€
-    print(f"\n[PARAMETERS â€” NaN/Inf]")
+    print(f"\n[PARAMETERS NaN/Inf]")
     found_param = False
     for name, param in model.named_parameters():
         has_nan = torch.isnan(param).any().item()
         has_inf = torch.isinf(param).any().item()
         if has_nan or has_inf:
-            print(f"  âŒ PARAM  {name[:60]}"
+            print(f"   PARAM  {name[:60]}"
                   f" | nan={has_nan} inf={has_inf}"
                   f" | min={param.min():.4f} max={param.max():.4f}")
             found_param = True
     if not found_param:
-        print("  âœ… Táº¥t cáº£ parameters OK")
+        print("  parameters OK")
 
-    # â”€â”€ 5. TÃ¬m chÃ­nh xÃ¡c layer nÃ o cÃ³ NaN/Inf trong gradients â”€â”€â”€â”€
-    print(f"\n[GRADIENTS â€” NaN/Inf]")
+
+    print(f"\n[GRADIENTS  NaN/Inf]")
     found_grad = False
     for name, param in model.named_parameters():
         if param.grad is not None:
             has_nan = torch.isnan(param.grad).any().item()
             has_inf = torch.isinf(param.grad).any().item()
             if has_nan or has_inf:
-                print(f"  âŒ GRAD   {name[:60]}"
+                print(f"   GRAD   {name[:60]}"
                       f" | nan={has_nan} inf={has_inf}"
                       f" | norm={param.grad.norm():.4f}")
                 found_grad = True
     if not found_grad:
         print("  âœ… Táº¥t cáº£ gradients OK")
 
-    # â”€â”€ 6. Alpha params â€” suspect chÃ­nh â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
     print(f"\n[ALPHA PARAMS â€” chi tiáº¿t]")
     for name, param in model.named_parameters():
         if 'alpha' in name:
@@ -107,21 +152,21 @@ def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batc
                   f" | value={param.item():.6f}"
                   f" | grad={grad_norm}")
 
-    # â”€â”€ 7. BN running stats báº¥t thÆ°á»ng â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    print(f"\n[BATCHNORM â€” running stats báº¥t thÆ°á»ng]")
+  
+    print(f"\n[BATCHNORM  running stats]")
     found_bn = False
     for name, module in model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
             if module.running_var is not None:
                 min_var = module.running_var.min().item()
-                if min_var < 1e-6:  # variance gáº§n 0 â†’ chia sáº½ explode
+                if min_var < 1e-6:  
                     print(f"  âš ï¸  {name[:60]}"
                           f" | running_var min={min_var:.2e}"
                           f" | running_mean range=[{module.running_mean.min():.3f},"
                           f"{module.running_mean.max():.3f}]")
                     found_bn = True
     if not found_bn:
-        print("  âœ… Táº¥t cáº£ BN running stats OK")
+        print("  BN running stats OK")
 
     print(f"\n{'='*70}\n")
 
@@ -185,7 +230,7 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
 
     if missing:
-        print(f"\nÃ¢Å¡ Ã¯Â¸Â  Missing keys in model ({len(missing)}):")
+        print(f"\n Missing keys in model ({len(missing)}):")
         for key in missing[:10]:
             print(f"   - {key}")
         if len(missing) > 10:
@@ -418,13 +463,13 @@ def freeze_backbone(model):
     """
     Freeze toÃ n bá»™ backbone + khÃ³a BatchNorm running stats
     """
-    print("ðŸ”’ Freezing backbone (with BN locked)...")
+    print(" Freezing backbone (with BN locked)...")
 
     # 1ï¸âƒ£ Freeze táº¥t cáº£ parameters
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    # 2ï¸âƒ£ Lock toÃ n bá»™ BatchNorm trong backbone
+
     bn_count = 0
     for m in model.backbone.modules():
         if isinstance(m, nn.BatchNorm2d):
@@ -436,7 +481,7 @@ def freeze_backbone(model):
             bn_count += 1
 
     print(f"   â†’ {bn_count} BatchNorm layers locked")
-    print("âœ… Backbone frozen completely\n")
+    print(" Backbone frozen completely\n")
 def print_backbone_structure(model):
     """In ra  backbone debug"""
     print(f"\n{'='*70}")
@@ -866,7 +911,10 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-            
+                total_norm = check_gradients_detailed(self.model, topk=5)
+
+                if total_norm > 50:
+                    print("⚠️  Large total grad norm detected!")
                 grad_has_problem = False
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
@@ -884,7 +932,7 @@ class Trainer:
                     self.scaler.update()          # â† PHáº¢I gá»i Ä‘á»ƒ reset scaler state
                     continue
             
-                max_grad, total_norm = check_gradients(self.model, threshold=10.0)
+                total_norm = check_gradients_detailed(self.model, threshold=10.0, topk=5)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
             
                 if self.args.grad_clip > 0:
@@ -897,7 +945,7 @@ class Trainer:
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
                 if torch.isnan(loss) or torch.isinf(loss):
-                    print(f"\nâš ï¸  Loss NaN/Inf @ epoch {epoch} batch {batch_idx}"
+                    print(f"\n  Loss NaN/Inf @ epoch {epoch} batch {batch_idx}"
                           f" | CE={ce_loss.item():.4f} Dice={dice_loss.item():.4f}")
                 if self.scheduler and self.args.scheduler == 'onecycle':   # â† VÃ€O TRONG
                     self.scheduler.step()
@@ -1044,7 +1092,7 @@ class Trainer:
                     old_val = old_state[name].item()
                     with torch.no_grad():
                         param.fill_(old_val)
-                    print(f"âœ… '{name}': scalar {old_val:.6f} â†’ shape {tuple(param.shape)}")
+                    print(f" '{name}': scalar {old_val:.6f}  shape {tuple(param.shape)}")
     
         if load_optimizer and checkpoint.get('optimizer') is not None:
             try:
