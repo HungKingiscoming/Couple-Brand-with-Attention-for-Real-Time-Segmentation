@@ -450,117 +450,75 @@ class DWSABlock(nn.Module):
         self.alpha = nn.Parameter(torch.ones(channels) * 1e-4)
 
     def _attention(self, x_flat: Tensor) -> Tensor:
-        """
-        Stable attention:
-          - force fp32 for attention math (avoid fp16 overflow)
-          - normalize x_flat per-channel across sequence to reduce variance spikes
-          - clamp and use torch.nan_to_num BEFORE softmax to eliminate inf/nan
-          - cast back to original dtype at end
-        x_flat: (B', reduced, N)
-        returns: (B', reduced, N)
-        """
-        # save original dtype
-        orig_dtype = x_flat.dtype
+        # Force fp32 để tránh softmax overflow trong fp16
+        x_fp32 = x_flat.float()
     
-        # --- 1) operate in fp32 to avoid fp16 overflow ---
-        x_flat = x_flat.float()
-    
-        # --- 2) light normalization per channel across sequence (stabilizes q/k magnitudes) ---
-        # compute mean/std over seq dim (N)
-        mean = x_flat.mean(dim=2, keepdim=True)
-        std = x_flat.std(dim=2, unbiased=False, keepdim=True)
-        x_flat = (x_flat - mean) / (std + 1e-6)
-    
-        # --- 3) Q/K/V projections ---
         if self.qk_sharing:
-            base = self.qk_base(x_flat)   # (B', mid, N)
+            base = self.qk_base(x_fp32)
             q = self.q_head(base)
             k = self.k_head(base)
         else:
-            q = self.q_proj(x_flat)
-            k = self.k_proj(x_flat)
-        v = self.v_proj(x_flat)
+            q = self.q_proj(x_fp32)
+            k = self.k_proj(x_fp32)
+        v = self.v_proj(x_fp32)
     
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
-            # (B_, heads, N, head_dim)
             return t.view(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
     
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
     
-        # --- 4) safe matmul + scaling ---
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-    
-        # --- 5) clamp + remove NaN/inf BEFORE softmax ---
-        # clamp to reasonable range, then replace inf/nan with large negative so softmax -> ~0
         attn = attn.clamp(-50.0, 50.0)
-        attn = torch.nan_to_num(attn, nan=-1e9, posinf=1e9, neginf=-1e9)
-    
-        # --- 6) softmax (stable now) ---
-        attn = F.softmax(attn, dim=-1)
-        attn = torch.nan_to_num(attn, nan=0.0, posinf=1e9, neginf=-1e9)
-    
+        attn = F.softmax(attn, dim=-1)   # fp32 → không overflow
         attn = self.drop(attn)
     
-        out = torch.matmul(attn, v)                         # (B', heads, N, hd)
-        out = out.permute(0, 1, 3, 2).contiguous()          # (B', heads, hd, N)
-        B_, Hn, Hd, N = out.shape
-        out = out.view(B_, self.mid, N)                     # (B', mid, N)
-    
-        # cast back to original dtype (if using AMP)
-        if orig_dtype != torch.float32:
-            out = out.to(orig_dtype)
-    
-        return out
-    def forward(self, x):
-        B, C, H, W = x.shape
-        identity = x
-
-        # FIX 4: Layer norm TRÆ¯á»šC process
-        x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        
-        x_red = self.in_proj(x_ln)
-        B, C2, H, W = x_red.shape
-        N = H * W
-        x_flat = x_red.view(B, C2, N)
-
-        if self.qk_sharing:
-            base = self.qk_base(x_flat)
-            q = self.q_head(base)
-            k = self.k_head(base)
-        else:
-            q = self.q_proj(x_flat)
-            k = self.k_proj(x_flat)
-        v = self.v_proj(x_flat)
-
-        def split_heads(t):
-            B, Cmid, N = t.shape
-            head_dim = Cmid // self.num_heads
-            t = t.view(B, self.num_heads, head_dim, N)
-            return t
-
-        q = split_heads(q).permute(0, 1, 3, 2)
-        k = split_heads(k).permute(0, 1, 3, 2)
-        v = split_heads(v).permute(0, 1, 3, 2)
-
-        # FIX 5: Clamp attention scores
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)  # Prevent overflow
-        attn = F.softmax(attn, dim=-1)
-        attn = self.drop(attn)
-
         out = torch.matmul(attn, v)
         out = out.permute(0, 1, 3, 2).contiguous()
-        B_, Hn, Hd, N_ = out.shape
-        out = out.view(B, self.mid, N_)
-
-        out = self.o_proj(out)
-        out = out.view(B, C2, H, W)
-        out = self.out_proj(out)
-
-        # FIX 6: Scaled residual
-        return identity + self.alpha * out
+        B_, Hn, Hd, N = out.shape
+        out = out.view(B_, self.mid, N)
+    
+        # Cast về dtype gốc
+        return out.to(x_flat.dtype)
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+        identity = x
+    
+        # BN normalize input
+        x_norm = self.bn_in(x)
+        x_red  = self.in_proj(x_norm)   # (B, reduced, H, W)
+    
+        if self.window_size > 0:
+            ws = self.window_size
+            pad_h = (ws - H % ws) % ws
+            pad_w = (ws - W % ws) % ws
+            if pad_h > 0 or pad_w > 0:
+                x_red = F.pad(x_red, (0, pad_w, 0, pad_h))
+    
+            windows, (nH, nW) = _partition_windows(x_red, ws)
+            Bw, C2, _, _ = windows.shape
+            x_flat = windows.view(Bw, C2, ws * ws)
+    
+            out_flat = self._attention(x_flat)
+            out_flat = self.o_proj(out_flat)
+            out_win  = out_flat.view(Bw, C2, ws, ws)
+            out_red  = _merge_windows(out_win, nH, nW, B)
+    
+            if pad_h > 0 or pad_w > 0:
+                out_red = out_red[:, :, :H, :W]
+        else:
+            N = H * W
+            x_flat   = x_red.view(B, self.reduced, N)
+            out_flat = self._attention(x_flat)
+            out_flat = self.o_proj(out_flat)
+            out_red  = out_flat.view(B, self.reduced, H, W)
+    
+        out = self.bn_out(self.out_proj(out_red))
+    
+        # alpha clamp [0,1] — ngăn positive feedback loop
+        alpha = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
+        return identity + alpha * out
 
 
 class MultiScaleContextModule(nn.Module):
