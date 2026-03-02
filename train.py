@@ -42,53 +42,38 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 
 
 
-def check_gradients_detailed(model, threshold=10.0, topk=10):
-    """
-    In ra:
-    - total grad norm
-    - top K layers có grad lớn nhất
-    - grad/param ratio
-    """
-    grad_info = []
+def check_gradients_detailed(model, topk=5):
+    grad_list = []
     total_norm_sq = 0.0
+    max_grad = 0.0
 
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
+    for name, p in model.named_parameters():
+        if p.grad is not None:
+            gnorm = p.grad.norm().item()
+            pnorm = p.norm().item()
+            ratio = gnorm / (pnorm + 1e-12)
 
-        grad_norm = param.grad.norm().item()
-        param_norm = param.data.norm().item() + 1e-12
-        ratio = grad_norm / param_norm
+            grad_list.append((name, gnorm, pnorm, ratio))
+            total_norm_sq += gnorm ** 2
 
-        total_norm_sq += grad_norm ** 2
-
-        grad_info.append({
-            "name": name,
-            "grad_norm": grad_norm,
-            "param_norm": param_norm,
-            "ratio": ratio
-        })
+            if gnorm > max_grad:
+                max_grad = gnorm
 
     total_norm = total_norm_sq ** 0.5
 
-    # sort theo grad_norm giảm dần
-    grad_info = sorted(grad_info, key=lambda x: x["grad_norm"], reverse=True)
+    grad_list.sort(key=lambda x: x[1], reverse=True)
 
-    print("\n" + "="*70)
-    print("GRADIENT MONITOR")
-    print("="*70)
-    print(f"Total Grad Norm: {total_norm:.4f}")
+    print("\nGRADIENT MONITOR")
+    print(f"Total Grad Norm: {total_norm:.2f}\n")
 
-    for i, info in enumerate(grad_info[:topk]):
-        print(f"[{i+1}] {info['name'][:60]}")
-        print(f"     Grad Norm : {info['grad_norm']:.4f}")
-        print(f"     Param Norm: {info['param_norm']:.4f}")
-        print(f"     Ratio     : {info['ratio']:.4f}")
+    for i, (name, gnorm, pnorm, ratio) in enumerate(grad_list[:topk]):
+        print(f"[{i+1}] {name}")
+        print(f"     Grad Norm : {gnorm:.4f}")
+        print(f"     Param Norm: {pnorm:.4f}")
+        print(f"     Ratio     : {ratio:.4f}")
         print("-"*70)
 
-    print("="*70 + "\n")
-
-    return total_norm
+    return max_grad, total_norm
 def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batch_idx):
 
     print(f"\n{'='*70}")
@@ -911,7 +896,9 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                total_norm = check_gradients_detailed(self.model, topk=5)
+                max_grad, total_norm = check_gradients_detailed(self.model, topk=5)
+                max_grad_epoch = max(max_grad_epoch, max_grad)
+            
 
                 if total_norm > 50:
                     print("⚠️  Large total grad norm detected!")
@@ -932,7 +919,7 @@ class Trainer:
                     self.scaler.update()          # â† PHáº¢I gá»i Ä‘á»ƒ reset scaler state
                     continue
             
-                total_norm = check_gradients_detailed(self.model, threshold=10.0, topk=5)
+                max_grad, total_norm = check_gradients_detailed(self.model, topk=5)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
             
                 if self.args.grad_clip > 0:
