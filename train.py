@@ -1265,7 +1265,7 @@ def main():
     # Test forward
     model = model.to(device)
     with torch.no_grad():
-        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+        sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
     
         feats = model.backbone(sample)
     
