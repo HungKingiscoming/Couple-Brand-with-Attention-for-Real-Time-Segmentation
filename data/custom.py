@@ -390,7 +390,7 @@ def create_dataloaders(
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False
+        drop_last=True
     )
     
     print(f"\n{'='*60}")
