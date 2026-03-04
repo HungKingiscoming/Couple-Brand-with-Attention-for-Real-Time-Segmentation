@@ -771,14 +771,22 @@ class GCNetCore(BaseModule):
                 nn.init.constant_(m.bias, 0)
 
     def forward_stem(self, x: Tensor):
-        """Stem: trả về (feat, c1, c2, out_size) để GCNetWithEnhance inject DWSA giữa stages."""
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         c1 = c2 = None
         feat = x
         for i, layer in enumerate(self.stem):
-            feat = layer(feat)
-            if i == 0: c1 = feat   # H/2, C
-            if i == 1: c2 = feat   # H/4, C
+            if self.training and i <= 1:
+                # i=0: ConvModule stride=2, H → H/2  (131072 pixels)
+                # i=1: ConvModule stride=2, H/2 → H/4 (32768 pixels)
+                # Spatial quá lớn → gradient tích lũy overflow trong fp16
+                # → tạm thời tính bằng fp32, sau đó cast về fp16
+                with torch.autocast(device_type='cuda', enabled=False):
+                    feat = layer(feat.float())   # feat.float() = ép fp32
+                feat = feat.to(x.dtype)          # cast về fp16 để tiếp tục
+            else:
+                feat = layer(feat)               # GCBlock: spatial nhỏ hơn, fp16 OK
+            if i == 0: c1 = feat
+            if i == 1: c2 = feat
         return feat, c1, c2, out_size
 
     def forward_stage4(self, x: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
