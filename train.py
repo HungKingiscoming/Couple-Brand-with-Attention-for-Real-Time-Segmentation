@@ -638,7 +638,7 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
         # very small LR for alpha
         param_groups.append({'params': alpha_params, 'lr': base_lr * alpha_lr_factor, 'name': 'alpha'})
 
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=5e-4)
 
     # attach initial_lr for warmup/restore
     for g in optimizer.param_groups:
@@ -1137,7 +1137,7 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=5.0)  # Ã¢â€ Â INCREASED from 1.0
+    parser.add_argument("--grad_clip", type=float, default=2.0)  # Ã¢â€ Â INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     parser.add_argument("--alpha_lr_factor", type=float, default=0.01,
