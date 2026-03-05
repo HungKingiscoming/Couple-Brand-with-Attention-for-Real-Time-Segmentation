@@ -752,8 +752,9 @@ class GCNetCore(BaseModule):
             branch_channels=ppm_channels,
             out_channels=channels * 4,
             num_scales=5,
-            kernel_sizes=[3, 5, 9, 17],   # giảm max kernel từ 33→17
-            strides=[1, 2, 4, 8],         # giảm max stride từ 16→8
+            kernel_sizes=[3, 5, 7, 9],    # giảm từ [5,9,17,33]
+            strides=[1, 2, 2, 4],         # giảm từ [2,4,8,16]
+            paddings=[1, 2, 3, 4],        # padding = kernel//2 (hợp lệ)
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,)
 
