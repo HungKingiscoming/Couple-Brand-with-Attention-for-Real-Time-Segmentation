@@ -752,10 +752,10 @@ class GCNetCore(BaseModule):
             branch_channels=ppm_channels,
             out_channels=channels * 4,
             num_scales=5,
-            kernel_sizes=[5, 9, 17, 33],
-            strides=[2, 4, 8, 16],
+            kernel_sizes=[3, 5, 9, 17],   # giảm max kernel từ 33→17
+            strides=[1, 2, 4, 8],         # giảm max stride từ 16→8
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg)
+            act_cfg=act_cfg,
 
         self.kaiming_init()
 
