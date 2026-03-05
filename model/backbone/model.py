@@ -755,7 +755,7 @@ class GCNetCore(BaseModule):
             kernel_sizes=[3, 5, 9, 17],   # giảm max kernel từ 33→17
             strides=[1, 2, 4, 8],         # giảm max stride từ 16→8
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
+            act_cfg=act_cfg,)
 
         self.kaiming_init()
 
