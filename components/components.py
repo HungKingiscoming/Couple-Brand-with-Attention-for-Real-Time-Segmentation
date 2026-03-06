@@ -372,33 +372,21 @@ class DAPPM(BaseModule):
             act_cfg=act_cfg
         )
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
-        # Get input size
+    def forward(self, x):
         input_size = x.shape[2:]
-        
-        # Initial convolution
         out = self.conv_init(x)
         
-        # Multi-scale features
+        prev = out
         multi_scale_features = [out]
-        for scale in self.scales:
-            scaled_out = scale(out)
-            # Upsample to original size
-            scaled_out = resize(scaled_out, size=input_size, mode='bilinear', align_corners=False)
-            multi_scale_features.append(scaled_out)
+        for scale_module in self.scales:
+            scaled = scale_module(prev)          # ← dùng prev, không phải out
+            scaled = resize(scaled, size=input_size, mode='bilinear', align_corners=False)
+            prev = scaled + prev                 # ← cascade cộng dồn
+            multi_scale_features.append(prev)
         
-        # Concatenate multi-scale features
         out = torch.cat(multi_scale_features, dim=1)
-        
-        # Compression
         out = self.compression(out)
-        
-        # Add shortcut
-        shortcut = self.shortcut(x)
-        out = out + shortcut
-        
-        return out
+        return out + self.shortcut(x)
 
 
 # ============================================================================
