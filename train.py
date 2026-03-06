@@ -271,6 +271,8 @@ def build_scheduler(optimizer, args, train_loader, start_epoch: int = 0):
             return max((1 - step / remaining_epochs) ** 0.9, 1e-6)
         scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lambda)
         print(f"PolyLR ({label}, remaining_epochs={remaining_epochs})")
+    elif args.scheduler == "none":
+        return None
 
     else:  # cosine
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -1139,7 +1141,7 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--grad_clip", type=float, default=2.0)  # Ã¢â€ Â INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
-    parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
+    parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine","none"])
     parser.add_argument("--alpha_lr_factor", type=float, default=0.01,
                         help="learning rate factor for learnable alpha params in DWSA (very small)")
     parser.add_argument("--final_dice_weight", type=float, default=0.5,
