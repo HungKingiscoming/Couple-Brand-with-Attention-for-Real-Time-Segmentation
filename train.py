@@ -1,7 +1,7 @@
 # ============================================
 # FIXED train.py - Proper Gradient Clipping + Monitoring
 # ============================================
-import re
+
 import os
 import torch
 import torch.nn as nn
@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
+import re
 import argparse
 from pathlib import Path
 import json
