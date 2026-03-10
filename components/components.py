@@ -306,86 +306,49 @@ def resize(
 # DAPPM MODULE
 # ============================================================================
 class DAPPM(nn.Module):
-    """
-    DAPPM matching GCNet-S checkpoint structure exactly.
-
-    Thay thế class DAPPM trong components/components.py bằng class này.
-
-    Args:
-        in_channels:     C*16 = 512 (channels=32)
-        branch_channels: 128
-        out_channels:    C*4  = 128
-        num_scales:      5
-        kernel_sizes:    AvgPool kernel cho scales[1..4]
-        strides:         AvgPool strides
-        paddings:        AvgPool paddings
-    """
-    def __init__(self,
-                 in_channels,
-                 branch_channels,
-                 out_channels,
-                 num_scales=5,
-                 kernel_sizes=(3, 5, 7, 9),
-                 strides=(1, 2, 2, 4),
-                 paddings=(1, 2, 3, 4),
-                 norm_cfg=None,   # unused, kept for API compat
-                 act_cfg=None,    # unused, kept for API compat
-                 init_cfg=None):
+    def __init__(self, in_channels, branch_channels, out_channels,
+                 num_scales=5, kernel_sizes=(3,5,7,9),
+                 strides=(1,2,2,4), paddings=(1,2,3,4),
+                 norm_cfg=None, act_cfg=None, init_cfg=None):
         super().__init__()
         self.num_scales = num_scales
 
+        def make_conv(ic, oc, k, p=0):
+            m = nn.Sequential()
+            m.add_module('conv', nn.Conv2d(ic, oc, k, padding=p, bias=False))
+            m.add_module('bn',   nn.BatchNorm2d(oc))
+            m.add_module('relu', nn.ReLU(inplace=True))
+            return m
+
+        # scales[0]: Conv1x1, no pool
         self.scales = nn.ModuleList()
+        self.scales.append(make_conv(in_channels, branch_channels, 1))
 
-        # scales[0]: Conv1x1 trực tiếp (no AvgPool)
-        # keys: scales.0.conv.*, scales.0.bn.*
-        self.scales.append(
-            _ConvBNReLU(in_channels, branch_channels, 1)
-        )
-
-        # scales[1..4]: Sequential(AvgPool2d, ConvBNReLU)
-        # keys: scales.i.0 = AvgPool (no params), scales.i.1.conv.*, scales.i.1.bn.*
+        # scales[1..4]: Sequential(AvgPool, Conv1x1)
         for i in range(num_scales - 1):
             self.scales.append(nn.Sequential(
-                nn.AvgPool2d(kernel_size=kernel_sizes[i],
-                             stride=strides[i],
-                             padding=paddings[i]),
-                _ConvBNReLU(in_channels, branch_channels, 1)
+                nn.AvgPool2d(kernel_sizes[i], stride=strides[i], padding=paddings[i]),
+                make_conv(in_channels, branch_channels, 1)
             ))
 
         # processes[0..3]: Conv3x3 cascade
-        # keys: processes.i.conv.*, processes.i.bn.*
         self.processes = nn.ModuleList([
-            _ConvBNReLU(branch_channels, branch_channels, 3, padding=1)
+            make_conv(branch_channels, branch_channels, 3, p=1)
             for _ in range(num_scales - 1)
         ])
 
-        # compression: cat(num_scales × branch_ch) → out_ch
-        self.compression = _ConvBNReLU(
-            branch_channels * num_scales, out_channels, 1)
-
-        # shortcut: x gốc → out_ch
-        self.shortcut = _ConvBNReLU(in_channels, out_channels, 1)
+        self.compression = make_conv(branch_channels * num_scales, out_channels, 1)
+        self.shortcut    = make_conv(in_channels, out_channels, 1)
 
     def forward(self, x):
-        input_size = x.shape[2:]
-        scale_outs = []
-
-        # scale[0]: no pool, Conv1x1
-        scale_outs.append(self.scales[0](x))
-
-        # scales[1..4]: pool + conv, cascade + process
+        h, w = x.shape[2:]
+        outs = [self.scales[0](x)]
         for i in range(1, self.num_scales):
-            s = self.scales[i](x)
-            s = F.interpolate(s, size=input_size,
+            s = F.interpolate(self.scales[i](x), size=(h,w),
                               mode='bilinear', align_corners=False)
-            s = self.processes[i - 1](s + scale_outs[i - 1])
-            scale_outs.append(s)
-
-        out = torch.cat(scale_outs, dim=1)
-        out = self.compression(out)
-        return out + self.shortcut(x)
-
-
+            s = self.processes[i-1](s + outs[i-1])
+            outs.append(s)
+        return self.compression(torch.cat(outs, dim=1)) + self.shortcut(x)
 # ============================================================================
 # BASE DECODE HEAD
 # ============================================================================
