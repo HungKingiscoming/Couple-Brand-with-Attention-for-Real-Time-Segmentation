@@ -21,10 +21,6 @@ class GatedFusion(nn.Module):
             ConvModule(channels, channels, 1, norm_cfg=None,
                        act_cfg=dict(type='Sigmoid')))
 
-    def forward(self, skip, dec):
-        gate = self.gate_conv(torch.cat([skip, dec], dim=1))
-        return gate * skip + (1.0 - gate) * dec
-
     def forward(self, skip_feat: Tensor, dec_feat: Tensor) -> Tensor:
         concat = torch.cat([skip_feat, dec_feat], dim=1)
         gate = self.gate_conv(concat)
