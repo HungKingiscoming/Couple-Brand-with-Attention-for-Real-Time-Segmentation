@@ -62,7 +62,19 @@ class BaseModule(nn.Module):
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-
+class _ConvBNReLU(nn.Sequential):
+    """Conv + BN + ReLU với attribute names .conv và .bn (khớp checkpoint)."""
+    def __init__(self, in_ch, out_ch, kernel, padding=0, act=True):
+        layers = [
+            ('conv', nn.Conv2d(in_ch, out_ch, kernel, padding=padding, bias=False)),
+            ('bn',   nn.BatchNorm2d(out_ch)),
+        ]
+        if act:
+            layers.append(('relu', nn.ReLU(inplace=True)))
+        super().__init__(*[v for _, v in layers])
+        # Re-add with named attributes so state_dict uses .conv/.bn keys
+        for name, mod in layers:
+            setattr(self, name, mod)
 # ============================================================================
 # NORMALIZATION LAYERS
 # ============================================================================
@@ -293,98 +305,83 @@ def resize(
 # ============================================================================
 # DAPPM MODULE
 # ============================================================================
-class DAPPM(BaseModule):
-    """DAPPM module (Dual Attention Pyramid Pooling Module).
-    
-    Args:
-        in_channels: Input channels
-        branch_channels: Channels for each branch
-        out_channels: Output channels
-        num_scales: Number of scales
-        kernel_sizes: Kernel sizes for each scale
-        strides: Strides for each scale
-        paddings: Paddings for each scale
-        norm_cfg: Normalization config
-        act_cfg: Activation config
+class DAPPM(nn.Module):
     """
-    
-    def __init__(
-        self,
-        in_channels: int,
-        branch_channels: int,
-        out_channels: int,
-        num_scales: int = 5,
-        kernel_sizes: Tuple[int, ...] = (5, 9, 17, 33),
-        strides: Tuple[int, ...] = (2, 4, 8, 16),
-        paddings: Tuple[int, ...] = (2, 4, 8, 16),
-        norm_cfg: OptConfigType = dict(type='BN'),
-        act_cfg: OptConfigType = dict(type='ReLU'),
-        init_cfg: OptConfigType = None,
-    ):
-        super().__init__(init_cfg)
-        
+    DAPPM matching GCNet-S checkpoint structure exactly.
+
+    Thay thế class DAPPM trong components/components.py bằng class này.
+
+    Args:
+        in_channels:     C*16 = 512 (channels=32)
+        branch_channels: 128
+        out_channels:    C*4  = 128
+        num_scales:      5
+        kernel_sizes:    AvgPool kernel cho scales[1..4]
+        strides:         AvgPool strides
+        paddings:        AvgPool paddings
+    """
+    def __init__(self,
+                 in_channels,
+                 branch_channels,
+                 out_channels,
+                 num_scales=5,
+                 kernel_sizes=(3, 5, 7, 9),
+                 strides=(1, 2, 2, 4),
+                 paddings=(1, 2, 3, 4),
+                 norm_cfg=None,   # unused, kept for API compat
+                 act_cfg=None,    # unused, kept for API compat
+                 init_cfg=None):
+        super().__init__()
         self.num_scales = num_scales
-        
-        # Initial convolution
-        self.conv_init = ConvModule(
-            in_channels,
-            branch_channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-        
-        # Multi-scale branches
+
         self.scales = nn.ModuleList()
+
+        # scales[0]: Conv1x1 trực tiếp (no AvgPool)
+        # keys: scales.0.conv.*, scales.0.bn.*
+        self.scales.append(
+            _ConvBNReLU(in_channels, branch_channels, 1)
+        )
+
+        # scales[1..4]: Sequential(AvgPool2d, ConvBNReLU)
+        # keys: scales.i.0 = AvgPool (no params), scales.i.1.conv.*, scales.i.1.bn.*
         for i in range(num_scales - 1):
-            self.scales.append(
-                nn.Sequential(
-                    nn.AvgPool2d(
-                        kernel_size=kernel_sizes[i],
-                        stride=strides[i],
-                        padding=paddings[i]
-                    ),
-                    ConvModule(
-                        branch_channels,
-                        branch_channels,
-                        kernel_size=1,
-                        norm_cfg=norm_cfg,
-                        act_cfg=act_cfg
-                    )
-                )
-            )
-        
-        # Compression convolution
-        self.compression = ConvModule(
-            branch_channels * num_scales,
-            out_channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-        
-        # Shortcut
-        self.shortcut = ConvModule(
-            in_channels,
-            out_channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-    
+            self.scales.append(nn.Sequential(
+                nn.AvgPool2d(kernel_size=kernel_sizes[i],
+                             stride=strides[i],
+                             padding=paddings[i]),
+                _ConvBNReLU(in_channels, branch_channels, 1)
+            ))
+
+        # processes[0..3]: Conv3x3 cascade
+        # keys: processes.i.conv.*, processes.i.bn.*
+        self.processes = nn.ModuleList([
+            _ConvBNReLU(branch_channels, branch_channels, 3, padding=1)
+            for _ in range(num_scales - 1)
+        ])
+
+        # compression: cat(num_scales × branch_ch) → out_ch
+        self.compression = _ConvBNReLU(
+            branch_channels * num_scales, out_channels, 1)
+
+        # shortcut: x gốc → out_ch
+        self.shortcut = _ConvBNReLU(in_channels, out_channels, 1)
+
     def forward(self, x):
         input_size = x.shape[2:]
-        out = self.conv_init(x)
-        
-        prev = out
-        multi_scale_features = [out]
-        for scale_module in self.scales:
-            scaled = scale_module(prev)          # ← dùng prev, không phải out
-            scaled = resize(scaled, size=input_size, mode='bilinear', align_corners=False)
-            prev = scaled + prev                 # ← cascade cộng dồn
-            multi_scale_features.append(prev)
-        
-        out = torch.cat(multi_scale_features, dim=1)
+        scale_outs = []
+
+        # scale[0]: no pool, Conv1x1
+        scale_outs.append(self.scales[0](x))
+
+        # scales[1..4]: pool + conv, cascade + process
+        for i in range(1, self.num_scales):
+            s = self.scales[i](x)
+            s = F.interpolate(s, size=input_size,
+                              mode='bilinear', align_corners=False)
+            s = self.processes[i - 1](s + scale_outs[i - 1])
+            scale_outs.append(s)
+
+        out = torch.cat(scale_outs, dim=1)
         out = self.compression(out)
         return out + self.shortcut(x)
 
