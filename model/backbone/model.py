@@ -436,206 +436,164 @@ def _merge_windows(windows: Tensor, nH: int, nW: int, B: int) -> Tensor:
 
 class DWSABlock(nn.Module):
     """
-    Depthwise Separable Attention Block với hỗ trợ Window Attention.
+    Depthwise Separable Attention with optional Window Attention.
 
-    window_size = 0  → Full attention   — dùng cho stage5 (N=256), stage6 (N=64)
-    window_size > 0  → Window attention — dùng cho stage4 (N=1024, quá lớn cho full)
-
-    Tại sao window attention tốt cho stage4:
-    - Stage4 ở H/16: cần capture local patterns (edge, texture) không cần global
-    - Global context đã được DAPPM xử lý ở stage6
-    - Window size=8 → N=64 per window, memory = 0.25MB thay vì 64MB
-    - Đúng inductive bias: local attention early stages, global attention later
-      (giống Swin Transformer design principle)
-
-    Norm: BN thay vì LN/GN — nhất quán với toàn model, fuse-compatible.
-    Alpha: clamp [0,1] — tránh polarity flip và gradient explosion.
+    Fixes vs original:
+      - alpha is nn.Parameter (was register_buffer → grad was always None)
+      - o_proj runs in fp32 alongside attention (was running in fp16 → precision mismatch)
+      - No manual clamp on attention logits (fp32 softmax is numerically stable)
     """
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4,
-                 qk_sharing=True, groups=4, alpha=0.1,
-                 window_size: int = 0):
-        """
-        Args:
-            window_size: 0 = full attention, >0 = window attention.
-                         Nên là ước số của H và W tại resolution đó.
-                         Ví dụ: stage4 ở H/16=32px → window_size=8 (4 windows/dim)
-        """
+                 qk_sharing=True, groups=4, alpha=0.01, window_size=0):
         super().__init__()
         assert channels % reduction == 0
-        self.channels = channels
-        self.num_heads = num_heads
+        self.channels    = channels
+        self.num_heads   = num_heads
         self.window_size = window_size
 
-        reduced = channels // reduction
-        mid = max(reduced // 2, num_heads)
+        reduced     = channels // reduction
+        mid         = max(reduced // 2, num_heads)
         self.reduced = reduced
-        self.mid = mid
+        self.mid     = mid
 
-        # BN trước in_proj
-        self.bn_in = nn.BatchNorm2d(channels)
-        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
-        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
-        # BN sau out_proj
-        self.bn_out = nn.BatchNorm2d(channels)
+        self.bn_in   = nn.BatchNorm2d(channels)
+        self.in_proj = nn.Conv2d(channels, reduced, 1, bias=False)
+        self.out_proj = nn.Conv2d(reduced, channels, 1, bias=False)
+        self.bn_out  = nn.BatchNorm2d(channels)
 
         g = _get_valid_groups(reduced, groups)
 
         self.qk_sharing = qk_sharing
         if qk_sharing:
-            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
-            self.q_head  = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
-            self.k_head  = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+            self.qk_base = nn.Conv1d(reduced, mid, 1, groups=g, bias=False)
+            self.q_head  = nn.Conv1d(mid, mid, 1, bias=True)
+            self.k_head  = nn.Conv1d(mid, mid, 1, bias=True)
         else:
-            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+            self.q_proj = nn.Conv1d(reduced, mid, 1, groups=g, bias=True)
+            self.k_proj = nn.Conv1d(reduced, mid, 1, groups=g, bias=True)
 
-        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
+        self.v_proj = nn.Conv1d(reduced, mid, 1, groups=g, bias=True)
+
+        # FIX 2: o_proj is now called inside _attention in fp32
+        # keeping it here as nn.Conv1d so parameters are registered normally
+        self.o_proj = nn.Conv1d(mid, reduced, 1, groups=g, bias=True)
 
         self.drop  = nn.Dropout(drop)
         self.scale = (mid // num_heads) ** -0.5
-        self.register_buffer("alpha", torch.ones(channels) * 0.1)
+
+        # FIX 1: was register_buffer → grad always None → module never learned
+        # init small (0.01) so residual connection dominates early training
+        self.alpha = nn.Parameter(torch.full((channels,), alpha))
 
     def _attention(self, x_flat: Tensor) -> Tensor:
-        # Force fp32 để tránh softmax overflow trong fp16
-        x_fp32 = x_flat.float()
-    
+        """
+        Full attention computation in fp32.
+        x_flat: (B, reduced, N)  — may be fp16 on entry
+        returns: (B, reduced, N) — same dtype as input
+        """
+        orig_dtype = x_flat.dtype
+        x_fp32 = x_flat.float()   # cast to fp32
+
         if self.qk_sharing:
             base = self.qk_base(x_fp32)
-            q = self.q_head(base)
-            k = self.k_head(base)
+            q    = self.q_head(base)
+            k    = self.k_head(base)
         else:
             q = self.q_proj(x_fp32)
             k = self.k_proj(x_fp32)
         v = self.v_proj(x_fp32)
-    
+
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
             return t.view(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
-    
+
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
-    
+
+        # fp32 softmax — numerically stable, no manual clamp needed
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-50.0, 50.0)
-        attn = F.softmax(attn, dim=-1)   # fp32 → không overflow
+        attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
-    
-        out = torch.matmul(attn, v)
+
+        out = torch.matmul(attn, v)                        # (B, heads, N, hd)
         out = out.permute(0, 1, 3, 2).contiguous()
         B_, Hn, Hd, N = out.shape
-        out = out.view(B_, self.mid, N)
-    
-        # Cast về dtype gốc
-        return out.to(x_flat.dtype)
+        out = out.view(B_, self.mid, N)                    # (B, mid, N)
+
+        # FIX 2: o_proj runs in fp32 here (not in fp16 after cast-back)
+        out = self.o_proj(out)                             # (B, reduced, N) in fp32
+
+        return out.to(orig_dtype)                          # cast back to input dtype
+
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
         identity = x
-    
-        # BN normalize input
+
         x_norm = self.bn_in(x)
         x_red  = self.in_proj(x_norm)   # (B, reduced, H, W)
-    
+
         if self.window_size > 0:
-            ws = self.window_size
+            ws    = self.window_size
             pad_h = (ws - H % ws) % ws
             pad_w = (ws - W % ws) % ws
             if pad_h > 0 or pad_w > 0:
                 x_red = F.pad(x_red, (0, pad_w, 0, pad_h))
-    
             windows, (nH, nW) = _partition_windows(x_red, ws)
             Bw, C2, _, _ = windows.shape
-            x_flat = windows.view(Bw, C2, ws * ws)
-    
-            out_flat = self._attention(x_flat)
-            out_flat = self.o_proj(out_flat)
-            out_win  = out_flat.view(Bw, C2, ws, ws)
-            out_red  = _merge_windows(out_win, nH, nW, B)
-    
+            out_flat = self._attention(windows.view(Bw, C2, ws * ws))
+            out_red  = _merge_windows(out_flat.view(Bw, C2, ws, ws), nH, nW, B)
             if pad_h > 0 or pad_w > 0:
                 out_red = out_red[:, :, :H, :W]
         else:
-            N = H * W
-            x_flat   = x_red.view(B, self.reduced, N)
-            out_flat = self._attention(x_flat)
-            out_flat = self.o_proj(out_flat)
+            N       = H * W
+            out_flat = self._attention(x_red.view(B, self.reduced, N))
             out_red  = out_flat.view(B, self.reduced, H, W)
-    
+
         out = self.bn_out(self.out_proj(out_red))
 
-        if identity.shape != out.shape:
-            print("⚠️ DWSA SHAPE MISMATCH")
-            print("identity:", identity.shape)
-            print("out     :", out.shape)
-            raise RuntimeError("DWSA shape mismatch")
-        
+        # alpha is a Parameter now — clamped [0,1] only for stability
         alpha = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
         return identity + alpha * out
 
 class MultiScaleContextModule(nn.Module):
-    """
-    Lightweight multi-scale context sau DAPPM.
-    branch_ratio cao (16) để output channels rất nhỏ — chỉ tinh chỉnh,
-    không compete với DAPPM.
-    """
     def __init__(self, in_channels, out_channels, scales=(1, 2),
                  branch_ratio=16, alpha=0.1):
         super().__init__()
-        self.scales = scales
-        self.in_channels = in_channels
+        self.scales      = scales
+        self.in_channels  = in_channels
         self.out_channels = out_channels
 
-        total_branch_channels = max(in_channels // branch_ratio, len(scales))
-        base = total_branch_channels // len(scales)
-        extra = total_branch_channels % len(scales)
-
-        per_branch_list = []
-        for i in range(len(scales)):
-            c = base + (1 if i < extra else 0)
-            per_branch_list.append(max(c, 1))
-        fused_channels = sum(per_branch_list)
+        total = max(in_channels // branch_ratio, len(scales))
+        base  = total // len(scales)
+        extra = total % len(scales)
+        per   = [max(base + (1 if i < extra else 0), 1) for i in range(len(scales))]
+        fused = sum(per)
 
         self.scale_branches = nn.ModuleList()
-        for s, c_out in zip(scales, per_branch_list):
+        for s, c in zip(scales, per):
             if s == 1:
-                self.scale_branches.append(
-                    nn.Sequential(
-                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
-                    )
-                )
+                self.scale_branches.append(nn.Sequential(
+                    nn.Conv2d(in_channels, c, 1, bias=False),
+                    nn.BatchNorm2d(c), nn.ReLU(inplace=True)))
             else:
-                self.scale_branches.append(
-                    nn.Sequential(
-                        nn.AvgPool2d(kernel_size=s, stride=s),
-                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
-                    )
-                )
+                self.scale_branches.append(nn.Sequential(
+                    nn.AvgPool2d(s, stride=s),
+                    nn.Conv2d(in_channels, c, 1, bias=False),
+                    nn.BatchNorm2d(c), nn.ReLU(inplace=True)))
 
         self.fusion = nn.Sequential(
-            nn.Conv2d(
-                fused_channels, fused_channels,
-                kernel_size=3, padding=1,
-                groups=fused_channels, bias=False,
-            ),
-            nn.BatchNorm2d(fused_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),
-        )
+            nn.Conv2d(fused, fused, 3, padding=1, groups=fused, bias=False),
+            nn.BatchNorm2d(fused), nn.ReLU(inplace=True),
+            nn.Conv2d(fused, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels))
 
-        self.alpha = nn.Parameter(torch.ones(out_channels) * 1e-4)
+        # init 0.1 instead of 1e-4 so module contributes from early epochs
+        self.alpha = nn.Parameter(torch.full((out_channels,), 0.1))
 
-        if in_channels != out_channels:
-            self.proj = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels),
-            )
-        else:
-            self.proj = None
+        self.proj = (nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels))
+            if in_channels != out_channels else None)
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -643,14 +601,12 @@ class MultiScaleContextModule(nn.Module):
         for s, branch in zip(self.scales, self.scale_branches):
             o = branch(x)
             if o.shape[-2:] != (H, W):
-                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=False)
+                o = F.interpolate(o, (H, W), mode='bilinear', align_corners=False)
             outs.append(o)
-
         fused = torch.cat(outs, dim=1)
-        out = self.fusion(fused)
-
+        out   = self.fusion(fused)
         x_proj = self.proj(x) if self.proj is not None else x
-        alpha = self.alpha.view(1, -1, 1, 1)   # (out_channels,) → (1, out_channels, 1, 1)
+        alpha  = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
         return x_proj + alpha * out
 
 
@@ -1030,211 +986,104 @@ class GCNetCore(BaseModule):
 
 class GCNetWithEnhance(BaseModule):
     """
-    Enhanced GCNet backbone.
-
-    Flow:
-        x → GCNetCore → {c1, c2, c4, s4, s5, s6, x_d6}
-                              ↓       ↓    ↓    ↓
-                           DWSA4  DWSA5 DWSA6   |
-                                              SPP (một lần duy nhất)
-                              ↓
-                         MultiScaleContext (optional, lightweight)
-                              ↓
-                         final_proj
-                              ↓
-                        c5 = x_d6 + x_spp
+    Backbone wrapper: GCNetCore + DWSA stages + MultiScaleContext + final_proj.
 
     Output dict: {c1, c2, c4, c5}
+      c1 : H/2,  C    = 32
+      c2 : H/4,  C    = 32
+      c4 : H/8,  C*2  = 64  (detail branch, aux head input)
+      c5 : H/8,  C*4  = 128 (fused detail+semantic, main decoder input)
     """
-
     def __init__(self,
-                 in_channels: int = 3,
-                 channels: int = 32,
-                 ppm_channels: int = 128,
-                 num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
-                 dwsa_stages: List[str] = ('stage4', 'stage5', 'stage6'),
-                 dwsa_num_heads: int = 4,
-                 dwsa_reduction: int = 4,
-                 dwsa_qk_sharing: bool = True,
-                 dwsa_groups: int = 4,
-                 dwsa_drop: float = 0.1,
-                 dwsa_alpha: float = 0.1,
-                 # stage4 dùng window attention để tránh OOM (H/16 → N=1024)
-                 # window_size=8 → N=64 per window, memory ~0.25MB vs 64MB full
-                 dwsa4_window_size: int = 8,
-                 use_multi_scale_context: bool = True,
-                 ms_scales: Tuple[int, ...] = (1, 2),
-                 ms_branch_ratio: int = 16,
-                 ms_alpha: float = 0.1,
-                 align_corners: bool = False,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                 init_cfg: OptConfigType = None,
-                 deploy: bool = False):
+                 in_channels=3, channels=32, ppm_channels=128,
+                 num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
+                 dwsa_stages=('stage4', 'stage5', 'stage6'),
+                 dwsa_num_heads=4, dwsa_reduction=4,
+                 dwsa_qk_sharing=True, dwsa_groups=4,
+                 dwsa_drop=0.1, dwsa_alpha=0.01,
+                 dwsa4_window_size=8,
+                 use_multi_scale_context=True,
+                 ms_scales=(1, 2), ms_branch_ratio=16, ms_alpha=0.1,
+                 align_corners=False,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 act_cfg=dict(type='ReLU', inplace=True),
+                 init_cfg=None, deploy=False):
         super().__init__(init_cfg)
 
         self.align_corners = align_corners
-        self.channels = channels
-        self.deploy = deploy
-        self.dwsa4_window_size = dwsa4_window_size
+        self.channels      = channels
+        self.deploy        = deploy
 
-        valid_stages = {'stage4', 'stage5', 'stage6'}
-        invalid = set(dwsa_stages) - valid_stages
-        if invalid:
-            raise ValueError(f"Invalid dwsa_stages: {invalid}. Valid: {valid_stages}")
+        valid = {'stage4', 'stage5', 'stage6'}
+        bad   = set(dwsa_stages) - valid
+        if bad:
+            raise ValueError(f"Invalid dwsa_stages: {bad}")
 
         self.backbone = GCNetCore(
-            in_channels=in_channels,
-            channels=channels,
+            in_channels=in_channels, channels=channels,
             ppm_channels=ppm_channels,
             num_blocks_per_stage=num_blocks_per_stage,
             align_corners=align_corners,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-            init_cfg=None,
-            deploy=deploy,
-        )
+            norm_cfg=norm_cfg, act_cfg=act_cfg,
+            init_cfg=None, deploy=deploy)
 
         C = channels
-        self.dwsa4 = None
-        self.dwsa5 = None
-        self.dwsa6 = None
+        self.dwsa4 = self.dwsa5 = self.dwsa6 = None
 
         for stage in dwsa_stages:
+            kw = dict(num_heads=dwsa_num_heads, reduction=dwsa_reduction,
+                      qk_sharing=dwsa_qk_sharing, groups=dwsa_groups,
+                      drop=dwsa_drop, alpha=dwsa_alpha)
             if stage == 'stage4':
-                self.dwsa4 = DWSABlock(
-                    C * 4,
-                    num_heads=dwsa_num_heads,
-                    reduction=dwsa_reduction,
-                    qk_sharing=dwsa_qk_sharing,
-                    groups=dwsa_groups,
-                    drop=dwsa_drop,
-                    alpha=dwsa_alpha,
-                    window_size=dwsa4_window_size,  # window attention — tránh OOM
-                )
+                self.dwsa4 = DWSABlock(C*4,  window_size=dwsa4_window_size, **kw)
             elif stage == 'stage5':
-                self.dwsa5 = DWSABlock(
-                    C * 8,
-                    num_heads=dwsa_num_heads,
-                    reduction=dwsa_reduction,
-                    qk_sharing=dwsa_qk_sharing,
-                    groups=dwsa_groups,
-                    drop=dwsa_drop,
-                    alpha=dwsa_alpha,
-                    window_size=0,  # full attention — N=256, safe
-                )
+                self.dwsa5 = DWSABlock(C*8,  window_size=0, **kw)
             elif stage == 'stage6':
-                self.dwsa6 = DWSABlock(
-                    C * 16,
-                    num_heads=dwsa_num_heads,
-                    reduction=dwsa_reduction,
-                    qk_sharing=dwsa_qk_sharing,
-                    groups=dwsa_groups,
-                    drop=dwsa_drop,
-                    alpha=dwsa_alpha,
-                    window_size=0,  # full attention — N=64, trivial
-                )
+                self.dwsa6 = DWSABlock(C*16, window_size=0, **kw)
 
-        if use_multi_scale_context:
-            self.ms_context = MultiScaleContextModule(
-                C * 4, C * 4,
-                scales=ms_scales,
-                branch_ratio=ms_branch_ratio,
-                alpha=ms_alpha,
-            )
-        else:
-            self.ms_context = None
+        self.ms_context = (
+            MultiScaleContextModule(C*4, C*4, scales=ms_scales,
+                                    branch_ratio=ms_branch_ratio, alpha=ms_alpha)
+            if use_multi_scale_context else None)
 
-        self.final_proj = ConvModule(
-            in_channels=C * 4,
-            out_channels=C * 4,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-        )
+        self.final_proj = ConvModule(C*4, C*4, 1,
+                                     norm_cfg=norm_cfg, act_cfg=act_cfg)
 
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """
-        Cascade DWSA injection đúng thứ tự — s4, s5, s6 bổ trợ nhau qua bilateral fusion:
-
-        Stem → Stage4 → [DWSA4] → Stage5 → [DWSA5] → Stage6 → [DWSA6] → SPP
-                  ↑                    ↑                   ↑
-            x_s4 enhanced         x_s5 enhanced        x_s6 enhanced
-            ảnh hưởng x_d5        ảnh hưởng x_d5        đưa vào SPP
-            qua compression_2     qua detail_branch      tốt hơn
-            và down_2
-
-        Tức là DWSA4 → cải thiện input cho stage5 → cải thiện x_s5
-             → DWSA5 → cải thiện input cho stage6 → cải thiện x_s6
-             → DWSA6 → cải thiện input cho SPP → cải thiện c5
-        """
+    def forward(self, x):
         bb = self.backbone
         feat, c1, c2, out_size = bb.forward_stem(x)
 
-        # ── Stage 4 ──────────────────────────────────────────────
         x_s4, x_d4 = bb.forward_stage4(feat, out_size)
-        c4 = x_d4.clone()   # aux head input trước khi x_d4 bị stage5 dùng tiếp
-
-        # DWSA4: enhance x_s4 → stage5 nhận semantic context tốt hơn
-        # → compression_2(x_s5) và down_2(x_d5) chất lượng cao hơn
+        c4 = x_d4.clone()
         if self.dwsa4 is not None:
             x_s4 = self.dwsa4(x_s4)
 
-        # ── Stage 5 ──────────────────────────────────────────────
         x_s5, x_d5 = bb.forward_stage5(x_s4, x_d4, out_size)
-
-        # DWSA5: enhance x_s5 → stage6 nhận semantic context tốt hơn
-        # → x_s6 chất lượng cao hơn → SPP thu được global context tốt hơn
         if self.dwsa5 is not None:
             x_s5 = self.dwsa5(x_s5)
 
-        # ── Stage 6 ──────────────────────────────────────────────
         x_s6, x_d6 = bb.forward_stage6(x_s5, x_d5)
-
-        # DWSA6: enhance x_s6 ngay trước SPP — spatial self-attention
-        # ở resolution thấp nhất (H/64) để global context coherent hơn
         if self.dwsa6 is not None:
             x_s6 = self.dwsa6(x_s6)
 
-        # ── SPP (một lần duy nhất, trên x_s6 đã enhanced) ───────
         x_spp = bb.spp(x_s6)
-        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
+        x_spp = resize(x_spp, size=out_size, mode='bilinear',
+                       align_corners=self.align_corners)
 
-        # Lightweight multi-scale refinement sau SPP
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
 
         x_spp = self.final_proj(x_spp)
+        c5    = x_d6 + x_spp
 
-        # Merge detail + semantic
-        c5 = x_d6 + x_spp
-
-        return dict(
-            c1=c1,   # H/2, C   = 32  — decoder skip (stem layer 0)
-            c2=c2,   # H/4, C   = 32  — decoder skip (stem layer 1)
-            c4=c4,   # H/8, C*2 = 64  — detail branch: aux head + decoder skip stage0
-            c5=c5,   # H/8, C*4 = 128 — fused output: main decoder input
-        )
+        return dict(c1=c1, c2=c2, c4=c4, c5=c5)
 
     def switch_to_deploy(self):
-        """
-        Deploy mode:
-        1. Fuse tất cả GCBlock (path_3x3_1 + path_3x3_2 + path_1x1 → single conv)
-        2. Fuse BN trong DAPPM/MultiScaleContext nếu có thể
-        3. DWSA giữ nguyên (không thể fuse attention)
-
-        Kết quả: params giảm ~2/3 số GCBlock params, inference nhanh hơn.
-        """
-        # Fuse GCNetCore
         self.backbone.switch_to_deploy()
-
-        # Mark deploy
         self.deploy = True
-
-        print("✅ Switched to deploy mode:")
-        print(f"   GCBlock: all paths fused → single 3x3 conv")
-        print(f"   DWSA: kept as-is (attention không fuse được)")
-        print(f"   SPP: kept as-is")
+        print("Switched to deploy mode")
+        print("  GCBlock: all paths fused -> single 3x3 conv")
+        print("  DWSA: kept as-is (attention not fuseable)")
 
     @torch.no_grad()
     def count_params(self):
