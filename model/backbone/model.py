@@ -51,20 +51,22 @@ class ConvBN(nn.Module):
 # =============================================================================
 
 _PATHS = {
-    # Stem + detail: spatial lớn (H/4-H/8), 2 paths đủ
+    # Stem + detail: spatial lớn, 2 paths là đủ
     'stem_same':       2,
     'stem_down':       2,
     'detail_same':     2,
     'detail_down':     2,
-    # Semantic[0]: H/16, C*4=128
+    # Semantic[0]: C*4=128ch — rẻ, có thể để 2
     'semantic_0_down': 2,
     'semantic_0_same': 2,
-    # Semantic[1]: H/32, C*8=256
-    'semantic_1_down': 3,
-    'semantic_1_same': 3,
-    # Semantic[2]: H/64, C*16=512 — không tăng paths vì channel đã rất đắt
-    'semantic_2_down': 3,
-    'semantic_2_same': 3,
+    # Semantic[1]: C*8=256ch — 2 paths (~8M), 3 paths (~12M)
+    'semantic_1_down': 2,
+    'semantic_1_same': 2,
+    # Semantic[2]: C*16=512ch — MỖI PATH = 2.36M
+    # 2 paths = ~7M, 3 paths = ~10M
+    # Giữ 2 để tổng ~15M training
+    'semantic_2_down': 2,
+    'semantic_2_same': 2,
 }
 
 
