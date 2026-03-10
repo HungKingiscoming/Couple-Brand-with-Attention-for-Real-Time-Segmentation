@@ -203,6 +203,15 @@ def _remap_gcblock_key(key: str) -> str:
     # Key không thuộc GCBlock hoặc không cần remap
     return key
 
+
+def _is_gcblock_key(key: str) -> bool:
+    return bool(re.search(r'\.(path_3x3_[12]|path_1x1|path_residual)\.', key))
+
+
+# ──────────────────────────────────────────────────────────────────
+# Main loader
+# ──────────────────────────────────────────────────────────────────
+
 def load_pretrained_gcnet_core_v2(
     model: nn.Module,
     ckpt_path: str,
@@ -225,7 +234,10 @@ def load_pretrained_gcnet_core_v2(
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    model_state = model.backbone.state_dict()
+    # model.backbone = GCNetWithEnhance → keys có dạng "backbone.stem.X..."
+    # model.backbone.backbone = GCNetCore  → keys có dạng "stem.X..." ← match với checkpoint
+    gcnet_core = model.backbone.backbone
+    model_state = gcnet_core.state_dict()
 
     compatible  = {}
     skipped_ckpt = []
@@ -285,7 +297,7 @@ def load_pretrained_gcnet_core_v2(
 
         print()
 
-    missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
+    missing, unexpected = gcnet_core.load_state_dict(compatible, strict=False)
 
     if verbose and missing:
         # Chỉ in các key thực sự missing (không phải DWSA/ms_context vốn không có trong ckpt)
@@ -298,8 +310,7 @@ def load_pretrained_gcnet_core_v2(
                 print(f"  - {k}")
 
     return rate
-def _is_gcblock_key(key: str) -> bool:
-    return bool(re.search(r'\.(path_3x3_[12]|path_1x1|path_residual)\.', key))
+
 
 def _get_max_lrs(optimizer, base_lr, backbone_lr_factor, alpha_lr_factor):
     """
