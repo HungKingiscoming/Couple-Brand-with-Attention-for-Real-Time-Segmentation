@@ -696,7 +696,7 @@ class ModelConfig:
                 "dwsa_qk_sharing": True,
                 "dwsa_groups": 4,
                 "dwsa_drop": 0.1,  
-                "dwsa_alpha": 0.1, 
+                "dwsa_alpha": 0.01, 
                 "use_multi_scale_context": True,
                 "ms_alpha": 0.1, 
                 "align_corners": False,
@@ -880,7 +880,7 @@ class Trainer:
                         align_corners=False
                     )
                     aux_ce_loss = self.ce(aux_logits, masks)
-                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    aux_weight = self.args.aux_weight * (0.4 + 0.6 * (1 - epoch / self.args.epochs) ** 0.9)
                     loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps            
@@ -908,13 +908,9 @@ class Trainer:
                             grad_has_problem = True
             
                 if grad_has_problem:
-                    debug_nan_check(
-                        self.model, loss, ce_loss, dice_loss,
-                        outputs, masks, epoch, batch_idx
-                    )
-                    self.optimizer.zero_grad(set_to_none=True)
-                    self.scaler.update()          # â† PHáº¢I gá»i Ä‘á»ƒ reset scaler state
-                    continue
+                    for p in self.model.parameters():
+                        if p.grad is not None:
+                            p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
             
                 max_grad_epoch = max(max_grad_epoch, max_grad)
             
