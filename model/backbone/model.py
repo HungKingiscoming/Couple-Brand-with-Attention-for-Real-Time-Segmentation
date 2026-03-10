@@ -680,7 +680,10 @@ class GCNetWithEnhance(BaseModule):
         x_s6, x_d6 = bb.forward_stage6(x_s5, x_d5)
         if self.dwsa6 is not None:
             x_s6 = self.dwsa6(x_s6)
-
+        print(f"x_s6 shape: {x_s6.shape}")
+        print(f"x_d6 shape: {x_d6.shape}")
+        print(f"C*16 = {self.backbone.channels * 16}")
+        print(f"spp in_channels = {self.backbone.spp.scales[0].conv.weight.shape}")
         x_spp = bb.spp(x_s6)
         x_spp = resize(x_spp, size=out_size, mode='bilinear',
                        align_corners=self.align_corners)
