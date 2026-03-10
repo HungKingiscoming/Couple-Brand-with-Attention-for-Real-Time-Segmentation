@@ -26,7 +26,7 @@ _PATHS = {
     'semantic_1_down': 4,
     'semantic_1_same': 4,
     'semantic_2_down': 4,
-    'semantic_2_same': 5,
+    'semantic_2_same': 3,
 }
 class ConvBN(nn.Module):
     """Conv2d + BatchNorm2d, không activation — dùng bên trong GCBlock."""
