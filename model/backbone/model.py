@@ -196,7 +196,18 @@ class Block3x3(BaseModule):
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
-
+_PATHS = {
+    'stem_same':       3,
+    'stem_down':       3,
+    'detail_same':     3,
+    'detail_down':     3,
+    'semantic_0_down': 3,
+    'semantic_0_same': 4,
+    'semantic_1_down': 4,
+    'semantic_1_same': 4,
+    'semantic_2_down': 4,
+    'semantic_2_same': 5,
+}
 
 class GCBlock(nn.Module):
     """
