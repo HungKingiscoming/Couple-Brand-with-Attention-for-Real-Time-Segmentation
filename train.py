@@ -145,74 +145,160 @@ def debug_nan_check(model, loss, ce_loss, dice_loss, outputs, masks, epoch, batc
 
     print(f"\n{'='*70}\n")
 
-def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
+def _strip_prefix(key: str, prefixes=('backbone.', 'model.', 'module.')) -> str:
+    for p in prefixes:
+        if key.startswith(p):
+            key = key[len(p):]
+    return key
+
+
+def _remap_gcblock_key(key: str) -> str:
+    """
+    Transform một key thuộc GCBlock từ arch cũ → arch mới.
+
+    Ví dụ:
+        stem.2.path_3x3_1.conv1.conv.weight
+            → stem.2.paths_3x3.0.conv.weight
+
+        stem.2.path_3x3_2.conv1.bn.running_mean
+            → stem.2.paths_3x3.1.bn.running_mean
+
+        stem.2.path_1x1.conv1.conv.weight
+            → stem.2.path_1x1.conv.weight
+
+        stem.2.path_residual.weight
+            → stem.2.path_identity.weight
+
+    Trả về None nếu key không cần thiết (conv2, v.v.)
+    """
+
+    # ── path_3x3_1 / path_3x3_2 ──────────────────────────────────
+    m = re.match(r'(.*\.)path_3x3_([12])\.(conv1)\.(conv|bn)\.(.+)', key)
+    if m:
+        prefix, idx, _, layer, suffix = m.groups()
+        new_idx = int(idx) - 1   # 1→0, 2→1
+        return f'{prefix}paths_3x3.{new_idx}.{layer}.{suffix}'
+
+    # conv2 trong path_3x3_* → bỏ qua (không có trong arch mới)
+    if re.match(r'.*\.path_3x3_[12]\.conv2\..*', key):
+        return None
+
+    # ── path_1x1 ─────────────────────────────────────────────────
+    m = re.match(r'(.*\.)path_1x1\.(conv1)\.(conv|bn)\.(.+)', key)
+    if m:
+        prefix, _, layer, suffix = m.groups()
+        return f'{prefix}path_1x1.{layer}.{suffix}'
+
+    # conv2 trong path_1x1 → bỏ qua
+    if re.match(r'.*\.path_1x1\.conv2\..*', key):
+        return None
+
+    # ── path_residual → path_identity ────────────────────────────
+    m = re.match(r'(.*\.)path_residual\.(.+)', key)
+    if m:
+        prefix, suffix = m.groups()
+        return f'{prefix}path_identity.{suffix}'
+
+    # Key không thuộc GCBlock hoặc không cần remap
+    return key
+
+def load_pretrained_gcnet_core_v2(
+    model: nn.Module,
+    ckpt_path: str,
+    strict_match: bool = False,
+    verbose: bool = True,
+) -> float:
+    """
+    Load pretrained GCNet weights vào model với GCBlock multi-path mới.
+
+    Args:
+        model      : Segmentor (có model.backbone là GCNetWithEnhance)
+        ckpt_path  : đường dẫn file .pth
+        strict_match: nếu True, chỉ load exact key match
+        verbose    : in chi tiết
+
+    Returns:
+        load_rate  : % params được load thành công
+    """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
     model_state = model.backbone.state_dict()
-    compatible = {}
-    skipped = []
 
-    model_key_map = {}
-    for mk in model_state.keys():
-        normalized = mk
-        for pref in ['backbone.', 'model.', 'module.']:
-            if normalized.startswith(pref):
-                normalized = normalized[len(pref):]
-        model_key_map[normalized] = mk
+    compatible  = {}
+    skipped_ckpt = []
+    shape_mismatch = []
 
     for ckpt_key, ckpt_val in state.items():
-        normalized_ckpt = ckpt_key
-        for pref in ['backbone.', 'model.', 'module.']:
-            if normalized_ckpt.startswith(pref):
-                normalized_ckpt = normalized_ckpt[len(pref):]
+        # 1. Strip common prefixes
+        norm_key = _strip_prefix(ckpt_key)
 
-        matched = False
+        # 2. Remap GCBlock keys
+        if _is_gcblock_key(norm_key):
+            norm_key = _remap_gcblock_key(norm_key)
+            if norm_key is None:
+                # conv2 layers — không cần thiết trong arch mới
+                skipped_ckpt.append((ckpt_key, 'conv2_not_needed'))
+                continue
 
-        if normalized_ckpt in model_key_map:
-            mk = model_key_map[normalized_ckpt]
-            if model_state[mk].shape == ckpt_val.shape:
-                compatible[mk] = ckpt_val
-                matched = True
-
-        if not matched and not strict_match:
-            for norm_model, mk in model_key_map.items():
-                if norm_model.endswith(normalized_ckpt) or normalized_ckpt.endswith(norm_model):
-                    if model_state[mk].shape == ckpt_val.shape:
-                        compatible[mk] = ckpt_val
-                        matched = True
-                        break
-
-        if not matched:
-            skipped.append(ckpt_key)
+        # 3. Try exact match trong model state
+        if norm_key in model_state:
+            if model_state[norm_key].shape == ckpt_val.shape:
+                compatible[norm_key] = ckpt_val
+            else:
+                shape_mismatch.append((ckpt_key, norm_key,
+                                       tuple(model_state[norm_key].shape),
+                                       tuple(ckpt_val.shape)))
+        else:
+            skipped_ckpt.append((ckpt_key, 'key_not_found'))
 
     loaded = len(compatible)
-    total = len(model_state)
-    rate = 100 * loaded / total if total > 0 else 0.0
+    total  = len(model_state)
+    rate   = 100.0 * loaded / total if total > 0 else 0.0
 
-    print(f"\n{'='*70}")
-    print("WEIGHT LOADING SUMMARY")
-    print(f"{'='*70}")
-    print(f"Loaded:   {loaded:>5} / {total} params ({rate:.1f}%)")
-    print(f"Skipped:  {len(skipped):>5} params from checkpoint")
-    print(f"{'='*70}")
+    if verbose:
+        print(f"\n{'='*70}")
+        print("WEIGHT LOADING SUMMARY (v2 — with GCBlock remap)")
+        print(f"{'='*70}")
+        print(f"Loaded:         {loaded:>5} / {total} model params ({rate:.1f}%)")
+        print(f"Skipped (ckpt): {len(skipped_ckpt):>5} checkpoint keys")
+        print(f"Shape mismatch: {len(shape_mismatch):>5} keys")
+        print(f"{'='*70}")
 
-    if rate < 50:
-        print(" WARNING: Less than 50% params loaded!")
-        print(f"   First 5 skipped keys: {skipped[:5]}")
+        if shape_mismatch:
+            print(f"\nShape mismatches (first 5):")
+            for ck, mk, ms, cs in shape_mismatch[:5]:
+                print(f"  ckpt: {ck}")
+                print(f"  model key: {mk}")
+                print(f"  model shape: {ms}  vs  ckpt shape: {cs}")
+                print()
+
+        if rate < 50:
+            print(f"\nWARNING: Only {rate:.1f}% loaded!")
+            not_found = [(ck, reason) for ck, reason in skipped_ckpt
+                         if reason == 'key_not_found']
+            print(f"  First 5 'key_not_found':")
+            for ck, _ in not_found[:5]:
+                print(f"    {ck}")
+
+        print()
 
     missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
 
-    if missing:
-        print(f"\n Missing keys in model ({len(missing)}):")
-        for key in missing[:10]:
-            print(f"   - {key}")
-        if len(missing) > 10:
-            print(f"   ... and {len(missing)-10} more")
-    print()
+    if verbose and missing:
+        # Chỉ in các key thực sự missing (không phải DWSA/ms_context vốn không có trong ckpt)
+        expected_missing = {'dwsa4', 'dwsa5', 'dwsa6', 'ms_context', 'final_proj'}
+        real_missing = [k for k in missing
+                        if not any(em in k for em in expected_missing)]
+        if real_missing:
+            print(f"Unexpected missing keys ({len(real_missing)}):")
+            for k in real_missing[:10]:
+                print(f"  - {k}")
 
     return rate
+def _is_gcblock_key(key: str) -> bool:
+    return bool(re.search(r'\.(path_3x3_[12]|path_1x1|path_residual)\.', key))
 
 def _get_max_lrs(optimizer, base_lr, backbone_lr_factor, alpha_lr_factor):
     """
@@ -1250,7 +1336,7 @@ def main():
     print(f"{'='*70}\n")
     
     if args.pretrained_weights:
-        load_pretrained_gcnet_core(model, args.pretrained_weights)
+        load_pretrained_gcnet_core_v2(model, args.pretrained_weights)
     
     if args.freeze_backbone:
         freeze_backbone(model)
