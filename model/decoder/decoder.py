@@ -99,9 +99,9 @@ class EnhancedDecoder(nn.Module):
         # c4 (detail branch) and c5 (semantic+SPP) have different semantic levels.
         # LayerScale init ~1.0 lets the model learn how much c4 contributes
         # without breaking initialisation (identical to original at step 0).
-        self.c4_proj = ConvModule(c4_channels, D, kernel_size=1,
-                          norm_cfg=norm_cfg, act_cfg=act_cfg)
-                        if c4_channels != D else nn.Identity())
+        self.c4_proj = (ConvModule(c4_channels, D, kernel_size=1,
+                   norm_cfg=norm_cfg, act_cfg=act_cfg)
+                if c4_channels != D else nn.Identity())
         self.c4_scale = nn.Parameter(torch.ones(D))   # per-channel scale for c4
 
         if use_gated_fusion:
