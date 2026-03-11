@@ -629,11 +629,13 @@ class GCNetWithEnhance(BaseModule):
         self.channels      = channels
         self.deploy        = deploy
 
+        # ── Validate dwsa_stages ──────────────────────────────────────────────
         valid = {'stage4', 'stage5', 'stage6'}
         bad   = set(dwsa_stages) - valid
         if bad:
             raise ValueError(f"Invalid dwsa_stages: {bad}")
 
+        # ── Backbone core ─────────────────────────────────────────────────────
         self.backbone = GCNetCore(
             in_channels=in_channels, channels=channels,
             ppm_channels=ppm_channels,
@@ -642,7 +644,13 @@ class GCNetWithEnhance(BaseModule):
             norm_cfg=norm_cfg, act_cfg=act_cfg,
             init_cfg=None, deploy=deploy)
 
-        C = channels
+        C = channels  # 32
+
+        # ── DWSA Attention Blocks ─────────────────────────────────────────────
+        # Mỗi stage có channel size khác nhau:
+        #   stage4: C*4  = 128  (H/16, semantic branch sau stage 4)
+        #   stage5: C*8  = 256  (H/32, semantic branch sau stage 5)
+        #   stage6: C*16 = 512  (H/64, semantic branch sau stage 6)
         self.dwsa4 = self.dwsa5 = self.dwsa6 = None
 
         for stage in dwsa_stages:
@@ -650,47 +658,138 @@ class GCNetWithEnhance(BaseModule):
                       qk_sharing=dwsa_qk_sharing, groups=dwsa_groups,
                       drop=dwsa_drop, alpha=dwsa_alpha)
             if stage == 'stage4':
+                # window_size > 0: dùng Window Attention vì H/16 còn lớn
                 self.dwsa4 = DWSABlock(C*4,  window_size=dwsa4_window_size, **kw)
             elif stage == 'stage5':
+                # window_size=0: global attention vì H/32 đã nhỏ
                 self.dwsa5 = DWSABlock(C*8,  window_size=0, **kw)
             elif stage == 'stage6':
+                # window_size=0: global attention vì H/64 rất nhỏ
                 self.dwsa6 = DWSABlock(C*16, window_size=0, **kw)
 
+        # ── MultiScale Context ────────────────────────────────────────────────
+        # Capture context ở nhiều scale trước khi fuse với detail branch
         self.ms_context = (
             MultiScaleContextModule(C*4, C*4, scales=ms_scales,
                                     branch_ratio=ms_branch_ratio, alpha=ms_alpha)
             if use_multi_scale_context else None)
 
+        # ── Final projection cho semantic path ───────────────────────────────
+        # Chuẩn hoá semantic features trước khi fuse với detail branch
         self.final_proj = ConvModule(C*4, C*4, 1,
                                      norm_cfg=norm_cfg, act_cfg=act_cfg)
 
+        # ── [MỚI] GatedFusion: thay x_d6 + x_spp bằng learned gate ──────────
+        #
+        # Lý do cần GatedFusion:
+        #   x_d6  = detail branch  → spatial detail, edges, textures  (low-level)
+        #   x_spp = semantic path  → object context, categories       (high-level)
+        #
+        # Phép cộng đơn giản (x_d6 + x_spp) giả định cả 2 đóng góp bằng nhau
+        # tại mọi vị trí → SAI. Ví dụ:
+        #   - Vùng biên object: x_d6 quan trọng hơn → gate ≈ 1.0
+        #   - Vùng trung tâm object: x_spp quan trọng hơn → gate ≈ 0.0
+        #
+        # Công thức:
+        #   gate = sigmoid( Conv1x1( concat(x_d6, x_spp) ) )  ∈ (0, 1)
+        #   c5   = gate * x_d6 + (1 - gate) * x_spp
+        #
+        # Input:  concat(x_d6, x_spp) → C*4*2 = 256 channels
+        # Output: gate map             → C*4   = 128 channels
+        self.fusion_gate = nn.Sequential(
+            # Conv1: học interaction giữa detail và semantic, giảm channel
+            ConvModule(C*4 * 2, C*4, 1, norm_cfg=norm_cfg, act_cfg=act_cfg),
+            # Conv2: project thành gate values
+            nn.Conv2d(C*4, C*4, 1, bias=True),
+            # Sigmoid: ép gate về (0, 1)
+            nn.Sigmoid()
+        )
+
+        # Init gate về 0.5 ban đầu: tin đều x_d6 và x_spp
+        # Cách: weight=0 → Conv2d output=bias, sigmoid(0)=0.5
+        nn.init.zeros_(self.fusion_gate[1].weight)
+        nn.init.zeros_(self.fusion_gate[1].bias)
+
+    # =========================================================================
+
     def forward(self, x):
         bb = self.backbone
+
+        # ── Stem: input → H/8 features ───────────────────────────────────────
+        # feat    : (B, C*2, H/8,  W/8)
+        # c1      : (B, C,   H/2,  W/2)  ← skip cho decoder stage 2
+        # c2      : (B, C,   H/4,  W/4)  ← skip cho decoder stage 1
+        # out_size: (H/8, W/8) dùng để resize về sau
         feat, c1, c2, out_size = bb.forward_stem(x)
 
+        # ── Stage 4: H/8 → H/16 (semantic) / giữ H/8 (detail) ───────────────
+        # x_s4: (B, C*4, H/16, W/16)  semantic branch
+        # x_d4: (B, C*2, H/8,  W/8)   detail branch
         x_s4, x_d4 = bb.forward_stage4(feat, out_size)
+
+        # Lưu c4 trước khi detail branch tiếp tục xử lý
+        # c4 dùng cho aux head (supervision phụ)
         c4 = x_d4.clone()
+
+        # Optional: DWSA attention trên semantic branch tại H/16
+        # Dùng window attention vì feature map còn lớn
         if self.dwsa4 is not None:
             x_s4 = self.dwsa4(x_s4)
 
+        # ── Stage 5: H/16 → H/32 (semantic) / giữ H/8 (detail) ──────────────
+        # x_s5: (B, C*8, H/32, W/32)
+        # x_d5: (B, C*2, H/8,  W/8)
         x_s5, x_d5 = bb.forward_stage5(x_s4, x_d4, out_size)
+
+        # Optional: DWSA global attention trên semantic branch tại H/32
         if self.dwsa5 is not None:
             x_s5 = self.dwsa5(x_s5)
 
+        # ── Stage 6: H/32 → H/64 (semantic) / H/8 → C*4 (detail) ───────────
+        # x_s6: (B, C*16, H/64, W/64)  → vào DAPPM
+        # x_d6: (B, C*4,  H/8,  W/8)   → fuse với semantic ở cuối
         x_s6, x_d6 = bb.forward_stage6(x_s5, x_d5)
+
+        # Optional: DWSA global attention trên semantic branch tại H/64
         if self.dwsa6 is not None:
             x_s6 = self.dwsa6(x_s6)
+
+        # ── DAPPM (SPP): capture multi-scale semantic context ─────────────────
+        # x_s6  : (B, C*16, H/64, W/64)
+        # x_spp : (B, C*4,  H/64, W/64) → resize về H/8
         x_spp = bb.spp(x_s6)
         x_spp = resize(x_spp, size=out_size, mode='bilinear',
                        align_corners=self.align_corners)
+        # x_spp : (B, C*4, H/8, W/8)
 
+        # Optional: thêm multi-scale context sau SPP
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
 
+        # Chuẩn hoá semantic features lần cuối
         x_spp = self.final_proj(x_spp)
-        c5    = x_d6 + x_spp
+        # x_spp : (B, C*4, H/8, W/8)
+
+        # ── [MỚI] GatedFusion: fuse detail + semantic ────────────────────────
+        #
+        # Tại đây:
+        #   x_d6  : (B, C*4, H/8, W/8)  detail features
+        #   x_spp : (B, C*4, H/8, W/8)  semantic features
+        #
+        # Bước 1: concat → (B, C*8, H/8, W/8)
+        # Bước 2: học gate ∈ (0,1) → (B, C*4, H/8, W/8)
+        # Bước 3: weighted sum
+        gate = self.fusion_gate(torch.cat([x_d6, x_spp], dim=1))
+        #   gate ≈ 1.0 → tin x_d6 (detail) hơn
+        #   gate ≈ 0.5 → tin đều (init state)
+        #   gate ≈ 0.0 → tin x_spp (semantic) hơn
+
+        c5 = gate * x_d6 + (1.0 - gate) * x_spp
+        # c5 : (B, C*4, H/8, W/8) → vào EnhancedDecoder
 
         return dict(c1=c1, c2=c2, c4=c4, c5=c5)
+
+    # =========================================================================
 
     def switch_to_deploy(self):
         self.backbone.switch_to_deploy()
@@ -698,6 +797,7 @@ class GCNetWithEnhance(BaseModule):
         print("Switched to deploy mode")
         print("  GCBlock: all paths fused -> single 3x3 conv")
         print("  DWSA: kept as-is (attention not fuseable)")
+        print("  fusion_gate: kept as-is")
 
     @torch.no_grad()
     def count_params(self):
