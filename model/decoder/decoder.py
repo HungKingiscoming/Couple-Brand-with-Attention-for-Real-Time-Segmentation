@@ -99,9 +99,12 @@ class EnhancedDecoder(nn.Module):
         # c4 (detail branch) and c5 (semantic+SPP) have different semantic levels.
         # LayerScale init ~1.0 lets the model learn how much c4 contributes
         # without breaking initialisation (identical to original at step 0).
-        self.c4_proj = (ConvModule(c4_channels, D, kernel_size=1,
-                   norm_cfg=norm_cfg, act_cfg=act_cfg)
-                if c4_channels != D else nn.Identity())
+        self.c4_proj = (
+            ConvModule(c4_channels, D, kernel_size=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg)
+            if c4_channels != D
+            else nn.Identity()
+        )
         self.c4_scale = nn.Parameter(torch.ones(D))   # per-channel scale for c4
 
         if use_gated_fusion:
@@ -115,9 +118,12 @@ class EnhancedDecoder(nn.Module):
             ResidualBlock(D, norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(D, D2, 3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
-        self.c2_proj = ConvModule(c2_channels, D2, kernel_size=1,
-                          norm_cfg=norm_cfg, act_cfg=act_cfg)
-                        if c2_channels != D2 else nn.Identity())
+        self.c2_proj = (
+            ConvModule(c2_channels, D2, kernel_size=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg)
+            if c2_channels != D2
+            else nn.Identity()
+        )
         if use_gated_fusion:
             self.fusion1 = GatedFusion(D2, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
@@ -129,9 +135,12 @@ class EnhancedDecoder(nn.Module):
             DWConvModule(D2, 3, norm_cfg=norm_cfg, act_cfg=act_cfg),
             DWConvModule(D2, 3, norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
-        self.c1_proj = ConvModule(c1_channels, D2, kernel_size=1,
-                          norm_cfg=norm_cfg, act_cfg=act_cfg)
-                        if c1_channels != D2 else nn.Identity())
+        self.c1_proj = (
+            ConvModule(c1_channels, D2, kernel_size=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg)
+            if c1_channels != D2
+            else nn.Identity()
+        )
         if use_gated_fusion:
             self.fusion2 = GatedFusion(D2, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
