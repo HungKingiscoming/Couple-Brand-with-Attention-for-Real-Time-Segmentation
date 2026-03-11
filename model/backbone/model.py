@@ -242,7 +242,7 @@ class DWSABlock(nn.Module):
 
         # FIX 1: was register_buffer → grad always None → module never learned
         # init small (0.01) so residual connection dominates early training
-        self.alpha = nn.Parameter(torch.full((channels,), alpha))
+        self.alpha = nn.Parameter(torch.full((channels,), -4.595))
 
     def _attention(self, x_flat: Tensor) -> Tensor:
         """
@@ -353,7 +353,7 @@ class MultiScaleContextModule(nn.Module):
             nn.BatchNorm2d(out_channels))
 
         # init 0.1 instead of 1e-4 so module contributes from early epochs
-        self.alpha = nn.Parameter(torch.full((out_channels,), -2.2))
+        self.alpha = nn.Parameter(torch.full((out_channels,), -2.197))
 
         self.proj = (nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
