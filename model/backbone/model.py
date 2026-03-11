@@ -311,7 +311,7 @@ class DWSABlock(nn.Module):
         out = self.bn_out(self.out_proj(out_red))
 
         # alpha is a Parameter now — clamped [0,1] only for stability
-        alpha = self.alpha.clamp(0.0, 1.0).view(1, -1, 1, 1)
+        alpha = torch.sigmoid(self.alpha).view(1, -1, 1, 1)
         return identity + alpha * out
 
 
@@ -353,7 +353,7 @@ class MultiScaleContextModule(nn.Module):
             nn.BatchNorm2d(out_channels))
 
         # init 0.1 instead of 1e-4 so module contributes from early epochs
-        self.alpha = nn.Parameter(torch.full((out_channels,), 0.1))
+        self.alpha = nn.Parameter(torch.full((out_channels,), -2.2))
 
         self.proj = (nn.Sequential(
             nn.Conv2d(in_channels, out_channels, 1, bias=False),
