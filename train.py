@@ -717,30 +717,31 @@ class ModelConfig:
                 "dwsa_qk_sharing": True,
                 "dwsa_groups": 4,
                 "dwsa_drop": 0.1,
-                "dwsa_alpha": 0.01,
+                "dwsa_alpha": 0.1,           # proven: 0.1 (file bạn, mIoU=0.5415)
                 "use_multi_scale_context": True,
                 "ms_alpha": 0.1,
                 "align_corners": False,
                 "deploy": False
             },
             "head": {
-                "in_channels":      C * 4,
-                "c4_channels":      C * 2,
-                "c2_channels":      C,
-                "c1_channels":      C,
+                "in_channels":      C * 4,   # 128 — c5
+                "c4_channels":      C * 2,   #  64 — c4 detail branch stage4
+                "c2_channels":      C,        #  32 — c2 stem layer 1
+                "c1_channels":      C,        #  32 — c1 stem layer 0
                 "decoder_channels": 128,
                 "dropout_ratio":    0.1,
                 "align_corners":    False,
+                "use_gated_fusion": True,     # GatedFusion proven (file bạn)
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
-                "act_cfg":  {'type': 'ReLU', 'inplace': False}
+                "act_cfg":  {'type': 'ReLU', 'inplace': True}
             },
             "aux_head": {
-                "in_channels":   C * 2,
+                "in_channels":   C * 2,      # 64 — c4
                 "mid_channels":  64,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
-                "act_cfg":  {'type': 'ReLU', 'inplace': False}
+                "act_cfg":  {'type': 'ReLU', 'inplace': True}
             },
             "loss": {
                 "ce_weight":    1.0,
