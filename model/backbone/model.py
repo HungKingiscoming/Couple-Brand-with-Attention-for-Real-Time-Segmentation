@@ -375,10 +375,12 @@ def _merge_windows(windows: Tensor, nH: int, nW: int, B: int) -> Tensor:
 
 
 # =============================================================================
-# DWSABlock — Fixes từ Bước 2:
-#   1. alpha: nn.Parameter (không phải register_buffer)
-#   2. o_proj trong fp32 bên trong _attention
-#   3. sigmoid(alpha) thay vì clamp
+# DWSABlock — Best-of-Both merge:
+#   ✅ BN (từ file bạn): proven stable, mIoU=0.5415, không NaN
+#   ✅ attn.clamp(-10,10): tránh overflow fp16 → NaN gradient
+#   ✅ o_proj fp32: tránh numerical instability ở fp16
+#   ✅ scalar alpha + clamp(0,1): proven stable (từ file bạn)
+#   ✅ qk_sharing: giữ nguyên (cả hai đều có)
 # =============================================================================
 
 class DWSABlock(nn.Module):
@@ -387,9 +389,15 @@ class DWSABlock(nn.Module):
 
     window_size = 0  → Full attention   (stage5 N=256, stage6 N=64)
     window_size > 0  → Window attention (stage4 N=1024 → OOM nếu full)
+
+    Norm: BN thay vì LN — nhất quán với toàn model, fuse-compatible,
+          proven stable trong thực nghiệm (không NaN qua 30 epochs).
+    Alpha: scalar clamp[0,1] — đơn giản, proven stable, không polarity flip.
+    o_proj fp32: tránh numerical instability trong attention computation.
+    clamp(-10,10): tránh overflow trước softmax với fp16 AMP.
     """
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4,
-                 qk_sharing=True, groups=4, alpha=0.01, window_size=0):
+                 qk_sharing=True, groups=4, alpha=0.1, window_size=0):
         super().__init__()
         assert channels % reduction == 0
         self.channels    = channels
@@ -401,13 +409,12 @@ class DWSABlock(nn.Module):
         self.reduced = reduced
         self.mid     = mid
 
-        # LayerNorm thay BN: attention hoạt động trên sequence → LN phù hợp hơn
-        # BN dùng running stats trên batch → không ổn với batch nhỏ (4) và window attention
-        # LN normalize theo channel tại từng spatial position → stable hơn
-        self.ln      = nn.LayerNorm(channels)
+        # BN: proven stable (file bạn: 0 NaN qua 30 epochs)
+        # nhất quán với backbone BN → fuse-compatible khi deploy
+        self.bn_in  = nn.BatchNorm2d(channels)
         self.in_proj  = nn.Conv2d(channels, reduced, 1, bias=False)
         self.out_proj = nn.Conv2d(reduced, channels, 1, bias=False)
-        self.ln_out  = nn.LayerNorm(channels)
+        self.bn_out = nn.BatchNorm2d(channels)
 
         g = _get_valid_groups(reduced, groups)
 
@@ -426,18 +433,18 @@ class DWSABlock(nn.Module):
         self.drop  = nn.Dropout(drop)
         self.scale = (mid // num_heads) ** -0.5
 
-        # FIX 1: nn.Parameter → grad luôn tồn tại
-        # FIX 3: lưu pre-sigmoid, sigmoid(-4.60) ≈ 0.01
-        alpha_init = math.log(alpha / (1.0 - alpha))
-        self.alpha = nn.Parameter(torch.full((channels,), alpha_init))
+        # Scalar alpha + clamp(0,1): proven stable (file bạn)
+        # init nhỏ (0.1) → attention bắt đầu conservative, học dần
+        self.alpha = nn.Parameter(torch.tensor(alpha))
 
     def _attention(self, x_flat: Tensor) -> Tensor:
         """
-        Attention + o_proj trong fp32.
-        FIX 2: o_proj chạy fp32 trước khi cast về dtype gốc.
+        Core attention. o_proj chạy fp32 để tránh numerical instability.
+        x_flat: (B', reduced, N)
+        returns: (B', reduced, N)
         """
         orig_dtype = x_flat.dtype
-        x_fp32    = x_flat.float()
+        x_fp32    = x_flat.float()   # cast fp32 cho attention computation
 
         if self.qk_sharing:
             base = self.qk_base(x_fp32)
@@ -456,7 +463,7 @@ class DWSABlock(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)   # tránh overflow fp16 → NaN gradient
+        attn = attn.clamp(-10, 10)   # ← tránh overflow fp16 → NaN gradient
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
@@ -464,19 +471,17 @@ class DWSABlock(nn.Module):
         out = out.permute(0, 1, 3, 2).contiguous()
         B_, Hn, Hd, N = out.shape
         out = out.view(B_, self.mid, N)
+        out = self.o_proj(out)       # fp32
 
-        # FIX 2: o_proj trong fp32
-        out = self.o_proj(out)
-
-        return out.to(orig_dtype)
+        return out.to(orig_dtype)    # cast về dtype gốc (fp16 nếu AMP)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
         identity = x
 
-        # LayerNorm: (B,C,H,W) → permute → (B,H,W,C) → LN → permute back
-        x_norm = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x_red  = self.in_proj(x_norm)
+        # BN normalize → in_proj giảm chiều
+        x_norm = self.bn_in(x)
+        x_red  = self.in_proj(x_norm)   # (B, reduced, H, W)
 
         if self.window_size > 0:
             ws    = self.window_size
@@ -495,12 +500,11 @@ class DWSABlock(nn.Module):
             out_flat = self._attention(x_red.view(B, self.reduced, N))
             out_red  = out_flat.view(B, self.reduced, H, W)
 
-        out = self.out_proj(out_red)
-        # LayerNorm output: (B,C,H,W) → permute → LN → permute back
-        out = self.ln_out(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        # out_proj + BN
+        out = self.bn_out(self.out_proj(out_red))   # (B, C, H, W)
 
-        # FIX 3: sigmoid → gradient luôn > 0
-        alpha = torch.sigmoid(self.alpha).view(1, -1, 1, 1)
+        # Scalar alpha clamp(0,1): proven stable, không polarity flip
+        alpha = self.alpha.clamp(0.0, 1.0)
         return identity + alpha * out
 
 
@@ -706,12 +710,7 @@ class GCNetCore(BaseModule):
         c1 = c2 = None
         feat = x
         for i, layer in enumerate(self.stem):
-            if self.training and i <= 1:
-                with torch.autocast(device_type='cuda', enabled=False):
-                    feat = layer(feat.float())
-                feat = feat.to(x.dtype)
-            else:
-                feat = layer(feat)
+            feat = layer(feat)
             if i == 0: c1 = feat
             if i == 1: c2 = feat
         return feat, c1, c2, out_size
@@ -778,7 +777,11 @@ class GCNetCore(BaseModule):
 
 
 # =============================================================================
-# GCNetWithEnhance — LayerNorm DWSA + simple add fusion
+# GCNetWithEnhance — Best-of-Both backbone
+#   ✅ BN DWSABlock (proven stable, mIoU=0.5415)
+#   ✅ DAPPM kernels [5,9,17,33] (large receptive field)
+#   ✅ Simple add c5 = x_d6 + x_spp (no GatedFusion)
+#   ✅ Cascade DWSA: Stage4→Stage5→Stage6→SPP
 # =============================================================================
 
 class GCNetWithEnhance(BaseModule):
@@ -786,13 +789,16 @@ class GCNetWithEnhance(BaseModule):
     Enhanced GCNet backbone.
 
     Output: {c1, c2, c4, c5}
-      c1: H/2,  C    = 32  — decoder skip
-      c2: H/4,  C    = 32  — decoder skip
-      c4: H/8,  C*2  = 64  — aux head input
-      c5: H/8,  C*4  = 128 — main decoder input
+      c1: H/2,  C    = 32  — decoder skip (stem layer 0)
+      c2: H/4,  C    = 32  — decoder skip (stem layer 1)
+      c4: H/8,  C*2  = 64  — detail branch stage4 → aux head + decoder stage0 skip
+      c5: H/8,  C*4  = 128 — fused detail+semantic → main decoder input
 
-    Cascade DWSA:
-      Stage4→[DWSA4]→Stage5→[DWSA5]→Stage6→[DWSA6]→SPP
+    Cascade DWSA injection:
+      Stem → Stage4 → [DWSA4] → Stage5 → [DWSA5] → Stage6 → [DWSA6] → SPP
+               ↑                    ↑                   ↑
+         x_s4 enhanced        x_s5 enhanced        x_s6 enhanced
+         → stage5 tốt hơn     → stage6 tốt hơn     → SPP tốt hơn
     """
     def __init__(self,
                  in_channels=3, channels=32, ppm_channels=128,
@@ -800,7 +806,7 @@ class GCNetWithEnhance(BaseModule):
                  dwsa_stages=('stage4', 'stage5', 'stage6'),
                  dwsa_num_heads=4, dwsa_reduction=4,
                  dwsa_qk_sharing=True, dwsa_groups=4,
-                 dwsa_drop=0.1, dwsa_alpha=0.01,
+                 dwsa_drop=0.1, dwsa_alpha=0.1,   # 0.1 proven (file bạn)
                  dwsa4_window_size=8,
                  use_multi_scale_context=True,
                  ms_scales=(1, 2), ms_branch_ratio=16, ms_alpha=0.1,
