@@ -401,10 +401,13 @@ class DWSABlock(nn.Module):
         self.reduced = reduced
         self.mid     = mid
 
-        self.bn_in   = nn.BatchNorm2d(channels)
+        # LayerNorm thay BN: attention hoạt động trên sequence → LN phù hợp hơn
+        # BN dùng running stats trên batch → không ổn với batch nhỏ (4) và window attention
+        # LN normalize theo channel tại từng spatial position → stable hơn
+        self.ln      = nn.LayerNorm(channels)
         self.in_proj  = nn.Conv2d(channels, reduced, 1, bias=False)
         self.out_proj = nn.Conv2d(reduced, channels, 1, bias=False)
-        self.bn_out  = nn.BatchNorm2d(channels)
+        self.ln_out  = nn.LayerNorm(channels)
 
         g = _get_valid_groups(reduced, groups)
 
@@ -453,6 +456,7 @@ class DWSABlock(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.clamp(-10, 10)   # tránh overflow fp16 → NaN gradient
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
@@ -470,7 +474,8 @@ class DWSABlock(nn.Module):
         B, C, H, W = x.shape
         identity = x
 
-        x_norm = self.bn_in(x)
+        # LayerNorm: (B,C,H,W) → permute → (B,H,W,C) → LN → permute back
+        x_norm = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
         x_red  = self.in_proj(x_norm)
 
         if self.window_size > 0:
@@ -490,7 +495,9 @@ class DWSABlock(nn.Module):
             out_flat = self._attention(x_red.view(B, self.reduced, N))
             out_red  = out_flat.view(B, self.reduced, H, W)
 
-        out = self.bn_out(self.out_proj(out_red))
+        out = self.out_proj(out_red)
+        # LayerNorm output: (B,C,H,W) → permute → LN → permute back
+        out = self.ln_out(out.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # FIX 3: sigmoid → gradient luôn > 0
         alpha = torch.sigmoid(self.alpha).view(1, -1, 1, 1)
@@ -670,11 +677,17 @@ class GCNetCore(BaseModule):
                        norm_cfg=norm_cfg, act_cfg=None))
 
         # ── DAPPM ─────────────────────────────────────────────────────────────
+        # kernel_sizes=[5,9,17,33], strides=[2,4,8,16]:
+        #   Receptive field lớn hơn nhiều so với [3,5,7,9]
+        #   Phù hợp foggy images: fog tạo long-range dependency
+        #   (xe ở xa bị ảnh hưởng bởi fog density của toàn scene)
+        # paddings = kernel_size // 2 để giữ nguyên spatial size sau pool
+        # ⚠️  Shape thay đổi → không load được pretrain weights của spp
         self.spp = DAPPM(
             in_channels=C*16, branch_channels=ppm_channels,
             out_channels=C*4, num_scales=5,
-            kernel_sizes=[3, 5, 7, 9], strides=[1, 2, 2, 4],
-            paddings=[1, 2, 3, 4], norm_cfg=norm_cfg, act_cfg=act_cfg)
+            kernel_sizes=[5, 9, 17, 33], strides=[2, 4, 8, 16],
+            paddings=[2, 4, 8, 16], norm_cfg=norm_cfg, act_cfg=act_cfg)
 
         self.kaiming_init()
 
@@ -739,7 +752,7 @@ class GCNetCore(BaseModule):
         Stage 6.
         In:  x_s5 đã qua DWSA5
         Out: x_s6 (H/64,C*16) → [DWSA6] → SPP
-             x_d6 (H/8, C*4)  → GatedFusion với x_spp → c5
+             x_d6 (H/8, C*4)  → add với x_spp → c5
         """
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
@@ -765,7 +778,7 @@ class GCNetCore(BaseModule):
 
 
 # =============================================================================
-# GCNetWithEnhance — file cũ + GatedFusion (Bước 3)
+# GCNetWithEnhance — LayerNorm DWSA + simple add fusion
 # =============================================================================
 
 class GCNetWithEnhance(BaseModule):
@@ -836,18 +849,6 @@ class GCNetWithEnhance(BaseModule):
         self.final_proj = ConvModule(C*4, C*4, 1,
                                      norm_cfg=norm_cfg, act_cfg=act_cfg)
 
-        # ── GatedFusion (Bước 3) ─────────────────────────────────────────────
-        # gate = sigmoid(Conv(concat(x_d6, x_spp))) ∈ (0,1)
-        # c5   = gate * x_d6 + (1-gate) * x_spp
-        # Init: weight=0, bias=0 → sigmoid(0)=0.5 → tin đều lúc đầu
-        self.fusion_gate = nn.Sequential(
-            ConvModule(C*4 * 2, C*4, 1, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            nn.Conv2d(C*4, C*4, 1, bias=True),
-            nn.Sigmoid(),
-        )
-        nn.init.zeros_(self.fusion_gate[1].weight)
-        nn.init.zeros_(self.fusion_gate[1].bias)
-
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         bb = self.backbone
         feat, c1, c2, out_size = bb.forward_stem(x)
@@ -872,9 +873,7 @@ class GCNetWithEnhance(BaseModule):
             x_spp = self.ms_context(x_spp)
         x_spp = self.final_proj(x_spp)
 
-        # GatedFusion thay vì x_d6 + x_spp
-        gate = self.fusion_gate(torch.cat([x_d6, x_spp], dim=1))
-        c5   = gate * x_d6 + (1.0 - gate) * x_spp
+        c5 = x_d6 + x_spp
 
         return dict(c1=c1, c2=c2, c4=c4, c5=c5)
 
@@ -884,7 +883,7 @@ class GCNetWithEnhance(BaseModule):
         print("Switched to deploy mode:")
         print("  GCBlock: 2×Block3x3(double) + Block1x1(double) → 1 Conv3x3")
         print("  Deploy: torch.einsum (chính xác)")
-        print("  DWSA/fusion_gate: kept as-is")
+        print("  DWSA: kept as-is")
 
     @torch.no_grad()
     def count_params(self):
@@ -898,7 +897,6 @@ class GCNetWithEnhance(BaseModule):
         ms      = (sum(p.numel() for p in self.ms_context.parameters())
                    if self.ms_context else 0)
         proj    = sum(p.numel() for p in self.final_proj.parameters())
-        gate    = sum(p.numel() for p in self.fusion_gate.parameters())
 
         print(f"\n{'='*50}")
         print("GCNetWithEnhance Parameters")
@@ -908,7 +906,6 @@ class GCNetWithEnhance(BaseModule):
         print(f"  DWSA blocks:          {dwsa/1e6:.2f}M")
         print(f"  MultiScaleContext:    {ms/1e6:.2f}M")
         print(f"  final_proj:           {proj/1e6:.2f}M")
-        print(f"  fusion_gate:          {gate/1e6:.2f}M")
         print(f"{'='*50}")
         print(f"  TOTAL:                {total/1e6:.2f}M")
         print(f"{'='*50}\n")
