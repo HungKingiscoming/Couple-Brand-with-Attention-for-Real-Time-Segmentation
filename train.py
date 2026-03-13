@@ -673,27 +673,9 @@ class Trainer:
                 outputs = self.model.forward_train(imgs)
                 logits = outputs["main"]    # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn resolution tháº¥p
             
-                # â”€â”€ CE: upsample logit lÃªn full resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                logits_full = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
+                logits_full = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
                 ce_loss = self.ce(logits_full, masks)
-            
-                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
-                if self.dice_weight > 0:
-                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
-                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-                    dice_loss = self.dice(logits, masks_small)
-                else:
-                    dice_loss = torch.tensor(0.0, device=logits.device)
+                dice_loss = self.dice(logits_full, masks)
             
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             
@@ -706,7 +688,7 @@ class Trainer:
                         align_corners=False
                     )
                     aux_ce_loss = self.ce(aux_logits, masks)
-                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    aux_weight = 0.4 
                     loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps
