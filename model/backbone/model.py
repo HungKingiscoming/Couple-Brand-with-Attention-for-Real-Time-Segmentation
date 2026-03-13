@@ -18,335 +18,330 @@ from components.components import (
 )
 
 
-# =============================================================================
-# Block3x3 — từ file 6
-# Conv3x3→BN → Conv1x1→BN (double-conv, richer representation)
-# =============================================================================
-
-class Block3x3(BaseModule):
-    """
-    Double-conv path: Conv3x3→BN → Conv1x1→BN.
-
-    Tại sao double-conv tốt hơn single ConvBN:
-      Conv3x3: học spatial patterns (edges, textures)
-      Conv1x1: học channel interactions trên spatial features đó
-      → biểu diễn phong phú hơn với cùng receptive field
-
-    Khi deploy: 2 conv fuse thành 1 Conv3x3 bằng torch.einsum
-    → inference cost giống single-conv, expressiveness cao hơn lúc training.
-    """
-    def __init__(self,
-                 in_channels: int,
-                 out_channels: int,
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 padding: Union[int, Tuple[int, int]] = 1,
-                 bias: bool = False,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 deploy: bool = False):
-        super().__init__()
-        self.in_channels  = in_channels
-        self.out_channels = out_channels
-        self.stride       = stride
-        self.padding      = padding
-        self.deploy       = deploy
-
-        if deploy:
-            self.conv = nn.Conv2d(
-                in_channels, out_channels, kernel_size=3,
-                stride=stride, padding=padding, bias=True)
-        else:
-            # Conv3x3→BN: học spatial features
-            self.conv1 = ConvModule(
-                in_channels=in_channels, out_channels=out_channels,
-                kernel_size=3, stride=stride, padding=padding,
-                bias=bias, norm_cfg=norm_cfg, act_cfg=None)
-            # Conv1x1→BN: học channel mixing trên spatial features đã học
-            self.conv2 = ConvModule(
-                in_channels=out_channels, out_channels=out_channels,
-                kernel_size=1, stride=1, padding=0,
-                bias=bias, norm_cfg=norm_cfg, act_cfg=None)
-
-    def forward(self, x):
-        if self.deploy:
-            return self.conv(x)
-        return self.conv2(self.conv1(x))
-
-    def _fuse_bn_tensor(self, conv_module: nn.Module):
-        """Fuse ConvModule (Conv + BN) thành kernel và bias."""
-        kernel       = conv_module.conv.weight
-        running_mean = conv_module.bn.running_mean
-        running_var  = conv_module.bn.running_var
-        gamma        = conv_module.bn.weight
-        beta         = conv_module.bn.bias
-        eps          = conv_module.bn.eps
-        std          = (running_var + eps).sqrt()
-        t            = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta - running_mean * gamma / std
-
-    def switch_to_deploy(self):
-        """
-        Fuse Conv3x3→BN + Conv1x1→BN thành 1 Conv3x3 duy nhất.
-
-        Toán học:
-          y = W2_fused * (W1_fused * x + b1) + b2
-            = (W2 @ W1) * x + (W2 * b1 + b2)
-
-        torch.einsum('oi,ichw->ochw', W2_sq, W1):
-          W2_sq: (out, out) — squeeze spatial dims
-          W1   : (out, in, 3, 3)
-          result: (out, in, 3, 3)
-        """
-        W1, b1 = self._fuse_bn_tensor(self.conv1)   # (out, in, 3, 3), (out,)
-        W2, b2 = self._fuse_bn_tensor(self.conv2)   # (out, out, 1, 1), (out,)
-
-        W_fused = torch.einsum(
-            'oi,ichw->ochw',
-            W2.squeeze(3).squeeze(2),   # (out, out)
-            W1                          # (out, in, 3, 3)
-        )
-        b_fused = b2 + (b1.view(1, -1, 1, 1) * W2).sum(3).sum(2).sum(1)
-
-        self.conv = nn.Conv2d(
-            self.in_channels, self.out_channels, kernel_size=3,
-            stride=self.stride, padding=self.padding, bias=True)
-        self.conv.weight.data = W_fused
-        self.conv.bias.data   = b_fused
-        self.__delattr__('conv1')
-        self.__delattr__('conv2')
-        self.deploy = True
-
-
-# =============================================================================
-# Block1x1 — từ file 6
-# Conv1x1→BN → Conv1x1→BN (double-conv cho 1x1 path)
-# =============================================================================
+# ===========================
+# GCBlock classes (giá»¯ nguyÃªn tá»« code gá»‘c â€” há»— trá»£ deploy)
+# ===========================
 
 class Block1x1(BaseModule):
-    """
-    Double-conv 1x1: Conv1x1→BN → Conv1x1→BN.
-    Khi deploy: fuse thành 1 Conv1x1 → pad thành 3x3 để cộng với kernel chính.
-    """
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 bias: bool = False,
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[int, Tuple[int]] = 0,
+                 bias: bool = True,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  deploy: bool = False):
         super().__init__()
-        self.in_channels  = in_channels
+        self.in_channels = in_channels
         self.out_channels = out_channels
-        self.stride       = stride
-        self.deploy       = deploy
+        self.stride = stride
+        self.padding = padding
+        self.bias = bias
+        self.deploy = deploy
 
-        if deploy:
+        if self.deploy:
             self.conv = nn.Conv2d(
                 in_channels, out_channels, kernel_size=1,
-                stride=stride, padding=0, bias=True)
+                stride=stride, padding=padding, bias=True)
         else:
             self.conv1 = ConvModule(
-                in_channels=in_channels, out_channels=out_channels,
-                kernel_size=1, stride=stride, padding=0,
-                bias=bias, norm_cfg=norm_cfg, act_cfg=None)
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                stride=stride,
+                padding=padding,
+                bias=bias,
+                norm_cfg=norm_cfg,
+                act_cfg=None)
             self.conv2 = ConvModule(
-                in_channels=out_channels, out_channels=out_channels,
-                kernel_size=1, stride=1, padding=0,
-                bias=bias, norm_cfg=norm_cfg, act_cfg=None)
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=padding,
+                bias=bias,
+                norm_cfg=norm_cfg,
+                act_cfg=None)
 
     def forward(self, x):
         if self.deploy:
             return self.conv(x)
-        return self.conv2(self.conv1(x))
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
 
-    def _fuse_bn_tensor(self, conv_module: nn.Module):
-        kernel       = conv_module.conv.weight
-        running_mean = conv_module.bn.running_mean
-        running_var  = conv_module.bn.running_var
-        gamma        = conv_module.bn.weight
-        beta         = conv_module.bn.bias
-        eps          = conv_module.bn.eps
-        std          = (running_var + eps).sqrt()
-        t            = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta - running_mean * gamma / std
+    def _fuse_bn_tensor(self, conv: nn.Module):
+        kernel = conv.conv.weight
+        bias = conv.conv.bias
+        running_mean = conv.bn.running_mean
+        running_var = conv.bn.running_var
+        gamma = conv.bn.weight
+        beta = conv.bn.bias
+        eps = conv.bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
 
     def switch_to_deploy(self):
-        """Fuse 2 Conv1x1 thành 1 Conv1x1."""
-        W1, b1 = self._fuse_bn_tensor(self.conv1)   # (out, in, 1, 1)
-        W2, b2 = self._fuse_bn_tensor(self.conv2)   # (out, out, 1, 1)
-
-        W_fused = torch.einsum(
-            'oi,ichw->ochw',
-            W2.squeeze(3).squeeze(2),
-            W1
-        )
-        b_fused = b2 + (b1.view(1, -1, 1, 1) * W2).sum(3).sum(2).sum(1)
-
+        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
+        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
         self.conv = nn.Conv2d(
-            self.in_channels, self.out_channels, kernel_size=1,
-            stride=self.stride, padding=0, bias=True)
-        self.conv.weight.data = W_fused
-        self.conv.bias.data   = b_fused
+            self.in_channels, self.out_channels,
+            kernel_size=1, stride=self.stride,
+            padding=self.padding, bias=True)
+        self.conv.weight.data = torch.einsum(
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
+        self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
 
 
-# =============================================================================
-# GCBlock — kết hợp:
-#   - File 6: 2 paths cố định (Block3x3 double-conv + Block1x1 double-conv)
-#   - File 6: deploy dùng torch.einsum bên trong từng Block
-#   - File cũ: identity path fuse logic
-# =============================================================================
-
-class GCBlock(nn.Module):
-    """
-    Re-parameterizable Block — 2 paths cố định.
-
-    Training:
-        path_3x3_1   : Block3x3 (Conv3x3→BN → Conv1x1→BN)
-        path_3x3_2   : Block3x3 (Conv3x3→BN → Conv1x1→BN)
-        path_1x1     : Block1x1 (Conv1x1→BN → Conv1x1→BN)
-        path_identity: BN only  (chỉ khi in==out, stride==1)
-
-    Deploy:
-        reparam_conv : single Conv3x3 + bias  (tất cả paths fused)
-        → inference cost = 1 Conv3x3, expressiveness cao hơn lúc training
-    """
+class Block3x3(BaseModule):
     def __init__(self,
                  in_channels: int,
                  out_channels: int,
-                 kernel_size: int = 3,
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 padding: Union[int, Tuple[int, int]] = 1,
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[int, Tuple[int]] = 0,
+                 bias: bool = True,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 deploy: bool = False):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.stride = stride
+        self.padding = padding
+        self.bias = bias
+        self.deploy = deploy
+
+        if self.deploy:
+            self.conv = nn.Conv2d(
+                in_channels, out_channels,
+                kernel_size=3, stride=stride,
+                padding=padding, bias=True)
+        else:
+            self.conv1 = ConvModule(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=3,
+                stride=stride,
+                padding=padding,
+                bias=bias,
+                norm_cfg=norm_cfg,
+                act_cfg=None)
+            self.conv2 = ConvModule(
+                in_channels=out_channels,
+                out_channels=out_channels,
+                kernel_size=1,
+                stride=1,
+                padding=0,
+                bias=bias,
+                norm_cfg=norm_cfg,
+                act_cfg=None)
+
+    def forward(self, x):
+        if self.deploy:
+            return self.conv(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        return x
+
+    def _fuse_bn_tensor(self, conv: nn.Module):
+        kernel = conv.conv.weight
+        bias = conv.conv.bias
+        running_mean = conv.bn.running_mean
+        running_var = conv.bn.running_var
+        gamma = conv.bn.weight
+        beta = conv.bn.bias
+        eps = conv.bn.eps
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+
+    def switch_to_deploy(self):
+        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
+        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
+        self.conv = nn.Conv2d(
+            self.in_channels, self.out_channels,
+            kernel_size=3, stride=self.stride,
+            padding=self.padding, bias=True)
+        self.conv.weight.data = torch.einsum(
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
+        self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
+        self.__delattr__('conv1')
+        self.__delattr__('conv2')
+        self.deploy = True
+
+
+class GCBlock(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int]] = 3,
+                 stride: Union[int, Tuple[int]] = 1,
+                 padding: Union[int, Tuple[int]] = 1,
                  padding_mode: Optional[str] = 'zeros',
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
                  act: bool = True,
                  deploy: bool = False):
         super().__init__()
-        self.in_channels  = in_channels
+        self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kernel_size  = kernel_size
-        self.stride       = stride
-        self.padding      = padding
-        self.deploy       = deploy
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
+        self.deploy = deploy
 
         assert kernel_size == 3
         assert padding == 1
 
-        self.act_fn = build_activation_layer(act_cfg) if act else nn.Identity()
+        padding_11 = padding - kernel_size // 2
+
+        if act:
+            self.relu = build_activation_layer(act_cfg)
+        else:
+            self.relu = nn.Identity()
 
         if deploy:
-            self.reparam_conv = nn.Conv2d(
-                in_channels, out_channels, kernel_size=kernel_size,
-                stride=stride, padding=padding, bias=True,
+            self.reparam_3x3 = nn.Conv2d(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=True,
                 padding_mode=padding_mode)
         else:
-            # Identity path: chỉ khi in==out và stride==1
-            if in_channels == out_channels and stride == 1:
-                self.path_identity = build_norm_layer(
-                    norm_cfg, num_features=in_channels)[1]
+            if (out_channels == in_channels) and stride == 1:
+                self.path_residual = build_norm_layer(norm_cfg, num_features=in_channels)[1]
             else:
-                self.path_identity = None
+                self.path_residual = None
 
             self.path_3x3_1 = Block3x3(
-                in_channels=in_channels, out_channels=out_channels,
-                stride=stride, padding=padding, bias=False, norm_cfg=norm_cfg)
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                padding=padding,
+                bias=False,
+                norm_cfg=norm_cfg,
+            )
             self.path_3x3_2 = Block3x3(
-                in_channels=in_channels, out_channels=out_channels,
-                stride=stride, padding=padding, bias=False, norm_cfg=norm_cfg)
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                padding=padding,
+                bias=False,
+                norm_cfg=norm_cfg,
+            )
             self.path_1x1 = Block1x1(
-                in_channels=in_channels, out_channels=out_channels,
-                stride=stride, bias=False, norm_cfg=norm_cfg)
+                in_channels=in_channels,
+                out_channels=out_channels,
+                stride=stride,
+                padding=padding_11,
+                bias=False,
+                norm_cfg=norm_cfg,
+            )
 
-    def forward(self, x: Tensor) -> Tensor:
-        if hasattr(self, 'reparam_conv'):
-            return self.act_fn(self.reparam_conv(x))
+    def forward(self, inputs: Tensor) -> Tensor:
+        if hasattr(self, 'reparam_3x3'):
+            return self.relu(self.reparam_3x3(inputs))
 
-        id_out = self.path_identity(x) if self.path_identity is not None else 0
+        if self.path_residual is None:
+            id_out = 0
+        else:
+            id_out = self.path_residual(inputs)
 
-        return self.act_fn(
-            self.path_3x3_1(x)
-            + self.path_3x3_2(x)
-            + self.path_1x1(x)
+        return self.relu(
+            self.path_3x3_1(inputs)
+            + self.path_3x3_2(inputs)
+            + self.path_1x1(inputs)
             + id_out
         )
 
-    def _fuse_identity_to_kernel_bias(self):
-        """Fuse BN-only identity path thành kernel 3x3 tương đương."""
-        device = next(self.parameters()).device
-        if self.path_identity is None:
-            return (
-                torch.zeros(self.out_channels, self.in_channels, 3, 3, device=device),
-                torch.zeros(self.out_channels, device=device)
-            )
-        bn    = self.path_identity
-        std   = (bn.running_var + bn.eps).sqrt()
-        scale = bn.weight / std
+    def _pad_1x1_to_3x3_tensor(self, kernel1x1):
+        if kernel1x1 is None:
+            return 0
+        return torch.nn.functional.pad(kernel1x1, [1, 1, 1, 1])
 
-        W_id = torch.zeros(self.in_channels, self.in_channels, 3, 3, device=device)
-        for i in range(self.in_channels):
-            W_id[i, i, 1, 1] = scale[i]
+    def _fuse_bn_tensor(self, conv: nn.Module):
+        if conv is None:
+            return 0, 0
+        if isinstance(conv, ConvModule):
+            kernel = conv.conv.weight
+            running_mean = conv.bn.running_mean
+            running_var = conv.bn.running_var
+            gamma = conv.bn.weight
+            beta = conv.bn.bias
+            eps = conv.bn.eps
+        else:
+            running_mean = conv.running_mean
+            running_var = conv.running_var
+            gamma = conv.weight
+            beta = conv.bias
+            eps = conv.eps
+            if not hasattr(self, 'id_tensor'):
+                input_in_channels = self.in_channels
+                kernel_value = np.zeros(
+                    (self.in_channels, input_in_channels, 3, 3),
+                    dtype=np.float32)
+                for i in range(self.in_channels):
+                    kernel_value[i, i % input_in_channels, 1, 1] = 1
+                self.id_tensor = torch.from_numpy(kernel_value).to(conv.weight.device)
+            kernel = self.id_tensor
+        std = (running_var + eps).sqrt()
+        t = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
 
-        b_id = bn.bias - bn.weight * bn.running_mean / std
-        return W_id, b_id
-
-    @torch.no_grad()
-    def switch_to_deploy(self):
-        """
-        Fuse tất cả paths → 1 Conv3x3.
-        torch.einsum xảy ra bên trong switch_to_deploy() của Block3x3/Block1x1.
-        """
-        if hasattr(self, 'reparam_conv'):
-            return
-
-        # Fuse từng path (einsum bên trong)
+    def get_equivalent_kernel_bias(self):
         self.path_3x3_1.switch_to_deploy()
-        W1, b1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
-
+        kernel3x3_1, bias3x3_1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
         self.path_3x3_2.switch_to_deploy()
-        W2, b2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
-
+        kernel3x3_2, bias3x3_2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
         self.path_1x1.switch_to_deploy()
-        W_1x1   = self.path_1x1.conv.weight.data
-        b_1x1   = self.path_1x1.conv.bias.data
-        W_1x1_p = F.pad(W_1x1, [1, 1, 1, 1])   # (out,in,1,1) → (out,in,3,3)
+        kernel1x1, bias1x1 = self.path_1x1.conv.weight.data, self.path_1x1.conv.bias.data
+        kernelid, biasid = self._fuse_bn_tensor(self.path_residual)
 
-        W_id, b_id = self._fuse_identity_to_kernel_bias()
+        kernel = (
+            kernel3x3_1
+            + kernel3x3_2
+            + self._pad_1x1_to_3x3_tensor(kernel1x1)
+            + kernelid
+        )
+        bias = bias3x3_1 + bias3x3_2 + bias1x1 + biasid
+        return kernel, bias
 
-        W_fused = W1 + W2 + W_1x1_p + W_id
-        b_fused = b1 + b2 + b_1x1   + b_id
-
-        device = W_fused.device
-        self.reparam_conv = nn.Conv2d(
-            self.in_channels, self.out_channels,
-            kernel_size=self.kernel_size, stride=self.stride,
-            padding=self.padding, bias=True
-        ).to(device)
-        self.reparam_conv.weight.data = W_fused
-        self.reparam_conv.bias.data   = b_fused
-
+    def switch_to_deploy(self):
+        if hasattr(self, 'reparam_3x3'):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.reparam_3x3 = nn.Conv2d(
+            in_channels=self.in_channels,
+            out_channels=self.out_channels,
+            kernel_size=self.kernel_size,
+            stride=self.stride,
+            padding=self.padding,
+            bias=True)
+        self.reparam_3x3.weight.data = kernel
+        self.reparam_3x3.bias.data = bias
         for p in self.parameters():
             p.detach_()
-        for attr in ['path_3x3_1', 'path_3x3_2', 'path_1x1',
-                     'path_identity', 'id_tensor']:
-            if hasattr(self, attr):
-                self.__delattr__(attr)
+        if hasattr(self, 'path_3x3_1'):
+            self.__delattr__('path_3x3_1')
+        if hasattr(self, 'path_3x3_2'):
+            self.__delattr__('path_3x3_2')
+        if hasattr(self, 'path_1x1'):
+            self.__delattr__('path_1x1')
+        if hasattr(self, 'path_residual'):
+            self.__delattr__('path_residual')
+        if hasattr(self, 'id_tensor'):
+            self.__delattr__('id_tensor')
         self.deploy = True
 
-    def extra_repr(self):
-        if self.deploy:
-            return f"in={self.in_channels}, out={self.out_channels}, [DEPLOY]"
-        has_id = self.path_identity is not None
-        return (f"in={self.in_channels}, out={self.out_channels}, "
-                f"stride={self.stride}, "
-                f"2×Block3x3(double-conv) + Block1x1(double-conv) "
-                f"+ {'identity' if has_id else 'no_identity'}")
 
-
-# =============================================================================
-# DWSA helpers
-# =============================================================================
+# ===========================
+# DWSA + MultiScale
+# ===========================
 
 def _get_valid_groups(channels, desired_groups):
     if desired_groups <= 1:
@@ -360,201 +355,252 @@ def _get_valid_groups(channels, desired_groups):
 
 
 def _partition_windows(x: Tensor, ws: int) -> Tuple[Tensor, Tuple[int, int]]:
+    """
+    Chia feature map thÃ nh cÃ¡c windows khÃ´ng chá»“ng láº·p.
+    Args:
+        x  : (B, C, H, W)
+        ws : window size
+    Returns:
+        windows : (B * nH * nW, C, ws, ws)
+        (nH, nW): sá»‘ windows theo chiá»u H vÃ  W
+    """
     B, C, H, W = x.shape
     nH, nW = H // ws, W // ws
+    # (B, C, nH, ws, nW, ws) â†’ (B, nH, nW, C, ws, ws) â†’ (B*nH*nW, C, ws, ws)
     x = x.view(B, C, nH, ws, nW, ws)
     x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
-    return x.view(B * nH * nW, C, ws, ws), (nH, nW)
+    windows = x.view(B * nH * nW, C, ws, ws)
+    return windows, (nH, nW)
 
 
 def _merge_windows(windows: Tensor, nH: int, nW: int, B: int) -> Tensor:
+    """
+    GhÃ©p windows láº¡i thÃ nh feature map.
+    Args:
+        windows: (B * nH * nW, C, ws, ws)
+    Returns:
+        x      : (B, C, nH*ws, nW*ws)
+    """
     _, C, ws, _ = windows.shape
     x = windows.view(B, nH, nW, C, ws, ws)
     x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
     return x.view(B, C, nH * ws, nW * ws)
 
 
-# =============================================================================
-# DWSABlock — Best-of-Both merge:
-#   ✅ BN (từ file bạn): proven stable, mIoU=0.5415, không NaN
-#   ✅ attn.clamp(-10,10): tránh overflow fp16 → NaN gradient
-#   ✅ o_proj fp32: tránh numerical instability ở fp16
-#   ✅ scalar alpha + clamp(0,1): proven stable (từ file bạn)
-#   ✅ qk_sharing: giữ nguyên (cả hai đều có)
-# =============================================================================
-
 class DWSABlock(nn.Module):
     """
-    Depthwise Separable Attention với Window Attention tùy chọn.
+    Depthwise Separable Attention Block vá»›i há»— trá»£ Window Attention.
 
-    window_size = 0  → Full attention   (stage5 N=256, stage6 N=64)
-    window_size > 0  → Window attention (stage4 N=1024 → OOM nếu full)
+    window_size = 0  â†’ Full attention   â€” dÃ¹ng cho stage5 (N=256), stage6 (N=64)
+    window_size > 0  â†’ Window attention â€” dÃ¹ng cho stage4 (N=1024, quÃ¡ lá»›n cho full)
 
-    Norm: BN thay vì LN — nhất quán với toàn model, fuse-compatible,
-          proven stable trong thực nghiệm (không NaN qua 30 epochs).
-    Alpha: scalar clamp[0,1] — đơn giản, proven stable, không polarity flip.
-    o_proj fp32: tránh numerical instability trong attention computation.
-    clamp(-10,10): tránh overflow trước softmax với fp16 AMP.
+    Táº¡i sao window attention tá»‘t cho stage4:
+    - Stage4 á»Ÿ H/16: cáº§n capture local patterns (edge, texture) khÃ´ng cáº§n global
+    - Global context Ä‘Ã£ Ä‘Æ°á»£c DAPPM xá»­ lÃ½ á»Ÿ stage6
+    - Window size=8 â†’ N=64 per window, memory = 0.25MB thay vÃ¬ 64MB
+    - ÄÃºng inductive bias: local attention early stages, global attention later
+      (giá»‘ng Swin Transformer design principle)
+
+    Norm: BN thay vÃ¬ LN/GN â€” nháº¥t quÃ¡n vá»›i toÃ n model, fuse-compatible.
+    Alpha: clamp [0,1] â€” trÃ¡nh polarity flip vÃ  gradient explosion.
     """
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4,
-                 qk_sharing=True, groups=4, alpha=0.1, window_size=0):
+                 qk_sharing=True, groups=4, alpha=0.1,
+                 window_size: int = 0):
+        """
+        Args:
+            window_size: 0 = full attention, >0 = window attention.
+                         NÃªn lÃ  Æ°á»›c sá»‘ cá»§a H vÃ  W táº¡i resolution Ä‘Ã³.
+                         VÃ­ dá»¥: stage4 á»Ÿ H/16=32px â†’ window_size=8 (4 windows/dim)
+        """
         super().__init__()
         assert channels % reduction == 0
-        self.channels    = channels
-        self.num_heads   = num_heads
+        self.channels = channels
+        self.num_heads = num_heads
         self.window_size = window_size
 
         reduced = channels // reduction
-        mid     = max(reduced // 2, num_heads)
+        mid = max(reduced // 2, num_heads)
         self.reduced = reduced
-        self.mid     = mid
+        self.mid = mid
 
-        # BN: proven stable (file bạn: 0 NaN qua 30 epochs)
-        # nhất quán với backbone BN → fuse-compatible khi deploy
-        self.bn_in  = nn.BatchNorm2d(channels)
-        self.in_proj  = nn.Conv2d(channels, reduced, 1, bias=False)
-        self.out_proj = nn.Conv2d(reduced, channels, 1, bias=False)
+        # BN trÆ°á»›c in_proj
+        self.bn_in = nn.BatchNorm2d(channels)
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
+        # BN sau out_proj
         self.bn_out = nn.BatchNorm2d(channels)
 
         g = _get_valid_groups(reduced, groups)
 
         self.qk_sharing = qk_sharing
         if qk_sharing:
-            self.qk_base = nn.Conv1d(reduced, mid, 1, groups=g, bias=False)
-            self.q_head  = nn.Conv1d(mid, mid, 1, bias=True)
-            self.k_head  = nn.Conv1d(mid, mid, 1, bias=True)
+            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
+            self.q_head  = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+            self.k_head  = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
         else:
-            self.q_proj = nn.Conv1d(reduced, mid, 1, groups=g, bias=True)
-            self.k_proj = nn.Conv1d(reduced, mid, 1, groups=g, bias=True)
+            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
 
-        self.v_proj = nn.Conv1d(reduced, mid, 1, groups=g, bias=True)
-        self.o_proj = nn.Conv1d(mid, reduced, 1, groups=g, bias=True)
+        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
 
         self.drop  = nn.Dropout(drop)
         self.scale = (mid // num_heads) ** -0.5
-
-        # Scalar alpha + clamp(0,1): proven stable (file bạn)
-        # init nhỏ (0.1) → attention bắt đầu conservative, học dần
         self.alpha = nn.Parameter(torch.tensor(alpha))
 
     def _attention(self, x_flat: Tensor) -> Tensor:
         """
-        Core attention. o_proj chạy fp32 để tránh numerical instability.
-        x_flat: (B', reduced, N)
-        returns: (B', reduced, N)
+        Core attention computation.
+        Args:
+            x_flat: (B', reduced, N)  â€” B' = B*nH*nW khi dÃ¹ng window attention
+        Returns:
+            out   : (B', reduced, N)
         """
-        orig_dtype = x_flat.dtype
-        x_fp32    = x_flat.float()   # cast fp32 cho attention computation
-
         if self.qk_sharing:
-            base = self.qk_base(x_fp32)
-            q    = self.q_head(base)
-            k    = self.k_head(base)
+            base = self.qk_base(x_flat)
+            q = self.q_head(base)
+            k = self.k_head(base)
         else:
-            q = self.q_proj(x_fp32)
-            k = self.k_proj(x_fp32)
-        v = self.v_proj(x_fp32)
+            q = self.q_proj(x_flat)
+            k = self.k_proj(x_flat)
+        v = self.v_proj(x_flat)
 
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
             return t.view(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
+            # â†’ (B', heads, N, head_dim)
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)   # ← tránh overflow fp16 → NaN gradient
+        attn = attn.clamp(-10, 10)
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
-        out = torch.matmul(attn, v)
-        out = out.permute(0, 1, 3, 2).contiguous()
+        out = torch.matmul(attn, v)                          # (B', heads, N, hd)
+        out = out.permute(0, 1, 3, 2).contiguous()          # (B', heads, hd, N)
         B_, Hn, Hd, N = out.shape
-        out = out.view(B_, self.mid, N)
-        out = self.o_proj(out)       # fp32
-
-        return out.to(orig_dtype)    # cast về dtype gốc (fp16 nếu AMP)
+        return out.view(B_, self.mid, N)                     # (B', mid, N)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
         identity = x
 
-        # BN normalize → in_proj giảm chiều
+        # Normalize + project xuá»‘ng reduced dim
         x_norm = self.bn_in(x)
         x_red  = self.in_proj(x_norm)   # (B, reduced, H, W)
 
         if self.window_size > 0:
-            ws    = self.window_size
+            # â”€â”€ Window attention (stage4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            ws = self.window_size
+
+            # Pad náº¿u H, W khÃ´ng chia háº¿t cho ws
             pad_h = (ws - H % ws) % ws
             pad_w = (ws - W % ws) % ws
             if pad_h > 0 or pad_w > 0:
                 x_red = F.pad(x_red, (0, pad_w, 0, pad_h))
+            Hp, Wp = x_red.shape[2], x_red.shape[3]
+
+            # Partition â†’ (B*nH*nW, reduced, ws, ws)
             windows, (nH, nW) = _partition_windows(x_red, ws)
-            Bw, C2, _, _      = windows.shape
-            out_flat = self._attention(windows.view(Bw, C2, ws * ws))
-            out_red  = _merge_windows(out_flat.view(Bw, C2, ws, ws), nH, nW, B)
+            Bw, C2, _, _ = windows.shape
+            x_flat = windows.view(Bw, C2, ws * ws)  # (B*nH*nW, reduced, wsÂ²)
+
+            # Attention trong tá»«ng window Ä‘á»™c láº­p
+            out_flat = self._attention(x_flat)       # (B*nH*nW, mid, wsÂ²)
+
+            # Project back
+            out_flat = self.o_proj(out_flat)         # (B*nH*nW, reduced, wsÂ²)
+            out_win  = out_flat.view(Bw, C2, ws, ws)
+
+            # Merge windows â†’ (B, reduced, Hp, Wp)
+            out_red = _merge_windows(out_win, nH, nW, B)
+
+            # Crop padding náº¿u cÃ³
             if pad_h > 0 or pad_w > 0:
                 out_red = out_red[:, :, :H, :W]
+
         else:
-            N        = H * W
-            out_flat = self._attention(x_red.view(B, self.reduced, N))
+            # â”€â”€ Full attention (stage5, stage6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            N = H * W
+            x_flat   = x_red.view(B, self.reduced, N)
+            out_flat = self._attention(x_flat)       # (B, mid, N)
+            out_flat = self.o_proj(out_flat)         # (B, reduced, N)
             out_red  = out_flat.view(B, self.reduced, H, W)
 
-        # out_proj + BN
-        out = self.bn_out(self.out_proj(out_red))   # (B, C, H, W)
+        # Project back lÃªn channels + BN
+        out = self.bn_out(self.out_proj(out_red))    # (B, C, H, W)
 
-        # Scalar alpha clamp(0,1): proven stable, không polarity flip
         alpha = self.alpha.clamp(0.0, 1.0)
         return identity + alpha * out
 
 
-# =============================================================================
-# MultiScaleContextModule — Fixes từ Bước 2:
-#   - alpha init pre-sigmoid (sigmoid(-2.2) ≈ 0.1)
-#   - sigmoid bound: alpha ∈ (0,1)
-# =============================================================================
-
 class MultiScaleContextModule(nn.Module):
+    """
+    Lightweight multi-scale context sau DAPPM.
+    branch_ratio cao (16) Ä‘á»ƒ output channels ráº¥t nhá» â€” chá»‰ tinh chá»‰nh,
+    khÃ´ng compete vá»›i DAPPM.
+    """
     def __init__(self, in_channels, out_channels, scales=(1, 2),
                  branch_ratio=16, alpha=0.1):
         super().__init__()
-        self.scales      = scales
-        self.in_channels  = in_channels
+        self.scales = scales
+        self.in_channels = in_channels
         self.out_channels = out_channels
 
-        total = max(in_channels // branch_ratio, len(scales))
-        base  = total // len(scales)
-        extra = total % len(scales)
-        per   = [max(base + (1 if i < extra else 0), 1) for i in range(len(scales))]
-        fused = sum(per)
+        total_branch_channels = max(in_channels // branch_ratio, len(scales))
+        base = total_branch_channels // len(scales)
+        extra = total_branch_channels % len(scales)
+
+        per_branch_list = []
+        for i in range(len(scales)):
+            c = base + (1 if i < extra else 0)
+            per_branch_list.append(max(c, 1))
+        fused_channels = sum(per_branch_list)
 
         self.scale_branches = nn.ModuleList()
-        for s, c in zip(scales, per):
+        for s, c_out in zip(scales, per_branch_list):
             if s == 1:
-                self.scale_branches.append(nn.Sequential(
-                    nn.Conv2d(in_channels, c, 1, bias=False),
-                    nn.BatchNorm2d(c), nn.ReLU(inplace=True)))
+                self.scale_branches.append(
+                    nn.Sequential(
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
+                        nn.BatchNorm2d(c_out),
+                        nn.ReLU(inplace=True),
+                    )
+                )
             else:
-                self.scale_branches.append(nn.Sequential(
-                    nn.AvgPool2d(s, stride=s),
-                    nn.Conv2d(in_channels, c, 1, bias=False),
-                    nn.BatchNorm2d(c), nn.ReLU(inplace=True)))
+                self.scale_branches.append(
+                    nn.Sequential(
+                        nn.AvgPool2d(kernel_size=s, stride=s),
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
+                        nn.BatchNorm2d(c_out),
+                        nn.ReLU(inplace=True),
+                    )
+                )
 
         self.fusion = nn.Sequential(
-            nn.Conv2d(fused, fused, 3, padding=1, groups=fused, bias=False),
-            nn.BatchNorm2d(fused), nn.ReLU(inplace=True),
-            nn.Conv2d(fused, out_channels, 1, bias=False),
-            nn.BatchNorm2d(out_channels))
+            nn.Conv2d(
+                fused_channels, fused_channels,
+                kernel_size=3, padding=1,
+                groups=fused_channels, bias=False,
+            ),
+            nn.BatchNorm2d(fused_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
 
-        # FIX: pre-sigmoid init, sigmoid(-2.2) ≈ 0.1
-        alpha_init = math.log(alpha / (1.0 - alpha))
-        self.alpha = nn.Parameter(torch.full((out_channels,), alpha_init))
+        self.alpha = nn.Parameter(torch.tensor(alpha))
 
-        self.proj = (
-            nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, bias=False),
-                nn.BatchNorm2d(out_channels))
-            if in_channels != out_channels else None)
+        if in_channels != out_channels:
+            self.proj = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.proj = None
 
     def forward(self, x):
         B, C, H, W = x.shape
@@ -562,143 +608,176 @@ class MultiScaleContextModule(nn.Module):
         for s, branch in zip(self.scales, self.scale_branches):
             o = branch(x)
             if o.shape[-2:] != (H, W):
-                o = F.interpolate(o, (H, W), mode='bilinear', align_corners=False)
+                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=False)
             outs.append(o)
-        fused  = torch.cat(outs, dim=1)
-        out    = self.fusion(fused)
+
+        fused = torch.cat(outs, dim=1)
+        out = self.fusion(fused)
+
         x_proj = self.proj(x) if self.proj is not None else x
-        alpha  = torch.sigmoid(self.alpha).view(1, -1, 1, 1)
+        alpha = self.alpha.clamp(0.0, 1.0)
         return x_proj + alpha * out
 
 
-# =============================================================================
-# GCNetCore — giữ nguyên từ file cũ
-# GCBlock bên trong tự động dùng architecture mới
-# =============================================================================
+# ===========================
+# GCNetCore â€” FIXED:
+#   - KHÃ”NG tÃ­nh SPP á»Ÿ Ä‘Ã¢y ná»¯a, tráº£ vá» s6 raw
+#   - c4 dÃ¹ng clone() trÃ¡nh gradient corruption
+#   - Giá»¯ nguyÃªn switch_to_deploy() tá»« gá»‘c
+# ===========================
 
 class GCNetCore(BaseModule):
     def __init__(self,
-                 in_channels=3, channels=32, ppm_channels=128,
-                 num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
-                 align_corners=False,
-                 norm_cfg=dict(type='BN', requires_grad=True),
-                 act_cfg=dict(type='ReLU', inplace=True),
-                 init_cfg=None, deploy=False):
+                 in_channels: int = 3,
+                 channels: int = 32,
+                 ppm_channels: int = 128,
+                 num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
+                 align_corners: bool = False,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 init_cfg: OptConfigType = None,
+                 deploy: bool = False):
         super().__init__(init_cfg)
-        self.in_channels   = in_channels
-        self.channels      = channels
-        self.ppm_channels  = ppm_channels
-        self.align_corners = align_corners
-        self.norm_cfg      = norm_cfg
-        self.act_cfg       = act_cfg
-        self.deploy        = deploy
-        C = channels
 
-        # ── Stem ─────────────────────────────────────────────────────────────
+        self.in_channels = in_channels
+        self.channels = channels
+        self.ppm_channels = ppm_channels
+        self.num_blocks_per_stage = num_blocks_per_stage
+        self.align_corners = align_corners
+        self.norm_cfg = norm_cfg
+        self.act_cfg = act_cfg
+        self.deploy = deploy
+
         self.stem = nn.Sequential(
-            ConvModule(in_channels, C, 3, stride=2, padding=1,
-                       norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C, C, 3, stride=2, padding=1,
-                       norm_cfg=norm_cfg, act_cfg=act_cfg),
-            *[GCBlock(C, C, stride=1, norm_cfg=norm_cfg,
-                      act_cfg=act_cfg, deploy=deploy)
-              for _ in range(num_blocks_per_stage[0])],
-            GCBlock(C, C*2, stride=2, norm_cfg=norm_cfg,
-                    act_cfg=act_cfg, deploy=deploy),
-            *[GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
-                      act_cfg=act_cfg, deploy=deploy)
-              for _ in range(num_blocks_per_stage[1] - 1)],
+            ConvModule(
+                in_channels=in_channels,
+                out_channels=channels,
+                kernel_size=3, stride=2, padding=1,
+                norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(
+                in_channels=channels,
+                out_channels=channels,
+                kernel_size=3, stride=2, padding=1,
+                norm_cfg=norm_cfg, act_cfg=act_cfg),
+            *[GCBlock(
+                in_channels=channels, out_channels=channels, stride=1,
+                norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy
+            ) for _ in range(num_blocks_per_stage[0])],
+            GCBlock(
+                in_channels=channels, out_channels=channels * 2, stride=2,
+                norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+            *[GCBlock(
+                in_channels=channels * 2, out_channels=channels * 2, stride=1,
+                norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy
+            ) for _ in range(num_blocks_per_stage[1] - 1)],
         )
         self.relu = build_activation_layer(act_cfg)
 
-        # ── Semantic Branch ───────────────────────────────────────────────────
-        self.semantic_branch_layers = nn.ModuleList([
+        self.semantic_branch_layers = nn.ModuleList()
+        self.semantic_branch_layers.append(
             nn.Sequential(
-                GCBlock(C*2, C*4, stride=2, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, deploy=deploy),
-                *[GCBlock(C*4, C*4, stride=1, norm_cfg=norm_cfg,
-                          act_cfg=act_cfg, deploy=deploy)
+                GCBlock(channels * 2, channels * 4, stride=2,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+                *[GCBlock(channels * 4, channels * 4, stride=1,
+                          norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[2][0] - 2)],
-                GCBlock(C*4, C*4, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, act=False, deploy=deploy),
-            ),
+                GCBlock(channels * 4, channels * 4, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+            )
+        )
+        self.semantic_branch_layers.append(
             nn.Sequential(
-                GCBlock(C*4, C*8, stride=2, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, deploy=deploy),
-                *[GCBlock(C*8, C*8, stride=1, norm_cfg=norm_cfg,
-                          act_cfg=act_cfg, deploy=deploy)
+                GCBlock(channels * 4, channels * 8, stride=2,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+                *[GCBlock(channels * 8, channels * 8, stride=1,
+                          norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[3][0] - 2)],
-                GCBlock(C*8, C*8, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, act=False, deploy=deploy),
-            ),
+                GCBlock(channels * 8, channels * 8, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+            )
+        )
+        self.semantic_branch_layers.append(
             nn.Sequential(
-                GCBlock(C*8, C*16, stride=2, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, deploy=deploy),
-                *[GCBlock(C*16, C*16, stride=1, norm_cfg=norm_cfg,
-                          act_cfg=act_cfg, deploy=deploy)
+                GCBlock(channels * 8, channels * 16, stride=2,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+                *[GCBlock(channels * 16, channels * 16, stride=1,
+                          norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[4][0] - 2)],
-                GCBlock(C*16, C*16, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, act=False, deploy=deploy),
-            ),
-        ])
+                GCBlock(channels * 16, channels * 16, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+            )
+        )
 
-        # ── Detail Branch ─────────────────────────────────────────────────────
-        self.detail_branch_layers = nn.ModuleList([
+        self.detail_branch_layers = nn.ModuleList()
+        self.detail_branch_layers.append(
             nn.Sequential(
-                *[GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
-                          act_cfg=act_cfg, deploy=deploy)
+                *[GCBlock(channels * 2, channels * 2, stride=1,
+                          norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[2][1] - 1)],
-                GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, act=False, deploy=deploy),
-            ),
+                GCBlock(channels * 2, channels * 2, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+            )
+        )
+        self.detail_branch_layers.append(
             nn.Sequential(
-                *[GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
-                          act_cfg=act_cfg, deploy=deploy)
+                *[GCBlock(channels * 2, channels * 2, stride=1,
+                          norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[3][1] - 1)],
-                GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, act=False, deploy=deploy),
-            ),
+                GCBlock(channels * 2, channels * 2, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+            )
+        )
+        self.detail_branch_layers.append(
             nn.Sequential(
-                GCBlock(C*2, C*4, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, deploy=deploy),
-                *[GCBlock(C*4, C*4, stride=1, norm_cfg=norm_cfg,
-                          act_cfg=act_cfg, deploy=deploy)
+                GCBlock(channels * 2, channels * 4, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+                *[GCBlock(channels * 4, channels * 4, stride=1,
+                          norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
                   for _ in range(num_blocks_per_stage[4][1] - 2)],
-                GCBlock(C*4, C*4, stride=1, norm_cfg=norm_cfg,
-                        act_cfg=act_cfg, act=False, deploy=deploy),
-            ),
-        ])
+                GCBlock(channels * 4, channels * 4, stride=1,
+                        norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+            )
+        )
 
-        # ── Bilateral Fusion ──────────────────────────────────────────────────
-        self.compression_1 = ConvModule(C*4, C*2, 1, norm_cfg=norm_cfg, act_cfg=None)
-        self.down_1        = ConvModule(C*2, C*4, 3, stride=2, padding=1,
-                                         norm_cfg=norm_cfg, act_cfg=None)
-        self.compression_2 = ConvModule(C*8, C*2, 1, norm_cfg=norm_cfg, act_cfg=None)
-        self.down_2        = nn.Sequential(
-            ConvModule(C*2, C*4, 3, stride=2, padding=1,
-                       norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C*4, C*8, 3, stride=2, padding=1,
-                       norm_cfg=norm_cfg, act_cfg=None))
+        self.compression_1 = ConvModule(
+            channels * 4, channels * 2, kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=None)
+        self.down_1 = ConvModule(
+            channels * 2, channels * 4, kernel_size=3,
+            stride=2, padding=1, norm_cfg=norm_cfg, act_cfg=None)
+        self.compression_2 = ConvModule(
+            channels * 8, channels * 2, kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=None)
+        self.down_2 = nn.Sequential(
+            ConvModule(
+                channels * 2, channels * 4,
+                kernel_size=3, stride=2, padding=1,
+                norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(
+                channels * 4, channels * 8,
+                kernel_size=3, stride=2, padding=1,
+                norm_cfg=norm_cfg, act_cfg=None))
 
-        # ── DAPPM ─────────────────────────────────────────────────────────────
-        # kernel_sizes=[5,9,17,33], strides=[2,4,8,16]:
-        #   Receptive field lớn hơn nhiều so với [3,5,7,9]
-        #   Phù hợp foggy images: fog tạo long-range dependency
-        #   (xe ở xa bị ảnh hưởng bởi fog density của toàn scene)
-        # paddings = kernel_size // 2 để giữ nguyên spatial size sau pool
-        # ⚠️  Shape thay đổi → không load được pretrain weights của spp
+        # SPP váº«n náº±m trong GCNetCore Ä‘á»ƒ load weight tá»« pretrained gá»‘c
+        # nhÆ°ng KHÃ”NG Ä‘Æ°á»£c gá»i trong forward() ná»¯a
+        # GCNetWithEnhance sáº½ gá»i self.backbone.spp() má»™t láº§n duy nháº¥t
         self.spp = DAPPM(
-            in_channels=C*16, branch_channels=ppm_channels,
-            out_channels=C*4, num_scales=5,
-            kernel_sizes=[5, 9, 17, 33], strides=[2, 4, 8, 16],
-            paddings=[2, 4, 8, 16], norm_cfg=norm_cfg, act_cfg=act_cfg)
+            in_channels=channels * 16,
+            branch_channels=ppm_channels,
+            out_channels=channels * 4,
+            num_scales=5,
+            kernel_sizes=[5, 9, 17, 33],
+            strides=[2, 4, 8, 16],
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
 
         self.kaiming_init()
 
     def kaiming_init(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
@@ -706,208 +785,326 @@ class GCNetCore(BaseModule):
                 nn.init.constant_(m.bias, 0)
 
     def forward_stem(self, x: Tensor):
+        """Stem: tráº£ vá» (feat, c1, c2, out_size) Ä‘á»ƒ GCNetWithEnhance inject DWSA giá»¯a stages."""
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
         c1 = c2 = None
         feat = x
         for i, layer in enumerate(self.stem):
             feat = layer(feat)
-            if i == 0: c1 = feat
-            if i == 1: c2 = feat
+            if i == 0: c1 = feat   # H/2, C
+            if i == 1: c2 = feat   # H/4, C
         return feat, c1, c2, out_size
 
     def forward_stage4(self, x: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
         """
         Stage 4 bilateral fusion.
-        Out: x_s4 (H/16,C*4) → [DWSA4] → stage5 semantic tốt hơn
-             x_d4 (H/8, C*2) → cascade detail
+        In:  x    â€” H/4, C*2
+        Out: x_s4 â€” H/16, C*4  (semantic raw â†’ nÆ¡i inject DWSA4)
+             x_d4 â€” H/8,  C*2  (detail, Ä‘Ã£ fused)
+
+        Náº¿u DWSA4 Ä‘Æ°á»£c apply trÃªn x_s4 trÆ°á»›c khi gá»i forward_stage5,
+        thÃ¬ compression_2(x_s5) vÃ  down_2 á»Ÿ stage5 sáº½ nháº­n Ä‘Æ°á»£c
+        semantic context tá»‘t hÆ¡n â†’ x_d5 tá»‘t hÆ¡n â†’ x_s6 tá»‘t hÆ¡n â†’ SPP tá»‘t hÆ¡n.
         """
         x_s4 = self.semantic_branch_layers[0](x)
         x_d4 = self.detail_branch_layers[0](x)
-        comp = self.compression_1(self.relu(x_s4))
+        comp_c4 = self.compression_1(self.relu(x_s4))
         x_s4 = x_s4 + self.down_1(self.relu(x_d4))
-        x_d4 = x_d4 + resize(comp, size=out_size, mode='bilinear',
-                              align_corners=self.align_corners)
+        x_d4 = x_d4 + resize(
+            comp_c4, size=out_size, mode='bilinear', align_corners=self.align_corners)
         return x_s4, x_d4
 
-    def forward_stage5(self, x_s4: Tensor, x_d4: Tensor,
-                       out_size: Tuple) -> Tuple[Tensor, Tensor]:
+    def forward_stage5(self, x_s4: Tensor, x_d4: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
         """
         Stage 5 bilateral fusion.
-        In:  x_s4 đã qua DWSA4 → semantic context tốt hơn
-        Out: x_s5 (H/32,C*8) → [DWSA5]
-             x_d5 (H/8, C*2)
+        In:  x_s4 â€” H/16, C*4  (Ä‘Ã£ qua DWSA4 náº¿u cÃ³)
+             x_d4 â€” H/8,  C*2
+        Out: x_s5 â€” H/32, C*8  (semantic raw â†’ nÆ¡i inject DWSA5)
+             x_d5 â€” H/8,  C*2  (detail, Ä‘Ã£ fused)
+
+        Cascade tÃ¡c dá»¥ng cá»§a DWSA4:
+        DWSA4(x_s4) â†’ x_s5 cháº¥t lÆ°á»£ng cao hÆ¡n â†’ compression_2 tá»‘t hÆ¡n â†’ x_d5 tá»‘t hÆ¡n.
         """
         x_s5 = self.semantic_branch_layers[1](self.relu(x_s4))
         x_d5 = self.detail_branch_layers[1](self.relu(x_d4))
-        comp = self.compression_2(self.relu(x_s5))
+        comp_c5 = self.compression_2(self.relu(x_s5))
         x_s5 = x_s5 + self.down_2(self.relu(x_d5))
-        x_d5 = x_d5 + resize(comp, size=out_size, mode='bilinear',
-                              align_corners=self.align_corners)
+        x_d5 = x_d5 + resize(
+            comp_c5, size=out_size, mode='bilinear', align_corners=self.align_corners)
         return x_s5, x_d5
 
-    def forward_stage6(self, x_s5: Tensor,
-                       x_d5: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward_stage6(self, x_s5: Tensor, x_d5: Tensor) -> Tuple[Tensor, Tensor]:
         """
         Stage 6.
-        In:  x_s5 đã qua DWSA5
-        Out: x_s6 (H/64,C*16) → [DWSA6] → SPP
-             x_d6 (H/8, C*4)  → add với x_spp → c5
+        In:  x_s5 â€” H/32, C*8  (Ä‘Ã£ qua DWSA5 náº¿u cÃ³)
+             x_d5 â€” H/8,  C*2
+        Out: x_s6 â€” H/64, C*16 (semantic raw â†’ nÆ¡i inject DWSA6 â†’ SPP)
+             x_d6 â€” H/8,  C*4  (detail branch final)
+
+        Cascade tÃ¡c dá»¥ng cá»§a DWSA5:
+        DWSA5(x_s5) â†’ x_s6 cháº¥t lÆ°á»£ng cao hÆ¡n â†’ DWSA6(x_s6) â†’ SPP tá»‘t hÆ¡n â†’ c5 tá»‘t hÆ¡n.
         """
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
         return x_s6, x_d6
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        """
+        Standard forward â€” dÃ¹ng khi standalone (khÃ´ng cÃ³ GCNetWithEnhance bá»c ngoÃ i).
+        DWSA vÃ  SPP khÃ´ng Ä‘Æ°á»£c apply á»Ÿ Ä‘Ã¢y.
+        """
         feat, c1, c2, out_size = self.forward_stem(x)
         x_s4, x_d4 = self.forward_stage4(feat, out_size)
-        c4          = x_d4.clone()
+        c4 = x_d4.clone()  # clone trÆ°á»›c khi x_d4 tiáº¿p tá»¥c bá»‹ dÃ¹ng á»Ÿ stage5
         x_s5, x_d5 = self.forward_stage5(x_s4, x_d4, out_size)
         x_s6, x_d6 = self.forward_stage6(x_s5, x_d5)
-        return dict(c1=c1, c2=c2, c4=c4,
-                    x_s4=x_s4, x_s5=x_s5, x_s6=x_s6, x_d6=x_d6)
+        return dict(
+            c1=c1, c2=c2, c4=c4,
+            x_s4=x_s4, x_s5=x_s5, x_s6=x_s6,
+            x_d6=x_d6,
+        )
 
     def switch_to_deploy(self):
-        count = 0
+        """Fuse táº¥t cáº£ GCBlock vá» single conv â€” giá»‘ng model gá»‘c."""
         for m in self.modules():
             if isinstance(m, GCBlock):
                 m.switch_to_deploy()
-                count += 1
         self.deploy = True
-        print(f"Fused {count} GCBlock → single Conv3x3 (torch.einsum)")
 
 
-# =============================================================================
-# GCNetWithEnhance — Best-of-Both backbone
-#   ✅ BN DWSABlock (proven stable, mIoU=0.5415)
-#   ✅ DAPPM kernels [5,9,17,33] (large receptive field)
-#   ✅ Simple add c5 = x_d6 + x_spp (no GatedFusion)
-#   ✅ Cascade DWSA: Stage4→Stage5→Stage6→SPP
-# =============================================================================
+# ===========================
+# GCNetWithEnhance â€” FIXED:
+#   - SPP chá»‰ tÃ­nh Má»˜T Láº¦N, sau DWSA6
+#   - switch_to_deploy() hoÃ n chá»‰nh cho cáº£ DWSA + GCNetCore
+#   - DWSA Ä‘Æ°á»£c bypass khi deploy (khÃ´ng cÃ³ tÃ¡c dá»¥ng trong inference
+#     vÃ¬ alpha Ä‘Ã£ learned, cÃ³ thá»ƒ fold vÃ o final_proj)
+# ===========================
 
 class GCNetWithEnhance(BaseModule):
     """
     Enhanced GCNet backbone.
 
-    Output: {c1, c2, c4, c5}
-      c1: H/2,  C    = 32  — decoder skip (stem layer 0)
-      c2: H/4,  C    = 32  — decoder skip (stem layer 1)
-      c4: H/8,  C*2  = 64  — detail branch stage4 → aux head + decoder stage0 skip
-      c5: H/8,  C*4  = 128 — fused detail+semantic → main decoder input
+    Flow:
+        x â†’ GCNetCore â†’ {c1, c2, c4, s4, s5, s6, x_d6}
+                              â†“       â†“    â†“    â†“
+                           DWSA4  DWSA5 DWSA6   |
+                                              SPP (má»™t láº§n duy nháº¥t)
+                              â†“
+                         MultiScaleContext (optional, lightweight)
+                              â†“
+                         final_proj
+                              â†“
+                        c5 = x_d6 + x_spp
 
-    Cascade DWSA injection:
-      Stem → Stage4 → [DWSA4] → Stage5 → [DWSA5] → Stage6 → [DWSA6] → SPP
-               ↑                    ↑                   ↑
-         x_s4 enhanced        x_s5 enhanced        x_s6 enhanced
-         → stage5 tốt hơn     → stage6 tốt hơn     → SPP tốt hơn
+    Output dict: {c1, c2, c4, c5}
     """
+
     def __init__(self,
-                 in_channels=3, channels=32, ppm_channels=128,
-                 num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
-                 dwsa_stages=('stage4', 'stage5', 'stage6'),
-                 dwsa_num_heads=4, dwsa_reduction=4,
-                 dwsa_qk_sharing=True, dwsa_groups=4,
-                 dwsa_drop=0.1, dwsa_alpha=0.1,   # 0.1 proven (file bạn)
-                 dwsa4_window_size=8,
-                 use_multi_scale_context=True,
-                 ms_scales=(1, 2), ms_branch_ratio=16, ms_alpha=0.1,
-                 align_corners=False,
-                 norm_cfg=dict(type='BN', requires_grad=True),
-                 act_cfg=dict(type='ReLU', inplace=True),
-                 init_cfg=None, deploy=False):
+                 in_channels: int = 3,
+                 channels: int = 32,
+                 ppm_channels: int = 128,
+                 num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
+                 dwsa_stages: List[str] = ('stage4', 'stage5', 'stage6'),
+                 dwsa_num_heads: int = 4,
+                 dwsa_reduction: int = 4,
+                 dwsa_qk_sharing: bool = True,
+                 dwsa_groups: int = 4,
+                 dwsa_drop: float = 0.1,
+                 dwsa_alpha: float = 0.1,
+                 # stage4 dÃ¹ng window attention Ä‘á»ƒ trÃ¡nh OOM (H/16 â†’ N=1024)
+                 # window_size=8 â†’ N=64 per window, memory ~0.25MB vs 64MB full
+                 dwsa4_window_size: int = 8,
+                 use_multi_scale_context: bool = True,
+                 ms_scales: Tuple[int, ...] = (1, 2),
+                 ms_branch_ratio: int = 16,
+                 ms_alpha: float = 0.1,
+                 align_corners: bool = False,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 init_cfg: OptConfigType = None,
+                 deploy: bool = False):
         super().__init__(init_cfg)
 
         self.align_corners = align_corners
-        self.channels      = channels
-        self.deploy        = deploy
+        self.channels = channels
+        self.deploy = deploy
+        self.dwsa4_window_size = dwsa4_window_size
 
-        valid = {'stage4', 'stage5', 'stage6'}
-        bad   = set(dwsa_stages) - valid
-        if bad:
-            raise ValueError(f"Invalid dwsa_stages: {bad}")
+        valid_stages = {'stage4', 'stage5', 'stage6'}
+        invalid = set(dwsa_stages) - valid_stages
+        if invalid:
+            raise ValueError(f"Invalid dwsa_stages: {invalid}. Valid: {valid_stages}")
 
         self.backbone = GCNetCore(
-            in_channels=in_channels, channels=channels,
+            in_channels=in_channels,
+            channels=channels,
             ppm_channels=ppm_channels,
             num_blocks_per_stage=num_blocks_per_stage,
             align_corners=align_corners,
-            norm_cfg=norm_cfg, act_cfg=act_cfg,
-            init_cfg=None, deploy=deploy)
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+            init_cfg=None,
+            deploy=deploy,
+        )
 
         C = channels
-        self.dwsa4 = self.dwsa5 = self.dwsa6 = None
+        self.dwsa4 = None
+        self.dwsa5 = None
+        self.dwsa6 = None
 
         for stage in dwsa_stages:
-            kw = dict(num_heads=dwsa_num_heads, reduction=dwsa_reduction,
-                      qk_sharing=dwsa_qk_sharing, groups=dwsa_groups,
-                      drop=dwsa_drop, alpha=dwsa_alpha)
             if stage == 'stage4':
-                self.dwsa4 = DWSABlock(C*4,  window_size=dwsa4_window_size, **kw)
+                self.dwsa4 = DWSABlock(
+                    C * 4,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                    alpha=dwsa_alpha,
+                    window_size=dwsa4_window_size,  # window attention â€” trÃ¡nh OOM
+                )
             elif stage == 'stage5':
-                self.dwsa5 = DWSABlock(C*8,  window_size=0, **kw)
+                self.dwsa5 = DWSABlock(
+                    C * 8,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                    alpha=dwsa_alpha,
+                    window_size=0,  # full attention â€” N=256, safe
+                )
             elif stage == 'stage6':
-                self.dwsa6 = DWSABlock(C*16, window_size=0, **kw)
+                self.dwsa6 = DWSABlock(
+                    C * 16,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                    alpha=dwsa_alpha,
+                    window_size=0,  # full attention â€” N=64, trivial
+                )
 
-        self.ms_context = (
-            MultiScaleContextModule(C*4, C*4, scales=ms_scales,
-                                    branch_ratio=ms_branch_ratio, alpha=ms_alpha)
-            if use_multi_scale_context else None)
+        if use_multi_scale_context:
+            self.ms_context = MultiScaleContextModule(
+                C * 4, C * 4,
+                scales=ms_scales,
+                branch_ratio=ms_branch_ratio,
+                alpha=ms_alpha,
+            )
+        else:
+            self.ms_context = None
 
-        self.final_proj = ConvModule(C*4, C*4, 1,
-                                     norm_cfg=norm_cfg, act_cfg=act_cfg)
+        self.final_proj = ConvModule(
+            in_channels=C * 4,
+            out_channels=C * 4,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg,
+        )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
+        """
+        Cascade DWSA injection Ä‘Ãºng thá»© tá»± â€” s4, s5, s6 bá»• trá»£ nhau qua bilateral fusion:
+
+        Stem â†’ Stage4 â†’ [DWSA4] â†’ Stage5 â†’ [DWSA5] â†’ Stage6 â†’ [DWSA6] â†’ SPP
+                  â†‘                    â†‘                   â†‘
+            x_s4 enhanced         x_s5 enhanced        x_s6 enhanced
+            áº£nh hÆ°á»Ÿng x_d5        áº£nh hÆ°á»Ÿng x_d5        Ä‘Æ°a vÃ o SPP
+            qua compression_2     qua detail_branch      tá»‘t hÆ¡n
+            vÃ  down_2
+
+        Tá»©c lÃ  DWSA4 â†’ cáº£i thiá»‡n input cho stage5 â†’ cáº£i thiá»‡n x_s5
+             â†’ DWSA5 â†’ cáº£i thiá»‡n input cho stage6 â†’ cáº£i thiá»‡n x_s6
+             â†’ DWSA6 â†’ cáº£i thiá»‡n input cho SPP â†’ cáº£i thiá»‡n c5
+        """
         bb = self.backbone
         feat, c1, c2, out_size = bb.forward_stem(x)
 
+        # â”€â”€ Stage 4 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         x_s4, x_d4 = bb.forward_stage4(feat, out_size)
-        c4 = x_d4.clone()
+        c4 = x_d4.clone()   # aux head input trÆ°á»›c khi x_d4 bá»‹ stage5 dÃ¹ng tiáº¿p
+
+        # DWSA4: enhance x_s4 â†’ stage5 nháº­n semantic context tá»‘t hÆ¡n
+        # â†’ compression_2(x_s5) vÃ  down_2(x_d5) cháº¥t lÆ°á»£ng cao hÆ¡n
         if self.dwsa4 is not None:
             x_s4 = self.dwsa4(x_s4)
 
+        # â”€â”€ Stage 5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         x_s5, x_d5 = bb.forward_stage5(x_s4, x_d4, out_size)
+
+        # DWSA5: enhance x_s5 â†’ stage6 nháº­n semantic context tá»‘t hÆ¡n
+        # â†’ x_s6 cháº¥t lÆ°á»£ng cao hÆ¡n â†’ SPP thu Ä‘Æ°á»£c global context tá»‘t hÆ¡n
         if self.dwsa5 is not None:
             x_s5 = self.dwsa5(x_s5)
 
+        # â”€â”€ Stage 6 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         x_s6, x_d6 = bb.forward_stage6(x_s5, x_d5)
+
+        # DWSA6: enhance x_s6 ngay trÆ°á»›c SPP â€” spatial self-attention
+        # á»Ÿ resolution tháº¥p nháº¥t (H/64) Ä‘á»ƒ global context coherent hÆ¡n
         if self.dwsa6 is not None:
             x_s6 = self.dwsa6(x_s6)
 
+        # â”€â”€ SPP (má»™t láº§n duy nháº¥t, trÃªn x_s6 Ä‘Ã£ enhanced) â”€â”€â”€â”€â”€â”€â”€
         x_spp = bb.spp(x_s6)
-        x_spp = resize(x_spp, size=out_size, mode='bilinear',
-                       align_corners=self.align_corners)
+        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
+
+        # Lightweight multi-scale refinement sau SPP
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
+
         x_spp = self.final_proj(x_spp)
 
+        # Merge detail + semantic
         c5 = x_d6 + x_spp
 
-        return dict(c1=c1, c2=c2, c4=c4, c5=c5)
+        return dict(
+            c1=c1,   # H/2, C   = 32  â€” decoder skip (stem layer 0)
+            c2=c2,   # H/4, C   = 32  â€” decoder skip (stem layer 1)
+            c4=c4,   # H/8, C*2 = 64  â€” detail branch: aux head + decoder skip stage0
+            c5=c5,   # H/8, C*4 = 128 â€” fused output: main decoder input
+        )
 
     def switch_to_deploy(self):
+        """
+        Deploy mode:
+        1. Fuse táº¥t cáº£ GCBlock (path_3x3_1 + path_3x3_2 + path_1x1 â†’ single conv)
+        2. Fuse BN trong DAPPM/MultiScaleContext náº¿u cÃ³ thá»ƒ
+        3. DWSA giá»¯ nguyÃªn (khÃ´ng thá»ƒ fuse attention)
+
+        Káº¿t quáº£: params giáº£m ~2/3 sá»‘ GCBlock params, inference nhanh hÆ¡n.
+        """
+        # Fuse GCNetCore
         self.backbone.switch_to_deploy()
+
+        # Mark deploy
         self.deploy = True
-        print("Switched to deploy mode:")
-        print("  GCBlock: 2×Block3x3(double) + Block1x1(double) → 1 Conv3x3")
-        print("  Deploy: torch.einsum (chính xác)")
-        print("  DWSA: kept as-is")
+
+        print("âœ… Switched to deploy mode:")
+        print(f"   GCBlock: all paths fused â†’ single 3x3 conv")
+        print(f"   DWSA: kept as-is (attention khÃ´ng fuse Ä‘Æ°á»£c)")
+        print(f"   SPP: kept as-is")
 
     @torch.no_grad()
     def count_params(self):
-        total   = sum(p.numel() for p in self.parameters())
-        spp_set = set(self.backbone.spp.parameters())
-        bb_core = sum(p.numel() for p in self.backbone.parameters()
-                      if p not in spp_set)
-        spp     = sum(p.numel() for p in self.backbone.spp.parameters())
-        dwsa    = sum(p.numel() for m in [self.dwsa4, self.dwsa5, self.dwsa6]
-                      if m is not None for p in m.parameters())
-        ms      = (sum(p.numel() for p in self.ms_context.parameters())
-                   if self.ms_context else 0)
-        proj    = sum(p.numel() for p in self.final_proj.parameters())
+        total = sum(p.numel() for p in self.parameters())
+        backbone_core = sum(p.numel() for p in self.backbone.parameters()
+                           if not any(p is sp for sp in self.backbone.spp.parameters()))
+        spp = sum(p.numel() for p in self.backbone.spp.parameters())
+        dwsa = sum(
+            p.numel() for m in [self.dwsa4, self.dwsa5, self.dwsa6]
+            if m is not None for p in m.parameters()
+        )
+        ms = sum(p.numel() for p in self.ms_context.parameters()) if self.ms_context else 0
+        proj = sum(p.numel() for p in self.final_proj.parameters())
 
         print(f"\n{'='*50}")
-        print("GCNetWithEnhance Parameters")
+        print(f"GCNetWithEnhance Parameter Count")
         print(f"{'='*50}")
-        print(f"  GCNetCore (excl SPP): {bb_core/1e6:.2f}M")
+        print(f"  GCNetCore (excl SPP): {backbone_core/1e6:.2f}M")
         print(f"  DAPPM (SPP):          {spp/1e6:.2f}M")
         print(f"  DWSA blocks:          {dwsa/1e6:.2f}M")
         print(f"  MultiScaleContext:    {ms/1e6:.2f}M")
