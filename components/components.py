@@ -62,19 +62,7 @@ class BaseModule(nn.Module):
                 if hasattr(m, 'bias') and m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-class _ConvBNReLU(nn.Sequential):
-    """Conv + BN + ReLU với attribute names .conv và .bn (khớp checkpoint)."""
-    def __init__(self, in_ch, out_ch, kernel, padding=0, act=True):
-        layers = [
-            ('conv', nn.Conv2d(in_ch, out_ch, kernel, padding=padding, bias=False)),
-            ('bn',   nn.BatchNorm2d(out_ch)),
-        ]
-        if act:
-            layers.append(('relu', nn.ReLU(inplace=True)))
-        super().__init__(*[v for _, v in layers])
-        # Re-add with named attributes so state_dict uses .conv/.bn keys
-        for name, mod in layers:
-            setattr(self, name, mod)
+
 # ============================================================================
 # NORMALIZATION LAYERS
 # ============================================================================
@@ -305,50 +293,114 @@ def resize(
 # ============================================================================
 # DAPPM MODULE
 # ============================================================================
-class DAPPM(nn.Module):
-    def __init__(self, in_channels, branch_channels, out_channels,
-                 num_scales=5, kernel_sizes=(3,5,7,9),
-                 strides=(1,2,2,4), paddings=(1,2,3,4),
-                 norm_cfg=None, act_cfg=None, init_cfg=None):
-        super().__init__()
+class DAPPM(BaseModule):
+    """DAPPM module (Dual Attention Pyramid Pooling Module).
+    
+    Args:
+        in_channels: Input channels
+        branch_channels: Channels for each branch
+        out_channels: Output channels
+        num_scales: Number of scales
+        kernel_sizes: Kernel sizes for each scale
+        strides: Strides for each scale
+        paddings: Paddings for each scale
+        norm_cfg: Normalization config
+        act_cfg: Activation config
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        branch_channels: int,
+        out_channels: int,
+        num_scales: int = 5,
+        kernel_sizes: Tuple[int, ...] = (5, 9, 17, 33),
+        strides: Tuple[int, ...] = (2, 4, 8, 16),
+        paddings: Tuple[int, ...] = (2, 4, 8, 16),
+        norm_cfg: OptConfigType = dict(type='BN'),
+        act_cfg: OptConfigType = dict(type='ReLU'),
+        init_cfg: OptConfigType = None,
+    ):
+        super().__init__(init_cfg)
+        
         self.num_scales = num_scales
-
-        def make_conv(ic, oc, k, p=0):
-            m = nn.Sequential()
-            m.add_module('conv', nn.Conv2d(ic, oc, k, padding=p, bias=False))
-            m.add_module('bn',   nn.BatchNorm2d(oc))
-            m.add_module('relu', nn.ReLU(inplace=True))
-            return m
-
-        # scales[0]: Conv1x1, no pool
+        
+        # Initial convolution
+        self.conv_init = ConvModule(
+            in_channels,
+            branch_channels,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
+        )
+        
+        # Multi-scale branches
         self.scales = nn.ModuleList()
-        self.scales.append(make_conv(in_channels, branch_channels, 1))
-
-        # scales[1..4]: Sequential(AvgPool, Conv1x1)
         for i in range(num_scales - 1):
-            self.scales.append(nn.Sequential(
-                nn.AvgPool2d(kernel_sizes[i], stride=strides[i], padding=paddings[i]),
-                make_conv(in_channels, branch_channels, 1)
-            ))
+            self.scales.append(
+                nn.Sequential(
+                    nn.AvgPool2d(
+                        kernel_size=kernel_sizes[i],
+                        stride=strides[i],
+                        padding=paddings[i]
+                    ),
+                    ConvModule(
+                        branch_channels,
+                        branch_channels,
+                        kernel_size=1,
+                        norm_cfg=norm_cfg,
+                        act_cfg=act_cfg
+                    )
+                )
+            )
+        
+        # Compression convolution
+        self.compression = ConvModule(
+            branch_channels * num_scales,
+            out_channels,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
+        )
+        
+        # Shortcut
+        self.shortcut = ConvModule(
+            in_channels,
+            out_channels,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
+        )
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        # Get input size
+        input_size = x.shape[2:]
+        
+        # Initial convolution
+        out = self.conv_init(x)
+        
+        # Multi-scale features
+        multi_scale_features = [out]
+        for scale in self.scales:
+            scaled_out = scale(out)
+            # Upsample to original size
+            scaled_out = resize(scaled_out, size=input_size, mode='bilinear', align_corners=False)
+            multi_scale_features.append(scaled_out)
+        
+        # Concatenate multi-scale features
+        out = torch.cat(multi_scale_features, dim=1)
+        
+        # Compression
+        out = self.compression(out)
+        
+        # Add shortcut
+        shortcut = self.shortcut(x)
+        out = out + shortcut
+        
+        return out
 
-        # processes[0..3]: Conv3x3 cascade
-        self.processes = nn.ModuleList([
-            make_conv(branch_channels, branch_channels, 3, p=1)
-            for _ in range(num_scales - 1)
-        ])
 
-        self.compression = make_conv(branch_channels * num_scales, out_channels, 1)
-        self.shortcut    = make_conv(in_channels, out_channels, 1)
-
-    def forward(self, x):
-        h, w = x.shape[2:]
-        outs = [self.scales[0](x)]
-        for i in range(1, self.num_scales):
-            s = F.interpolate(self.scales[i](x), size=(h,w),
-                              mode='bilinear', align_corners=False)
-            s = self.processes[i-1](s + outs[i-1])
-            outs.append(s)
-        return self.compression(torch.cat(outs, dim=1)) + self.shortcut(x)
 # ============================================================================
 # BASE DECODE HEAD
 # ============================================================================
