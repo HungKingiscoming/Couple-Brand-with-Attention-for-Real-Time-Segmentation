@@ -39,6 +39,71 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
+
+class LovaszSoftmaxLoss(nn.Module):
+    """
+    Lovasz-Softmax Loss for semantic segmentation
+    Directly optimizes IoU.
+    """
+
+    def __init__(self, ignore_index=255):
+        super().__init__()
+        self.ignore_index = ignore_index
+
+    def forward(self, logits, targets):
+
+        probs = F.softmax(logits, dim=1)
+
+        B, C, H, W = probs.shape
+
+        losses = []
+
+        for c in range(C):
+
+            fg = (targets == c).float()
+
+            if self.ignore_index is not None:
+                valid = (targets != self.ignore_index).float()
+                fg = fg * valid
+
+            if fg.sum() == 0:
+                continue
+
+            pc = probs[:, c, :, :]
+
+            errors = (fg - pc).abs()
+
+            errors = errors.reshape(-1)
+            fg = fg.reshape(-1)
+
+            errors_sorted, perm = torch.sort(errors, descending=True)
+            fg_sorted = fg[perm]
+
+            grad = self.lovasz_grad(fg_sorted)
+
+            loss = torch.dot(errors_sorted, grad)
+
+            losses.append(loss)
+
+        if len(losses) == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+
+        return torch.mean(torch.stack(losses))
+
+    def lovasz_grad(self, gt_sorted):
+
+        gts = gt_sorted.sum()
+
+        intersection = gts - gt_sorted.cumsum(0)
+        union = gts + (1 - gt_sorted).cumsum(0)
+
+        jaccard = 1.0 - intersection / union
+
+        if gt_sorted.numel() > 1:
+            jaccard[1:] = jaccard[1:] - jaccard[:-1]
+
+        return jaccard
+
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -551,6 +616,7 @@ class ModelConfig:
             "loss": {
                 "ce_weight": 1.0,
                 "dice_weight": 0.5,
+                "lovasz_weight": 0.5,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
@@ -609,7 +675,8 @@ class Trainer:
             ignore_index=args.ignore_index,
             reduction='mean'
         )
-        
+        self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
+        self.lovasz_weight = loss_cfg.get("lovasz_weight", 0.0)
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
@@ -644,7 +711,7 @@ class Trainer:
         print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision: {self.args.use_amp}")
         print(f"Gradient clipping: {self.args.grad_clip}")
-        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
+        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Lovasz({loss_cfg['lovasz_weight']})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -676,8 +743,13 @@ class Trainer:
                 logits_full = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
                 ce_loss = self.ce(logits_full, masks)
                 dice_loss = self.dice(logits_full, masks)
-            
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+                lovasz_loss = self.lovasz(logits_full, masks)
+                
+                loss = (
+                    self.ce_weight * ce_loss +
+                    self.dice_weight * dice_loss +
+                    self.lovasz_weight * lovasz_loss
+                )
             
                 # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
                 if "aux" in outputs and self.args.aux_weight > 0:
@@ -767,9 +839,9 @@ class Trainer:
                 masks = masks.squeeze(1)
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)          # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn
-    
-                # CE: upsample logit lÃªn full resolution
+                logits = self.model(imgs)      
+                
+               
                 logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
@@ -777,19 +849,23 @@ class Trainer:
                     align_corners=False
                 )
                 ce_loss = self.ce(logits_full, masks)
-    
-                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
+                lovasz_loss = self.lovasz(logits_full, masks)
+                 
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),   # cáº§n unsqueeze + float cho interpolate
-                        size=logits.shape[-2:],        # H/2, W/2 â€” KHÃ”NG pháº£i logits_full
+                        masks.unsqueeze(1).float(),  
+                        size=logits.shape[-2:],       
                         mode='nearest'
-                    ).squeeze(1).long()               # tráº£ vá» (B, H/2, W/2) long
+                    ).squeeze(1).long()            
                     dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
     
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+                loss = (
+                    self.ce_weight * ce_loss +
+                    self.dice_weight * dice_loss +
+                    self.lovasz_weight * lovasz_loss
+                )
     
             total_loss += loss.item()
     
@@ -814,10 +890,10 @@ class Trainer:
         acc          = intersection.sum() / (confusion_matrix.sum() + 1e-10)
     
         return {
-            'loss'         : total_loss / len(loader),
-            'miou'         : miou,
-            'accuracy'     : acc,
-            'per_class_iou': iou,
+            'loss': avg_loss,
+            'ce': avg_ce,
+            'dice': avg_dice,
+            'lovasz': avg_lovasz
         }
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
