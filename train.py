@@ -829,79 +829,106 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, loader, epoch):
-        self.model.eval()
-        total_loss = 0.0
-        
-        num_classes = self.args.num_classes
-        confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
-        
-        pbar = tqdm(loader, desc="Validation")
-        
-        for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs  = imgs.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True).long()
-            
-            if masks.dim() == 4:
-                masks = masks.squeeze(1)
-    
-            with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)      
-                
-               
-                logits_full = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
-                ce_loss = self.ce(logits_full, masks)
-                lovasz_loss = self.lovasz(logits_full, masks)
-                 
-                if self.dice_weight > 0:
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),  
-                        size=logits.shape[-2:],       
-                        mode='nearest'
-                    ).squeeze(1).long()            
-                    dice_loss = self.dice(logits, masks_small)
-                else:
-                    dice_loss = torch.tensor(0.0, device=logits.device)
-    
-                loss = (
-                    self.ce_weight * ce_loss +
-                    self.dice_weight * dice_loss +
-                    self.lovasz_weight * lovasz_loss
-                )
-    
-            total_loss += loss.item()
-    
-            # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
-            pred   = logits_full.argmax(1).cpu().numpy()
-            target = masks.cpu().numpy()
-            
-            mask_valid = (target >= 0) & (target < num_classes)
-            label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
-            count  = np.bincount(label, minlength=num_classes**2)
-            confusion_matrix += count.reshape(num_classes, num_classes)
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-            if batch_idx % 20 == 0:
-                clear_gpu_memory()
-    
-        intersection = np.diag(confusion_matrix)
-        union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
-        iou          = intersection / (union + 1e-10)
-        miou         = np.nanmean(iou)
-        acc          = intersection.sum() / (confusion_matrix.sum() + 1e-10)
-    
-        return {
-            'loss': avg_loss,
-            'ce': avg_ce,
-            'dice': avg_dice,
-            'lovasz': avg_lovasz
-        }
 
+    self.model.eval()
+
+    total_loss = 0.0
+    total_ce = 0.0
+    total_dice = 0.0
+    total_lovasz = 0.0
+
+    num_classes = self.args.num_classes
+    confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+
+    pbar = tqdm(loader, desc="Validation")
+
+    for batch_idx, (imgs, masks) in enumerate(pbar):
+
+        imgs  = imgs.to(self.device, non_blocking=True)
+        masks = masks.to(self.device, non_blocking=True).long()
+
+        if masks.dim() == 4:
+            masks = masks.squeeze(1)
+
+        with autocast(device_type='cuda', enabled=self.args.use_amp):
+
+            logits = self.model(imgs)
+
+            logits_full = F.interpolate(
+                logits,
+                size=masks.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+
+            ce_loss = self.ce(logits_full, masks)
+            lovasz_loss = self.lovasz(logits_full, masks)
+
+            if self.dice_weight > 0:
+                masks_small = F.interpolate(
+                    masks.unsqueeze(1).float(),
+                    size=logits.shape[-2:],
+                    mode='nearest'
+                ).squeeze(1).long()
+
+                dice_loss = self.dice(logits, masks_small)
+
+            else:
+                dice_loss = torch.tensor(0.0, device=logits.device)
+
+            loss = (
+                self.ce_weight * ce_loss +
+                self.dice_weight * dice_loss +
+                self.lovasz_weight * lovasz_loss
+            )
+
+        # accumulate loss
+        total_loss += loss.item()
+        total_ce += ce_loss.item()
+        total_dice += dice_loss.item()
+        total_lovasz += lovasz_loss.item()
+
+        # mIoU computation
+        pred   = logits_full.argmax(1).cpu().numpy()
+        target = masks.cpu().numpy()
+
+        mask_valid = (target >= 0) & (target < num_classes)
+
+        label = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
+        count = np.bincount(label, minlength=num_classes**2)
+
+        confusion_matrix += count.reshape(num_classes, num_classes)
+
+        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        if batch_idx % 20 == 0:
+            clear_gpu_memory()
+
+    # ===== calculate metrics =====
+
+    num_batches = len(loader)
+
+    avg_loss = total_loss / num_batches
+    avg_ce = total_ce / num_batches
+    avg_dice = total_dice / num_batches
+    avg_lovasz = total_lovasz / num_batches
+
+    intersection = np.diag(confusion_matrix)
+    union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
+
+    iou = intersection / (union + 1e-10)
+    miou = np.nanmean(iou)
+
+    acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
+
+    return {
+        'loss': avg_loss,
+        'ce': avg_ce,
+        'dice': avg_dice,
+        'lovasz': avg_lovasz,
+        'miou': miou,
+        'acc': acc
+    }
     def save_checkpoint(self, epoch, metrics, is_best=False):
         checkpoint = {
             'epoch': epoch,
