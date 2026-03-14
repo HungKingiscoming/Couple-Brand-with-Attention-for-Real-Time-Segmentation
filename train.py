@@ -1,3 +1,7 @@
+# ============================================
+# FIXED train.py - Proper Gradient Clipping + Monitoring
+# ============================================
+
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -35,67 +39,6 @@ from model.head.segmentation_head import (
 )
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
-
-
-class LovaszSoftmaxLoss(nn.Module):
-
-    def __init__(self, ignore_index=255):
-        super().__init__()
-        self.ignore_index = ignore_index
-
-    def lovasz_grad(self, gt_sorted):
-        gts = gt_sorted.sum()
-
-        intersection = gts - gt_sorted.cumsum(0)
-        union = gts + (1 - gt_sorted).cumsum(0)
-
-        jaccard = 1.0 - intersection / union
-
-        if gt_sorted.numel() > 1:
-            jaccard[1:] = jaccard[1:] - jaccard[:-1]
-
-        return jaccard
-
-    def forward(self, logits, labels):
-
-        probs = F.softmax(logits, dim=1)
-
-        B, C, H, W = probs.shape
-
-        probs = probs.permute(0, 2, 3, 1).reshape(-1, C)
-        labels = labels.view(-1)
-
-        if self.ignore_index is not None:
-            valid = labels != self.ignore_index
-            probs = probs[valid]
-            labels = labels[valid]
-
-        losses = []
-
-        for c in range(C):
-
-            fg = (labels == c).float()
-
-            if fg.sum() == 0:
-                continue
-
-            class_pred = probs[:, c]
-
-            errors = (fg - class_pred).abs()
-
-            errors_sorted, perm = torch.sort(errors, descending=True)
-            fg_sorted = fg[perm]
-
-            grad = self.lovasz_grad(fg_sorted)
-
-            loss = torch.dot(errors_sorted, grad)
-
-            losses.append(loss)
-
-        if len(losses) == 0:
-            return logits.sum() * 0
-
-        return torch.mean(torch.stack(losses))
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
@@ -560,6 +503,31 @@ def check_gradients(model, threshold=10.0):
     return max_grad, total_norm
 
 
+def build_scheduler(optimizer, args, train_loader, start_epoch=0):
+    """
+    Build scheduler sau khi rebuild optimizer (gọi khi unfreeze backbone).
+    start_epoch: epoch hiện tại để tính remaining steps.
+    """
+    remaining_epochs = args.epochs - start_epoch
+
+    if args.scheduler == 'onecycle':
+        # OneCycle không phù hợp khi resume giữa chừng → dùng Cosine
+        print(f"  [build_scheduler] OneCycle không phù hợp khi resume → dùng CosineAnnealing")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(remaining_epochs, 1), eta_min=1e-7
+        )
+    elif args.scheduler == 'poly':
+        def poly_lambda(epoch):
+            return max((1 - epoch / max(remaining_epochs, 1)) ** 0.9, 1e-7 / max(args.lr, 1e-10))
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lambda)
+        print(f"  [build_scheduler] PolyLR remaining_epochs={remaining_epochs}")
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=max(remaining_epochs, 1), eta_min=1e-7
+        )
+    return scheduler
+
+
 # ============================================
 # MODEL CONFIG
 # ============================================
@@ -609,7 +577,6 @@ class ModelConfig:
             "loss": {
                 "ce_weight": 1.0,
                 "dice_weight": 0.5,
-                "lovasz_weight": 0.5,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
@@ -668,8 +635,7 @@ class Trainer:
             ignore_index=args.ignore_index,
             reduction='mean'
         )
-        self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
-        self.lovasz_weight = loss_cfg.get("lovasz_weight", 0.0)
+        
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
@@ -704,7 +670,7 @@ class Trainer:
         print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision: {self.args.use_amp}")
         print(f"Gradient clipping: {self.args.grad_clip}")
-        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Lovasz({loss_cfg['lovasz_weight']})")
+        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -733,29 +699,29 @@ class Trainer:
                 outputs = self.model.forward_train(imgs)
                 logits = outputs["main"]    # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn resolution tháº¥p
             
-                logits_full = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
-                ce_loss = self.ce(logits_full, masks)
-                dice_loss = self.dice(logits_full, masks)
-                logits_small = F.interpolate(
-                    logits_full,
-                    scale_factor=0.5,
-                    mode="bilinear",
+                # â”€â”€ CE: upsample logit lÃªn full resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                logits_full = F.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode='bilinear',
                     align_corners=False
                 )
-                
-                masks_small = F.interpolate(
-                    masks.unsqueeze(1).float(),
-                    scale_factor=0.5,
-                    mode="nearest"
-                ).squeeze(1).long()
-                
-                lovasz_loss = self.lovasz(logits_small, masks_small)
-                
-                loss = (
-                    self.ce_weight * ce_loss +
-                    self.dice_weight * dice_loss +
-                    self.lovasz_weight * lovasz_loss
-                )
+                ce_loss = self.ce(logits_full, masks)
+            
+                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
+                if self.dice_weight > 0:
+                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
+                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    dice_loss = self.dice(logits, masks_small)
+                else:
+                    dice_loss = torch.tensor(0.0, device=logits.device)
+            
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             
                 # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
                 if "aux" in outputs and self.args.aux_weight > 0:
@@ -766,7 +732,7 @@ class Trainer:
                         align_corners=False
                     )
                     aux_ce_loss = self.ce(aux_logits, masks)
-                    aux_weight = 0.4 
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps
@@ -777,7 +743,7 @@ class Trainer:
                 print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            torch.cuda.empty_cache()
+            
             self.scaler.scale(loss).backward()
             
 
@@ -829,106 +795,71 @@ class Trainer:
 
     @torch.no_grad()
     def validate(self, loader, epoch):
-
         self.model.eval()
-    
         total_loss = 0.0
-        total_ce = 0.0
-        total_dice = 0.0
-        total_lovasz = 0.0
-    
+        
         num_classes = self.args.num_classes
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
-    
+        
         pbar = tqdm(loader, desc="Validation")
-    
+        
         for batch_idx, (imgs, masks) in enumerate(pbar):
-    
             imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
-    
+            
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
+                logits = self.model(imgs)          # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn
     
-                logits = self.model(imgs)
-    
+                # CE: upsample logit lÃªn full resolution
                 logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
                     mode='bilinear',
                     align_corners=False
                 )
-    
                 ce_loss = self.ce(logits_full, masks)
-                lovasz_loss = self.lovasz(logits_full, masks)
     
+                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
+                # FIX: dùng logits_full nhất quán với train_epoch
                 if self.dice_weight > 0:
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-    
-                    dice_loss = self.dice(logits, masks_small)
-    
+                    dice_loss = self.dice(logits_full, masks)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
     
-                loss = (
-                    self.ce_weight * ce_loss +
-                    self.dice_weight * dice_loss +
-                    self.lovasz_weight * lovasz_loss
-                )
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
     
-            # accumulate loss
             total_loss += loss.item()
-            total_ce += ce_loss.item()
-            total_dice += dice_loss.item()
-            total_lovasz += lovasz_loss.item()
     
-            # mIoU computation
+            # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
             pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
-    
+            
             mask_valid = (target >= 0) & (target < num_classes)
-    
-            label = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
-            count = np.bincount(label, minlength=num_classes**2)
-    
+            label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
+            count  = np.bincount(label, minlength=num_classes**2)
             confusion_matrix += count.reshape(num_classes, num_classes)
-    
+            
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
+            
             if batch_idx % 20 == 0:
                 clear_gpu_memory()
     
-        # ===== calculate metrics =====
-    
-        num_batches = len(loader)
-    
-        avg_loss = total_loss / num_batches
-        avg_ce = total_ce / num_batches
-        avg_dice = total_dice / num_batches
-        avg_lovasz = total_lovasz / num_batches
-    
         intersection = np.diag(confusion_matrix)
-        union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
-    
-        iou = intersection / (union + 1e-10)
-        miou = np.nanmean(iou)
-    
-        acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
+        union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
+        iou          = intersection / (union + 1e-10)
+        miou         = np.nanmean(iou)
+        acc          = intersection.sum() / (confusion_matrix.sum() + 1e-10)
     
         return {
-            'loss': avg_loss,
-            'ce': avg_ce,
-            'dice': avg_dice,
-            'lovasz': avg_lovasz,
-            'miou': miou,
-            'acc': acc
+            'loss'         : total_loss / len(loader),
+            'miou'         : miou,
+            'accuracy'     : acc,
+            'per_class_iou': iou,
         }
+
     def save_checkpoint(self, epoch, metrics, is_best=False):
         checkpoint = {
             'epoch': epoch,
@@ -1179,17 +1110,10 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
-        n_groups = len(optimizer.param_groups)
-    
-        if n_groups == 1:
-            max_lrs = args.lr
-        elif n_groups == 2:
-            max_lrs = [
-                args.lr * args.backbone_lr_factor,
-                args.lr,
-            ]
-        else:
-            raise ValueError(f"Unexpected param_groups: {n_groups}")
+        # Tự động lấy max_lr từ mỗi param group — không hardcode số groups
+        max_lrs = [g['lr'] for g in optimizer.param_groups]
+        if len(max_lrs) == 1:
+            max_lrs = max_lrs[0]
     
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -1345,12 +1269,12 @@ def main():
               f"Dice: {train_metrics['dice']:.4f}")
         print(f"Val   - Loss: {val_metrics['loss']:.4f} | "
               f"mIoU: {val_metrics['miou']:.4f} | "
-              f"Acc: {val_metrics['acc']:.4f}")
+              f"Acc: {val_metrics['accuracy']:.4f}")
         print(f"{'='*70}\n")
         
         trainer.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
         trainer.writer.add_scalar('val/miou', val_metrics['miou'], epoch)
-        trainer.writer.add_scalar('val/acc', val_metrics['acc'], epoch)
+        trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
         
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
