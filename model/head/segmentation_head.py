@@ -24,6 +24,7 @@ class GatedFusion(nn.Module):
         act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
     ):
         super().__init__()
+
         self.gate_conv = nn.Sequential(
             ConvModule(
                 in_channels=channels * 2,
@@ -42,9 +43,12 @@ class GatedFusion(nn.Module):
         )
 
     def forward(self, skip: Tensor, dec: Tensor) -> Tensor:
-        gate = self.gate_conv(torch.cat([skip, dec], dim=1))
-        return gate * skip + (1.0 - gate) * dec
 
+        gate = self.gate_conv(torch.cat([skip, dec], dim=1))
+
+        out = dec + gate * skip
+
+        return out
 
 class DWConvModule(nn.Module):
 
