@@ -46,6 +46,20 @@ class LovaszSoftmaxLoss(nn.Module):
         super().__init__()
         self.ignore_index = ignore_index
 
+    def lovasz_grad(self, gt_sorted):
+
+        gts = gt_sorted.sum()
+
+        intersection = gts - gt_sorted.cumsum(0)
+        union = gts + (1 - gt_sorted).cumsum(0)
+
+        jaccard = 1.0 - intersection / union
+
+        if gt_sorted.numel() > 1:
+            jaccard[1:] = jaccard[1:] - jaccard[:-1]
+
+        return jaccard
+
     def forward(self, logits, targets):
 
         probs = F.softmax(logits, dim=1)
