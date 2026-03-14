@@ -734,7 +734,20 @@ class Trainer:
                 logits_full = F.interpolate(logits, size=masks.shape[-2:], mode='bilinear', align_corners=False)
                 ce_loss = self.ce(logits_full, masks)
                 dice_loss = self.dice(logits_full, masks)
-                lovasz_loss = self.lovasz(logits_full, masks)
+                logits_small = F.interpolate(
+                    logits_full,
+                    scale_factor=0.5,
+                    mode="bilinear",
+                    align_corners=False
+                )
+                
+                masks_small = F.interpolate(
+                    masks.unsqueeze(1).float(),
+                    scale_factor=0.5,
+                    mode="nearest"
+                ).squeeze(1).long()
+                
+                lovasz_loss = self.lovasz(logits_small, masks_small)
                 
                 loss = (
                     self.ce_weight * ce_loss +
