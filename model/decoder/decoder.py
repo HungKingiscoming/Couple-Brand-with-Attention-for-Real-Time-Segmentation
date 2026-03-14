@@ -39,7 +39,7 @@ class GatedFusion(nn.Module):
     def forward(self, skip_feat: Tensor, dec_feat: Tensor) -> Tensor:
         concat = torch.cat([skip_feat, dec_feat], dim=1)
         gate = self.gate_conv(concat)
-        out = gate * skip_feat + (1 - gate) * dec_feat
+        out = dec_feat + gate * skip_feat
         return out
 
 
@@ -214,21 +214,21 @@ class EnhancedDecoder(nn.Module):
     def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
         # Stage 1: H/8 Ã¢â€ â€™ H/4
         x = self.up1(c5)
-        x = self.refine1(x)
+
         c2_proj = self.c2_proj(c2)
-        if self.use_gated_fusion:
-            x = self.fusion1_gate(c2_proj, x)
-        else:
-            x = self.fusion1(torch.cat([x, c2_proj], dim=1))
+        
+        x = self.fusion1_gate(c2_proj, x)
+        
+        x = self.refine1(x)
 
         # Stage 2: H/4 Ã¢â€ â€™ H/2
         x = self.up2(x)
-        x = self.refine2(x)
+        
         c1_proj = self.c1_proj(c1)
-        if self.use_gated_fusion:
-            x = self.fusion2_gate(c1_proj, x)
-        else:
-            x = self.fusion2(torch.cat([x, c1_proj], dim=1))
+        
+        x = self.fusion2_gate(c1_proj, x)
+        
+        x = self.refine2(x)
 
         # Stage 3: refine H/2
         x = self.refine3(x)
