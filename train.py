@@ -1350,7 +1350,7 @@ def main():
         
         trainer.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
         trainer.writer.add_scalar('val/miou', val_metrics['miou'], epoch)
-        trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
+        trainer.writer.add_scalar('val/acc', val_metrics['acc'], epoch)
         
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
