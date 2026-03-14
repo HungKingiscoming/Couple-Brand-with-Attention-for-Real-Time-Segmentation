@@ -1345,7 +1345,7 @@ def main():
               f"Dice: {train_metrics['dice']:.4f}")
         print(f"Val   - Loss: {val_metrics['loss']:.4f} | "
               f"mIoU: {val_metrics['miou']:.4f} | "
-              f"Acc: {val_metrics['accuracy']:.4f}")
+              f"Acc: {val_metrics['acc']:.4f}")
         print(f"{'='*70}\n")
         
         trainer.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
