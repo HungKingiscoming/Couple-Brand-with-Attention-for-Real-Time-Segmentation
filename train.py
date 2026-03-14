@@ -41,10 +41,6 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 
 
 class LovaszSoftmaxLoss(nn.Module):
-    """
-    Lovasz-Softmax Loss for semantic segmentation
-    Directly optimizes IoU.
-    """
 
     def __init__(self, ignore_index=255):
         super().__init__()
@@ -58,23 +54,21 @@ class LovaszSoftmaxLoss(nn.Module):
 
         losses = []
 
+        valid = (targets != self.ignore_index)
+
         for c in range(C):
 
-            fg = (targets == c).float()
-
-            if self.ignore_index is not None:
-                valid = (targets != self.ignore_index).float()
-                fg = fg * valid
+            fg = (targets == c) & valid
 
             if fg.sum() == 0:
                 continue
 
             pc = probs[:, c, :, :]
 
-            errors = (fg - pc).abs()
+            pc = pc[valid]
+            fg = fg[valid].float()
 
-            errors = errors.reshape(-1)
-            fg = fg.reshape(-1)
+            errors = (fg - pc).abs()
 
             errors_sorted, perm = torch.sort(errors, descending=True)
             fg_sorted = fg[perm]
@@ -86,23 +80,9 @@ class LovaszSoftmaxLoss(nn.Module):
             losses.append(loss)
 
         if len(losses) == 0:
-            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+            return logits.sum() * 0
 
         return torch.mean(torch.stack(losses))
-
-    def lovasz_grad(self, gt_sorted):
-
-        gts = gt_sorted.sum()
-
-        intersection = gts - gt_sorted.cumsum(0)
-        union = gts + (1 - gt_sorted).cumsum(0)
-
-        jaccard = 1.0 - intersection / union
-
-        if gt_sorted.numel() > 1:
-            jaccard[1:] = jaccard[1:] - jaccard[:-1]
-
-        return jaccard
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
@@ -771,7 +751,7 @@ class Trainer:
                 print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            
+            torch.cuda.empty_cache()
             self.scaler.scale(loss).backward()
             
 
