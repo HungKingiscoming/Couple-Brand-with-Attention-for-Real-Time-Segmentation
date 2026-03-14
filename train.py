@@ -44,7 +44,6 @@ class LovaszSoftmaxLoss(nn.Module):
         self.ignore_index = ignore_index
 
     def lovasz_grad(self, gt_sorted):
-
         gts = gt_sorted.sum()
 
         intersection = gts - gt_sorted.cumsum(0)
@@ -57,29 +56,32 @@ class LovaszSoftmaxLoss(nn.Module):
 
         return jaccard
 
-    def forward(self, logits, targets):
+    def forward(self, logits, labels):
 
         probs = F.softmax(logits, dim=1)
 
         B, C, H, W = probs.shape
 
-        losses = []
+        probs = probs.permute(0, 2, 3, 1).reshape(-1, C)
+        labels = labels.view(-1)
 
-        valid = (targets != self.ignore_index)
+        if self.ignore_index is not None:
+            valid = labels != self.ignore_index
+            probs = probs[valid]
+            labels = labels[valid]
+
+        losses = []
 
         for c in range(C):
 
-            fg = (targets == c) & valid
+            fg = (labels == c).float()
 
             if fg.sum() == 0:
                 continue
 
-            pc = probs[:, c, :, :]
+            class_pred = probs[:, c]
 
-            pc = pc[valid]
-            fg = fg[valid].float()
-
-            errors = (fg - pc).abs()
+            errors = (fg - class_pred).abs()
 
             errors_sorted, perm = torch.sort(errors, descending=True)
             fg_sorted = fg[perm]
