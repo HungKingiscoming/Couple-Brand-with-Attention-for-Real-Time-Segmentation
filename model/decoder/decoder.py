@@ -215,18 +215,18 @@ class EnhancedDecoder(nn.Module):
         # Stage 1: H/8 Ã¢â€ â€™ H/4
         x = self.up1(c5)
 
-        c2_proj = self.c2_proj(c2)
+        skip = self.c2_proj(c2).detach()
         
-        x = self.fusion1_gate(c2_proj, x)
+        x = self.fusion1(skip, x)
         
         x = self.refine1(x)
 
         # Stage 2: H/4 Ã¢â€ â€™ H/2
         x = self.up2(x)
+
+        skip = self.c1_proj(c1).detach()
         
-        c1_proj = self.c1_proj(c1)
-        
-        x = self.fusion2_gate(c1_proj, x)
+        x = self.fusion2(skip, x)
         
         x = self.refine2(x)
 
