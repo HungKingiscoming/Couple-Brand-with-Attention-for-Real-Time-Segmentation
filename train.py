@@ -3,7 +3,6 @@
 # ============================================
 
 import os
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -1076,10 +1075,11 @@ def main():
     print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     count_trainable_params(model)
     
-    # Test forward
+    # Test forward — dùng batch_size=2 để tránh BN lỗi với spatial 1x1
     model = model.to(device)
+    model.eval()  # eval mode để BN dùng running stats, không cần batch > 1
     with torch.no_grad():
-        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+        sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
             outputs = model.forward_train(sample)
             print(f"Forward pass successful!")
@@ -1089,6 +1089,7 @@ def main():
         except Exception as e:
             print(f"Forward pass FAILED: {e}\n")
             return
+    model.train()  # trả về train mode
     
     # Optimizer
     if args.use_discriminative_lr:
