@@ -290,6 +290,127 @@ class LovaszSoftmaxLoss(nn.Module):
             return logits.sum() * 0
         return torch.mean(torch.stack(losses))
 
+
+class BoundaryLoss(nn.Module):
+    """
+    BCE Boundary Loss với fog-aware weighting.
+    
+    Pipeline:
+      1. Tạo GT boundary mask: pixel có neighbor khác class → boundary=1
+      2. Tính predicted boundary = max class prob thấp (uncertain region)
+      3. BCE giữa predicted uncertainty và GT boundary
+      4. Fog-aware: chỉ tính tại pixels model đã confident (bỏ qua foggy ambiguous)
+    
+    Lý do dùng cho Foggy Cityscapes:
+      - Boundary thật sự mờ do fog → cần lọc noisy boundary signal
+      - confidence_threshold loại bỏ pixel quá uncertain (fog region)
+      - Chỉ phạt model khi nó sai tại boundary RÕ RÀNG
+    """
+    def __init__(
+        self,
+        ignore_index: int = 255,
+        kernel_size: int = 3,           # kích thước neighborhood để detect boundary
+        confidence_threshold: float = 0.7,  # chỉ tính loss tại pixel confident này
+        pos_weight: float = 3.0,        # weight cho boundary pixels (thường ít hơn non-boundary)
+    ):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.kernel_size = kernel_size
+        self.confidence_threshold = confidence_threshold
+        # BCE với pos_weight để cân bằng boundary vs non-boundary pixels
+        self.register_buffer('pos_weight', torch.tensor(pos_weight))
+
+    def _get_boundary_mask(self, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Tạo binary boundary mask từ GT labels.
+        Boundary = pixel có ít nhất 1 neighbor thuộc class khác.
+        
+        Args:
+            labels: (B, H, W) long — GT class labels
+        Returns:
+            boundary: (B, H, W) float — 1 tại boundary, 0 otherwise
+                      ignore_index pixels → 0 (không tính)
+        """
+        B, H, W = labels.shape
+        
+        # Convert sang float để dùng pooling
+        # ignore_index pixels sẽ được handle sau
+        valid_mask = (labels != self.ignore_index)  # (B, H, W)
+        
+        # Tạo label map với ignore → -1 để không confuse với class 0
+        labels_safe = labels.clone().float()
+        labels_safe[~valid_mask] = -1.0
+        
+        labels_4d = labels_safe.unsqueeze(1)  # (B, 1, H, W)
+        pad = self.kernel_size // 2
+        
+        # Max và min trong neighborhood
+        # Nếu max != min → có boundary
+        max_pool = F.max_pool2d(
+            labels_4d, kernel_size=self.kernel_size,
+            stride=1, padding=pad
+        ).squeeze(1)  # (B, H, W)
+        
+        # Min pool = -max_pool(-x)
+        min_pool = -F.max_pool2d(
+            -labels_4d, kernel_size=self.kernel_size,
+            stride=1, padding=pad
+        ).squeeze(1)  # (B, H, W)
+        
+        # Boundary: max != min VÀ pixel hợp lệ
+        boundary = ((max_pool != min_pool) & valid_mask).float()  # (B, H, W)
+        
+        return boundary
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits: (B, C, H, W) — predictions tại full resolution
+            labels: (B, H, W)   — GT labels tại full resolution
+        Returns:
+            scalar loss
+        """
+        B, C, H, W = logits.shape
+        
+        # 1. GT boundary mask
+        with torch.no_grad():
+            boundary_gt = self._get_boundary_mask(labels)  # (B, H, W)
+        
+        # 2. Predicted boundary = 1 - max_prob (uncertainty)
+        #    Tại boundary thật: model nên uncertain → max_prob thấp
+        #    Tại non-boundary: model nên confident → max_prob cao
+        probs = F.softmax(logits, dim=1)                    # (B, C, H, W)
+        max_prob, _ = probs.max(dim=1)                      # (B, H, W)
+        pred_boundary = 1.0 - max_prob                      # (B, H, W) — uncertainty map
+        
+        # 3. Fog-aware mask: chỉ tính loss tại pixel model đã confident
+        #    Bỏ qua pixel quá uncertain (likely foggy ambiguous region)
+        #    confidence_threshold=0.7: chỉ tính khi model >= 70% confident
+        with torch.no_grad():
+            confident_mask = (max_prob >= self.confidence_threshold)  # (B, H, W)
+            valid_mask = (labels != self.ignore_index)                 # (B, H, W)
+            compute_mask = confident_mask & valid_mask                 # (B, H, W)
+        
+        if compute_mask.sum() == 0:
+            return torch.tensor(0.0, device=logits.device, requires_grad=True)
+        
+        # 4. BCE với pos_weight cho boundary pixels
+        pred_flat = pred_boundary[compute_mask]    # (N,)
+        gt_flat   = boundary_gt[compute_mask]      # (N,)
+        
+        # Weighted BCE: boundary pixels (gt=1) weight cao hơn
+        bce = F.binary_cross_entropy(
+            pred_flat.clamp(1e-6, 1 - 1e-6),
+            gt_flat,
+            reduction='none'
+        )
+        
+        # Apply pos_weight manually
+        weight = torch.where(gt_flat > 0.5, self.pos_weight, torch.ones_like(gt_flat))
+        loss = (bce * weight).mean()
+        
+        return loss
+
 # ============================================
 # UTILITIES
 # ============================================
@@ -675,9 +796,10 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "loss": {
-                "ce_weight": 1.0,
-                "dice_weight": 1.0,   # tăng từ 0.5→1.0: boundary segmentation tốt hơn
-                "lovasz_weight": 0.5, # Lovász: tối ưu trực tiếp IoU
+                "ce_weight": 1.0,     
+                "dice_weight": 1.0,   
+                "lovasz_weight": 0.0,  
+                "boundary_weight": 0.3, 
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
@@ -739,6 +861,13 @@ class Trainer:
         
         self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
         self.lovasz_weight = loss_cfg.get('lovasz_weight', 0.0)
+        self.boundary = BoundaryLoss(
+            ignore_index=args.ignore_index,
+            kernel_size=3,
+            confidence_threshold=0.7,
+            pos_weight=3.0,
+        )
+        self.boundary_weight = loss_cfg.get('boundary_weight', 0.0)
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
@@ -773,8 +902,9 @@ class Trainer:
         print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision: {self.args.use_amp}")
         print(f"Gradient clipping: {self.args.grad_clip}")
-        lovasz_w = loss_cfg.get('lovasz_weight', 0.0)
-        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Lovász({lovasz_w})")
+        lovasz_w   = loss_cfg.get('lovasz_weight', 0.0)
+        boundary_w = loss_cfg.get('boundary_weight', 0.0)
+        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Lovász({lovasz_w}) + Boundary({boundary_w})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -801,9 +931,7 @@ class Trainer:
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-                logits = outputs["main"]    # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn resolution tháº¥p
-            
-                # â”€â”€ CE: upsample logit lÃªn full resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                logits = outputs["main"]   
                 logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
@@ -812,10 +940,8 @@ class Trainer:
                 )
                 ce_loss = self.ce(logits_full, masks)
             
-                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
+
                 if self.dice_weight > 0:
-                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
-                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
                     masks_small = F.interpolate(
                         masks.unsqueeze(1).float(),
                         size=logits.shape[-2:],
@@ -825,9 +951,7 @@ class Trainer:
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
             
-                                # Lovász: tính trên H/4 resolution để tránh OOM và chậm
-                # sort() trên 8M pixels (logits_full) × 19 classes = quá nặng
-                # H/4 = 128×256 = 32K pixels → 16x nhanh hơn, loss vẫn hiệu quả
+
                 if self.lovasz_weight > 0:
                     # Dùng logits H/2 (output gốc) và downsample masks về H/2
                     # logits: (B,C,H/2,W/2), masks: (B,H,W) → masks_half: (B,H/2,W/2)
@@ -843,8 +967,18 @@ class Trainer:
                 loss = (self.ce_weight * ce_loss +
                         self.dice_weight * dice_loss +
                         self.lovasz_weight * lovasz_loss)
+
+                # Boundary loss: full resolution để detect boundary chính xác
+                if self.boundary_weight > 0:
+                    boundary_loss = self.boundary(logits_full, masks)
+                else:
+                    boundary_loss = torch.tensor(0.0, device=logits.device)
+
+                loss = (self.ce_weight    * ce_loss +
+                        self.dice_weight  * dice_loss +
+                        self.lovasz_weight * lovasz_loss +
+                        self.boundary_weight * boundary_loss)
             
-                # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = F.interpolate(
                         outputs["aux"],
@@ -942,9 +1076,7 @@ class Trainer:
                     align_corners=False
                 )
                 ce_loss = self.ce(logits_full, masks)
-    
-                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
-                # FIX: dùng logits_full nhất quán với train_epoch
+
                 if self.dice_weight > 0:
                     dice_loss = self.dice(logits_full, masks)
                 else:
@@ -961,13 +1093,18 @@ class Trainer:
                 else:
                     lovasz_loss_val = torch.tensor(0.0, device=logits.device)
 
-                loss = (self.ce_weight * ce_loss +
-                        self.dice_weight * dice_loss +
-                        self.lovasz_weight * lovasz_loss_val)
+                if self.boundary_weight > 0:
+                    boundary_loss_val = self.boundary(logits_full, masks)
+                else:
+                    boundary_loss_val = torch.tensor(0.0, device=logits.device)
+
+                loss = (self.ce_weight    * ce_loss +
+                        self.dice_weight  * dice_loss +
+                        self.lovasz_weight * lovasz_loss_val +
+                        self.boundary_weight * boundary_loss_val)
 
             total_loss += loss.item()
     
-            # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
             pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             
@@ -1331,13 +1468,11 @@ def main():
         if k >= 4:
             targets += ['stem']
         
-        # ðŸ”¥ LUÃ”N Ä‘áº£m báº£o stage Ä‘Ãºng tráº¡ng thÃ¡i
+
         if targets:
             unfreeze_backbone_progressive(model, targets)
         
-        # ðŸ” CHá»ˆ rebuild optimizer khi Ä‘Ãºng má»‘c unfreeze
-        # Khi đúng mốc unfreeze: KHÔNG rebuild optimizer, KHÔNG restart scheduler
-        # Chỉ add_param_group → LR curve tiếp tục smooth, không bị reset
+
         if epoch in unfreeze_epochs:
             trainer.set_loss_phase('full')
             added = add_backbone_params_to_optimizer(trainer.optimizer, model, args)
