@@ -244,6 +244,52 @@ class FocalLoss(nn.Module):
         return focal_loss.mean() if self.reduction == 'mean' else focal_loss
 
 
+
+
+class LovaszSoftmaxLoss(nn.Module):
+    """
+    Lovász-Softmax loss — tối ưu trực tiếp IoU per class.
+    Hiệu quả hơn CE cho boundary segmentation, đặc biệt với foggy domain.
+    """
+    def __init__(self, ignore_index=255):
+        super().__init__()
+        self.ignore_index = ignore_index
+
+    def lovasz_grad(self, gt_sorted):
+        gts = gt_sorted.sum()
+        intersection = gts - gt_sorted.float().cumsum(0)
+        union = gts + (1 - gt_sorted).float().cumsum(0)
+        jaccard = 1.0 - intersection / union
+        if gt_sorted.numel() > 1:
+            jaccard[1:] = jaccard[1:] - jaccard[:-1]
+        return jaccard
+
+    def forward(self, logits, labels):
+        probs = F.softmax(logits, dim=1)
+        B, C, H, W = probs.shape
+        probs  = probs.permute(0, 2, 3, 1).reshape(-1, C)
+        labels = labels.view(-1)
+
+        if self.ignore_index is not None:
+            valid  = labels != self.ignore_index
+            probs  = probs[valid]
+            labels = labels[valid]
+
+        losses = []
+        for c in range(C):
+            fg = (labels == c).float()
+            if fg.sum() == 0:
+                continue
+            errors = (fg - probs[:, c]).abs()
+            errors_sorted, perm = torch.sort(errors, descending=True)
+            fg_sorted = fg[perm]
+            grad = self.lovasz_grad(fg_sorted)
+            losses.append(torch.dot(errors_sorted, grad))
+
+        if not losses:
+            return logits.sum() * 0
+        return torch.mean(torch.stack(losses))
+
 # ============================================
 # UTILITIES
 # ============================================
@@ -504,27 +550,82 @@ def check_gradients(model, threshold=10.0):
 
 def build_scheduler(optimizer, args, train_loader, start_epoch=0):
     """
-    Build scheduler sau khi rebuild optimizer (gọi khi unfreeze backbone).
-    start_epoch: epoch hiện tại để tính remaining steps.
+    Build scheduler dựa trên TOTAL epochs (không phải remaining).
+    Luôn tính từ epoch 0 để LR curve nhất quán dù có unfreeze hay không.
+    
+    Khi unfreeze, KHÔNG gọi hàm này để rebuild — thay vào đó dùng
+    add_param_group() để thêm backbone params vào optimizer hiện tại.
+    Chỉ gọi hàm này 1 lần duy nhất lúc khởi tạo.
     """
-    remaining_epochs = args.epochs - start_epoch
+    total_epochs = args.epochs
 
     if args.scheduler == 'onecycle':
-        # OneCycle không phù hợp khi resume giữa chừng → dùng Cosine
-        print(f"  [build_scheduler] OneCycle không phù hợp khi resume → dùng CosineAnnealing")
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(remaining_epochs, 1), eta_min=1e-7
+        # Với unfreeze progressive, OneCycle không phù hợp → dùng Cosine
+        print(f"  [build_scheduler] Dùng CosineAnnealingWarmRestarts (ổn định hơn OneCycle khi unfreeze)")
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=max(total_epochs // 3, 10), T_mult=1, eta_min=1e-7
         )
     elif args.scheduler == 'poly':
+        # Poly LR tính trên TOTAL epochs — không restart khi unfreeze
         def poly_lambda(epoch):
-            return max((1 - epoch / max(remaining_epochs, 1)) ** 0.9, 1e-7 / max(args.lr, 1e-10))
+            return max((1 - epoch / max(total_epochs, 1)) ** 0.9, 1e-7 / max(args.lr, 1e-10))
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lambda)
-        print(f"  [build_scheduler] PolyLR remaining_epochs={remaining_epochs}")
+        print(f"  [build_scheduler] PolyLR total_epochs={total_epochs} (không restart khi unfreeze)")
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=max(remaining_epochs, 1), eta_min=1e-7
+            optimizer, T_max=total_epochs, eta_min=1e-7
         )
     return scheduler
+
+
+def add_backbone_params_to_optimizer(optimizer, model, args):
+    """
+    Thêm backbone params vào optimizer HIỆN TẠI thay vì rebuild.
+    Cách này giữ nguyên scheduler state → LR tiếp tục decay smooth,
+    không bị restart như khi rebuild optimizer hoàn toàn.
+    """
+    # Lấy tất cả param đang được track bởi optimizer
+    existing_params = set()
+    for group in optimizer.param_groups:
+        for p in group['params']:
+            existing_params.add(id(p))
+
+    # Tách params mới theo loại
+    new_backbone = []
+    new_alpha = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in existing_params:
+            continue  # đã có rồi, bỏ qua
+        if 'alpha' in name:
+            new_alpha.append(param)
+        elif 'backbone' in name:
+            new_backbone.append(param)
+
+    added = 0
+    if new_backbone:
+        optimizer.add_param_group({
+            'params': new_backbone,
+            'lr': args.lr * args.backbone_lr_factor,
+            'weight_decay': args.weight_decay,
+            'name': 'backbone_unfrozen',
+        })
+        added += len(new_backbone)
+        print(f"  add_param_group: +{len(new_backbone)} backbone params (lr={args.lr * args.backbone_lr_factor:.2e})")
+
+    if new_alpha:
+        optimizer.add_param_group({
+            'params': new_alpha,
+            'lr': args.lr * args.alpha_lr_factor,
+            'weight_decay': args.weight_decay,
+            'name': 'alpha_unfrozen',
+        })
+        added += len(new_alpha)
+        print(f"  add_param_group: +{len(new_alpha)} alpha params (lr={args.lr * args.alpha_lr_factor:.2e})")
+
+    return added
 
 
 # ============================================
@@ -559,7 +660,7 @@ class ModelConfig:
                 "c4_channels":    C * 2,   #  64 â€” c4 (detail branch stage4)
                 "c2_channels":    C,       #  32 â€” c2 (stem layer 1)
                 "c1_channels":    C,       #  32 â€” c1 (stem layer 0)
-                "decoder_channels": 128,
+                "decoder_channels": 256,  # tăng capacity: 128→256
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
@@ -575,7 +676,8 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight": 1.0,
-                "dice_weight": 0.5,
+                "dice_weight": 1.0,   # tăng từ 0.5→1.0: boundary segmentation tốt hơn
+                "lovasz_weight": 0.5, # Lovász: tối ưu trực tiếp IoU
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
@@ -635,6 +737,8 @@ class Trainer:
             reduction='mean'
         )
         
+        self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
+        self.lovasz_weight = loss_cfg.get('lovasz_weight', 0.0)
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
@@ -669,7 +773,8 @@ class Trainer:
         print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision: {self.args.use_amp}")
         print(f"Gradient clipping: {self.args.grad_clip}")
-        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
+        lovasz_w = loss_cfg.get('lovasz_weight', 0.0)
+        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Lovász({lovasz_w})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -720,7 +825,22 @@ class Trainer:
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
             
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+                                # Lovász: tính trên H/4 resolution để tránh OOM và chậm
+                # sort() trên 8M pixels (logits_full) × 19 classes = quá nặng
+                # H/4 = 128×256 = 32K pixels → 16x nhanh hơn, loss vẫn hiệu quả
+                if self.lovasz_weight > 0:
+                    logits_h4 = F.interpolate(logits, scale_factor=0.5,
+                                              mode='bilinear', align_corners=False)
+                    masks_h4 = F.interpolate(masks.unsqueeze(1).float(),
+                                             scale_factor=0.5, mode='nearest'
+                                             ).squeeze(1).long()
+                    lovasz_loss = self.lovasz(logits_h4, masks_h4)
+                else:
+                    lovasz_loss = torch.tensor(0.0, device=logits.device)
+
+                loss = (self.ce_weight * ce_loss +
+                        self.dice_weight * dice_loss +
+                        self.lovasz_weight * lovasz_loss)
             
                 # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
                 if "aux" in outputs and self.args.aux_weight > 0:
@@ -828,8 +948,21 @@ class Trainer:
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
     
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-    
+                # Lovász trong validate — dùng H/4 nhất quán với train
+                if self.lovasz_weight > 0:
+                    logits_h4 = F.interpolate(logits, scale_factor=0.5,
+                                              mode='bilinear', align_corners=False)
+                    masks_h4 = F.interpolate(masks.unsqueeze(1).float(),
+                                             scale_factor=0.5, mode='nearest'
+                                             ).squeeze(1).long()
+                    lovasz_loss_val = self.lovasz(logits_h4, masks_h4)
+                else:
+                    lovasz_loss_val = torch.tensor(0.0, device=logits.device)
+
+                loss = (self.ce_weight * ce_loss +
+                        self.dice_weight * dice_loss +
+                        self.lovasz_weight * lovasz_loss_val)
+
             total_loss += loss.item()
     
             # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
@@ -1201,55 +1334,17 @@ def main():
             unfreeze_backbone_progressive(model, targets)
         
         # ðŸ” CHá»ˆ rebuild optimizer khi Ä‘Ãºng má»‘c unfreeze
+        # Khi đúng mốc unfreeze: KHÔNG rebuild optimizer, KHÔNG restart scheduler
+        # Chỉ add_param_group → LR curve tiếp tục smooth, không bị reset
         if epoch in unfreeze_epochs:
-        
             trainer.set_loss_phase('full')
-        
-            if args.use_discriminative_lr:
-                optimizer = setup_discriminative_lr(
-                    model,
-                    base_lr=args.lr,
-                    backbone_lr_factor=args.backbone_lr_factor,
-                    weight_decay=args.weight_decay,
-                    alpha_lr_factor=args.alpha_lr_factor
-                )
-            else:
-                head_params = []
-                backbone_params = []
-                alpha_params = []
-        
-                for n, p in model.named_parameters():
-                    if not p.requires_grad:
-                        continue
-                    if 'alpha' in n:
-                        alpha_params.append(p)
-                    elif 'backbone' in n:
-                        backbone_params.append(p)
-                    else:
-                        head_params.append(p)
-        
-                groups = []
-                if head_params:
-                    groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
-                if backbone_params:
-                    groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
-                if alpha_params:
-                    groups.append({'params': alpha_params, 'lr': args.lr * args.alpha_lr_factor, 'name': 'alpha'})
-        
-                optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-        
-                for g in optimizer.param_groups:
-                    g.setdefault('initial_lr', g['lr'])
-        
-            trainer.optimizer = optimizer
-            trainer.scheduler  = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
-            print("\n" + "="*70)
-            print("Learning Rates after unfreezing:")
-            print("="*70)
-            for i, group in enumerate(optimizer.param_groups):
-                name = group.get('name', f'group_{i}')
-                print(f"   {name}: {group['lr']:.2e}")
-            print("="*70 + "\n")
+            added = add_backbone_params_to_optimizer(trainer.optimizer, model, args)
+            print(f"\n{'='*70}")
+            print(f"Epoch {epoch+1}: Unfreeze → added {added} param tensors to optimizer (NO scheduler restart)")
+            print("Current LR per group:")
+            for g in trainer.optimizer.param_groups:
+                print(f"  {g.get('name','?')}: lr={g['lr']:.2e} | {len(g['params'])} tensors")
+            print(f"{'='*70}\n")
 
         # Switch back to full loss
         if unfreeze_epochs:
