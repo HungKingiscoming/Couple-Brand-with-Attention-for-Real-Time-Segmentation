@@ -829,12 +829,14 @@ class Trainer:
                 # sort() trên 8M pixels (logits_full) × 19 classes = quá nặng
                 # H/4 = 128×256 = 32K pixels → 16x nhanh hơn, loss vẫn hiệu quả
                 if self.lovasz_weight > 0:
-                    logits_h4 = F.interpolate(logits, scale_factor=0.5,
-                                              mode='bilinear', align_corners=False)
-                    masks_h4 = F.interpolate(masks.unsqueeze(1).float(),
-                                             scale_factor=0.5, mode='nearest'
-                                             ).squeeze(1).long()
-                    lovasz_loss = self.lovasz(logits_h4, masks_h4)
+                    # Dùng logits H/2 (output gốc) và downsample masks về H/2
+                    # logits: (B,C,H/2,W/2), masks: (B,H,W) → masks_half: (B,H/2,W/2)
+                    masks_half = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    lovasz_loss = self.lovasz(logits, masks_half)
                 else:
                     lovasz_loss = torch.tensor(0.0, device=logits.device)
 
@@ -950,12 +952,12 @@ class Trainer:
     
                 # Lovász trong validate — dùng H/4 nhất quán với train
                 if self.lovasz_weight > 0:
-                    logits_h4 = F.interpolate(logits, scale_factor=0.5,
-                                              mode='bilinear', align_corners=False)
-                    masks_h4 = F.interpolate(masks.unsqueeze(1).float(),
-                                             scale_factor=0.5, mode='nearest'
-                                             ).squeeze(1).long()
-                    lovasz_loss_val = self.lovasz(logits_h4, masks_h4)
+                    masks_half = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    lovasz_loss_val = self.lovasz(logits, masks_half)
                 else:
                     lovasz_loss_val = torch.tensor(0.0, device=logits.device)
 
