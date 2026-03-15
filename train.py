@@ -99,7 +99,7 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
 
     if missing:
-        print(f"\nÃ¢Å¡ Ã¯Â¸Â  Missing keys in model ({len(missing)}):")
+        print(f"\n Missing keys in model ({len(missing)}):")
         for key in missing[:10]:
             print(f"   - {key}")
         if len(missing) > 10:
@@ -169,32 +169,27 @@ class DiceLoss(nn.Module):
         """
         B, C, H, W = logits.shape
 
-        # Valid mask â€” bá» ignore_index
-        valid_mask = (targets != self.ignore_index)                  # (B, H, W) bool
-
-        # One-hot targets â€” chá»‰ tÃ­nh trÃªn valid pixels
+        valid_mask = (targets != self.ignore_index)                
         targets_clamped = targets.clamp(0, C - 1)
-        targets_one_hot = F.one_hot(targets_clamped, num_classes=C)  # (B, H, W, C)
-        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  # (B, C, H, W)
+        targets_one_hot = F.one_hot(targets_clamped, num_classes=C) 
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  
         targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1).float()
 
         # Softmax probs â€” zero out invalid pixels
-        probs = F.softmax(logits, dim=1)                             # (B, C, H, W)
+        probs = F.softmax(logits, dim=1)                            
         probs = probs * valid_mask.unsqueeze(1).float()
 
         # Flatten spatial
-        probs_flat   = probs.reshape(B, C, -1)           # (B, C, N)
-        targets_flat = targets_one_hot.reshape(B, C, -1) # (B, C, N)
+        probs_flat   = probs.reshape(B, C, -1)          
+        targets_flat = targets_one_hot.reshape(B, C, -1)
 
         # Dice per class per batch
-        intersection = (probs_flat * targets_flat).sum(dim=2)        # (B, C)
-        cardinality  = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)  # (B, C)
+        intersection = (probs_flat * targets_flat).sum(dim=2)       
+        cardinality  = probs_flat.sum(dim=2) + targets_flat.sum(dim=2) 
 
-        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)  # (B, C)
+        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
 
         if self.log_loss:
-            # -log(dice): gradient explodes khi dice â†’ 0 (khÃ³ class)
-            # â†’ model bá»‹ Ã©p há»c hard class máº¡nh hÆ¡n
             dice_loss = -torch.log(dice_score.clamp(min=self.smooth))
         else:
             dice_loss = 1.0 - dice_score  # (B, C)
@@ -203,13 +198,11 @@ class DiceLoss(nn.Module):
         if self.class_weights is not None:
             dice_loss = dice_loss * self.class_weights.unsqueeze(0)  # (B, C)
 
-        # Chá»‰ tÃ­nh trung bÃ¬nh trÃªn cÃ¡c class cÃ³ pixel trong batch
-        # (trÃ¡nh class khÃ´ng xuáº¥t hiá»‡n kÃ©o loss vá» 0)
-        class_present = targets_flat.sum(dim=2) > 0  # (B, C) bool
+        class_present = targets_flat.sum(dim=2) > 0  
         dice_loss = dice_loss * class_present.float()
 
-        n_present = class_present.float().sum(dim=1).clamp(min=1)  # (B,)
-        dice_loss = dice_loss.sum(dim=1) / n_present                # (B,)
+        n_present = class_present.float().sum(dim=1).clamp(min=1)  
+        dice_loss = dice_loss.sum(dim=1) / n_present              
 
         return dice_loss.mean()
 
@@ -247,10 +240,6 @@ class FocalLoss(nn.Module):
 
 
 class LovaszSoftmaxLoss(nn.Module):
-    """
-    Lovász-Softmax loss — tối ưu trực tiếp IoU per class.
-    Hiệu quả hơn CE cho boundary segmentation, đặc biệt với foggy domain.
-    """
     def __init__(self, ignore_index=255):
         super().__init__()
         self.ignore_index = ignore_index
@@ -292,20 +281,6 @@ class LovaszSoftmaxLoss(nn.Module):
 
 
 class BoundaryLoss(nn.Module):
-    """
-    BCE Boundary Loss với fog-aware weighting.
-    
-    Pipeline:
-      1. Tạo GT boundary mask: pixel có neighbor khác class → boundary=1
-      2. Tính predicted boundary = max class prob thấp (uncertain region)
-      3. BCE giữa predicted uncertainty và GT boundary
-      4. Fog-aware: chỉ tính tại pixels model đã confident (bỏ qua foggy ambiguous)
-    
-    Lý do dùng cho Foggy Cityscapes:
-      - Boundary thật sự mờ do fog → cần lọc noisy boundary signal
-      - confidence_threshold loại bỏ pixel quá uncertain (fog region)
-      - Chỉ phạt model khi nó sai tại boundary RÕ RÀNG
-    """
     def __init__(
         self,
         ignore_index: int = 255,
@@ -321,31 +296,13 @@ class BoundaryLoss(nn.Module):
         self.register_buffer('pos_weight', torch.tensor(pos_weight))
 
     def _get_boundary_mask(self, labels: torch.Tensor) -> torch.Tensor:
-        """
-        Tạo binary boundary mask từ GT labels.
-        Boundary = pixel có ít nhất 1 neighbor thuộc class khác.
-        
-        Args:
-            labels: (B, H, W) long — GT class labels
-        Returns:
-            boundary: (B, H, W) float — 1 tại boundary, 0 otherwise
-                      ignore_index pixels → 0 (không tính)
-        """
         B, H, W = labels.shape
-        
-        # Convert sang float để dùng pooling
-        # ignore_index pixels sẽ được handle sau
-        valid_mask = (labels != self.ignore_index)  # (B, H, W)
-        
-        # Tạo label map với ignore → -1 để không confuse với class 0
+        valid_mask = (labels != self.ignore_index)
         labels_safe = labels.clone().float()
         labels_safe[~valid_mask] = -1.0
         
         labels_4d = labels_safe.unsqueeze(1)  # (B, 1, H, W)
         pad = self.kernel_size // 2
-        
-        # Max và min trong neighborhood
-        # Nếu max != min → có boundary
         max_pool = F.max_pool2d(
             labels_4d, kernel_size=self.kernel_size,
             stride=1, padding=pad
