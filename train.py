@@ -410,7 +410,7 @@ class BoundaryLoss(nn.Module):
         bce = F.binary_cross_entropy_with_logits(
             pred_logit,
             gt_flat,
-            pos_weight=self.pos_weight.expand_as(gt_flat),
+            pos_weight=self.pos_weight.to(pred_logit.device),
             reduction='mean'
         )
         loss = bce
