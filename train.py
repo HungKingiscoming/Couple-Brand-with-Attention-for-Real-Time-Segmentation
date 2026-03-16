@@ -1033,7 +1033,6 @@ class Trainer:
                                               size=masks.shape[-2:],
                                               mode="bilinear", align_corners=False)
                     loss = loss + 0.4 * ds_decay * self.ce(aux_logits, masks)
-                    loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps
     
