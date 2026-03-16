@@ -24,7 +24,6 @@ class GatedFusion(nn.Module):
         act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
     ):
         super().__init__()
-
         self.gate_conv = nn.Sequential(
             ConvModule(
                 in_channels=channels * 2,
@@ -43,12 +42,9 @@ class GatedFusion(nn.Module):
         )
 
     def forward(self, skip: Tensor, dec: Tensor) -> Tensor:
-
         gate = self.gate_conv(torch.cat([skip, dec], dim=1))
+        return gate * skip + (1.0 - gate) * dec
 
-        out = dec + gate * skip
-
-        return out
 
 class DWConvModule(nn.Module):
 
@@ -184,17 +180,12 @@ class EnhancedDecoder(nn.Module):
                                      norm_cfg=norm_cfg, act_cfg=act_cfg)
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
 
-    def forward(self, c5: Tensor, c4: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
-        """
-        Args:
-            c5: (B, C*4, H/8, W/8)   = (B, 128, H/8, W/8)
-            c4: (B, C*2, H/8, W/8)   = (B,  64, H/8, W/8)  Ã¢â€ Â same spatial as c5
-            c2: (B, C,   H/4, W/4)   = (B,  32, H/4, W/4)
-            c1: (B, C,   H/2, W/2)   = (B,  32, H/2, W/2)
-        Returns:
-            (B, D//2, H/2, W/2) = (B, 64, H/2, W/2)
-        """
-        # Stage 0: refine c5, fuse c4 (cÃƒÂ¹ng resolution H/8)
+    def forward(
+        self,
+        c5: Tensor, c4: Tensor, c2: Tensor, c1: Tensor,
+        return_intermediate: bool = False,
+    ):
+        # Stage 0: refine c5, fuse c4 @ H/8
         x = self.refine0(c5)
         c4p = self.c4_proj(c4)
         if self.use_gated_fusion:
@@ -202,7 +193,7 @@ class EnhancedDecoder(nn.Module):
         else:
             x = self.fusion0(torch.cat([c4p, x], dim=1))
 
-        # Stage 1: H/8 Ã¢â€ â€™ H/4, fuse c2
+        # Stage 1: H/8 -> H/4, fuse c2
         x = self.up1(x)
         x = self.refine1(x)
         c2p = self.c2_proj(c2)
@@ -210,8 +201,9 @@ class EnhancedDecoder(nn.Module):
             x = self.fusion1(c2p, x)
         else:
             x = self.fusion1(torch.cat([c2p, x], dim=1))
+        feat_h4 = x  # (B, 64, H/4, W/4) — deep supervision
 
-        # Stage 2: H/4 Ã¢â€ â€™ H/2, fuse c1
+        # Stage 2: H/4 -> H/2, fuse c1
         x = self.up2(x)
         x = self.refine2(x)
         c1p = self.c1_proj(c1)
@@ -219,17 +211,22 @@ class EnhancedDecoder(nn.Module):
             x = self.fusion2(c1p, x)
         else:
             x = self.fusion2(torch.cat([c1p, x], dim=1))
+        feat_h2 = x  # (B, 64, H/2, W/2) — deep supervision
 
         x = self.final_proj(x)
         x = self.dropout(x)
-        return x   # (B, 64, H/2, W/2)
+
+        if return_intermediate:
+            return x, feat_h4, feat_h2
+        return x  # (B, 64, H/2, W/2)
+
 
 
 class GCNetAuxHead(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 64,    # C*2 = 64 vÃ¡Â»â€ºi channels=32
+        in_channels: int = 64,    # C*2 = 64 vá»›i channels=32
         mid_channels: int = 64,
         num_classes: int = 19,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
@@ -253,9 +250,9 @@ class GCNetAuxHead(nn.Module):
     def forward(self, feats: Dict[str, Tensor]) -> Tensor:
         """
         Args:
-            feats: backbone output dict, phÃ¡ÂºÂ£i cÃƒÂ³ key 'c4'
+            feats: backbone output dict, pháº£i cÃ³ key 'c4'
         Returns:
-            logits at H/8 resolution (sÃ¡ÂºÂ½ Ã„â€˜Ã†Â°Ã¡Â»Â£c upsample trong loss computation)
+            logits at H/8 resolution (sáº½ Ä‘Æ°á»£c upsample trong loss computation)
         """
         x = feats['c4'] if isinstance(feats, dict) else feats
         return self.conv_seg(self.conv1(x))
@@ -267,14 +264,14 @@ class GCNetHead(nn.Module):
     """
     Main segmentation head.
 
-    NhÃ¡ÂºÂ­n dict tÃ¡Â»Â« GCNetWithEnhance:
+    Nháº­n dict tá»« GCNetWithEnhance:
         {c1, c2, c4, c5}
 
     Pipeline:
-        c5 (H/8,  128) Ã¢â€â‚¬Ã¢â€Â
-        c4 (H/8,   64) Ã¢â€â‚¬Ã¢â€Â¤Ã¢â€ â€™ EnhancedDecoder Ã¢â€ â€™ (H/2, 64) Ã¢â€ â€™ conv_seg Ã¢â€ â€™ logits
-        c2 (H/4,   32) Ã¢â€â‚¬Ã¢â€Â¤
-        c1 (H/2,   32) Ã¢â€â‚¬Ã¢â€Ëœ
+        c5 (H/8,  128) â”€â”
+        c4 (H/8,   64) â”€â”¤â†’ EnhancedDecoder â†’ (H/2, 64) â†’ conv_seg â†’ logits
+        c2 (H/4,   32) â”€â”¤
+        c1 (H/2,   32) â”€â”˜
 
     channels=32 (default):
         in_channels  = C*4 = 128
@@ -285,7 +282,7 @@ class GCNetHead(nn.Module):
 
     def __init__(
         self,
-        in_channels: int = 128,      # c5 = C*4
+        in_channels: int = 128,
         num_classes: int = 19,
         decoder_channels: int = 128,
         dropout_ratio: float = 0.1,
@@ -293,12 +290,14 @@ class GCNetHead(nn.Module):
         act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
         align_corners: bool = False,
         use_gated_fusion: bool = True,
-        c4_channels: int = 64,       # C*2
-        c2_channels: int = 32,       # C
-        c1_channels: int = 32,       # C
+        c4_channels: int = 64,
+        c2_channels: int = 32,
+        c1_channels: int = 32,
+        use_deep_supervision: bool = True,
     ):
         super().__init__()
         self.align_corners = align_corners
+        self.use_deep_supervision = use_deep_supervision
 
         self.decoder = EnhancedDecoder(
             in_channels=in_channels,
@@ -318,19 +317,37 @@ class GCNetHead(nn.Module):
             nn.Conv2d(output_channels, num_classes, kernel_size=1),
         )
 
-    def forward(self, feats: Dict[str, Tensor]) -> Tensor:
-        """
-        Args:
-            feats: dict vÃ¡Â»â€ºi keys {c1, c2, c4, c5}
-        Returns:
-            logits: (B, num_classes, H/2, W/2)
-            Ã¢â‚¬â€ sÃ¡ÂºÂ½ Ã„â€˜Ã†Â°Ã¡Â»Â£c interpolate lÃƒÂªn full resolution trong Trainer
-        """
+        # Deep supervision heads — zero inference overhead (train only)
+        if use_deep_supervision:
+            mid = output_channels  # 64
+            self.aux_h4 = nn.Sequential(
+                ConvModule(mid, mid, kernel_size=3, padding=1,
+                           norm_cfg=norm_cfg, act_cfg=act_cfg),
+                nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
+                nn.Conv2d(mid, num_classes, kernel_size=1),
+            )
+            self.aux_h2 = nn.Sequential(
+                ConvModule(mid, mid, kernel_size=3, padding=1,
+                           norm_cfg=norm_cfg, act_cfg=act_cfg),
+                nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
+                nn.Conv2d(mid, num_classes, kernel_size=1),
+            )
+
+    def forward(
+        self,
+        feats: Dict[str, Tensor],
+        return_aux: bool = False,
+    ):
         c1 = feats['c1']
         c2 = feats['c2']
         c4 = feats['c4']
         c5 = feats['c5']
 
-        # c4 Ã„â€˜Ã†Â°Ã¡Â»Â£c Ã„â€˜Ã†Â°a vÃƒ o decoder nhÃ†Â° skip connection thÃ¡Â»Â±c sÃ¡Â»Â±
+        if return_aux and self.use_deep_supervision:
+            x, feat_h4, feat_h2 = self.decoder(
+                c5, c4, c2, c1, return_intermediate=True
+            )
+            return self.conv_seg(x), self.aux_h4(feat_h4), self.aux_h2(feat_h2)
+
         x = self.decoder(c5, c4, c2, c1)
         return self.conv_seg(x)
