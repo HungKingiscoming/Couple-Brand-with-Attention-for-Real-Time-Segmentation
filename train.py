@@ -788,8 +788,13 @@ class ModelConfig:
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
-                "norm_cfg": {'type': 'BN', 'requires_grad': True},
-                "act_cfg": {'type': 'ReLU', 'inplace': False}
+                "norm_cfg": {"type": "BN", "requires_grad": True},
+                "act_cfg": {"type": "ReLU", "inplace": False},
+                "use_deep_supervision": True,
+            },
+            "deep_sup": {
+                "aux_h4_weight": 0.2,
+                "aux_h2_weight": 0.3,
             },
             "aux_head": {
                 "in_channels": C * 2,
@@ -829,7 +834,16 @@ class Segmentor(nn.Module):
 
     def forward_train(self, x):
         feats = self.backbone(x)
-        outputs = {"main": self.decode_head(feats)}
+        # Deep supervision: decode_head trả về (main, aux_h4, aux_h2)
+        head_out = self.decode_head(feats, return_aux=True)
+        if isinstance(head_out, tuple):
+            outputs = {
+                "main":   head_out[0],
+                "ds_h4":  head_out[1],  # deep supervision H/4
+                "ds_h2":  head_out[2],  # deep supervision H/2
+            }
+        else:
+            outputs = {"main": head_out}
         if self.aux_head is not None:
             outputs["aux"] = self.aux_head(feats)
         return outputs
@@ -865,6 +879,10 @@ class Trainer:
         
         self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
         self.lovasz_weight = loss_cfg.get('lovasz_weight', 0.0)
+        # Deep supervision weights
+        deep_sup_cfg = getattr(args, 'deep_sup_config', {})
+        self.ds_h4_weight = deep_sup_cfg.get('aux_h4_weight', 0.2)
+        self.ds_h2_weight = deep_sup_cfg.get('aux_h2_weight', 0.3)
         self.boundary = BoundaryLoss(
             ignore_index=args.ignore_index,
             kernel_size=3,
@@ -995,15 +1013,26 @@ class Trainer:
                         self.boundary_weight * boundary_loss)
             
                 # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
+                # Deep supervision: H/4 and H/2 with epoch decay
+                ds_decay = max(1.0 - epoch / max(self.args.epochs, 1), 0.1)
+
+                if "ds_h4" in outputs and self.ds_h4_weight > 0:
+                    ds_h4_up = F.interpolate(outputs["ds_h4"],
+                                             size=masks.shape[-2:],
+                                             mode="bilinear", align_corners=False)
+                    loss = loss + self.ds_h4_weight * ds_decay * self.ce(ds_h4_up, masks)
+
+                if "ds_h2" in outputs and self.ds_h2_weight > 0:
+                    ds_h2_up = F.interpolate(outputs["ds_h2"],
+                                             size=masks.shape[-2:],
+                                             mode="bilinear", align_corners=False)
+                    loss = loss + self.ds_h2_weight * ds_decay * self.ce(ds_h2_up, masks)
+
                 if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = F.interpolate(
-                        outputs["aux"],
-                        size=masks.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    aux_ce_loss = self.ce(aux_logits, masks)
-                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    aux_logits = F.interpolate(outputs["aux"],
+                                              size=masks.shape[-2:],
+                                              mode="bilinear", align_corners=False)
+                    loss = loss + 0.4 * ds_decay * self.ce(aux_logits, masks)
                     loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps
@@ -1299,6 +1328,7 @@ def main():
     # Config
     cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
+    args.deep_sup_config = cfg["deep_sup"]
     
     print(f" Model Config:")
     print(f"DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
