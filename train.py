@@ -310,7 +310,7 @@ class BoundaryLoss(nn.Module):
         self,
         ignore_index: int = 255,
         kernel_size: int = 3,           # kích thước neighborhood để detect boundary
-        confidence_threshold: float = 0.7,  # chỉ tính loss tại pixel confident này
+        confidence_threshold: float = 0.5,  # giảm từ 0.7: nhiều pixel hơn → gradient ổn định hơn
         pos_weight: float = 3.0,        # weight cho boundary pixels (thường ít hơn non-boundary)
     ):
         super().__init__()
@@ -400,16 +400,14 @@ class BoundaryLoss(nn.Module):
         pred_flat = pred_boundary[compute_mask]    # (N,) ∈ (0,1)
         gt_flat   = boundary_gt[compute_mask]      # (N,) ∈ {0,1}
 
-        # Convert prob → logit: logit = log(p / (1-p))
-        pred_logit = torch.log(
-            pred_flat.clamp(1e-6, 1 - 1e-6) /
-            (1 - pred_flat.clamp(1e-6, 1 - 1e-6))
-        )
+        # torch.logit() có numerical stability tốt hơn manual log(p/(1-p))
+        # eps=1e-4 thay vì 1e-6 — an toàn hơn với float16 trên GPU
+        pred_logit = torch.logit(pred_flat.float(), eps=1e-4)
 
-        # BCEWithLogitsLoss: safe với AMP, tích hợp sigmoid bên trong
+        # BCEWithLogitsLoss: safe với AMP
         bce = F.binary_cross_entropy_with_logits(
             pred_logit,
-            gt_flat,
+            gt_flat.float(),
             pos_weight=self.pos_weight.to(pred_logit.device),
             reduction='mean'
         )
@@ -981,10 +979,15 @@ class Trainer:
                         self.lovasz_weight * lovasz_loss)
 
                 # Boundary loss: full resolution để detect boundary chính xác
+                # Boundary loss: full resolution để detect boundary chính xác
                 if self.boundary_weight > 0:
                     boundary_loss = self.boundary(logits_full, masks)
+                    # Guard: NaN/Inf có thể xảy ra với float16 khi logit explode
+                    if torch.isnan(boundary_loss) or torch.isinf(boundary_loss):
+                        boundary_loss = torch.tensor(0.0, device=logits.device)
                 else:
                     boundary_loss = torch.tensor(0.0, device=logits.device)
+
 
                 loss = (self.ce_weight    * ce_loss +
                         self.dice_weight  * dice_loss +
@@ -1238,7 +1241,7 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=5.0)  # Ã¢â€ Â INCREASED from 1.0
+    parser.add_argument("--grad_clip", type=float, default=1.0)  # Ã¢â€ Â INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     parser.add_argument("--alpha_lr_factor", type=float, default=0.01,
