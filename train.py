@@ -1203,7 +1203,17 @@ class Trainer:
     def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        self.model.load_state_dict(checkpoint['model'])
+        # strict=False: cho phép load partial weights
+        # Missing keys (aux_h4, aux_h2) sẽ giữ nguyên random init — đây là đúng
+        # khi thêm deep supervision heads mới vào architecture
+        missing, unexpected = self.model.load_state_dict(
+            checkpoint['model'], strict=False
+        )
+        if missing:
+            print(f'  New weights (will train from scratch): {len(missing)} keys')
+            # Chỉ print nếu có unexpected — đó mới là vấn đề
+        if unexpected:
+            print(f'  WARNING unexpected keys: {unexpected[:5]}')
 
         if load_optimizer and checkpoint.get('optimizer') is not None:
             try:
