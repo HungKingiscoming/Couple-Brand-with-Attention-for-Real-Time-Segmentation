@@ -217,7 +217,7 @@ class EnhancedDecoder(nn.Module):
 
         skip = self.c2_proj(c2).detach()
         
-        x = self.fusion1(skip, x)
+        x = self.fusion1_gate(skip, x)
         
         x = self.refine1(x)
 
@@ -226,7 +226,7 @@ class EnhancedDecoder(nn.Module):
 
         skip = self.c1_proj(c1).detach()
         
-        x = self.fusion2(skip, x)
+        x = self.fusion2_gate(skip, x)
         
         x = self.refine2(x)
 
