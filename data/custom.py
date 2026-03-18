@@ -193,10 +193,11 @@ def get_train_transforms(
     std: List[float] = [0.229, 0.224, 0.225],
     dataset_type: str = 'normal'
 ) -> A.Compose:
-    # Phần chung: resize + hình học
+
+    # ===== GEOMETRIC (CORE) =====
     base_list = [
-        A.Resize(height=img_size[0], width=img_size[1], p=1.0),
-        A.RandomScale(scale_limit=0.25, p=0.5),
+        A.RandomScale(scale_limit=0.4, p=1.0),
+
         A.PadIfNeeded(
             min_height=img_size[0],
             min_width=img_size[1],
@@ -205,51 +206,72 @@ def get_train_transforms(
             mask_value=255,
             p=1.0
         ),
+
         A.RandomCrop(height=img_size[0], width=img_size[1], p=1.0),
-        A.ShiftScaleRotate(
-            shift_limit=0.1,
-            scale_limit=0.0,  # đã scale ở RandomScale
-            rotate_limit=10,
-            border_mode=cv2.BORDER_REFLECT_101,
-            p=0.5
-        ),
+
         A.HorizontalFlip(p=0.5),
+
+        # ❌ REMOVE ROTATE (rất quan trọng cho Cityscapes)
+        # A.ShiftScaleRotate(...)
     ]
 
+    # ===== DATASET-SPECIFIC =====
     if dataset_type == 'foggy':
-        # Augment dành cho foggy
         foggy_specific = [
-            # Blur nhẹ nhưng thường xuyên hơn
-            A.OneOf([
-                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
-                A.MotionBlur(blur_limit=5, p=1.0),
-            ], p=0.3),
 
-            # Điều chỉnh độ dày sương: brightness + contrast + gamma yếu
-            A.OneOf([
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.1,  # nhỏ hơn normal
-                    contrast_limit=0.1,
-                    p=1.0
-                ),
-                A.RandomGamma(gamma_limit=(90, 110), p=1.0),
-            ], p=0.5),
-
-            # Optional: thêm haze nhẹ
-            A.RandomFog(
-                fog_coef_lower=0.1,
-                fog_coef_upper=0.3,
-                alpha_coef=0.08,
+            # 🔥 Robustness (rất quan trọng)
+            A.CoarseDropout(
+                max_holes=6,
+                max_height=32,
+                max_width=32,
+                fill_value=0,
+                mask_fill_value=255,
                 p=0.3
             ),
-        ]
-    else:
-        # Augment dành cho normal (giữ gần như như cũ)
-        foggy_specific = [
+
+            # Blur nhẹ (giảm lại)
             A.OneOf([
-                A.GaussianBlur(blur_limit=(3, 7), p=1.0),
-                A.MedianBlur(blur_limit=5, p=1.0),
+                A.GaussianBlur(blur_limit=3, p=1.0),
+                A.MotionBlur(blur_limit=3, p=1.0),
+            ], p=0.15),
+
+            # Light intensity change
+            A.OneOf([
+                A.RandomBrightnessContrast(
+                    brightness_limit=0.08,
+                    contrast_limit=0.08,
+                    p=1.0
+                ),
+                A.RandomGamma(gamma_limit=(95, 105), p=1.0),
+            ], p=0.3),
+
+            # ⚠️ Fog rất nhẹ (hoặc có thể tắt)
+            A.RandomFog(
+                fog_coef_lower=0.05,
+                fog_coef_upper=0.15,
+                alpha_coef=0.05,
+                p=0.1
+            ),
+        ]
+
+    else:
+        # NORMAL dataset → augment mạnh hơn
+        foggy_specific = [
+
+            A.CoarseDropout(
+                max_holes=8,
+                max_height=32,
+                max_width=32,
+                fill_value=0,
+                mask_fill_value=255,
+                p=0.3
+            ),
+
+            A.OneOf([
+                A.GaussianBlur(blur_limit=3, p=1.0),
+                A.MedianBlur(blur_limit=3, p=1.0),
             ], p=0.1),
+
             A.OneOf([
                 A.ColorJitter(
                     brightness=0.1,
@@ -275,7 +297,6 @@ def get_train_transforms(
             ToTensorV2()
         ]
     )
-
 
 
 def get_val_transforms(
