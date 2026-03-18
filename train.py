@@ -1268,7 +1268,7 @@ def main():
     # Dataset
     parser.add_argument("--train_txt", required=True)
     parser.add_argument("--val_txt", required=True)
-    parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
+    parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--reset_best_metric", action="store_true")
