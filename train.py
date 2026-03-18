@@ -246,6 +246,81 @@ class FocalLoss(nn.Module):
 
 
 
+
+class OHEMLoss(nn.Module):
+    """
+    Online Hard Example Mining CE Loss.
+    
+    Thay vì tính CE trên toàn bộ pixel, chỉ lấy top-K pixel
+    có loss cao nhất (hard examples) để backward.
+    
+    Với Cityscapes Foggy:
+    - Easy pixels: road, sky, building (chiếm 50%+ dataset)
+    - Hard pixels: pole, rider, bicycle, traffic sign (< 5% dataset)
+    
+    OHEM tự động focus vào hard pixels mà không cần class weights thủ công.
+    Hiệu quả hơn class weights vì adapt theo từng batch.
+    
+    keep_ratio=0.3: giữ 30% pixel khó nhất — chuẩn cho Cityscapes
+    min_kept=100000: đảm bảo luôn có đủ pixels để train (tránh degenerate batch)
+    """
+    def __init__(
+        self,
+        ignore_index: int = 255,
+        keep_ratio: float = 0.3,
+        min_kept: int = 100000,
+        class_weights: torch.Tensor = None,
+    ):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.keep_ratio = keep_ratio
+        self.min_kept = min_kept
+        self.class_weights = class_weights  # (C,) tensor hoặc None
+
+    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """
+        OHEM + optional class weights:
+        1. Tính CE per-pixel với class_weights (nếu có)
+        2. Chỉ backward top keep_ratio% pixel khó nhất
+        
+        Args:
+            logits: (B, C, H, W)
+            labels: (B, H, W)
+        """
+        B, C, H, W = logits.shape
+
+        # CE per-pixel — dùng class_weights nếu có
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        loss_per_pixel = F.cross_entropy(
+            logits, labels,
+            weight=weight,
+            ignore_index=self.ignore_index,
+            reduction='none'
+        ).view(-1)  # (B*H*W,)
+
+        # Chỉ tính trên valid pixels
+        valid_mask = (labels.view(-1) != self.ignore_index)
+        valid_losses = loss_per_pixel[valid_mask]
+        n_valid = valid_losses.numel()
+
+        if n_valid == 0:
+            return logits.sum() * 0
+
+        # Số pixel giữ lại
+        n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
+        n_keep = min(n_keep, n_valid)
+
+        # Top-K hard pixels
+        if n_keep < n_valid:
+            sorted_losses, _ = torch.sort(valid_losses, descending=True)
+            threshold = sorted_losses[n_keep - 1].detach()
+            hard_losses = valid_losses[valid_losses >= threshold]
+        else:
+            hard_losses = valid_losses
+
+        return hard_losses.mean()
+
+
 class LovaszSoftmaxLoss(nn.Module):
     """
     Lovász-Softmax loss — tối ưu trực tiếp IoU per class.
@@ -793,8 +868,8 @@ class ModelConfig:
                 "use_deep_supervision": True,
             },
             "deep_sup": {
-                "aux_h4_weight": 0.2,
-                "aux_h2_weight": 0.3,
+                "aux_h4_weight": 0.0,  # bỏ deep supervision
+                "aux_h2_weight": 0.0,
             },
             "aux_head": {
                 "in_channels": C * 2,
@@ -805,14 +880,16 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "loss": {
-                "ce_weight": 1.0,      # per-pixel classification
-                "dice_weight": 1.0,    # class overlap + imbalance
-                "lovasz_weight": 0.0,  # bỏ: overlap với Dice, gradient conflict
-                "boundary_weight": 0.3, # boundary refinement fog-aware (tăng từ 0.2 vì bỏ Lovász)
+                "ohem_weight": 1.0,    # OHEM-CE: focus hard pixels (pole, fence, rider...)
+                "dice_weight": 1.0,    # Dice: class overlap
+                "lovasz_weight": 0.0,  # off
+                "boundary_weight": 0.0, # off: đã chứng minh không hiệu quả
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
-                "dice_smooth": 1e-5
+                "dice_smooth": 1e-5,
+                # ce_weight giữ lại để dùng cho aux/ds heads
+                "ce_weight": 0.0,      # main head dùng OHEM thay CE
             }
         }
 
@@ -834,16 +911,7 @@ class Segmentor(nn.Module):
 
     def forward_train(self, x):
         feats = self.backbone(x)
-        # Deep supervision: decode_head trả về (main, aux_h4, aux_h2)
-        head_out = self.decode_head(feats, return_aux=True)
-        if isinstance(head_out, tuple):
-            outputs = {
-                "main":   head_out[0],
-                "ds_h4":  head_out[1],  # deep supervision H/4
-                "ds_h2":  head_out[2],  # deep supervision H/2
-            }
-        else:
-            outputs = {"main": head_out}
+        outputs = {"main": self.decode_head(feats)}
         if self.aux_head is not None:
             outputs["aux"] = self.aux_head(feats)
         return outputs
@@ -876,6 +944,14 @@ class Trainer:
             ignore_index=args.ignore_index,
             reduction='mean'
         )
+        # OHEM + class_weights: focus hard pixels VÀ rare classes
+        self.ohem = OHEMLoss(
+            ignore_index=args.ignore_index,
+            keep_ratio=0.3,
+            min_kept=100000,
+            class_weights=class_weights,  # None nếu không dùng --use_class_weights
+        )
+        self.ohem_weight = loss_cfg.get('ohem_weight', 1.0)
         
         self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
         self.lovasz_weight = loss_cfg.get('lovasz_weight', 0.0)
@@ -924,9 +1000,9 @@ class Trainer:
         print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision: {self.args.use_amp}")
         print(f"Gradient clipping: {self.args.grad_clip}")
-        lovasz_w   = loss_cfg.get('lovasz_weight', 0.0)
+        ohem_w     = loss_cfg.get('ohem_weight', 0.0)
         boundary_w = loss_cfg.get('boundary_weight', 0.0)
-        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']}) + Lovász({lovasz_w}) + Boundary({boundary_w})")
+        print(f"Loss: OHEM({ohem_w}) + Dice({loss_cfg['dice_weight']}) + Boundary({boundary_w})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -962,78 +1038,28 @@ class Trainer:
                     mode='bilinear',
                     align_corners=False
                 )
-                ce_loss = self.ce(logits_full, masks)
-            
-                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
+                # OHEM: focus hard pixels (pole, fence, rider, motorcycle...)
+                # class_weights da duoc inject vao OHEMLoss khi init
+                ohem_loss = self.ohem(logits_full, masks)
+
+                # Dice: tren logits_full nhat quan voi validate
                 if self.dice_weight > 0:
-                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
-                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-                    dice_loss = self.dice(logits, masks_small)
+                    dice_loss = self.dice(logits_full, masks)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-            
-                                # Lovász: tính trên H/4 resolution để tránh OOM và chậm
-                # sort() trên 8M pixels (logits_full) × 19 classes = quá nặng
-                # H/4 = 128×256 = 32K pixels → 16x nhanh hơn, loss vẫn hiệu quả
-                if self.lovasz_weight > 0:
-                    # Dùng logits H/2 (output gốc) và downsample masks về H/2
-                    # logits: (B,C,H/2,W/2), masks: (B,H,W) → masks_half: (B,H/2,W/2)
-                    masks_half = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-                    lovasz_loss = self.lovasz(logits, masks_half)
-                else:
-                    lovasz_loss = torch.tensor(0.0, device=logits.device)
 
-                loss = (self.ce_weight * ce_loss +
-                        self.dice_weight * dice_loss +
-                        self.lovasz_weight * lovasz_loss)
+                loss = (self.ohem_weight * ohem_loss +
+                        self.dice_weight * dice_loss)
 
-                # Boundary loss: full resolution để detect boundary chính xác
-                # Boundary loss: full resolution để detect boundary chính xác
-                if self.boundary_weight > 0:
-                    boundary_loss = self.boundary(logits_full, masks)
-                    # Guard: NaN/Inf có thể xảy ra với float16 khi logit explode
-                    if torch.isnan(boundary_loss) or torch.isinf(boundary_loss):
-                        boundary_loss = torch.tensor(0.0, device=logits.device)
-                else:
-                    boundary_loss = torch.tensor(0.0, device=logits.device)
-
-
-                loss = (self.ce_weight    * ce_loss +
-                        self.dice_weight  * dice_loss +
-                        self.lovasz_weight * lovasz_loss +
-                        self.boundary_weight * boundary_loss)
-            
-                # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
-                # Deep supervision: H/4 and H/2 with epoch decay
-                ds_decay = max(1.0 - epoch / max(self.args.epochs, 1), 0.1)
-
-                if "ds_h4" in outputs and self.ds_h4_weight > 0:
-                    ds_h4_up = F.interpolate(outputs["ds_h4"],
-                                             size=masks.shape[-2:],
-                                             mode="bilinear", align_corners=False)
-                    loss = loss + self.ds_h4_weight * ds_decay * self.ce(ds_h4_up, masks)
-
-                if "ds_h2" in outputs and self.ds_h2_weight > 0:
-                    ds_h2_up = F.interpolate(outputs["ds_h2"],
-                                             size=masks.shape[-2:],
-                                             mode="bilinear", align_corners=False)
-                    loss = loss + self.ds_h2_weight * ds_decay * self.ce(ds_h2_up, masks)
-
+                # Aux head: plain CE (khong OHEM) voi decay
                 if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = F.interpolate(outputs["aux"],
-                                              size=masks.shape[-2:],
-                                              mode="bilinear", align_corners=False)
-                    loss = loss + 0.4 * ds_decay * self.ce(aux_logits, masks)
-            
+                    aux_logits = F.interpolate(
+                        outputs["aux"], size=masks.shape[-2:],
+                        mode="bilinear", align_corners=False
+                    )
+                    aux_w = 0.4 * max(1.0 - epoch / max(self.args.epochs, 1), 0.1)
+                    loss = loss + aux_w * self.ce(aux_logits, masks)
+
                 loss = loss / self.args.accumulation_steps
     
             # FIX 1: Check NaN BEFORE backward
@@ -1119,35 +1145,15 @@ class Trainer:
                     mode='bilinear',
                     align_corners=False
                 )
-                ce_loss = self.ce(logits_full, masks)
-    
-                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
-                # FIX: dùng logits_full nhất quán với train_epoch
+                # OHEM + Dice - nhat quan voi train_epoch
+                ohem_loss = self.ohem(logits_full, masks)
                 if self.dice_weight > 0:
                     dice_loss = self.dice(logits_full, masks)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-    
-                # Lovász trong validate — dùng H/4 nhất quán với train
-                if self.lovasz_weight > 0:
-                    masks_half = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-                    lovasz_loss_val = self.lovasz(logits, masks_half)
-                else:
-                    lovasz_loss_val = torch.tensor(0.0, device=logits.device)
 
-                if self.boundary_weight > 0:
-                    boundary_loss_val = self.boundary(logits_full, masks)
-                else:
-                    boundary_loss_val = torch.tensor(0.0, device=logits.device)
-
-                loss = (self.ce_weight    * ce_loss +
-                        self.dice_weight  * dice_loss +
-                        self.lovasz_weight * lovasz_loss_val +
-                        self.boundary_weight * boundary_loss_val)
+                loss = (self.ohem_weight * ohem_loss +
+                        self.dice_weight * dice_loss)
 
             total_loss += loss.item()
     
@@ -1268,7 +1274,7 @@ def main():
     # Dataset
     parser.add_argument("--train_txt", required=True)
     parser.add_argument("--val_txt", required=True)
-    parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
+    parser.add_argument("--dataset_type", default="normal", choices=["normal", "foggy"])
     parser.add_argument("--num_classes", type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
     parser.add_argument("--reset_best_metric", action="store_true")
