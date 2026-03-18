@@ -244,252 +244,6 @@ class FocalLoss(nn.Module):
         return focal_loss.mean() if self.reduction == 'mean' else focal_loss
 
 
-
-
-
-class OHEMLoss(nn.Module):
-    """
-    Online Hard Example Mining CE Loss.
-    
-    Thay vì tính CE trên toàn bộ pixel, chỉ lấy top-K pixel
-    có loss cao nhất (hard examples) để backward.
-    
-    Với Cityscapes Foggy:
-    - Easy pixels: road, sky, building (chiếm 50%+ dataset)
-    - Hard pixels: pole, rider, bicycle, traffic sign (< 5% dataset)
-    
-    OHEM tự động focus vào hard pixels mà không cần class weights thủ công.
-    Hiệu quả hơn class weights vì adapt theo từng batch.
-    
-    keep_ratio=0.3: giữ 30% pixel khó nhất — chuẩn cho Cityscapes
-    min_kept=100000: đảm bảo luôn có đủ pixels để train (tránh degenerate batch)
-    """
-    def __init__(
-        self,
-        ignore_index: int = 255,
-        keep_ratio: float = 0.3,
-        min_kept: int = 100000,
-        class_weights: torch.Tensor = None,
-    ):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.keep_ratio = keep_ratio
-        self.min_kept = min_kept
-        self.class_weights = class_weights  # (C,) tensor hoặc None
-
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """
-        OHEM + optional class weights:
-        1. Tính CE per-pixel với class_weights (nếu có)
-        2. Chỉ backward top keep_ratio% pixel khó nhất
-        
-        Args:
-            logits: (B, C, H, W)
-            labels: (B, H, W)
-        """
-        B, C, H, W = logits.shape
-
-        # CE per-pixel — dùng class_weights nếu có
-        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
-        loss_per_pixel = F.cross_entropy(
-            logits, labels,
-            weight=weight,
-            ignore_index=self.ignore_index,
-            reduction='none'
-        ).view(-1)  # (B*H*W,)
-
-        # Chỉ tính trên valid pixels
-        valid_mask = (labels.view(-1) != self.ignore_index)
-        valid_losses = loss_per_pixel[valid_mask]
-        n_valid = valid_losses.numel()
-
-        if n_valid == 0:
-            return logits.sum() * 0
-
-        # Số pixel giữ lại
-        n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
-        n_keep = min(n_keep, n_valid)
-
-        # Top-K hard pixels
-        if n_keep < n_valid:
-            sorted_losses, _ = torch.sort(valid_losses, descending=True)
-            threshold = sorted_losses[n_keep - 1].detach()
-            hard_losses = valid_losses[valid_losses >= threshold]
-        else:
-            hard_losses = valid_losses
-
-        return hard_losses.mean()
-
-
-class LovaszSoftmaxLoss(nn.Module):
-    """
-    Lovász-Softmax loss — tối ưu trực tiếp IoU per class.
-    Hiệu quả hơn CE cho boundary segmentation, đặc biệt với foggy domain.
-    """
-    def __init__(self, ignore_index=255):
-        super().__init__()
-        self.ignore_index = ignore_index
-
-    def lovasz_grad(self, gt_sorted):
-        gts = gt_sorted.sum()
-        intersection = gts - gt_sorted.float().cumsum(0)
-        union = gts + (1 - gt_sorted).float().cumsum(0)
-        jaccard = 1.0 - intersection / union
-        if gt_sorted.numel() > 1:
-            jaccard[1:] = jaccard[1:] - jaccard[:-1]
-        return jaccard
-
-    def forward(self, logits, labels):
-        probs = F.softmax(logits, dim=1)
-        B, C, H, W = probs.shape
-        probs  = probs.permute(0, 2, 3, 1).reshape(-1, C)
-        labels = labels.view(-1)
-
-        if self.ignore_index is not None:
-            valid  = labels != self.ignore_index
-            probs  = probs[valid]
-            labels = labels[valid]
-
-        losses = []
-        for c in range(C):
-            fg = (labels == c).float()
-            if fg.sum() == 0:
-                continue
-            errors = (fg - probs[:, c]).abs()
-            errors_sorted, perm = torch.sort(errors, descending=True)
-            fg_sorted = fg[perm]
-            grad = self.lovasz_grad(fg_sorted)
-            losses.append(torch.dot(errors_sorted, grad))
-
-        if not losses:
-            return logits.sum() * 0
-        return torch.mean(torch.stack(losses))
-
-
-class BoundaryLoss(nn.Module):
-    """
-    BCE Boundary Loss với fog-aware weighting.
-    
-    Pipeline:
-      1. Tạo GT boundary mask: pixel có neighbor khác class → boundary=1
-      2. Tính predicted boundary = max class prob thấp (uncertain region)
-      3. BCE giữa predicted uncertainty và GT boundary
-      4. Fog-aware: chỉ tính tại pixels model đã confident (bỏ qua foggy ambiguous)
-    
-    Lý do dùng cho Foggy Cityscapes:
-      - Boundary thật sự mờ do fog → cần lọc noisy boundary signal
-      - confidence_threshold loại bỏ pixel quá uncertain (fog region)
-      - Chỉ phạt model khi nó sai tại boundary RÕ RÀNG
-    """
-    def __init__(
-        self,
-        ignore_index: int = 255,
-        kernel_size: int = 3,           # kích thước neighborhood để detect boundary
-        confidence_threshold: float = 0.5,  # giảm từ 0.7: nhiều pixel hơn → gradient ổn định hơn
-        pos_weight: float = 3.0,        # weight cho boundary pixels (thường ít hơn non-boundary)
-    ):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.kernel_size = kernel_size
-        self.confidence_threshold = confidence_threshold
-        # BCE với pos_weight để cân bằng boundary vs non-boundary pixels
-        self.register_buffer('pos_weight', torch.tensor(pos_weight))
-
-    def _get_boundary_mask(self, labels: torch.Tensor) -> torch.Tensor:
-        """
-        Tạo binary boundary mask từ GT labels.
-        Boundary = pixel có ít nhất 1 neighbor thuộc class khác.
-        
-        Args:
-            labels: (B, H, W) long — GT class labels
-        Returns:
-            boundary: (B, H, W) float — 1 tại boundary, 0 otherwise
-                      ignore_index pixels → 0 (không tính)
-        """
-        B, H, W = labels.shape
-        
-        # Convert sang float để dùng pooling
-        # ignore_index pixels sẽ được handle sau
-        valid_mask = (labels != self.ignore_index)  # (B, H, W)
-        
-        # Tạo label map với ignore → -1 để không confuse với class 0
-        labels_safe = labels.clone().float()
-        labels_safe[~valid_mask] = -1.0
-        
-        labels_4d = labels_safe.unsqueeze(1)  # (B, 1, H, W)
-        pad = self.kernel_size // 2
-        
-        # Max và min trong neighborhood
-        # Nếu max != min → có boundary
-        max_pool = F.max_pool2d(
-            labels_4d, kernel_size=self.kernel_size,
-            stride=1, padding=pad
-        ).squeeze(1)  # (B, H, W)
-        
-        # Min pool = -max_pool(-x)
-        min_pool = -F.max_pool2d(
-            -labels_4d, kernel_size=self.kernel_size,
-            stride=1, padding=pad
-        ).squeeze(1)  # (B, H, W)
-        
-        # Boundary: max != min VÀ pixel hợp lệ
-        boundary = ((max_pool != min_pool) & valid_mask).float()  # (B, H, W)
-        
-        return boundary
-
-    def forward(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            logits: (B, C, H, W) — predictions tại full resolution
-            labels: (B, H, W)   — GT labels tại full resolution
-        Returns:
-            scalar loss
-        """
-        B, C, H, W = logits.shape
-        
-        # 1. GT boundary mask
-        with torch.no_grad():
-            boundary_gt = self._get_boundary_mask(labels)  # (B, H, W)
-        
-        # 2. Predicted boundary = 1 - max_prob (uncertainty)
-        #    Tại boundary thật: model nên uncertain → max_prob thấp
-        #    Tại non-boundary: model nên confident → max_prob cao
-        probs = F.softmax(logits, dim=1)                    # (B, C, H, W)
-        max_prob, _ = probs.max(dim=1)                      # (B, H, W)
-        pred_boundary = 1.0 - max_prob                      # (B, H, W) — uncertainty map
-        
-        # 3. Fog-aware mask: chỉ tính loss tại pixel model đã confident
-        #    Bỏ qua pixel quá uncertain (likely foggy ambiguous region)
-        #    confidence_threshold=0.7: chỉ tính khi model >= 70% confident
-        with torch.no_grad():
-            confident_mask = (max_prob >= self.confidence_threshold)  # (B, H, W)
-            valid_mask = (labels != self.ignore_index)                 # (B, H, W)
-            compute_mask = confident_mask & valid_mask                 # (B, H, W)
-        
-        if compute_mask.sum() == 0:
-            return torch.tensor(0.0, device=logits.device, requires_grad=True)
-        
-        # 4. BCE với pos_weight cho boundary pixels
-        # Dùng binary_cross_entropy_with_logits để tương thích AMP autocast
-        # pred_boundary = 1 - max_prob ∈ (0,1) → convert sang logit space
-        pred_flat = pred_boundary[compute_mask]    # (N,) ∈ (0,1)
-        gt_flat   = boundary_gt[compute_mask]      # (N,) ∈ {0,1}
-
-        # torch.logit() có numerical stability tốt hơn manual log(p/(1-p))
-        # eps=1e-4 thay vì 1e-6 — an toàn hơn với float16 trên GPU
-        pred_logit = torch.logit(pred_flat.float(), eps=1e-4)
-
-        # BCEWithLogitsLoss: safe với AMP
-        bce = F.binary_cross_entropy_with_logits(
-            pred_logit,
-            gt_flat.float(),
-            pos_weight=self.pos_weight.to(pred_logit.device),
-            reduction='mean'
-        )
-        loss = bce
-        
-        return loss
-
 # ============================================
 # UTILITIES
 # ============================================
@@ -748,86 +502,6 @@ def check_gradients(model, threshold=10.0):
     return max_grad, total_norm
 
 
-def build_scheduler(optimizer, args, train_loader, start_epoch=0):
-    """
-    Build scheduler dựa trên TOTAL epochs (không phải remaining).
-    Luôn tính từ epoch 0 để LR curve nhất quán dù có unfreeze hay không.
-    
-    Khi unfreeze, KHÔNG gọi hàm này để rebuild — thay vào đó dùng
-    add_param_group() để thêm backbone params vào optimizer hiện tại.
-    Chỉ gọi hàm này 1 lần duy nhất lúc khởi tạo.
-    """
-    total_epochs = args.epochs
-
-    if args.scheduler == 'onecycle':
-        # Với unfreeze progressive, OneCycle không phù hợp → dùng Cosine
-        print(f"  [build_scheduler] Dùng CosineAnnealingWarmRestarts (ổn định hơn OneCycle khi unfreeze)")
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=max(total_epochs // 3, 10), T_mult=1, eta_min=1e-7
-        )
-    elif args.scheduler == 'poly':
-        # Poly LR tính trên TOTAL epochs — không restart khi unfreeze
-        def poly_lambda(epoch):
-            return max((1 - epoch / max(total_epochs, 1)) ** 0.9, 1e-7 / max(args.lr, 1e-10))
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lambda)
-        print(f"  [build_scheduler] PolyLR total_epochs={total_epochs} (không restart khi unfreeze)")
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=total_epochs, eta_min=1e-7
-        )
-    return scheduler
-
-
-def add_backbone_params_to_optimizer(optimizer, model, args):
-    """
-    Thêm backbone params vào optimizer HIỆN TẠI thay vì rebuild.
-    Cách này giữ nguyên scheduler state → LR tiếp tục decay smooth,
-    không bị restart như khi rebuild optimizer hoàn toàn.
-    """
-    # Lấy tất cả param đang được track bởi optimizer
-    existing_params = set()
-    for group in optimizer.param_groups:
-        for p in group['params']:
-            existing_params.add(id(p))
-
-    # Tách params mới theo loại
-    new_backbone = []
-    new_alpha = []
-
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if id(param) in existing_params:
-            continue  # đã có rồi, bỏ qua
-        if 'alpha' in name:
-            new_alpha.append(param)
-        elif 'backbone' in name:
-            new_backbone.append(param)
-
-    added = 0
-    if new_backbone:
-        optimizer.add_param_group({
-            'params': new_backbone,
-            'lr': args.lr * args.backbone_lr_factor,
-            'weight_decay': args.weight_decay,
-            'name': 'backbone_unfrozen',
-        })
-        added += len(new_backbone)
-        print(f"  add_param_group: +{len(new_backbone)} backbone params (lr={args.lr * args.backbone_lr_factor:.2e})")
-
-    if new_alpha:
-        optimizer.add_param_group({
-            'params': new_alpha,
-            'lr': args.lr * args.alpha_lr_factor,
-            'weight_decay': args.weight_decay,
-            'name': 'alpha_unfrozen',
-        })
-        added += len(new_alpha)
-        print(f"  add_param_group: +{len(new_alpha)} alpha params (lr={args.lr * args.alpha_lr_factor:.2e})")
-
-    return added
-
-
 # ============================================
 # MODEL CONFIG
 # ============================================
@@ -863,13 +537,8 @@ class ModelConfig:
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
-                "norm_cfg": {"type": "BN", "requires_grad": True},
-                "act_cfg": {"type": "ReLU", "inplace": False},
-                "use_deep_supervision": True,
-            },
-            "deep_sup": {
-                "aux_h4_weight": 0.0,  # bỏ deep supervision
-                "aux_h2_weight": 0.0,
+                "norm_cfg": {'type': 'BN', 'requires_grad': True},
+                "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
                 "in_channels": C * 2,
@@ -880,16 +549,12 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "loss": {
-                "ohem_weight": 1.0,    # OHEM-CE: focus hard pixels (pole, fence, rider...)
-                "dice_weight": 1.0,    # Dice: class overlap
-                "lovasz_weight": 0.0,  # off
-                "boundary_weight": 0.0, # off: đã chứng minh không hiệu quả
+                "ce_weight": 1.0,
+                "dice_weight": 0.5,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
-                "dice_smooth": 1e-5,
-                # ce_weight giữ lại để dùng cho aux/ds heads
-                "ce_weight": 0.0,      # main head dùng OHEM thay CE
+                "dice_smooth": 1e-5
             }
         }
 
@@ -944,28 +609,7 @@ class Trainer:
             ignore_index=args.ignore_index,
             reduction='mean'
         )
-        # OHEM + class_weights: focus hard pixels VÀ rare classes
-        self.ohem = OHEMLoss(
-            ignore_index=args.ignore_index,
-            keep_ratio=0.3,
-            min_kept=100000,
-            class_weights=class_weights,  # None nếu không dùng --use_class_weights
-        )
-        self.ohem_weight = loss_cfg.get('ohem_weight', 1.0)
         
-        self.lovasz = LovaszSoftmaxLoss(ignore_index=args.ignore_index)
-        self.lovasz_weight = loss_cfg.get('lovasz_weight', 0.0)
-        # Deep supervision weights
-        deep_sup_cfg = getattr(args, 'deep_sup_config', {})
-        self.ds_h4_weight = deep_sup_cfg.get('aux_h4_weight', 0.2)
-        self.ds_h2_weight = deep_sup_cfg.get('aux_h2_weight', 0.3)
-        self.boundary = BoundaryLoss(
-            ignore_index=args.ignore_index,
-            kernel_size=3,
-            confidence_threshold=0.7,
-            pos_weight=3.0,
-        )
-        self.boundary_weight = loss_cfg.get('boundary_weight', 0.0)
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
@@ -1000,9 +644,7 @@ class Trainer:
         print(f"Effective batch: {self.args.batch_size * self.args.accumulation_steps}")
         print(f"Mixed precision: {self.args.use_amp}")
         print(f"Gradient clipping: {self.args.grad_clip}")
-        ohem_w     = loss_cfg.get('ohem_weight', 0.0)
-        boundary_w = loss_cfg.get('boundary_weight', 0.0)
-        print(f"Loss: OHEM({ohem_w}) + Dice({loss_cfg['dice_weight']}) + Boundary({boundary_w})")
+        print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -1038,34 +680,41 @@ class Trainer:
                     mode='bilinear',
                     align_corners=False
                 )
-                # OHEM: focus hard pixels (pole, fence, rider, motorcycle...)
-                # class_weights da duoc inject vao OHEMLoss khi init
-                ohem_loss = self.ohem(logits_full, masks)
-
-                # Dice: tren logits_full nhat quan voi validate
+                ce_loss = self.ce(logits_full, masks)
+            
+                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
                 if self.dice_weight > 0:
-                    dice_loss = self.dice(logits_full, masks)
+                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
+                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-
-                loss = (self.ohem_weight * ohem_loss +
-                        self.dice_weight * dice_loss)
-
-                # Aux head: plain CE (khong OHEM) voi decay
+            
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+            
+                # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
                 if "aux" in outputs and self.args.aux_weight > 0:
                     aux_logits = F.interpolate(
-                        outputs["aux"], size=masks.shape[-2:],
-                        mode="bilinear", align_corners=False
+                        outputs["aux"],
+                        size=masks.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
                     )
-                    aux_w = 0.4 * max(1.0 - epoch / max(self.args.epochs, 1), 0.1)
-                    loss = loss + aux_w * self.ce(aux_logits, masks)
-
+                    aux_ce_loss = self.ce(aux_logits, masks)
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    loss = loss + aux_weight * aux_ce_loss
+            
                 loss = loss / self.args.accumulation_steps
     
             # FIX 1: Check NaN BEFORE backward
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\nNaN/Inf loss at epoch {epoch}, batch {batch_idx}")
-                print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
+                print(f"   OHEM: {ohem_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
             
@@ -1087,13 +736,13 @@ class Trainer:
                     self.scheduler.step()
                         
             total_loss += loss.item() * self.args.accumulation_steps
-            total_ce += ce_loss.item()
+            total_ce += ohem_loss.item()
             total_dice += dice_loss.item()
             
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ce': f'{ce_loss.item():.4f}',
+                'ohem': f'{ohem_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
                 'lr': f'{current_lr:.6f}',
                 'max_grad': f'{max_grad:.2f}'  # Ã¢â€ Â Monitor
@@ -1104,7 +753,7 @@ class Trainer:
             
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
+                self.writer.add_scalar('train/ohem_loss', ohem_loss.item(), self.global_step)
                 self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
                 self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # Ã¢â€ Â Log
@@ -1145,16 +794,21 @@ class Trainer:
                     mode='bilinear',
                     align_corners=False
                 )
-                # OHEM + Dice - nhat quan voi train_epoch
-                ohem_loss = self.ohem(logits_full, masks)
+                ce_loss = self.ce(logits_full, masks)
+    
+                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
                 if self.dice_weight > 0:
-                    dice_loss = self.dice(logits_full, masks)
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),   # cáº§n unsqueeze + float cho interpolate
+                        size=logits.shape[-2:],        # H/2, W/2 â€” KHÃ”NG pháº£i logits_full
+                        mode='nearest'
+                    ).squeeze(1).long()               # tráº£ vá» (B, H/2, W/2) long
+                    dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-
-                loss = (self.ohem_weight * ohem_loss +
-                        self.dice_weight * dice_loss)
-
+    
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+    
             total_loss += loss.item()
     
             # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
@@ -1208,17 +862,7 @@ class Trainer:
     def load_checkpoint(self, checkpoint_path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
-        # strict=False: cho phép load partial weights
-        # Missing keys (aux_h4, aux_h2) sẽ giữ nguyên random init — đây là đúng
-        # khi thêm deep supervision heads mới vào architecture
-        missing, unexpected = self.model.load_state_dict(
-            checkpoint['model'], strict=False
-        )
-        if missing:
-            print(f'  New weights (will train from scratch): {len(missing)} keys')
-            # Chỉ print nếu có unexpected — đó mới là vấn đề
-        if unexpected:
-            print(f'  WARNING unexpected keys: {unexpected[:5]}')
+        self.model.load_state_dict(checkpoint['model'])
 
         if load_optimizer and checkpoint.get('optimizer') is not None:
             try:
@@ -1285,7 +929,7 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=1.0)  # Ã¢â€ Â INCREASED from 1.0
+    parser.add_argument("--grad_clip", type=float, default=5.0)  # Ã¢â€ Â INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
     parser.add_argument("--alpha_lr_factor", type=float, default=0.01,
@@ -1343,7 +987,6 @@ def main():
     # Config
     cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
-    args.deep_sup_config = cfg["deep_sup"]
     
     print(f" Model Config:")
     print(f"DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
@@ -1411,11 +1054,10 @@ def main():
     print(f"Total parameters: {total_params:,} ({total_params/1e6:.2f}M)")
     count_trainable_params(model)
     
-    # Test forward — dùng batch_size=2 để tránh BN lỗi với spatial 1x1
+    # Test forward
     model = model.to(device)
-    model.eval()  # eval mode để BN dùng running stats, không cần batch > 1
     with torch.no_grad():
-        sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
+        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         try:
             outputs = model.forward_train(sample)
             print(f"Forward pass successful!")
@@ -1425,7 +1067,6 @@ def main():
         except Exception as e:
             print(f"Forward pass FAILED: {e}\n")
             return
-    model.train()  # trả về train mode
     
     # Optimizer
     if args.use_discriminative_lr:
@@ -1447,10 +1088,17 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
-        # Tự động lấy max_lr từ mỗi param group — không hardcode số groups
-        max_lrs = [g['lr'] for g in optimizer.param_groups]
-        if len(max_lrs) == 1:
-            max_lrs = max_lrs[0]
+        n_groups = len(optimizer.param_groups)
+    
+        if n_groups == 1:
+            max_lrs = args.lr
+        elif n_groups == 2:
+            max_lrs = [
+                args.lr * args.backbone_lr_factor,
+                args.lr,
+            ]
+        else:
+            raise ValueError(f"Unexpected param_groups: {n_groups}")
     
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
@@ -1537,17 +1185,55 @@ def main():
             unfreeze_backbone_progressive(model, targets)
         
         # ðŸ” CHá»ˆ rebuild optimizer khi Ä‘Ãºng má»‘c unfreeze
-        # Khi đúng mốc unfreeze: KHÔNG rebuild optimizer, KHÔNG restart scheduler
-        # Chỉ add_param_group → LR curve tiếp tục smooth, không bị reset
         if epoch in unfreeze_epochs:
+        
             trainer.set_loss_phase('full')
-            added = add_backbone_params_to_optimizer(trainer.optimizer, model, args)
-            print(f"\n{'='*70}")
-            print(f"Epoch {epoch+1}: Unfreeze → added {added} param tensors to optimizer (NO scheduler restart)")
-            print("Current LR per group:")
-            for g in trainer.optimizer.param_groups:
-                print(f"  {g.get('name','?')}: lr={g['lr']:.2e} | {len(g['params'])} tensors")
-            print(f"{'='*70}\n")
+        
+            if args.use_discriminative_lr:
+                optimizer = setup_discriminative_lr(
+                    model,
+                    base_lr=args.lr,
+                    backbone_lr_factor=args.backbone_lr_factor,
+                    weight_decay=args.weight_decay,
+                    alpha_lr_factor=args.alpha_lr_factor
+                )
+            else:
+                head_params = []
+                backbone_params = []
+                alpha_params = []
+        
+                for n, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if 'alpha' in n:
+                        alpha_params.append(p)
+                    elif 'backbone' in n:
+                        backbone_params.append(p)
+                    else:
+                        head_params.append(p)
+        
+                groups = []
+                if head_params:
+                    groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
+                if backbone_params:
+                    groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+                if alpha_params:
+                    groups.append({'params': alpha_params, 'lr': args.lr * args.alpha_lr_factor, 'name': 'alpha'})
+        
+                optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+        
+                for g in optimizer.param_groups:
+                    g.setdefault('initial_lr', g['lr'])
+        
+            trainer.optimizer = optimizer
+            trainer.scheduler  = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
+            print("\n" + "="*70)
+            print("Learning Rates after unfreezing:")
+            print("="*70)
+            for i, group in enumerate(optimizer.param_groups):
+                name = group.get('name', f'group_{i}')
+                print(f"   {name}: {group['lr']:.2e}")
+            print("="*70 + "\n")
 
         # Switch back to full loss
         if unfreeze_epochs:
