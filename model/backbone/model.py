@@ -388,31 +388,10 @@ def _merge_windows(windows: Tensor, nH: int, nW: int, B: int) -> Tensor:
 
 
 class DWSABlock(nn.Module):
-    """
-    Depthwise Separable Attention Block vÃ¡Â»â€ºi hÃ¡Â»â€” trÃ¡Â»Â£ Window Attention.
-
-    window_size = 0  Ã¢â€ â€™ Full attention   Ã¢â‚¬â€ dÃƒÂ¹ng cho stage5 (N=256), stage6 (N=64)
-    window_size > 0  Ã¢â€ â€™ Window attention Ã¢â‚¬â€ dÃƒÂ¹ng cho stage4 (N=1024, quÃƒÂ¡ lÃ¡Â»â€ºn cho full)
-
-    TÃ¡ÂºÂ¡i sao window attention tÃ¡Â»â€˜t cho stage4:
-    - Stage4 Ã¡Â»Å¸ H/16: cÃ¡ÂºÂ§n capture local patterns (edge, texture) khÃƒÂ´ng cÃ¡ÂºÂ§n global
-    - Global context Ã„â€˜ÃƒÂ£ Ã„â€˜Ã†Â°Ã¡Â»Â£c DAPPM xÃ¡Â»Â­ lÃƒÂ½ Ã¡Â»Å¸ stage6
-    - Window size=8 Ã¢â€ â€™ N=64 per window, memory = 0.25MB thay vÃƒÂ¬ 64MB
-    - Ã„ÂÃƒÂºng inductive bias: local attention early stages, global attention later
-      (giÃ¡Â»â€˜ng Swin Transformer design principle)
-
-    Norm: BN thay vÃƒÂ¬ LN/GN Ã¢â‚¬â€ nhÃ¡ÂºÂ¥t quÃƒÂ¡n vÃ¡Â»â€ºi toÃƒ n model, fuse-compatible.
-    Alpha: clamp [0,1] Ã¢â‚¬â€ trÃƒÂ¡nh polarity flip vÃƒ  gradient explosion.
-    """
     def __init__(self, channels, num_heads=2, drop=0.0, reduction=4,
-                 qk_sharing=True, groups=4, alpha=0.1,
+                 qk_sharing=True, groups=4, alpha=0.0,
                  window_size: int = 0):
-        """
-        Args:
-            window_size: 0 = full attention, >0 = window attention.
-                         NÃƒÂªn lÃƒ  Ã†Â°Ã¡Â»â€ºc sÃ¡Â»â€˜ cÃ¡Â»Â§a H vÃƒ  W tÃ¡ÂºÂ¡i resolution Ã„â€˜ÃƒÂ³.
-                         VÃƒÂ­ dÃ¡Â»Â¥: stage4 Ã¡Â»Å¸ H/16=32px Ã¢â€ â€™ window_size=8 (4 windows/dim)
-        """
+
         super().__init__()
         assert channels % reduction == 0
         self.channels = channels
@@ -533,7 +512,7 @@ class DWSABlock(nn.Module):
         # Project back lÃƒÂªn channels + BN
         out = self.bn_out(self.out_proj(out_red))    # (B, C, H, W)
 
-        alpha = self.alpha.clamp(0.0, 1.0)
+        alpha = torch.sigmoid(self.alpha)
         return identity + alpha * out
 
 
@@ -544,7 +523,7 @@ class MultiScaleContextModule(nn.Module):
     khÃƒÂ´ng compete vÃ¡Â»â€ºi DAPPM.
     """
     def __init__(self, in_channels, out_channels, scales=(1, 2),
-                 branch_ratio=16, alpha=0.1):
+                 branch_ratio=8, alpha=0.0):
         super().__init__()
         self.scales = scales
         self.in_channels = in_channels
@@ -608,7 +587,7 @@ class MultiScaleContextModule(nn.Module):
         for s, branch in zip(self.scales, self.scale_branches):
             o = branch(x)
             if o.shape[-2:] != (H, W):
-                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=False)
+                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=True)
             outs.append(o)
 
         fused = torch.cat(outs, dim=1)
@@ -619,12 +598,6 @@ class MultiScaleContextModule(nn.Module):
         return x_proj + alpha * out
 
 
-# ===========================
-# GCNetCore Ã¢â‚¬â€ FIXED:
-#   - KHÃƒâ€NG tÃƒÂ­nh SPP Ã¡Â»Å¸ Ã„â€˜ÃƒÂ¢y nÃ¡Â»Â¯a, trÃ¡ÂºÂ£ vÃ¡Â»Â s6 raw
-#   - c4 dÃƒÂ¹ng clone() trÃƒÂ¡nh gradient corruption
-#   - GiÃ¡Â»Â¯ nguyÃƒÂªn switch_to_deploy() tÃ¡Â»Â« gÃ¡Â»â€˜c
-# ===========================
 
 class GCNetCore(BaseModule):
     def __init__(self,
@@ -796,54 +769,32 @@ class GCNetCore(BaseModule):
         return feat, c1, c2, out_size
 
     def forward_stage4(self, x: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
-        """
-        Stage 4 bilateral fusion.
-        In:  x    Ã¢â‚¬â€ H/4, C*2
-        Out: x_s4 Ã¢â‚¬â€ H/16, C*4  (semantic raw Ã¢â€ â€™ nÃ†Â¡i inject DWSA4)
-             x_d4 Ã¢â‚¬â€ H/8,  C*2  (detail, Ã„â€˜ÃƒÂ£ fused)
-
-        NÃ¡ÂºÂ¿u DWSA4 Ã„â€˜Ã†Â°Ã¡Â»Â£c apply trÃƒÂªn x_s4 trÃ†Â°Ã¡Â»â€ºc khi gÃ¡Â»Âi forward_stage5,
-        thÃƒÂ¬ compression_2(x_s5) vÃƒ  down_2 Ã¡Â»Å¸ stage5 sÃ¡ÂºÂ½ nhÃ¡ÂºÂ­n Ã„â€˜Ã†Â°Ã¡Â»Â£c
-        semantic context tÃ¡Â»â€˜t hÃ†Â¡n Ã¢â€ â€™ x_d5 tÃ¡Â»â€˜t hÃ†Â¡n Ã¢â€ â€™ x_s6 tÃ¡Â»â€˜t hÃ†Â¡n Ã¢â€ â€™ SPP tÃ¡Â»â€˜t hÃ†Â¡n.
-        """
         x_s4 = self.semantic_branch_layers[0](x)
         x_d4 = self.detail_branch_layers[0](x)
         comp_c4 = self.compression_1(self.relu(x_s4))
         x_s4 = x_s4 + self.down_1(self.relu(x_d4))
         x_d4 = x_d4 + resize(
-            comp_c4, size=out_size, mode='bilinear', align_corners=self.align_corners)
+            comp_c4,
+            size=x_d4.shape[-2:],   # ✅ FIX
+            mode='bilinear',
+            align_corners=self.align_corners
+        )
         return x_s4, x_d4
 
     def forward_stage5(self, x_s4: Tensor, x_d4: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
-        """
-        Stage 5 bilateral fusion.
-        In:  x_s4 Ã¢â‚¬â€ H/16, C*4  (Ã„â€˜ÃƒÂ£ qua DWSA4 nÃ¡ÂºÂ¿u cÃƒÂ³)
-             x_d4 Ã¢â‚¬â€ H/8,  C*2
-        Out: x_s5 Ã¢â‚¬â€ H/32, C*8  (semantic raw Ã¢â€ â€™ nÃ†Â¡i inject DWSA5)
-             x_d5 Ã¢â‚¬â€ H/8,  C*2  (detail, Ã„â€˜ÃƒÂ£ fused)
-
-        Cascade tÃƒÂ¡c dÃ¡Â»Â¥ng cÃ¡Â»Â§a DWSA4:
-        DWSA4(x_s4) Ã¢â€ â€™ x_s5 chÃ¡ÂºÂ¥t lÃ†Â°Ã¡Â»Â£ng cao hÃ†Â¡n Ã¢â€ â€™ compression_2 tÃ¡Â»â€˜t hÃ†Â¡n Ã¢â€ â€™ x_d5 tÃ¡Â»â€˜t hÃ†Â¡n.
-        """
         x_s5 = self.semantic_branch_layers[1](self.relu(x_s4))
         x_d5 = self.detail_branch_layers[1](self.relu(x_d4))
         comp_c5 = self.compression_2(self.relu(x_s5))
         x_s5 = x_s5 + self.down_2(self.relu(x_d5))
         x_d5 = x_d5 + resize(
-            comp_c5, size=out_size, mode='bilinear', align_corners=self.align_corners)
+            comp_c5,
+            size=x_d5.shape[-2:],   # ✅ FIX
+            mode='bilinear',
+            align_corners=self.align_corners
+        )
         return x_s5, x_d5
 
     def forward_stage6(self, x_s5: Tensor, x_d5: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Stage 6.
-        In:  x_s5 Ã¢â‚¬â€ H/32, C*8  (Ã„â€˜ÃƒÂ£ qua DWSA5 nÃ¡ÂºÂ¿u cÃƒÂ³)
-             x_d5 Ã¢â‚¬â€ H/8,  C*2
-        Out: x_s6 Ã¢â‚¬â€ H/64, C*16 (semantic raw Ã¢â€ â€™ nÃ†Â¡i inject DWSA6 Ã¢â€ â€™ SPP)
-             x_d6 Ã¢â‚¬â€ H/8,  C*4  (detail branch final)
-
-        Cascade tÃƒÂ¡c dÃ¡Â»Â¥ng cÃ¡Â»Â§a DWSA5:
-        DWSA5(x_s5) Ã¢â€ â€™ x_s6 chÃ¡ÂºÂ¥t lÃ†Â°Ã¡Â»Â£ng cao hÃ†Â¡n Ã¢â€ â€™ DWSA6(x_s6) Ã¢â€ â€™ SPP tÃ¡Â»â€˜t hÃ†Â¡n Ã¢â€ â€™ c5 tÃ¡Â»â€˜t hÃ†Â¡n.
-        """
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
         return x_s6, x_d6
@@ -855,7 +806,7 @@ class GCNetCore(BaseModule):
         """
         feat, c1, c2, out_size = self.forward_stem(x)
         x_s4, x_d4 = self.forward_stage4(feat, out_size)
-        c4 = x_d4.clone()  # clone trÃ†Â°Ã¡Â»â€ºc khi x_d4 tiÃ¡ÂºÂ¿p tÃ¡Â»Â¥c bÃ¡Â»â€¹ dÃƒÂ¹ng Ã¡Â»Å¸ stage5
+        c4 = x_d4.detach().clone() 
         x_s5, x_d5 = self.forward_stage5(x_s4, x_d4, out_size)
         x_s6, x_d6 = self.forward_stage6(x_s5, x_d5)
         return dict(
@@ -881,24 +832,6 @@ class GCNetCore(BaseModule):
 # ===========================
 
 class GCNetWithEnhance(BaseModule):
-    """
-    Enhanced GCNet backbone.
-
-    Flow:
-        x Ã¢â€ â€™ GCNetCore Ã¢â€ â€™ {c1, c2, c4, s4, s5, s6, x_d6}
-                              Ã¢â€ â€œ       Ã¢â€ â€œ    Ã¢â€ â€œ    Ã¢â€ â€œ
-                           DWSA4  DWSA5 DWSA6   |
-                                              SPP (mÃ¡Â»â„¢t lÃ¡ÂºÂ§n duy nhÃ¡ÂºÂ¥t)
-                              Ã¢â€ â€œ
-                         MultiScaleContext (optional, lightweight)
-                              Ã¢â€ â€œ
-                         final_proj
-                              Ã¢â€ â€œ
-                        c5 = x_d6 + x_spp
-
-    Output dict: {c1, c2, c4, c5}
-    """
-
     def __init__(self,
                  in_channels: int = 3,
                  channels: int = 32,
@@ -913,7 +846,7 @@ class GCNetWithEnhance(BaseModule):
                  dwsa_alpha: float = 0.1,
                  # stage4 dÃƒÂ¹ng window attention Ã„â€˜Ã¡Â»Æ’ trÃƒÂ¡nh OOM (H/16 Ã¢â€ â€™ N=1024)
                  # window_size=8 Ã¢â€ â€™ N=64 per window, memory ~0.25MB vs 64MB full
-                 dwsa4_window_size: int = 8,
+                 dwsa4_window_size: int = 4,
                  use_multi_scale_context: bool = True,
                  ms_scales: Tuple[int, ...] = (1, 2),
                  ms_branch_ratio: int = 16,
@@ -1006,24 +939,10 @@ class GCNetWithEnhance(BaseModule):
         )
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
-        """
-        Cascade DWSA injection Ã„â€˜ÃƒÂºng thÃ¡Â»Â© tÃ¡Â»Â± Ã¢â‚¬â€ s4, s5, s6 bÃ¡Â»â€¢ trÃ¡Â»Â£ nhau qua bilateral fusion:
-
-        Stem Ã¢â€ â€™ Stage4 Ã¢â€ â€™ [DWSA4] Ã¢â€ â€™ Stage5 Ã¢â€ â€™ [DWSA5] Ã¢â€ â€™ Stage6 Ã¢â€ â€™ [DWSA6] Ã¢â€ â€™ SPP
-                  Ã¢â€ â€˜                    Ã¢â€ â€˜                   Ã¢â€ â€˜
-            x_s4 enhanced         x_s5 enhanced        x_s6 enhanced
-            Ã¡ÂºÂ£nh hÃ†Â°Ã¡Â»Å¸ng x_d5        Ã¡ÂºÂ£nh hÃ†Â°Ã¡Â»Å¸ng x_d5        Ã„â€˜Ã†Â°a vÃƒ o SPP
-            qua compression_2     qua detail_branch      tÃ¡Â»â€˜t hÃ†Â¡n
-            vÃƒ  down_2
-
-        TÃ¡Â»Â©c lÃƒ  DWSA4 Ã¢â€ â€™ cÃ¡ÂºÂ£i thiÃ¡Â»â€¡n input cho stage5 Ã¢â€ â€™ cÃ¡ÂºÂ£i thiÃ¡Â»â€¡n x_s5
-             Ã¢â€ â€™ DWSA5 Ã¢â€ â€™ cÃ¡ÂºÂ£i thiÃ¡Â»â€¡n input cho stage6 Ã¢â€ â€™ cÃ¡ÂºÂ£i thiÃ¡Â»â€¡n x_s6
-             Ã¢â€ â€™ DWSA6 Ã¢â€ â€™ cÃ¡ÂºÂ£i thiÃ¡Â»â€¡n input cho SPP Ã¢â€ â€™ cÃ¡ÂºÂ£i thiÃ¡Â»â€¡n c5
-        """
         bb = self.backbone
         feat, c1, c2, out_size = bb.forward_stem(x)
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Stage 4 Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+       
         x_s4, x_d4 = bb.forward_stage4(feat, out_size)
         c4 = x_d4.clone()   # aux head input trÃ†Â°Ã¡Â»â€ºc khi x_d4 bÃ¡Â»â€¹ stage5 dÃƒÂ¹ng tiÃ¡ÂºÂ¿p
 
@@ -1032,34 +951,25 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa4 is not None:
             x_s4 = self.dwsa4(x_s4)
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Stage 5 Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+       
         x_s5, x_d5 = bb.forward_stage5(x_s4, x_d4, out_size)
-
-        # DWSA5: enhance x_s5 Ã¢â€ â€™ stage6 nhÃ¡ÂºÂ­n semantic context tÃ¡Â»â€˜t hÃ†Â¡n
-        # Ã¢â€ â€™ x_s6 chÃ¡ÂºÂ¥t lÃ†Â°Ã¡Â»Â£ng cao hÃ†Â¡n Ã¢â€ â€™ SPP thu Ã„â€˜Ã†Â°Ã¡Â»Â£c global context tÃ¡Â»â€˜t hÃ†Â¡n
         if self.dwsa5 is not None:
             x_s5 = self.dwsa5(x_s5)
-
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Stage 6 Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         x_s6, x_d6 = bb.forward_stage6(x_s5, x_d5)
 
-        # DWSA6: enhance x_s6 ngay trÃ†Â°Ã¡Â»â€ºc SPP Ã¢â‚¬â€ spatial self-attention
-        # Ã¡Â»Å¸ resolution thÃ¡ÂºÂ¥p nhÃ¡ÂºÂ¥t (H/64) Ã„â€˜Ã¡Â»Æ’ global context coherent hÃ†Â¡n
         if self.dwsa6 is not None:
             x_s6 = self.dwsa6(x_s6)
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ SPP (mÃ¡Â»â„¢t lÃ¡ÂºÂ§n duy nhÃ¡ÂºÂ¥t, trÃƒÂªn x_s6 Ã„â€˜ÃƒÂ£ enhanced) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
         x_spp = bb.spp(x_s6)
         x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
 
-        # Lightweight multi-scale refinement sau SPP
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
 
         x_spp = self.final_proj(x_spp)
 
-        # Merge detail + semantic
-        c5 = x_d6 + x_spp
+        gate = torch.sigmoid(self.c5_gate(torch.cat([x_d6, x_spp], dim=1)))
+        c5 = x_d6 + gate * x_spp
 
         return dict(
             c1=c1,   # H/2, C   = 32  Ã¢â‚¬â€ decoder skip (stem layer 0)
