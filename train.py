@@ -1008,7 +1008,7 @@ def main():
     )
     
     
-    model = Segmentor(backbone=backbone, head=head, aux_head=None)
+    model = Segmentor(backbone=backbone, head=head)
     
     print("\nApplying Optimizations...")
     # print("Converting BN Ã¢â€ â€™ GN")
