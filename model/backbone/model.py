@@ -708,7 +708,7 @@ class GCNetCore(BaseModule):
             )
         )
 
-        self.down_c4 = nn.Sequential(
+        self.comp_c4 = nn.Sequential(
             ConvModule(C*2, C*4, kernel_size=3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(C*4, C*8, kernel_size=1,     # thêm dòng này
