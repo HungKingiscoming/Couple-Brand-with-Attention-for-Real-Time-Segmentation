@@ -815,14 +815,9 @@ class GCNetCore(BaseModule):
 
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
-        print("\n=== STAGE 6 ===")
-        print("x_s5:", x_s5.shape)
-        print("x_d5:", x_d5.shape)
-        print("x_s6:", x_s6.shape)
-        print("x_d6:", x_d6.shape)
-
+       
         comp_c5 = self.comp_c5(self.relu(x_s5))
-        print("comp_c5:", comp_c5.shape)
+       
         x_d6 = x_d6 + F.interpolate(
             comp_c5,
             size=x_d6.shape[-2:],
@@ -832,7 +827,7 @@ class GCNetCore(BaseModule):
     
         # ===== detail → semantic (QUAN TRỌNG) =====
         down_c5 = self.down_c5(self.comp_c5(self.relu(x_s5)))
-        print("down_c5:", down_c5.shape)
+        
         if down_c5.shape[-2:] != x_s6.shape[-2:]:
             down_c5 = F.interpolate(
                 down_c5,
@@ -840,9 +835,7 @@ class GCNetCore(BaseModule):
                 mode='bilinear',
                 align_corners=False
             )
-        print("BEFORE ADD:")
-        print("x_s6:", x_s6.shape)
-        print("down_c5:", down_c5.shape)
+       
         x_s6 = x_s6 + down_c5
     
         return x_s6, x_d6
@@ -1027,24 +1020,13 @@ class GCNetWithEnhance(BaseModule):
         )
 
     def switch_to_deploy(self):
-        """
-        Deploy mode:
-        1. Fuse tÃ¡ÂºÂ¥t cÃ¡ÂºÂ£ GCBlock (path_3x3_1 + path_3x3_2 + path_1x1 Ã¢â€ â€™ single conv)
-        2. Fuse BN trong DAPPM/MultiScaleContext nÃ¡ÂºÂ¿u cÃƒÂ³ thÃ¡Â»Æ’
-        3. DWSA giÃ¡Â»Â¯ nguyÃƒÂªn (khÃƒÂ´ng thÃ¡Â»Æ’ fuse attention)
-
-        KÃ¡ÂºÂ¿t quÃ¡ÂºÂ£: params giÃ¡ÂºÂ£m ~2/3 sÃ¡Â»â€˜ GCBlock params, inference nhanh hÃ†Â¡n.
-        """
         # Fuse GCNetCore
         self.backbone.switch_to_deploy()
 
         # Mark deploy
         self.deploy = True
 
-        print("Ã¢Å“â€¦ Switched to deploy mode:")
-        print(f"   GCBlock: all paths fused Ã¢â€ â€™ single 3x3 conv")
-        print(f"   DWSA: kept as-is (attention khÃƒÂ´ng fuse Ã„â€˜Ã†Â°Ã¡Â»Â£c)")
-        print(f"   SPP: kept as-is")
+        
 
     @torch.no_grad()
     def count_params(self):
@@ -1059,15 +1041,5 @@ class GCNetWithEnhance(BaseModule):
         ms = sum(p.numel() for p in self.ms_context.parameters()) if self.ms_context else 0
         proj = sum(p.numel() for p in self.final_proj.parameters())
 
-        print(f"\n{'='*50}")
-        print(f"GCNetWithEnhance Parameter Count")
-        print(f"{'='*50}")
-        print(f"  GCNetCore (excl SPP): {backbone_core/1e6:.2f}M")
-        print(f"  DAPPM (SPP):          {spp/1e6:.2f}M")
-        print(f"  DWSA blocks:          {dwsa/1e6:.2f}M")
-        print(f"  MultiScaleContext:    {ms/1e6:.2f}M")
-        print(f"  final_proj:           {proj/1e6:.2f}M")
-        print(f"{'='*50}")
-        print(f"  TOTAL:                {total/1e6:.2f}M")
-        print(f"{'='*50}\n")
+       
         return total
