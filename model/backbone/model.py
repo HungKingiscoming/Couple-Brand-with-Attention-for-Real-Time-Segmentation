@@ -612,7 +612,6 @@ class GCNetCore(BaseModule):
             kernel_size=1,
             norm_cfg=norm_cfg, act_cfg=None
         )             
-        C = channels
         self.in_channels = in_channels
         self.channels = channels
         self.ppm_channels = ppm_channels
@@ -714,37 +713,37 @@ class GCNetCore(BaseModule):
         )
 
         self.comp_c4 = ConvModule(
-            C * 4, C * 2,
+            channels * 4, channels * 2,
             kernel_size=1,
             norm_cfg=norm_cfg, act_cfg=None
         )
         
-        # down_c4: C*2=64 → C*8=256  (để cộng vào x_s5)
+
         self.down_c4 = nn.Sequential(
-            ConvModule(C * 2, C * 4,
+            ConvModule(channels * 2, channels * 4,
                        kernel_size=3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C * 4, C * 8,
+            ConvModule(channels * 4, channels * 8,
                        kernel_size=1,
                        norm_cfg=norm_cfg, act_cfg=None)
         )
         
-        # comp_c5: nén C*8=256 → C*2=64  (dùng trong forward_stage5 và forward_stage6)
+
         self.comp_c5 = ConvModule(
-            C * 8, C * 2,
+            channels * 8, channels * 2,
             kernel_size=1,
             norm_cfg=norm_cfg, act_cfg=None
         )
         
         # down_c5: C*2=64 → C*16=512  (để cộng vào x_s6)
         self.down_c5 = nn.Sequential(
-            ConvModule(C * 2, C * 4,
+            ConvModule(channels * 2, channels * 4,
                        kernel_size=3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C * 4, C * 8,
+            ConvModule(channels * 4, channels * 8,
                        kernel_size=3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C * 8, C * 16,
+            ConvModule(channels * 8, channels * 16,
                        kernel_size=1,
                        norm_cfg=norm_cfg, act_cfg=None)
         )
@@ -950,7 +949,7 @@ class GCNetWithEnhance(BaseModule):
             deploy=deploy,
         )
 
-        C = channels
+        
         self.dwsa4 = None
         self.dwsa5 = None
         self.dwsa6 = None
@@ -958,7 +957,7 @@ class GCNetWithEnhance(BaseModule):
         for stage in dwsa_stages:
             if stage == 'stage4':
                 self.dwsa4 = DWSABlock(
-                    C * 4,
+                    channels * 4,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -969,7 +968,7 @@ class GCNetWithEnhance(BaseModule):
                 )
             elif stage == 'stage5':
                 self.dwsa5 = DWSABlock(
-                    C * 8,
+                    channels * 8,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -980,7 +979,7 @@ class GCNetWithEnhance(BaseModule):
                 )
             elif stage == 'stage6':
                 self.dwsa6 = DWSABlock(
-                    C * 16,
+                    channels * 16,
                     num_heads=dwsa_num_heads,
                     reduction=dwsa_reduction,
                     qk_sharing=dwsa_qk_sharing,
@@ -992,7 +991,7 @@ class GCNetWithEnhance(BaseModule):
 
         if use_multi_scale_context:
             self.ms_context = MultiScaleContextModule(
-                C * 4, C * 4,
+                channels * 4, channels * 4,
                 scales=ms_scales,
                 branch_ratio=ms_branch_ratio,
                 alpha=ms_alpha,
@@ -1002,8 +1001,8 @@ class GCNetWithEnhance(BaseModule):
             self.ms_context = None
 
         self.final_proj = ConvModule(
-            in_channels=C * 4,
-            out_channels=C * 4,
+            in_channels=channels * 4,
+            out_channels=channels * 4,
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
