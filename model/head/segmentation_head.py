@@ -142,7 +142,7 @@ class EnhancedDecoder(nn.Module):
 class GCNetHead(nn.Module):
     def __init__(
         self,
-        in_channels=128,
+        in_channels=256,
         num_classes=19,
         decoder_channels=128,
         dropout_ratio=0.1,
