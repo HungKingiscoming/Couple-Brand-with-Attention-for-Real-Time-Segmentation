@@ -816,13 +816,13 @@ class GCNetCore(BaseModule):
         # Cache relu một lần duy nhất
         relu_s5 = self.relu(x_s5)
         relu_d5 = self.relu(x_d5)
-    
+
         x_d6 = self.detail_branch_layers[2](relu_d5)
         x_s6 = self.semantic_branch_layers[2](relu_s5)
-    
+
         # comp_c5 tính MỘT LẦN, tái dùng cho cả hai nhánh
         comp_c5 = self.comp_c5(relu_s5)
-    
+
         # semantic → detail
         x_d6 = x_d6 + F.interpolate(
             comp_c5,
@@ -830,7 +830,7 @@ class GCNetCore(BaseModule):
             mode='bilinear',
             align_corners=self.align_corners
         )
-    
+
         # detail → semantic
         down_c5 = self.down_c5(comp_c5)
         if down_c5.shape[-2:] != x_s6.shape[-2:]:
@@ -842,7 +842,7 @@ class GCNetCore(BaseModule):
             )
         x_s6 = x_s6 + down_c5
 
-    return x_s6, x_d6
+        return x_s6, x_d6
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """
