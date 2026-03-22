@@ -607,7 +607,7 @@ class GCNetCore(BaseModule):
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
-
+        C = channels
         self.in_channels = in_channels
         self.channels = channels
         self.ppm_channels = ppm_channels
@@ -909,7 +909,7 @@ class GCNetWithEnhance(BaseModule):
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
-
+        C = channels
         self.align_corners = align_corners
         self.channels = channels
         self.deploy = deploy
