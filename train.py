@@ -1002,7 +1002,7 @@ def main():
     print("🔍 DEBUGGING BACKBONE SHAPES...")
     with torch.no_grad():
         # Tạo thử backbone core riêng lẻ để xem output
-        temp_backbone = GCNetCore(**cfg["backbone"]).to(device)
+        temp_backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
         temp_backbone.eval()
         dummy_in = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         temp_feats = temp_backbone(dummy_in)
