@@ -639,23 +639,31 @@ class Trainer:
 
     def compute_loss(self, outputs, target):
         loss = 0
-    
-        main = F.interpolate(outputs["main"], size=target.shape[-2:], mode='bilinear', align_corners=False)
-    
+
+        main = F.interpolate(
+            outputs["main"], size=target.shape[-2:],
+            mode='bilinear', align_corners=False
+        )
         ce_loss = self.ce(main, target)
         dice_loss = self.dice(main, target)
-    
+
         loss += self.ce_weight * ce_loss
         loss += self.dice_weight * dice_loss
-    
+
         if "aux_h4" in outputs:
-            aux_h4 = F.interpolate(outputs["aux_h4"], size=target.shape[-2:], mode='bilinear', align_corners=False)
+            aux_h4 = F.interpolate(
+                outputs["aux_h4"], size=target.shape[-2:],
+                mode='bilinear', align_corners=False
+            )
             loss += 0.4 * self.ce(aux_h4, target)
-    
+
         if "aux_h2" in outputs:
-            aux_h2 = F.interpolate(outputs["aux_h2"], size=target.shape[-2:], mode='bilinear', align_corners=False)
+            aux_h2 = F.interpolate(
+                outputs["aux_h2"], size=target.shape[-2:],
+                mode='bilinear', align_corners=False
+            )
             loss += 0.4 * self.ce(aux_h2, target)
-    
+
         return loss, ce_loss, dice_loss
     
     def set_loss_phase(self, phase: str):
@@ -707,7 +715,7 @@ class Trainer:
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
 
-                loss, ce_loss, dice_loss = self.compute_loss(outputs, masks, epoch)
+                loss, ce_loss, dice_loss = self.compute_loss(outputs, masks)
                 
                 loss = loss / self.args.accumulation_steps     
             # FIX 1: Check NaN BEFORE backward
