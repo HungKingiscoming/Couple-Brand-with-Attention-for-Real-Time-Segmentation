@@ -826,25 +826,24 @@ class GCNetCore(BaseModule):
         return x_s5, x_d5
 
     def forward_stage6(self, x_s5: Tensor, x_d5: Tensor) -> Tuple[Tensor, Tensor]:
-        # Cache relu một lần duy nhất
         relu_s5 = self.relu(x_s5)
         relu_d5 = self.relu(x_d5)
-
-        x_d6 = self.detail_branch_layers[2](relu_d5)
-        x_s6 = self.semantic_branch_layers[2](relu_s5)
-
-        # comp_c5 tính MỘT LẦN, tái dùng cho cả hai nhánh
+    
+        x_d6 = self.detail_branch_layers[2](relu_d5)   # → C*4=128ch
+        x_s6 = self.semantic_branch_layers[2](relu_s5) # → C*16=512ch
+    
+        # comp_c5: 256 → 64ch — dùng chung cho cả hai nhánh
         comp_c5 = self.comp_c5(relu_s5)
-
-        # semantic → detail
+    
+        # semantic → detail: cần project 64 → 128 để khớp x_d6
         x_d6 = x_d6 + F.interpolate(
-            comp_c5,
+            self.proj_c5_to_d6(comp_c5),   # 64 → 128ch ✓
             size=x_d6.shape[-2:],
             mode='bilinear',
             align_corners=self.align_corners
         )
-
-        # detail → semantic
+    
+        # detail → semantic: 64 → 512ch để khớp x_s6
         down_c5 = self.down_c5(comp_c5)
         if down_c5.shape[-2:] != x_s6.shape[-2:]:
             down_c5 = F.interpolate(
@@ -853,8 +852,8 @@ class GCNetCore(BaseModule):
                 mode='bilinear',
                 align_corners=False
             )
-        x_s6 = x_s6 + down_c5
-
+        x_s6 = x_s6 + down_c5   # 512 + 512ch ✓
+    
         return x_s6, x_d6
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
