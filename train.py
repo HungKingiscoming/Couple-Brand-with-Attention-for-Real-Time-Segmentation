@@ -552,8 +552,8 @@ class ModelConfig:
             "head": {
 
                 "in_channels":    256, 
-                "c4_channels":    64,   
-                "c2_channels":    32,      
+                "c4_channels":    128,   
+                "c2_channels":    64,      
                 "c1_channels":    32,       
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
