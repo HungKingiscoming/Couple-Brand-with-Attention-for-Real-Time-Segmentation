@@ -454,7 +454,8 @@ class DWSABlock(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)
+        if self.training:
+            attn = attn.clamp(-10, 10)
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
@@ -517,18 +518,13 @@ class DWSABlock(nn.Module):
 
 
 class MultiScaleContextModule(nn.Module):
-    """
-    Lightweight multi-scale context sau DAPPM.
-    branch_ratio cao (16) Ã„â€˜Ã¡Â»Æ’ output channels rÃ¡ÂºÂ¥t nhÃ¡Â»Â Ã¢â‚¬â€ chÃ¡Â»â€° tinh chÃ¡Â»â€°nh,
-    khÃƒÂ´ng compete vÃ¡Â»â€ºi DAPPM.
-    """
     def __init__(self, in_channels, out_channels, scales=(1, 2),
-                 branch_ratio=8, alpha=0.0):
+                 branch_ratio=8, alpha=0.0,align_corners=False):
         super().__init__()
         self.scales = scales
         self.in_channels = in_channels
         self.out_channels = out_channels
-
+        self.align_corners = align_corners
         total_branch_channels = max(in_channels // branch_ratio, len(scales))
         base = total_branch_channels // len(scales)
         extra = total_branch_channels % len(scales)
@@ -587,7 +583,7 @@ class MultiScaleContextModule(nn.Module):
         for s, branch in zip(self.scales, self.scale_branches):
             o = branch(x)
             if o.shape[-2:] != (H, W):
-                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=True)
+                o = F.interpolate(o, size=(H, W), mode='bilinear', align_corners=self.align_corners)
             outs.append(o)
 
         fused = torch.cat(outs, dim=1)
@@ -616,7 +612,7 @@ class GCNetCore(BaseModule):
         self.channels = channels
         self.ppm_channels = ppm_channels
         self.num_blocks_per_stage = num_blocks_per_stage
-        self.align_corners = True
+        self.align_corners = align_corners
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
         self.deploy = deploy
@@ -787,35 +783,47 @@ class GCNetCore(BaseModule):
         return x_s4, x_d4
 
     def forward_stage5(self, x_s4: Tensor, x_d4: Tensor, out_size: Tuple):
+        # Cache relu một lần
+        relu_s4 = self.relu(x_s4)
+    
         x_s5 = self.semantic_branch_layers[1](x_s4)
         x_d5 = self.detail_branch_layers[1](x_d4)
     
         # semantic → detail
         comp_c5 = self.comp_c5(self.relu(x_s5))
-        x_d5 = x_d5 + resize(
+        x_d5 = x_d5 + F.interpolate(
             comp_c5,
             size=x_d5.shape[-2:],
             mode='bilinear',
             align_corners=self.align_corners
         )
     
-        # 🔥 THÊM: detail → semantic (QUAN TRỌNG)
-        down_c4 = self.down_c4(self.comp_c4(self.relu(x_s4)))
-    
+        # detail → semantic — dùng relu_s4 đã cache
+        comp_c4 = self.comp_c4(relu_s4)
+        down_c4 = self.down_c4(comp_c4)
         if down_c4.shape[-2:] != x_s5.shape[-2:]:
-            down_c4 = F.interpolate(down_c4, size=x_s5.shape[-2:], mode='bilinear', align_corners=False)
-    
+            down_c4 = F.interpolate(
+                down_c4,
+                size=x_s5.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
         x_s5 = x_s5 + down_c4
     
         return x_s5, x_d5
 
     def forward_stage6(self, x_s5: Tensor, x_d5: Tensor) -> Tuple[Tensor, Tensor]:
-
-        x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
-        x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
-       
-        comp_c5 = self.comp_c5(self.relu(x_s5))
-       
+        # Cache relu một lần duy nhất
+        relu_s5 = self.relu(x_s5)
+        relu_d5 = self.relu(x_d5)
+    
+        x_d6 = self.detail_branch_layers[2](relu_d5)
+        x_s6 = self.semantic_branch_layers[2](relu_s5)
+    
+        # comp_c5 tính MỘT LẦN, tái dùng cho cả hai nhánh
+        comp_c5 = self.comp_c5(relu_s5)
+    
+        # semantic → detail
         x_d6 = x_d6 + F.interpolate(
             comp_c5,
             size=x_d6.shape[-2:],
@@ -823,9 +831,8 @@ class GCNetCore(BaseModule):
             align_corners=self.align_corners
         )
     
-        # ===== detail → semantic (QUAN TRỌNG) =====
-        down_c5 = self.down_c5(self.comp_c5(self.relu(x_s5)))
-        
+        # detail → semantic
+        down_c5 = self.down_c5(comp_c5)
         if down_c5.shape[-2:] != x_s6.shape[-2:]:
             down_c5 = F.interpolate(
                 down_c5,
@@ -833,10 +840,9 @@ class GCNetCore(BaseModule):
                 mode='bilinear',
                 align_corners=False
             )
-       
         x_s6 = x_s6 + down_c5
-    
-        return x_s6, x_d6
+
+    return x_s6, x_d6
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
         """
@@ -855,10 +861,17 @@ class GCNetCore(BaseModule):
         )
 
     def switch_to_deploy(self):
-        """Fuse tÃ¡ÂºÂ¥t cÃ¡ÂºÂ£ GCBlock vÃ¡Â»Â single conv Ã¢â‚¬â€ giÃ¡Â»â€˜ng model gÃ¡Â»â€˜c."""
-        for m in self.modules():
-            if isinstance(m, GCBlock):
-                m.switch_to_deploy()
+        # 1. Fuse tất cả GCBlock thành single conv
+        self.backbone.switch_to_deploy()
+    
+        # 2. Tắt dropout trong tất cả DWSABlock
+        for dwsa in [self.dwsa4, self.dwsa5, self.dwsa6]:
+            if dwsa is not None:
+                dwsa.drop = nn.Identity()
+    
+        # 3. Tắt dropout trong MultiScaleContextModule nếu có
+        # (không có dropout ở đây nhưng để sẵn cho tương lai)
+    
         self.deploy = True
 
 
@@ -971,6 +984,7 @@ class GCNetWithEnhance(BaseModule):
                 scales=ms_scales,
                 branch_ratio=ms_branch_ratio,
                 alpha=ms_alpha,
+                align_corners=align_corners,    # truyền xuống
             )
         else:
             self.ms_context = None
@@ -989,10 +1003,7 @@ class GCNetWithEnhance(BaseModule):
 
        
         x_s4, x_d4 = bb.forward_stage4(feat, out_size)
-        c4 = x_d4.detach().clone()   # aux head input trÃ†Â°Ã¡Â»â€ºc khi x_d4 bÃ¡Â»â€¹ stage5 dÃƒÂ¹ng tiÃ¡ÂºÂ¿p
-
-        # DWSA4: enhance x_s4 Ã¢â€ â€™ stage5 nhÃ¡ÂºÂ­n semantic context tÃ¡Â»â€˜t hÃ†Â¡n
-        # Ã¢â€ â€™ compression_2(x_s5) vÃƒ  down_2(x_d5) chÃ¡ÂºÂ¥t lÃ†Â°Ã¡Â»Â£ng cao hÃ†Â¡n
+        c4 = x_d4 
         if self.dwsa4 is not None:
             x_s4 = self.dwsa4(x_s4)
 
