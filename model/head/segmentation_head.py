@@ -62,7 +62,7 @@ class EnhancedDecoder(nn.Module):
         c4_channels=64,
         c2_channels=32,
         c1_channels=32,
-        decoder_channels=128,
+        decoder_channels=96,
         norm_cfg=dict(type='BN', requires_grad=True),
         act_cfg=dict(type='ReLU', inplace=True),
         dropout_ratio=0.1,
