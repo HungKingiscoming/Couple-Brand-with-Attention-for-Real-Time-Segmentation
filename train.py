@@ -1042,12 +1042,35 @@ def main():
     with torch.no_grad():
         sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
+            model = model.to(device)
+            model.eval() # Chuyển về chế độ eval để kiểm tra
             with torch.no_grad():
-                sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
+                sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+                print("\n" + "="*50)
+                print("🔍 DEBUG: CHECKING BACKBONE OUTPUT SHAPES")
+                print("="*50)
+                
+                # Gọi backbone để xem output từng stage
                 feats = model.backbone(sample)
-                for i, f in enumerate(feats):
-                    print(f"Feature {i} shape: {f.shape}")
-            outputs = model.forward_train(sample)
+                
+                if isinstance(feats, dict):
+                    for k, v in feats.items():
+                        print(f"Key: {k:5} | Shape: {list(v.shape)}")
+                elif isinstance(feats, (list, tuple)):
+                    for i, f in enumerate(feats):
+                        print(f"Index: {i} | Shape: {list(f.shape)}")
+                
+                # Kiểm tra biến 'out' sau khi concat trong forward của GCNetWithEnhance
+                # Nếu bạn có thể can thiệp vào forward của GCNetWithEnhance, hãy print ở đó.
+                print("="*50 + "\n")
+            # === ĐOẠN CHÈN DEBUG KẾT THÚC ===
+        
+            # Sau đó mới đến đoạn test forward_train cũ của bạn
+            try:
+                outputs = model.forward_train(sample)
+                print("Forward pass successful!")
+            except Exception as e:
+                print(f"Forward pass FAILED: {e}")
             print(f"Forward pass successful!")
             print(f"   Main:  {outputs['main'].shape}")
             if 'aux' in outputs:
