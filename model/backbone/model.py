@@ -708,33 +708,41 @@ class GCNetCore(BaseModule):
             )
         )
 
-        self.comp_c4 = nn.Sequential(
-            ConvModule(C*2, C*4, kernel_size=3, stride=2, padding=1,
-                       norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C*4, C*8, kernel_size=1,     # thêm dòng này
-                       norm_cfg=norm_cfg, act_cfg=None)
-        )
-        
-        self.down_c4 = ConvModule(
-            channels * 2, channels * 4, kernel_size=3,
-            stride=2, padding=1,
+        self.comp_c4 = ConvModule(
+            C * 4, C * 2,
+            kernel_size=1,
             norm_cfg=norm_cfg, act_cfg=None
         )
         
+        # down_c4: C*2=64 → C*8=256  (để cộng vào x_s5)
+        self.down_c4 = nn.Sequential(
+            ConvModule(C * 2, C * 4,
+                       kernel_size=3, stride=2, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(C * 4, C * 8,
+                       kernel_size=1,
+                       norm_cfg=norm_cfg, act_cfg=None)
+        )
+        
+        # comp_c5: nén C*8=256 → C*2=64  (dùng trong forward_stage5 và forward_stage6)
         self.comp_c5 = ConvModule(
-            channels * 8, channels * 2, kernel_size=1,
+            C * 8, C * 2,
+            kernel_size=1,
             norm_cfg=norm_cfg, act_cfg=None
         )
         
+        # down_c5: C*2=64 → C*16=512  (để cộng vào x_s6)
         self.down_c5 = nn.Sequential(
-            ConvModule(C*2, C*4, kernel_size=3, stride=2, padding=1,
+            ConvModule(C * 2, C * 4,
+                       kernel_size=3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C*4, C*8, kernel_size=3, stride=2, padding=1,
+            ConvModule(C * 4, C * 8,
+                       kernel_size=3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(C*8, C*16, kernel_size=1,    # thêm dòng này
+            ConvModule(C * 8, C * 16,
+                       kernel_size=1,
                        norm_cfg=norm_cfg, act_cfg=None)
         )
-
 
         self.spp = DAPPM(
             in_channels=channels * 16,
