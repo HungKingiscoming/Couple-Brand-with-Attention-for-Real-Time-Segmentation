@@ -712,9 +712,11 @@ class GCNetCore(BaseModule):
             )
         )
 
-        self.comp_c4 = ConvModule(
-            channels * 4, channels * 2, kernel_size=1,
-            norm_cfg=norm_cfg, act_cfg=None
+        self.down_c4 = nn.Sequential(
+            ConvModule(C*2, C*4, kernel_size=3, stride=2, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(C*4, C*8, kernel_size=1,     # thêm dòng này
+                       norm_cfg=norm_cfg, act_cfg=None)
         )
         
         self.down_c4 = ConvModule(
@@ -729,16 +731,12 @@ class GCNetCore(BaseModule):
         )
         
         self.down_c5 = nn.Sequential(
-            ConvModule(
-                channels * 2, channels * 4,
-                kernel_size=3, stride=2, padding=1,
-                norm_cfg=norm_cfg, act_cfg=act_cfg
-            ),
-            ConvModule(
-                channels * 4, channels * 8,
-                kernel_size=3, stride=2, padding=1,
-                norm_cfg=norm_cfg, act_cfg=None
-            )
+            ConvModule(C*2, C*4, kernel_size=3, stride=2, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(C*4, C*8, kernel_size=3, stride=2, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(C*8, C*16, kernel_size=1,    # thêm dòng này
+                       norm_cfg=norm_cfg, act_cfg=None)
         )
 
 
@@ -908,7 +906,13 @@ class GCNetWithEnhance(BaseModule):
         invalid = set(dwsa_stages) - valid_stages
         if invalid:
             raise ValueError(f"Invalid dwsa_stages: {invalid}. Valid: {valid_stages}")
-
+        self.c5_gate = ConvModule(
+            in_channels=C * 4 * 2,   # x_d6(128) + x_spp(128) = 256
+            out_channels=C * 4,       # gate shape = 128
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=None              # sigmoid apply thủ công trong forward
+        )
         self.backbone = GCNetCore(
             in_channels=in_channels,
             channels=channels,
