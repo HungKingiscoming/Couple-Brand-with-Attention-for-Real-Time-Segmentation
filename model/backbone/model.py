@@ -920,11 +920,11 @@ class GCNetWithEnhance(BaseModule):
         if invalid:
             raise ValueError(f"Invalid dwsa_stages: {invalid}. Valid: {valid_stages}")
         self.c5_gate = ConvModule(
-            in_channels=C * 4 * 2,   # x_d6(128) + x_spp(128) = 256
-            out_channels=C * 4,       # gate shape = 128
+            in_channels=channels * 4 * 2,   # x_d6(128) + x_spp(128) = 256
+            out_channels=channels * 4,       # = 128
             kernel_size=1,
             norm_cfg=norm_cfg,
-            act_cfg=None              # sigmoid apply thủ công trong forward
+            act_cfg=None
         )
         self.backbone = GCNetCore(
             in_channels=in_channels,
