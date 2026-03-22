@@ -39,6 +39,60 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
+def compute_loss(self, outputs, target):
+    loss = 0
+
+    # ========================
+    # 1. MAIN OUTPUT
+    # ========================
+    main = F.interpolate(
+        outputs["main"],
+        size=target.shape[-2:],
+        mode='bilinear',
+        align_corners=False
+    )
+
+    loss += self.ce_weight * self.ce(main, target)
+    loss += self.dice_weight * self.dice(main, target)
+
+    # ========================
+    # 2. DEEP SUPERVISION (H/4)
+    # ========================
+    if "aux_h4" in outputs:
+        aux_h4 = F.interpolate(
+            outputs["aux_h4"],
+            size=target.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        )
+        loss += 0.4 * self.ce(aux_h4, target)
+
+    # ========================
+    # 3. DEEP SUPERVISION (H/2)
+    # ========================
+    if "aux_h2" in outputs:
+        aux_h2 = F.interpolate(
+            outputs["aux_h2"],
+            size=target.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        )
+        loss += 0.4 * self.ce(aux_h2, target)
+
+    # ========================
+    # 4. AUX HEAD (c4)
+    # ========================
+    if "aux" in outputs:
+        aux = F.interpolate(
+            outputs["aux"],
+            size=target.shape[-2:],
+            mode='bilinear',
+            align_corners=False
+        )
+        loss += 0.4 * self.ce(aux, target)
+
+    return loss
+
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -576,9 +630,20 @@ class Segmentor(nn.Module):
 
     def forward_train(self, x):
         feats = self.backbone(x)
-        outputs = {"main": self.decode_head(feats)}
+    
+        # ⚠️ bật deep supervision
+        main_out, aux_h4, aux_h2 = self.decode_head(feats, return_aux=True)
+    
+        outputs = {
+            "main": main_out,
+            "aux_h4": aux_h4,
+            "aux_h2": aux_h2
+        }
+    
+        # aux head riêng (nếu có)
         if self.aux_head is not None:
             outputs["aux"] = self.aux_head(feats)
+    
         return outputs
 
 
@@ -671,50 +736,14 @@ class Trainer:
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-                logits = outputs["main"]    # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn resolution tháº¥p
-            
-                # â”€â”€ CE: upsample logit lÃªn full resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-                logits_full = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
-                ce_loss = self.ce(logits_full, masks)
-            
-                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
-                if self.dice_weight > 0:
-                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
-                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-                    dice_loss = self.dice(logits, masks_small)
-                else:
-                    dice_loss = torch.tensor(0.0, device=logits.device)
-            
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-            
-                # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
-                if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = F.interpolate(
-                        outputs["aux"],
-                        size=masks.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    aux_ce_loss = self.ce(aux_logits, masks)
-                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
-                    loss = loss + aux_weight * aux_ce_loss
-            
-                loss = loss / self.args.accumulation_steps
-    
+
+                loss, ce_loss, dice_loss = self.compute_loss(outputs, masks, epoch)
+                
+                loss = loss / self.args.accumulation_steps     
             # FIX 1: Check NaN BEFORE backward
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\nNaN/Inf loss at epoch {epoch}, batch {batch_idx}")
-                print(f"   OHEM: {ohem_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
+                print(f"   OHEM: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
             
@@ -736,13 +765,13 @@ class Trainer:
                     self.scheduler.step()
                         
             total_loss += loss.item() * self.args.accumulation_steps
-            total_ce += ohem_loss.item()
+            total_ce += ce_loss.item()
             total_dice += dice_loss.item()
             
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ohem': f'{ohem_loss.item():.4f}',
+                'ohem': f'{ce_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
                 'lr': f'{current_lr:.6f}',
                 'max_grad': f'{max_grad:.2f}'  # Ã¢â€ Â Monitor
@@ -753,7 +782,7 @@ class Trainer:
             
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ohem_loss', ohem_loss.item(), self.global_step)
+                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
                 self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
                 self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # Ã¢â€ Â Log
@@ -776,54 +805,54 @@ class Trainer:
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
         pbar = tqdm(loader, desc="Validation")
+        with torch.no_grad():
+            for batch_idx, (imgs, masks) in enumerate(pbar):
+                imgs  = imgs.to(self.device, non_blocking=True)
+                masks = masks.to(self.device, non_blocking=True).long()
+                
+                if masks.dim() == 4:
+                    masks = masks.squeeze(1)
         
-        for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs  = imgs.to(self.device, non_blocking=True)
-            masks = masks.to(self.device, non_blocking=True).long()
-            
-            if masks.dim() == 4:
-                masks = masks.squeeze(1)
+                with autocast(device_type='cuda', enabled=self.args.use_amp):
+                    logits = self.model(imgs)   # (B, C, H/2, W/2)
     
-            with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)          # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn
-    
-                # CE: upsample logit lÃªn full resolution
-                logits_full = F.interpolate(
-                    logits,
-                    size=masks.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                )
-                ce_loss = self.ce(logits_full, masks)
-    
-                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
-                if self.dice_weight > 0:
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),   # cáº§n unsqueeze + float cho interpolate
-                        size=logits.shape[-2:],        # H/2, W/2 â€” KHÃ”NG pháº£i logits_full
-                        mode='nearest'
-                    ).squeeze(1).long()               # tráº£ vá» (B, H/2, W/2) long
-                    dice_loss = self.dice(logits, masks_small)
-                else:
-                    dice_loss = torch.tensor(0.0, device=logits.device)
-    
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-    
-            total_loss += loss.item()
-    
-            # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
-            pred   = logits_full.argmax(1).cpu().numpy()
-            target = masks.cpu().numpy()
-            
-            mask_valid = (target >= 0) & (target < num_classes)
-            label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
-            count  = np.bincount(label, minlength=num_classes**2)
-            confusion_matrix += count.reshape(num_classes, num_classes)
-            
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            
-            if batch_idx % 20 == 0:
-                clear_gpu_memory()
+                    # ===== CE =====
+                    logits_full = F.interpolate(
+                        logits,
+                        size=masks.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    ce_loss = self.ce(logits_full, masks)
+                
+                    # ===== Dice =====
+                    if self.dice_weight > 0:
+                        masks_small = F.interpolate(
+                            masks.unsqueeze(1).float(),
+                            size=logits.shape[-2:],
+                            mode='nearest'
+                        ).squeeze(1).long()
+                
+                        dice_loss = self.dice(logits, masks_small)
+                    else:
+                        dice_loss = torch.tensor(0.0, device=logits.device)
+                
+                    loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss        
+                total_loss += loss.item()
+        
+                # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
+                pred   = logits_full.argmax(1).cpu().numpy()
+                target = masks.cpu().numpy()
+                
+                mask_valid = (target >= 0) & (target < num_classes)
+                label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
+                count  = np.bincount(label, minlength=num_classes**2)
+                confusion_matrix += count.reshape(num_classes, num_classes)
+                
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+                
+                if batch_idx % 20 == 0:
+                    clear_gpu_memory()
     
         intersection = np.diag(confusion_matrix)
         union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
