@@ -712,28 +712,36 @@ class GCNetCore(BaseModule):
             )
         )
 
-        self.compression_1 = ConvModule(
+        self.comp_c4 = ConvModule(
             channels * 4, channels * 2, kernel_size=1,
-            norm_cfg=norm_cfg, act_cfg=None)
-        self.down_1 = ConvModule(
+            norm_cfg=norm_cfg, act_cfg=None
+        )
+        
+        self.down_c4 = ConvModule(
             channels * 2, channels * 4, kernel_size=3,
-            stride=2, padding=1, norm_cfg=norm_cfg, act_cfg=None)
-        self.compression_2 = ConvModule(
+            stride=2, padding=1,
+            norm_cfg=norm_cfg, act_cfg=None
+        )
+        
+        self.comp_c5 = ConvModule(
             channels * 8, channels * 2, kernel_size=1,
-            norm_cfg=norm_cfg, act_cfg=None)
-        self.down_2 = nn.Sequential(
+            norm_cfg=norm_cfg, act_cfg=None
+        )
+        
+        self.down_c5 = nn.Sequential(
             ConvModule(
                 channels * 2, channels * 4,
                 kernel_size=3, stride=2, padding=1,
-                norm_cfg=norm_cfg, act_cfg=act_cfg),
+                norm_cfg=norm_cfg, act_cfg=act_cfg
+            ),
             ConvModule(
                 channels * 4, channels * 8,
                 kernel_size=3, stride=2, padding=1,
-                norm_cfg=norm_cfg, act_cfg=None))
+                norm_cfg=norm_cfg, act_cfg=None
+            )
+        )
 
-        # SPP vÃ¡ÂºÂ«n nÃ¡ÂºÂ±m trong GCNetCore Ã„â€˜Ã¡Â»Æ’ load weight tÃ¡Â»Â« pretrained gÃ¡Â»â€˜c
-        # nhÃ†Â°ng KHÃƒâ€NG Ã„â€˜Ã†Â°Ã¡Â»Â£c gÃ¡Â»Âi trong forward() nÃ¡Â»Â¯a
-        # GCNetWithEnhance sÃ¡ÂºÂ½ gÃ¡Â»Âi self.backbone.spp() mÃ¡Â»â„¢t lÃ¡ÂºÂ§n duy nhÃ¡ÂºÂ¥t
+
         self.spp = DAPPM(
             in_channels=channels * 16,
             branch_channels=ppm_channels,
@@ -771,7 +779,7 @@ class GCNetCore(BaseModule):
     def forward_stage4(self, x: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
         x_s4 = self.semantic_branch_layers[0](x)
         x_d4 = self.detail_branch_layers[0](x)
-        comp_c4 = self.compression4(x_s4)
+        comp_c4 = self.comp_c4(self.relu(x_s4))
         x_d4 = x_d4 + resize(
             comp_c4,
             size=x_d4.shape[-2:],
@@ -780,13 +788,12 @@ class GCNetCore(BaseModule):
         )
         return x_s4, x_d4
 
-    def forward_stage5(self, x_s4: Tensor, x_d4: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
+    def forward_stage5(self, x_s4: Tensor, x_d4: Tensor, out_size: Tuple):
         x_s5 = self.semantic_branch_layers[1](x_s4)
         x_d5 = self.detail_branch_layers[1](x_d4)
     
-        comp_c5 = self.compression5(x_s5)
-    
-        # ✅ FIX tương tự
+        # semantic → detail
+        comp_c5 = self.comp_c5(self.relu(x_s5))
         x_d5 = x_d5 + resize(
             comp_c5,
             size=x_d5.shape[-2:],
@@ -794,11 +801,44 @@ class GCNetCore(BaseModule):
             align_corners=self.align_corners
         )
     
+        # 🔥 THÊM: detail → semantic (QUAN TRỌNG)
+        down_c4 = self.down_c4(self.comp_c4(self.relu(x_s4)))
+    
+        if down_c4.shape[-2:] != x_s5.shape[-2:]:
+            down_c4 = F.interpolate(down_c4, size=x_s5.shape[-2:], mode='bilinear', align_corners=False)
+    
+        x_s5 = x_s5 + down_c4
+    
         return x_s5, x_d5
 
     def forward_stage6(self, x_s5: Tensor, x_d5: Tensor) -> Tuple[Tensor, Tensor]:
+
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
+    
+        # ===== semantic → detail =====
+        comp_c5 = self.comp_c5(self.relu(x_s5))
+    
+        x_d6 = x_d6 + F.interpolate(
+            comp_c5,
+            size=x_d6.shape[-2:],
+            mode='bilinear',
+            align_corners=self.align_corners
+        )
+    
+        # ===== detail → semantic (QUAN TRỌNG) =====
+        down_c5 = self.down_c5(self.comp_c5(self.relu(x_s5)))
+    
+        if down_c5.shape[-2:] != x_s6.shape[-2:]:
+            down_c5 = F.interpolate(
+                down_c5,
+                size=x_s6.shape[-2:],
+                mode='bilinear',
+                align_corners=False
+            )
+    
+        x_s6 = x_s6 + down_c5
+    
         return x_s6, x_d6
 
     def forward(self, x: Tensor) -> Dict[str, Tensor]:
@@ -808,7 +848,7 @@ class GCNetCore(BaseModule):
         """
         feat, c1, c2, out_size = self.forward_stem(x)
         x_s4, x_d4 = self.forward_stage4(feat, out_size)
-        c4 = x_d4.detach().clone() 
+        c4 = x_d4
         x_s5, x_d5 = self.forward_stage5(x_s4, x_d4, out_size)
         x_s6, x_d6 = self.forward_stage6(x_s5, x_d5)
         return dict(
