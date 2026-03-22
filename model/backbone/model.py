@@ -815,10 +815,14 @@ class GCNetCore(BaseModule):
 
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
-    
-        # ===== semantic → detail =====
+        print("\n=== STAGE 6 ===")
+        print("x_s5:", x_s5.shape)
+        print("x_d5:", x_d5.shape)
+        print("x_s6:", x_s6.shape)
+        print("x_d6:", x_d6.shape)
+
         comp_c5 = self.comp_c5(self.relu(x_s5))
-    
+        print("comp_c5:", comp_c5.shape)
         x_d6 = x_d6 + F.interpolate(
             comp_c5,
             size=x_d6.shape[-2:],
@@ -828,7 +832,7 @@ class GCNetCore(BaseModule):
     
         # ===== detail → semantic (QUAN TRỌNG) =====
         down_c5 = self.down_c5(self.comp_c5(self.relu(x_s5)))
-    
+        print("down_c5:", down_c5.shape)
         if down_c5.shape[-2:] != x_s6.shape[-2:]:
             down_c5 = F.interpolate(
                 down_c5,
@@ -836,7 +840,9 @@ class GCNetCore(BaseModule):
                 mode='bilinear',
                 align_corners=False
             )
-    
+        print("BEFORE ADD:")
+        print("x_s6:", x_s6.shape)
+        print("down_c5:", down_c5.shape)
         x_s6 = x_s6 + down_c5
     
         return x_s6, x_d6
