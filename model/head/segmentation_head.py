@@ -58,7 +58,7 @@ class ResidualBlock(nn.Module):
 class EnhancedDecoder(nn.Module):
     def __init__(
         self,
-        in_channels=128,
+        in_channels=256,
         c4_channels=64,
         c2_channels=32,
         c1_channels=32,
