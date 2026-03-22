@@ -607,6 +607,11 @@ class GCNetCore(BaseModule):
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
+        self.proj_c5_to_d6 = ConvModule(
+            C * 2, C * 4,
+            kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=None
+        )             
         C = channels
         self.in_channels = in_channels
         self.channels = channels
