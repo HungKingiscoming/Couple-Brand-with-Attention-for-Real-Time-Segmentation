@@ -426,7 +426,7 @@ class DWSABlock(nn.Module):
 
         self.drop  = nn.Dropout(drop)
         self.scale = (mid // num_heads) ** -0.5
-        self.alpha = nn.Parameter(torch.tensor(alpha))
+        self.alpha = nn.Parameter(torch.tensor(0.0))
 
     def _attention(self, x_flat: Tensor) -> Tensor:
         """
@@ -616,7 +616,7 @@ class GCNetCore(BaseModule):
         self.channels = channels
         self.ppm_channels = ppm_channels
         self.num_blocks_per_stage = num_blocks_per_stage
-        self.align_corners = align_corners
+        self.align_corners = True
         self.norm_cfg = norm_cfg
         self.act_cfg = act_cfg
         self.deploy = deploy
@@ -771,27 +771,29 @@ class GCNetCore(BaseModule):
     def forward_stage4(self, x: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
         x_s4 = self.semantic_branch_layers[0](x)
         x_d4 = self.detail_branch_layers[0](x)
-        comp_c4 = self.compression_1(self.relu(x_s4))
-        x_s4 = x_s4 + self.down_1(self.relu(x_d4))
+        comp_c4 = self.compression4(x_s4)
         x_d4 = x_d4 + resize(
             comp_c4,
-            size=x_d4.shape[-2:],   # ✅ FIX
+            size=x_d4.shape[-2:],
             mode='bilinear',
             align_corners=self.align_corners
         )
         return x_s4, x_d4
 
     def forward_stage5(self, x_s4: Tensor, x_d4: Tensor, out_size: Tuple) -> Tuple[Tensor, Tensor]:
-        x_s5 = self.semantic_branch_layers[1](self.relu(x_s4))
-        x_d5 = self.detail_branch_layers[1](self.relu(x_d4))
-        comp_c5 = self.compression_2(self.relu(x_s5))
-        x_s5 = x_s5 + self.down_2(self.relu(x_d5))
+        x_s5 = self.semantic_branch_layers[1](x_s4)
+        x_d5 = self.detail_branch_layers[1](x_d4)
+    
+        comp_c5 = self.compression5(x_s5)
+    
+        # ✅ FIX tương tự
         x_d5 = x_d5 + resize(
             comp_c5,
-            size=x_d5.shape[-2:],   # ✅ FIX
+            size=x_d5.shape[-2:],
             mode='bilinear',
             align_corners=self.align_corners
         )
+    
         return x_s5, x_d5
 
     def forward_stage6(self, x_s5: Tensor, x_d5: Tensor) -> Tuple[Tensor, Tensor]:
@@ -944,7 +946,7 @@ class GCNetWithEnhance(BaseModule):
 
        
         x_s4, x_d4 = bb.forward_stage4(feat, out_size)
-        c4 = x_d4.clone()   # aux head input trÃ†Â°Ã¡Â»â€ºc khi x_d4 bÃ¡Â»â€¹ stage5 dÃƒÂ¹ng tiÃ¡ÂºÂ¿p
+        c4 = x_d4.detach().clone()   # aux head input trÃ†Â°Ã¡Â»â€ºc khi x_d4 bÃ¡Â»â€¹ stage5 dÃƒÂ¹ng tiÃ¡ÂºÂ¿p
 
         # DWSA4: enhance x_s4 Ã¢â€ â€™ stage5 nhÃ¡ÂºÂ­n semantic context tÃ¡Â»â€˜t hÃ†Â¡n
         # Ã¢â€ â€™ compression_2(x_s5) vÃƒ  down_2(x_d5) chÃ¡ÂºÂ¥t lÃ†Â°Ã¡Â»Â£ng cao hÃ†Â¡n
@@ -961,7 +963,7 @@ class GCNetWithEnhance(BaseModule):
             x_s6 = self.dwsa6(x_s6)
 
         x_spp = bb.spp(x_s6)
-        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
+        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=True)
 
         if self.ms_context is not None:
             x_spp = self.ms_context(x_spp)
