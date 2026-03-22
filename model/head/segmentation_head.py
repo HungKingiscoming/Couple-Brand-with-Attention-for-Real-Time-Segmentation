@@ -174,6 +174,7 @@ class GCNetHead(nn.Module):
             self.aux_h2 = nn.Conv2d(out_ch, num_classes, 1)
 
     def forward(self, feats: Dict[str, Tensor], return_aux=False, img_size=None):
+        print(c5.shape)
         c1, c2, c4, c5 = feats['c1'], feats['c2'], feats['c4'], feats['c5']
 
         if return_aux and self.use_deep_supervision:
