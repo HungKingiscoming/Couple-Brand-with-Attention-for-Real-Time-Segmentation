@@ -585,11 +585,10 @@ class ModelConfig:
 # ============================================
 
 class Segmentor(nn.Module):
-    def __init__(self, backbone, head, aux_head=None):
+    def __init__(self, backbone, head):
         super().__init__()
         self.backbone = backbone
         self.decode_head = head
-        self.aux_head = aux_head
 
     def forward(self, x):
         feats = self.backbone(x)
@@ -597,21 +596,14 @@ class Segmentor(nn.Module):
 
     def forward_train(self, x):
         feats = self.backbone(x)
-    
-        # ⚠️ bật deep supervision
+
         main_out, aux_h4, aux_h2 = self.decode_head(feats, return_aux=True)
-    
-        outputs = {
+
+        return {
             "main": main_out,
             "aux_h4": aux_h4,
             "aux_h2": aux_h2
         }
-    
-        # aux head riêng (nếu có)
-        if self.aux_head is not None:
-            outputs["aux"] = self.aux_head(feats)
-    
-        return outputs
 
 
 # ============================================
