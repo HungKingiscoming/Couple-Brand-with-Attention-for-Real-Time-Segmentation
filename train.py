@@ -998,7 +998,27 @@ def main():
     print(f"{'='*70}")
     print("BUILDING MODEL")
     print(f"{'='*70}\n")
-    
+    # --- CHÈN ĐOẠN DEBUG NÀY VÀO ---
+    print("🔍 DEBUGGING BACKBONE SHAPES...")
+    with torch.no_grad():
+        # Tạo thử backbone core riêng lẻ để xem output
+        temp_backbone = GCNetCore(**cfg["backbone"]).to(device)
+        temp_backbone.eval()
+        dummy_in = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+        temp_feats = temp_backbone(dummy_in)
+        
+        # In ra các channels thực tế
+        print("\nBACKBONE OUTPUT CHANNELS:")
+        stage_names = ["c1", "c2", "c4", "c5"]
+        for i, f in enumerate(temp_feats):
+            print(f"   {stage_names[i]}: {f.shape[1]} channels")
+        
+        # Nhánh Detail của bạn mặc định là 128
+        print(f"   Detail Branch: 128 channels")
+        print(f"   => Head 'in_channels' should be: {temp_feats[-1].shape[1] + 128}\n")
+        
+        del temp_backbone
+        torch.cuda.empty_cache()
     backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
 
     
