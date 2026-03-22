@@ -38,26 +38,7 @@ from model.head.segmentation_head import (
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
-def compute_loss(self, outputs, target):
-    loss = 0
 
-    main = F.interpolate(outputs["main"], size=target.shape[-2:], mode='bilinear', align_corners=False)
-
-    ce_loss = self.ce(main, target)
-    dice_loss = self.dice(main, target)
-
-    loss += self.ce_weight * ce_loss
-    loss += self.dice_weight * dice_loss
-
-    if "aux_h4" in outputs:
-        aux_h4 = F.interpolate(outputs["aux_h4"], size=target.shape[-2:], mode='bilinear', align_corners=False)
-        loss += 0.4 * self.ce(aux_h4, target)
-
-    if "aux_h2" in outputs:
-        aux_h2 = F.interpolate(outputs["aux_h2"], size=target.shape[-2:], mode='bilinear', align_corners=False)
-        loss += 0.4 * self.ce(aux_h2, target)
-
-    return loss, ce_loss, dice_loss
 
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
@@ -429,6 +410,34 @@ def print_available_modules(model):
     
     print(f"{'='*70}\n")
 
+
+
+def build_scheduler(optimizer, args, train_loader, start_epoch=0):
+    if args.scheduler == 'onecycle':
+        remaining_steps = len(train_loader) * (args.epochs - start_epoch)
+        max_lrs = [g['lr'] for g in optimizer.param_groups]
+        return optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lrs,
+            total_steps=remaining_steps,
+            pct_start=0.05,
+            anneal_strategy='cos',
+            cycle_momentum=True,
+            base_momentum=0.85,
+            max_momentum=0.95,
+            div_factor=25,
+            final_div_factor=100000,
+        )
+    elif args.scheduler == 'poly':
+        return optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
+        )
+    else:
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs - start_epoch, eta_min=1e-6
+        )
+
 def count_trainable_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -501,26 +510,7 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
 
 
 # FIX: Monitor gradients
-def check_gradients(model, threshold=10.0):
-    """Monitor gradient norms"""
-    max_grad = 0.0
-    max_grad_name = ""
-    total_norm = 0.0
-    
-    for name, param in model.named_parameters():
-        if param.grad is not None:
-            grad_norm = param.grad.norm().item()
-            total_norm += grad_norm ** 2
-            if grad_norm > max_grad:
-                max_grad = grad_norm
-                max_grad_name = name
-    
-    total_norm = total_norm ** 0.5
-    
-    if max_grad > threshold:
-        print(f"Large gradient detected: {max_grad_name[:50]}... = {max_grad:.2f}")
-    
-    return max_grad, total_norm
+
 
 
 # ============================================
@@ -646,6 +636,27 @@ class Trainer:
         
         self.save_config()
         self._print_config(loss_cfg)
+
+    def compute_loss(self, outputs, target):
+        loss = 0
+    
+        main = F.interpolate(outputs["main"], size=target.shape[-2:], mode='bilinear', align_corners=False)
+    
+        ce_loss = self.ce(main, target)
+        dice_loss = self.dice(main, target)
+    
+        loss += self.ce_weight * ce_loss
+        loss += self.dice_weight * dice_loss
+    
+        if "aux_h4" in outputs:
+            aux_h4 = F.interpolate(outputs["aux_h4"], size=target.shape[-2:], mode='bilinear', align_corners=False)
+            loss += 0.4 * self.ce(aux_h4, target)
+    
+        if "aux_h2" in outputs:
+            aux_h2 = F.interpolate(outputs["aux_h2"], size=target.shape[-2:], mode='bilinear', align_corners=False)
+            loss += 0.4 * self.ce(aux_h2, target)
+    
+        return loss, ce_loss, dice_loss
     
     def set_loss_phase(self, phase: str):
         if phase == self.loss_phase:
@@ -711,10 +722,13 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                max_grad, total_norm = check_gradients(self.model, threshold=10.0)
-                max_grad_epoch = max(max_grad_epoch, max_grad)
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.args.grad_clip
+                    ).item()  # clip_grad_norm_ trả về total norm luôn, không cần tính riêng
+                else:
+                    total_norm = 0.0
+                max_grad_epoch = max(max_grad_epoch, max_grad)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -736,8 +750,6 @@ class Trainer:
                 'max_grad': f'{max_grad:.2f}'  # Ã¢â€ Â Monitor
             })
             
-            if batch_idx % 50 == 0:
-                clear_gpu_memory()
             
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
@@ -809,8 +821,6 @@ class Trainer:
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
-            if batch_idx % 20 == 0:
-                clear_gpu_memory()
     
         intersection = np.diag(confusion_matrix)
         union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
@@ -998,27 +1008,7 @@ def main():
     print(f"{'='*70}")
     print("BUILDING MODEL")
     print(f"{'='*70}\n")
-    # --- CHÈN ĐOẠN DEBUG NÀY VÀO ---
-    print("🔍 DEBUGGING BACKBONE SHAPES...")
-    with torch.no_grad():
-        # Tạo thử backbone core riêng lẻ để xem output
-        temp_backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
-        temp_backbone.eval()
-        dummy_in = torch.randn(1, 3, args.img_h, args.img_w).to(device)
-        temp_feats = temp_backbone(dummy_in)
-        
-        # In ra các channels thực tế
-        print("\nBACKBONE OUTPUT CHANNELS:")
-        stage_names = ["c1", "c2", "c4", "c5"]
-        for i, f in enumerate(temp_feats):
-            print(f"   {stage_names[i]}: {f.shape[1]} channels")
-        
-        # Nhánh Detail của bạn mặc định là 128
-        print(f"   Detail Branch: 128 channels")
-        print(f"   => Head 'in_channels' should be: {temp_feats[-1].shape[1] + 128}\n")
-        
-        del temp_backbone
-        torch.cuda.empty_cache()
+   
     backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
 
     
@@ -1119,17 +1109,7 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
-        n_groups = len(optimizer.param_groups)
-    
-        if n_groups == 1:
-            max_lrs = args.lr
-        elif n_groups == 2:
-            max_lrs = [
-                args.lr * args.backbone_lr_factor,
-                args.lr,
-            ]
-        else:
-            raise ValueError(f"Unexpected param_groups: {n_groups}")
+        max_lrs = [g['lr'] for g in optimizer.param_groups]
     
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
