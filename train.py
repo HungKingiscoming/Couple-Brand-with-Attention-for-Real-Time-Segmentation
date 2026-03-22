@@ -41,56 +41,24 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 def compute_loss(self, outputs, target):
     loss = 0
 
-    # ========================
-    # 1. MAIN OUTPUT
-    # ========================
-    main = F.interpolate(
-        outputs["main"],
-        size=target.shape[-2:],
-        mode='bilinear',
-        align_corners=False
-    )
+    main = F.interpolate(outputs["main"], size=target.shape[-2:], mode='bilinear', align_corners=False)
 
-    loss += self.ce_weight * self.ce(main, target)
-    loss += self.dice_weight * self.dice(main, target)
+    ce_loss = self.ce(main, target)
+    dice_loss = self.dice(main, target)
 
-    # ========================
-    # 2. DEEP SUPERVISION (H/4)
-    # ========================
+    loss += self.ce_weight * ce_loss
+    loss += self.dice_weight * dice_loss
+
     if "aux_h4" in outputs:
-        aux_h4 = F.interpolate(
-            outputs["aux_h4"],
-            size=target.shape[-2:],
-            mode='bilinear',
-            align_corners=False
-        )
+        aux_h4 = F.interpolate(outputs["aux_h4"], size=target.shape[-2:], mode='bilinear', align_corners=False)
         loss += 0.4 * self.ce(aux_h4, target)
 
-    # ========================
-    # 3. DEEP SUPERVISION (H/2)
-    # ========================
     if "aux_h2" in outputs:
-        aux_h2 = F.interpolate(
-            outputs["aux_h2"],
-            size=target.shape[-2:],
-            mode='bilinear',
-            align_corners=False
-        )
+        aux_h2 = F.interpolate(outputs["aux_h2"], size=target.shape[-2:], mode='bilinear', align_corners=False)
         loss += 0.4 * self.ce(aux_h2, target)
 
-    # ========================
-    # 4. AUX HEAD (c4)
-    # ========================
-    if "aux" in outputs:
-        aux = F.interpolate(
-            outputs["aux"],
-            size=target.shape[-2:],
-            mode='bilinear',
-            align_corners=False
-        )
-        loss += 0.4 * self.ce(aux, target)
+    return loss, ce_loss, dice_loss
 
-    return loss
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
@@ -804,54 +772,53 @@ class Trainer:
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
         pbar = tqdm(loader, desc="Validation")
-        with torch.no_grad():
-            for batch_idx, (imgs, masks) in enumerate(pbar):
-                imgs  = imgs.to(self.device, non_blocking=True)
-                masks = masks.to(self.device, non_blocking=True).long()
-                
-                if masks.dim() == 4:
-                    masks = masks.squeeze(1)
-        
-                with autocast(device_type='cuda', enabled=self.args.use_amp):
-                    logits = self.model(imgs)   # (B, C, H/2, W/2)
+        for batch_idx, (imgs, masks) in enumerate(pbar):
+            imgs  = imgs.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True).long()
+            
+            if masks.dim() == 4:
+                masks = masks.squeeze(1)
     
-                    # ===== CE =====
-                    logits_full = F.interpolate(
-                        logits,
-                        size=masks.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                    ce_loss = self.ce(logits_full, masks)
-                
-                    # ===== Dice =====
-                    if self.dice_weight > 0:
-                        masks_small = F.interpolate(
-                            masks.unsqueeze(1).float(),
-                            size=logits.shape[-2:],
-                            mode='nearest'
-                        ).squeeze(1).long()
-                
-                        dice_loss = self.dice(logits, masks_small)
-                    else:
-                        dice_loss = torch.tensor(0.0, device=logits.device)
-                
-                    loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss        
-                total_loss += loss.item()
-        
-                # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
-                pred   = logits_full.argmax(1).cpu().numpy()
-                target = masks.cpu().numpy()
-                
-                mask_valid = (target >= 0) & (target < num_classes)
-                label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
-                count  = np.bincount(label, minlength=num_classes**2)
-                confusion_matrix += count.reshape(num_classes, num_classes)
-                
-                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-                
-                if batch_idx % 20 == 0:
-                    clear_gpu_memory()
+            with autocast(device_type='cuda', enabled=self.args.use_amp):
+                logits = self.model(imgs)   # (B, C, H/2, W/2)
+
+                # ===== CE =====
+                logits_full = F.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+                ce_loss = self.ce(logits_full, masks)
+            
+                # ===== Dice =====
+                if self.dice_weight > 0:
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+            
+                    dice_loss = self.dice(logits, masks_small)
+                else:
+                    dice_loss = torch.tensor(0.0, device=logits.device)
+            
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss        
+            total_loss += loss.item()
+    
+            # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
+            pred   = logits_full.argmax(1).cpu().numpy()
+            target = masks.cpu().numpy()
+            
+            mask_valid = (target >= 0) & (target < num_classes)
+            label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
+            count  = np.bincount(label, minlength=num_classes**2)
+            confusion_matrix += count.reshape(num_classes, num_classes)
+            
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            
+            if batch_idx % 20 == 0:
+                clear_gpu_memory()
     
         intersection = np.diag(confusion_matrix)
         union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
@@ -1048,12 +1015,8 @@ def main():
         num_classes=args.num_classes,
     )
     
-    aux_head = GCNetAuxHead(
-        **cfg["aux_head"],
-        num_classes=args.num_classes,
-    )
     
-    model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
+    model = Segmentor(backbone=backbone, head=head, aux_head=None)
     
     print("\nApplying Optimizations...")
     # print("Converting BN Ã¢â€ â€™ GN")
