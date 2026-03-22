@@ -1042,6 +1042,11 @@ def main():
     with torch.no_grad():
         sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
+            with torch.no_grad():
+                sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
+                feats = model.backbone(sample)
+                for i, f in enumerate(feats):
+                    print(f"Feature {i} shape: {f.shape}")
             outputs = model.forward_train(sample)
             print(f"Forward pass successful!")
             print(f"   Main:  {outputs['main'].shape}")
