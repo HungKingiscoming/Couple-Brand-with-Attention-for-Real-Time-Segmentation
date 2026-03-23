@@ -591,7 +591,7 @@ class MultiScaleContextModule(nn.Module):
             nn.BatchNorm2d(out_channels),
         )
 
-        self.alpha_raw = nn.Parameter(torch.tensor(math.log(alpha / (1 - alpha))))
+        self.alpha = nn.Parameter(torch.tensor(alpha))
 
         if in_channels != out_channels:
             self.proj = nn.Sequential(
@@ -614,7 +614,7 @@ class MultiScaleContextModule(nn.Module):
         out = self.fusion(fused)
 
         x_proj = self.proj(x) if self.proj is not None else x
-        alpha = torch.sigmoid(self.alpha_raw)
+        alpha = torch.sigmoid(self.alpha)
         return x_proj + alpha * out
 
 
