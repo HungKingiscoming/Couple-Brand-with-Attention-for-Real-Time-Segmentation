@@ -12,7 +12,12 @@ from components.components import (
 
 
 class GatedFusion(nn.Module):
-    def __init__(self, channels, norm_cfg, act_cfg):
+    def __init__(
+        self,
+        channels: int,
+        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+    ):
         super().__init__()
         self.gate_conv = nn.Sequential(
             ConvModule(
@@ -31,164 +36,202 @@ class GatedFusion(nn.Module):
             )
         )
 
-    def forward(self, skip_feat, dec_feat):
+    def forward(self, skip_feat: Tensor, dec_feat: Tensor) -> Tensor:
         concat = torch.cat([skip_feat, dec_feat], dim=1)
         gate = self.gate_conv(concat)
-        return dec_feat + gate * skip_feat
+        out = gate * skip_feat + (1 - gate) * dec_feat
+        return out
 
 
 class DWConvModule(nn.Module):
-    def __init__(self, channels, kernel_size=3, norm_cfg=None, act_cfg=None):
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+    ):
         super().__init__()
         padding = kernel_size // 2
 
-        self.dw = ConvModule(
-            channels, channels,
+        self.dw_conv = ConvModule(
+            in_channels=channels,
+            out_channels=channels,
             kernel_size=kernel_size,
             padding=padding,
             groups=channels,
             norm_cfg=norm_cfg,
             act_cfg=None
         )
-        self.pw = ConvModule(
-            channels, channels,
+        self.pw_conv = ConvModule(
+            in_channels=channels,
+            out_channels=channels,
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg
         )
 
-    def forward(self, x):
-        return self.pw(self.dw(x))
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.dw_conv(x)
+        x = self.pw_conv(x)
+        return x
 
 
 class ResidualBlock(nn.Module):
-    def __init__(self, channels, norm_cfg, act_cfg):
+    def __init__(
+        self,
+        channels: int,
+        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+    ):
         super().__init__()
         self.conv1 = ConvModule(
-            channels, channels, 3, padding=1,
-            norm_cfg=norm_cfg, act_cfg=act_cfg
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=3,
+            padding=1,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg
         )
         self.conv2 = ConvModule(
-            channels, channels, 3, padding=1,
-            norm_cfg=norm_cfg, act_cfg=None
+            in_channels=channels,
+            out_channels=channels,
+            kernel_size=3,
+            padding=1,
+            norm_cfg=norm_cfg,
+            act_cfg=None
         )
         self.act = build_activation_layer(act_cfg)
 
-    def forward(self, x):
-        return self.act(self.conv2(self.conv1(x)) + x)
+    def forward(self, x: Tensor) -> Tensor:
+        identity = x
+        out = self.conv1(x)
+        out = self.conv2(out)
+        out = out + identity
+        out = self.act(out)
+        return out
 
 
 class EnhancedDecoder(nn.Module):
+    """
+    Decoder cho backbone GCNet-like:
+      - c5: (B, in_channels, H/8,  W/8)
+      - c2: (B, c2_channels, H/4,  W/4)
+      - c1: (B, c1_channels, H/2,  W/2)
+    Output:
+      - (B, decoder_channels//2, H/2, W/2)
+    """
     def __init__(
         self,
-        in_channels,
-        c2_channels,
-        c1_channels,
-        decoder_channels=128,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU', inplace=False),
-        dropout_ratio=0.1,
-        use_gated_fusion=True
+        in_channels: int,         # c5 channels, vÃƒÂ­ dÃ¡Â»Â¥ 128
+        c2_channels: int,         # vÃƒÂ­ dÃ¡Â»Â¥ 64
+        c1_channels: int,         # vÃƒÂ­ dÃ¡Â»Â¥ 32
+        decoder_channels: int = 128,
+        norm_cfg: dict = dict(type='BN', requires_grad=True),
+        act_cfg: dict = dict(type='ReLU', inplace=False),
+        dropout_ratio: float = 0.1,
+        use_gated_fusion: bool = True
     ):
         super().__init__()
         self.use_gated_fusion = use_gated_fusion
 
-        # ===== Stage 1 =====
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
-
+        # Stage 1: H/8 (c5) Ã¢â€ â€™ H/4, fuse vÃ¡Â»â€ºi c2
+        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine1 = nn.Sequential(
-            ResidualBlock(in_channels, norm_cfg, act_cfg),
+            ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(
-                in_channels, decoder_channels,
-                kernel_size=3, padding=1,
-                norm_cfg=norm_cfg, act_cfg=act_cfg
+                in_channels=in_channels,
+                out_channels=decoder_channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg
             )
         )
-
         self.c2_proj = ConvModule(
-            c2_channels, decoder_channels, kernel_size=1,
-            norm_cfg=norm_cfg, act_cfg=None
+            in_channels=c2_channels,
+            out_channels=decoder_channels,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=None
         ) if c2_channels != decoder_channels else nn.Identity()
-
         if use_gated_fusion:
-            self.fusion1_gate = GatedFusion(decoder_channels, norm_cfg, act_cfg)
+            self.fusion1_gate = GatedFusion(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion1 = ConvModule(
-                decoder_channels * 2, decoder_channels,
-                kernel_size=1, norm_cfg=norm_cfg, act_cfg=act_cfg
+                in_channels=decoder_channels * 2,
+                out_channels=decoder_channels,
+                kernel_size=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg
             )
 
-        # ===== Stage 2 =====
+        # Stage 2: H/4 Ã¢â€ â€™ H/2, fuse vÃ¡Â»â€ºi c1
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-
         self.refine2 = nn.Sequential(
-            ResidualBlock(decoder_channels, norm_cfg, act_cfg),
+            ResidualBlock(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(
-                decoder_channels, decoder_channels // 2,
-                kernel_size=3, padding=1,
-                norm_cfg=norm_cfg, act_cfg=act_cfg
+                in_channels=decoder_channels,
+                out_channels=decoder_channels // 2,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg
             )
         )
-
         self.c1_proj = ConvModule(
-            c1_channels, decoder_channels // 2,
-            kernel_size=1, norm_cfg=norm_cfg, act_cfg=None
+            in_channels=c1_channels,
+            out_channels=decoder_channels // 2,
+            kernel_size=1,
+            norm_cfg=norm_cfg,
+            act_cfg=None
         ) if c1_channels != decoder_channels // 2 else nn.Identity()
-
         if use_gated_fusion:
-            self.fusion2_gate = GatedFusion(decoder_channels // 2, norm_cfg, act_cfg)
+            self.fusion2_gate = GatedFusion(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion2 = ConvModule(
-                decoder_channels, decoder_channels // 2,
-                kernel_size=1, norm_cfg=norm_cfg, act_cfg=act_cfg
+                in_channels=decoder_channels,
+                out_channels=decoder_channels // 2,
+                kernel_size=1,
+                norm_cfg=norm_cfg,
+                act_cfg=act_cfg
             )
 
-        # ===== Final refine =====
+        # Stage 3: H/2 Ã¢â€ â€™ H/2 (refine)
         self.refine3 = nn.Sequential(
-            DWConvModule(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            DWConvModule(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg),
+            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
+            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
-
         self.final_proj = ConvModule(
-            decoder_channels // 2,
-            decoder_channels // 2,
+            in_channels=decoder_channels // 2,
+            out_channels=decoder_channels // 2,
             kernel_size=1,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg
         )
-
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
 
     def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
-        # ===== Stage 1 =====
+        # Stage 1: H/8 Ã¢â€ â€™ H/4
         x = self.up1(c5)
         x = self.refine1(x)
-
-        skip = self.c2_proj(c2)
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
-
+        c2_proj = self.c2_proj(c2)
         if self.use_gated_fusion:
-            x = self.fusion1_gate(skip, x)
+            x = self.fusion1_gate(c2_proj, x)
         else:
-            x = self.fusion1(torch.cat([skip, x], dim=1))
+            x = self.fusion1(torch.cat([x, c2_proj], dim=1))
 
-        # ===== Stage 2 =====
+        # Stage 2: H/4 Ã¢â€ â€™ H/2
         x = self.up2(x)
         x = self.refine2(x)
-
-        skip = self.c1_proj(c1)
-        if x.shape[-2:] != skip.shape[-2:]:
-            x = F.interpolate(x, size=skip.shape[-2:], mode='bilinear', align_corners=False)
-
+        c1_proj = self.c1_proj(c1)
         if self.use_gated_fusion:
-            x = self.fusion2_gate(skip, x)
+            x = self.fusion2_gate(c1_proj, x)
         else:
-            x = self.fusion2(torch.cat([skip, x], dim=1))
+            x = self.fusion2(torch.cat([x, c1_proj], dim=1))
 
-        # ===== Final =====
+        # Stage 3: refine H/2
         x = self.refine3(x)
         x = self.final_proj(x)
         x = self.dropout(x)
-
         return x
