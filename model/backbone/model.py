@@ -72,15 +72,16 @@ class Block1x1(BaseModule):
 
     def _fuse_bn_tensor(self, conv: nn.Module):
         kernel = conv.conv.weight
-        bias = conv.conv.bias
+        bias = conv.conv.bias if conv.conv.bias is not None else \
+            torch.zeros(kernel.shape[0], device=kernel.device, dtype=kernel.dtype)
         running_mean = conv.bn.running_mean
-        running_var = conv.bn.running_var
+        running_var  = conv.bn.running_var
         gamma = conv.bn.weight
-        beta = conv.bn.bias
-        eps = conv.bn.eps
+        beta  = conv.bn.bias
+        eps   = conv.bn.eps
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+        return kernel * t, beta + (bias - running_mean) * gamma / std
 
     def switch_to_deploy(self):
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
@@ -148,23 +149,24 @@ class Block3x3(BaseModule):
 
     def _fuse_bn_tensor(self, conv: nn.Module):
         kernel = conv.conv.weight
-        bias = conv.conv.bias
+        bias = conv.conv.bias if conv.conv.bias is not None else \
+            torch.zeros(kernel.shape[0], device=kernel.device, dtype=kernel.dtype)
         running_mean = conv.bn.running_mean
-        running_var = conv.bn.running_var
+        running_var  = conv.bn.running_var
         gamma = conv.bn.weight
-        beta = conv.bn.bias
-        eps = conv.bn.eps
+        beta  = conv.bn.bias
+        eps   = conv.bn.eps
         std = (running_var + eps).sqrt()
         t = (gamma / std).reshape(-1, 1, 1, 1)
-        return kernel * t, beta + (bias - running_mean) * gamma / std if self.bias else beta - running_mean * gamma / std
+        return kernel * t, beta + (bias - running_mean) * gamma / std
 
     def switch_to_deploy(self):
         kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
         kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
         self.conv = nn.Conv2d(
             self.in_channels, self.out_channels,
-            kernel_size=3, stride=self.stride,
-            padding=self.padding, bias=True)
+            kernel_size=1, stride=self.stride,
+            padding=self.padding, bias=True)   # padding đúng cho conv1 (1x1 đầu)
         self.conv.weight.data = torch.einsum(
             'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
         self.conv.bias.data = bias2 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1)
@@ -182,7 +184,7 @@ class GCBlock(nn.Module):
                  padding: Union[int, Tuple[int]] = 1,
                  padding_mode: Optional[str] = 'zeros',
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
                  act: bool = True,
                  deploy: bool = False):
         super().__init__()
@@ -469,8 +471,7 @@ class DWSABlock(nn.Module):
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
-            return t.view(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
-            # â†’ (B', heads, N, head_dim)
+            return t.reshape(B_, self.num_heads, hd, N).permute(0, 1, 3, 2))
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
@@ -481,7 +482,7 @@ class DWSABlock(nn.Module):
         out = torch.matmul(attn, v)                          # (B', heads, N, hd)
         out = out.permute(0, 1, 3, 2).contiguous()          # (B', heads, hd, N)
         B_, Hn, Hd, N = out.shape
-        return out.view(B_, self.mid, N)                     # (B', mid, N)
+        return out.reshape(B_, self.mid, N)                     # (B', mid, N)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
@@ -492,7 +493,6 @@ class DWSABlock(nn.Module):
         x_red  = self.in_proj(x_norm)   # (B, reduced, H, W)
 
         if self.window_size > 0:
-            # â”€â”€ Window attention (stage4) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ws = self.window_size
 
             # Pad náº¿u H, W khÃ´ng chia háº¿t cho ws
@@ -512,17 +512,15 @@ class DWSABlock(nn.Module):
 
             # Project back
             out_flat = self.o_proj(out_flat)         # (B*nH*nW, reduced, wsÂ²)
-            out_win  = out_flat.view(Bw, C2, ws, ws)
+            out_win = out_flat.reshape(Bw, C2, ws, ws) 
 
-            # Merge windows â†’ (B, reduced, Hp, Wp)
+
             out_red = _merge_windows(out_win, nH, nW, B)
 
             # Crop padding náº¿u cÃ³
             if pad_h > 0 or pad_w > 0:
                 out_red = out_red[:, :, :H, :W]
-
         else:
-            # â”€â”€ Full attention (stage5, stage6) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             N = H * W
             x_flat   = x_red.view(B, self.reduced, N)
             out_flat = self._attention(x_flat)       # (B, mid, N)
@@ -532,7 +530,7 @@ class DWSABlock(nn.Module):
         # Project back lÃªn channels + BN
         out = self.bn_out(self.out_proj(out_red))    # (B, C, H, W)
 
-        alpha = self.alpha.clamp(0.0, 1.0)
+        alpha = torch.sigmoid(self.alpha)
         return identity + alpha * out
 
 
