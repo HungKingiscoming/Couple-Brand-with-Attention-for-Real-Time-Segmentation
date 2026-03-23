@@ -33,13 +33,11 @@ from model.backbone.model import (
     MultiScaleContextModule,
 )
 from model.head.segmentation_head import (
-    GCNetHead
+    GCNetHead,
+    GCNetAuxHead,
 )
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
-
-
-
 
 def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
@@ -410,34 +408,6 @@ def print_available_modules(model):
     
     print(f"{'='*70}\n")
 
-
-
-def build_scheduler(optimizer, args, train_loader, start_epoch=0):
-    if args.scheduler == 'onecycle':
-        remaining_steps = len(train_loader) * (args.epochs - start_epoch)
-        max_lrs = [g['lr'] for g in optimizer.param_groups]
-        return optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lrs,
-            total_steps=remaining_steps,
-            pct_start=0.05,
-            anneal_strategy='cos',
-            cycle_momentum=True,
-            base_momentum=0.85,
-            max_momentum=0.95,
-            div_factor=25,
-            final_div_factor=100000,
-        )
-    elif args.scheduler == 'poly':
-        return optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
-        )
-    else:
-        return optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs - start_epoch, eta_min=1e-6
-        )
-
 def count_trainable_params(model):
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -510,7 +480,26 @@ def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay
 
 
 # FIX: Monitor gradients
-
+def check_gradients(model, threshold=10.0):
+    """Monitor gradient norms"""
+    max_grad = 0.0
+    max_grad_name = ""
+    total_norm = 0.0
+    
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            grad_norm = param.grad.norm().item()
+            total_norm += grad_norm ** 2
+            if grad_norm > max_grad:
+                max_grad = grad_norm
+                max_grad_name = name
+    
+    total_norm = total_norm ** 0.5
+    
+    if max_grad > threshold:
+        print(f"Large gradient detected: {max_grad_name[:50]}... = {max_grad:.2f}")
+    
+    return max_grad, total_norm
 
 
 # ============================================
@@ -540,11 +529,11 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-
-                "in_channels":    C * 4, 
-                "c4_channels":    C * 2,   
-                "c2_channels":    C,      
-                "c1_channels":    C,       
+                # c5 = C*4, c4 = C*2, c2 = C, c1 = C
+                "in_channels":    C * 4,   # 128 â€” c5
+                "c4_channels":    C * 2,   #  64 â€” c4 (detail branch stage4)
+                "c2_channels":    C,       #  32 â€” c2 (stem layer 1)
+                "c1_channels":    C,       #  32 â€” c1 (stem layer 0)
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -575,10 +564,11 @@ class ModelConfig:
 # ============================================
 
 class Segmentor(nn.Module):
-    def __init__(self, backbone, head):
+    def __init__(self, backbone, head, aux_head=None):
         super().__init__()
         self.backbone = backbone
         self.decode_head = head
+        self.aux_head = aux_head
 
     def forward(self, x):
         feats = self.backbone(x)
@@ -586,8 +576,10 @@ class Segmentor(nn.Module):
 
     def forward_train(self, x):
         feats = self.backbone(x)
-        main_out = self.decode_head(feats)
-        return {"main": main_out}
+        outputs = {"main": self.decode_head(feats)}
+        if self.aux_head is not None:
+            outputs["aux"] = self.aux_head(feats)
+        return outputs
 
 
 # ============================================
@@ -630,16 +622,6 @@ class Trainer:
         
         self.save_config()
         self._print_config(loss_cfg)
-
-    def compute_loss(self, outputs, target):
-        main = F.interpolate(
-            outputs["main"], size=target.shape[-2:],
-            mode='bilinear', align_corners=False
-        )
-        ce_loss = self.ce(main, target)
-        dice_loss = self.dice(main, target)
-        loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-        return loss, ce_loss, dice_loss
     
     def set_loss_phase(self, phase: str):
         if phase == self.loss_phase:
@@ -672,84 +654,118 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-    
+        
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
-        total_norm_epoch = 0.0
-        total_norm = 0.0
+        max_grad_epoch = 0.0
+        max_grad = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
-    
+        
         for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs  = imgs.to(self.device, non_blocking=True)
+            imgs = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
-    
+            
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-                loss, ce_loss, dice_loss = self.compute_loss(outputs, masks)
+                logits = outputs["main"]    # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn resolution tháº¥p
+            
+                # â”€â”€ CE: upsample logit lÃªn full resolution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                logits_full = F.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
+                ce_loss = self.ce(logits_full, masks)
+            
+                # â”€â”€ Dice: giá»¯ logit H/2, downsample mask xuá»‘ng cÃ¹ng size â”€â”€â”€â”€â”€â”€
+                if self.dice_weight > 0:
+                    # nearest-exact: chÃ­nh xÃ¡c hÆ¡n 'nearest' vá»›i kÃ­ch thÆ°á»›c láº»
+                    # khÃ´ng dÃ¹ng bilinear vÃ¬ mask lÃ  class label (integer), khÃ´ng ná»™i suy Ä‘Æ°á»£c
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    dice_loss = self.dice(logits, masks_small)
+                else:
+                    dice_loss = torch.tensor(0.0, device=logits.device)
+            
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+            
+                # â”€â”€ Aux: chá»‰ CE lÃ  Ä‘á»§, Dice khÃ´ng cáº§n thiáº¿t á»Ÿ aux head â”€â”€â”€â”€â”€â”€â”€â”€
+                if "aux" in outputs and self.args.aux_weight > 0:
+                    aux_logits = F.interpolate(
+                        outputs["aux"],
+                        size=masks.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                    aux_ce_loss = self.ce(aux_logits, masks)
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    loss = loss + aux_weight * aux_ce_loss
+            
                 loss = loss / self.args.accumulation_steps
     
+            # FIX 1: Check NaN BEFORE backward
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\nNaN/Inf loss at epoch {epoch}, batch {batch_idx}")
+                print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-    
+            
             self.scaler.scale(loss).backward()
-    
+            
+
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-    
+                max_grad, total_norm = check_gradients(self.model, threshold=10.0)
+                max_grad_epoch = max(max_grad_epoch, max_grad)
                 if self.args.grad_clip > 0:
-                    total_norm = torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), self.args.grad_clip
-                    ).item()
-                else:
-                    total_norm = 0.0
-    
-                total_norm_epoch = max(total_norm_epoch, total_norm)
-    
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-    
-                if self.scheduler and self.args.scheduler == 'onecycle':
+            
+                if self.scheduler and self.args.scheduler == 'onecycle':   # â† VÃ€O TRONG
                     self.scheduler.step()
-    
+                        
             total_loss += loss.item() * self.args.accumulation_steps
-            total_ce   += ce_loss.item()
+            total_ce += ce_loss.item()
             total_dice += dice_loss.item()
-    
+            
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ce':   f'{ce_loss.item():.4f}',      # đổi từ ohem → ce
+                'ce': f'{ce_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
-                'lr':   f'{current_lr:.6f}',
-                'grad': f'{total_norm:.2f}',           # dùng total_norm thay max_grad
+                'lr': f'{current_lr:.6f}',
+                'max_grad': f'{max_grad:.2f}'  # Ã¢â€ Â Monitor
             })
-    
+            
+            if batch_idx % 50 == 0:
+                clear_gpu_memory()
+            
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ce_loss',    ce_loss.item(),   self.global_step)
-                self.writer.add_scalar('train/dice_loss',  dice_loss.item(), self.global_step)
-                self.writer.add_scalar('train/lr',         current_lr,       self.global_step)
-                self.writer.add_scalar('train/grad_norm',  total_norm,       self.global_step)
+                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
+                self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
+                self.writer.add_scalar('train/lr', current_lr, self.global_step)
+                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # Ã¢â€ Â Log
     
         avg_loss = total_loss / len(loader)
-        avg_ce   = total_ce   / len(loader)
+        avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
-    
-        print(f"\nEpoch {epoch+1} Summary: Max Grad Norm = {total_norm_epoch:.2f}")
+        print(f"\nEpoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
         torch.cuda.empty_cache()
-    
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
-    
-        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice}
+        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
     @torch.no_grad()
     def validate(self, loader, epoch):
@@ -760,6 +776,7 @@ class Trainer:
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
         pbar = tqdm(loader, desc="Validation")
+        
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
@@ -768,9 +785,9 @@ class Trainer:
                 masks = masks.squeeze(1)
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)   # (B, C, H/2, W/2)
-
-                # ===== CE =====
+                logits = self.model(imgs)          # (B, C, H/2, W/2) â€” giá»¯ nguyÃªn
+    
+                # CE: upsample logit lÃªn full resolution
                 logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
@@ -778,20 +795,20 @@ class Trainer:
                     align_corners=False
                 )
                 ce_loss = self.ce(logits_full, masks)
-            
-                # ===== Dice =====
+    
+                # Dice: giá»¯ logit H/2, downsample mask â€” nháº¥t quÃ¡n vá»›i train_epoch
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
+                        masks.unsqueeze(1).float(),   # cáº§n unsqueeze + float cho interpolate
+                        size=logits.shape[-2:],        # H/2, W/2 â€” KHÃ”NG pháº£i logits_full
                         mode='nearest'
-                    ).squeeze(1).long()
-            
+                    ).squeeze(1).long()               # tráº£ vá» (B, H/2, W/2) long
                     dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-            
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss        
+    
+                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+    
             total_loss += loss.item()
     
             # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
@@ -805,6 +822,8 @@ class Trainer:
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
+            if batch_idx % 20 == 0:
+                clear_gpu_memory()
     
         intersection = np.diag(confusion_matrix)
         union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
@@ -992,7 +1011,7 @@ def main():
     print(f"{'='*70}")
     print("BUILDING MODEL")
     print(f"{'='*70}\n")
-   
+    
     backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
 
     
@@ -1001,8 +1020,12 @@ def main():
         num_classes=args.num_classes,
     )
     
+    aux_head = GCNetAuxHead(
+        **cfg["aux_head"],
+        num_classes=args.num_classes,
+    )
     
-    model = Segmentor(backbone=backbone, head=head)
+    model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
     
     print("\nApplying Optimizations...")
     # print("Converting BN Ã¢â€ â€™ GN")
@@ -1034,37 +1057,9 @@ def main():
     # Test forward
     model = model.to(device)
     with torch.no_grad():
-        sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
+        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         try:
-            model = model.to(device)
-            model.eval() # Chuyển về chế độ eval để kiểm tra
-            with torch.no_grad():
-                sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
-                print("\n" + "="*50)
-                print("🔍 DEBUG: CHECKING BACKBONE OUTPUT SHAPES")
-                print("="*50)
-                
-                # Gọi backbone để xem output từng stage
-                feats = model.backbone(sample)
-                
-                if isinstance(feats, dict):
-                    for k, v in feats.items():
-                        print(f"Key: {k:5} | Shape: {list(v.shape)}")
-                elif isinstance(feats, (list, tuple)):
-                    for i, f in enumerate(feats):
-                        print(f"Index: {i} | Shape: {list(f.shape)}")
-                
-                # Kiểm tra biến 'out' sau khi concat trong forward của GCNetWithEnhance
-                # Nếu bạn có thể can thiệp vào forward của GCNetWithEnhance, hãy print ở đó.
-                print("="*50 + "\n")
-            # === ĐOẠN CHÈN DEBUG KẾT THÚC ===
-        
-            # Sau đó mới đến đoạn test forward_train cũ của bạn
-            try:
-                outputs = model.forward_train(sample)
-                print("Forward pass successful!")
-            except Exception as e:
-                print(f"Forward pass FAILED: {e}")
+            outputs = model.forward_train(sample)
             print(f"Forward pass successful!")
             print(f"   Main:  {outputs['main'].shape}")
             if 'aux' in outputs:
@@ -1093,7 +1088,17 @@ def main():
     # Scheduler
     if args.scheduler == 'onecycle':
         total_steps = len(train_loader) * args.epochs
-        max_lrs = [g['lr'] for g in optimizer.param_groups]
+        n_groups = len(optimizer.param_groups)
+    
+        if n_groups == 1:
+            max_lrs = args.lr
+        elif n_groups == 2:
+            max_lrs = [
+                args.lr * args.backbone_lr_factor,
+                args.lr,
+            ]
+        else:
+            raise ValueError(f"Unexpected param_groups: {n_groups}")
     
         scheduler = optim.lr_scheduler.OneCycleLR(
             optimizer,
