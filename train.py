@@ -1165,7 +1165,7 @@ def main():
     )
     
     if args.resume:
-    reset_epoch = (args.resume_mode == "transfer")
+        reset_epoch = (args.resume_mode == "transfer")
     trainer.load_checkpoint(
         args.resume,
         reset_epoch=reset_epoch,
