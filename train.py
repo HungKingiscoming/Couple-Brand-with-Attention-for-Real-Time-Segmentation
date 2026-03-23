@@ -587,7 +587,7 @@ class Segmentor(nn.Module):
     def forward_train(self, x):
         feats = self.backbone(x)
         main_out = self.decode_head(feats)
-        return {"main": main_out}}
+        return {"main": main_out}
 
 
 # ============================================
@@ -672,83 +672,84 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-        
+    
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
-        max_grad_epoch = 0.0
-        max_grad = 0.0
+        total_norm_epoch = 0.0
+    
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
-        
+    
         for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs = imgs.to(self.device, non_blocking=True)
+            imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
-            
+    
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-
                 loss, ce_loss, dice_loss = self.compute_loss(outputs, masks)
-                
-                loss = loss / self.args.accumulation_steps     
-            # FIX 1: Check NaN BEFORE backward
+                loss = loss / self.args.accumulation_steps
+    
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\nNaN/Inf loss at epoch {epoch}, batch {batch_idx}")
-                print(f"   OHEM: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            
+    
             self.scaler.scale(loss).backward()
-            
-
+    
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
+    
                 if self.args.grad_clip > 0:
                     total_norm = torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.args.grad_clip
-                    ).item()  # clip_grad_norm_ trả về total norm luôn, không cần tính riêng
+                    ).item()
                 else:
                     total_norm = 0.0
-                max_grad_epoch = max(max_grad_epoch, max_grad)
+    
+                total_norm_epoch = max(total_norm_epoch, total_norm)
+    
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-            
-                if self.scheduler and self.args.scheduler == 'onecycle':   # â† VÃ€O TRONG
+    
+                if self.scheduler and self.args.scheduler == 'onecycle':
                     self.scheduler.step()
-                        
+    
             total_loss += loss.item() * self.args.accumulation_steps
-            total_ce += ce_loss.item()
+            total_ce   += ce_loss.item()
             total_dice += dice_loss.item()
-            
+    
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ohem': f'{ce_loss.item():.4f}',
+                'ce':   f'{ce_loss.item():.4f}',      # đổi từ ohem → ce
                 'dice': f'{dice_loss.item():.4f}',
-                'lr': f'{current_lr:.6f}',
-                'max_grad': f'{max_grad:.2f}'  # Ã¢â€ Â Monitor
+                'lr':   f'{current_lr:.6f}',
+                'grad': f'{total_norm:.2f}',           # dùng total_norm thay max_grad
             })
-            
-            
+    
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
-                self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
-                self.writer.add_scalar('train/lr', current_lr, self.global_step)
-                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # Ã¢â€ Â Log
+                self.writer.add_scalar('train/ce_loss',    ce_loss.item(),   self.global_step)
+                self.writer.add_scalar('train/dice_loss',  dice_loss.item(), self.global_step)
+                self.writer.add_scalar('train/lr',         current_lr,       self.global_step)
+                self.writer.add_scalar('train/grad_norm',  total_norm,       self.global_step)
     
         avg_loss = total_loss / len(loader)
-        avg_ce = total_ce / len(loader)
+        avg_ce   = total_ce   / len(loader)
         avg_dice = total_dice / len(loader)
-        print(f"\nEpoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
+    
+        print(f"\nEpoch {epoch+1} Summary: Max Grad Norm = {total_norm_epoch:.2f}")
         torch.cuda.empty_cache()
+    
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
-        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
+    
+        return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice}
 
     @torch.no_grad()
     def validate(self, loader, epoch):
