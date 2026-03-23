@@ -1086,12 +1086,15 @@ def main():
     with torch.no_grad():
         sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
         try:
+            model.eval()                          # ← thêm dòng này
             outputs = model.forward_train(sample)
+            model.train()                         # ← restore lại sau test
             print(f"Forward pass successful!")
             print(f"   Main:  {outputs['main'].shape}")
             if 'aux' in outputs:
                 print(f"   Aux:   {outputs['aux'].shape}\n")
         except Exception as e:
+            model.train()                         # ← restore dù fail
             print(f"Forward pass FAILED: {e}\n")
             return
     
