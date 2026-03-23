@@ -107,7 +107,33 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     print()
 
     return rate
+def build_scheduler(optimizer, args, train_loader, start_epoch=0):
+    n_groups = len(optimizer.param_groups)
+    remaining_steps = len(train_loader) * (args.epochs - start_epoch)
 
+    if args.scheduler == 'onecycle':
+        max_lrs = [g['lr'] for g in optimizer.param_groups]
+        return optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lrs,
+            total_steps=remaining_steps,
+            pct_start=0.05,
+            anneal_strategy='cos',
+            cycle_momentum=True,
+            base_momentum=0.85,
+            max_momentum=0.95,
+            div_factor=10,           # bắt đầu từ lr/10 thay vì lr/25 vì đang fine-tune
+            final_div_factor=1000,
+        )
+    elif args.scheduler == 'poly':
+        return optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda step: (1 - step / remaining_steps) ** 0.9
+        )
+    else:
+        return optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs - start_epoch, eta_min=1e-6
+        )
 def build_optimizer(model, args):
     backbone_params = []
     head_params = []
@@ -602,7 +628,9 @@ class Trainer:
         self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
             ignore_index=args.ignore_index,
-            reduction='mean'
+            reduction='mean',
+            log_loss=True,                          # hard class mining
+            class_weights=class_weights.to(device) if class_weights is not None else None,
         )
         self.ce = nn.CrossEntropyLoss(
             weight=class_weights.to(device) if class_weights is not None else None,
@@ -706,7 +734,7 @@ class Trainer:
                         align_corners=False
                     )
                     aux_ce_loss = self.ce(aux_logits, masks)
-                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.5
                     loss = loss + aux_weight * aux_ce_loss
             
                 loss = loss / self.args.accumulation_steps
@@ -723,10 +751,13 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                max_grad, total_norm = check_gradients(self.model, threshold=10.0)
-                max_grad_epoch = max(max_grad_epoch, max_grad)
-                if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                total_norm = torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    self.args.grad_clip if self.args.grad_clip > 0 else float('inf')
+                ).item()
+                max_grad_epoch = max(max_grad_epoch, total_norm)
+                if total_norm > 10.0:
+                    print(f"\nLarge grad at step {self.global_step}: {total_norm:.2f}")
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -748,8 +779,6 @@ class Trainer:
                 'max_grad': f'{max_grad:.2f}'  # Ã¢â€ Â Monitor
             })
             
-            if batch_idx % 50 == 0:
-                clear_gpu_memory()
             
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
@@ -812,8 +841,8 @@ class Trainer:
             total_loss += loss.item()
     
             # mIoU dÃ¹ng logits_full â€” full resolution Ä‘á»ƒ Ä‘áº¿m pixel chÃ­nh xÃ¡c
-            pred   = logits_full.argmax(1).cpu().numpy()
-            target = masks.cpu().numpy()
+            both = torch.stack([logits_full.argmax(1), masks], dim=0).cpu().numpy()
+            pred, target = both[0], both[1]
             
             mask_valid = (target >= 0) & (target < num_classes)
             label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
@@ -822,8 +851,6 @@ class Trainer:
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
-            if batch_idx % 20 == 0:
-                clear_gpu_memory()
     
         intersection = np.diag(confusion_matrix)
         union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
