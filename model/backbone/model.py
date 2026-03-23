@@ -471,7 +471,7 @@ class DWSABlock(nn.Module):
         def split_heads(t):
             B_, Cm, N = t.shape
             hd = Cm // self.num_heads
-            return t.reshape(B_, self.num_heads, hd, N).permute(0, 1, 3, 2))
+            return t.reshape(B_, self.num_heads, hd, N).permute(0, 1, 3, 2)
 
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
