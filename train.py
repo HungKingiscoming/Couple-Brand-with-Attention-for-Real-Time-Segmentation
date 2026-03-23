@@ -586,14 +586,8 @@ class Segmentor(nn.Module):
 
     def forward_train(self, x):
         feats = self.backbone(x)
-
-        main_out, aux_h4, aux_h2 = self.decode_head(feats, return_aux=True)
-
-        return {
-            "main": main_out,
-            "aux_h4": aux_h4,
-            "aux_h2": aux_h2
-        }
+        main_out = self.decode_head(feats)
+        return {"main": main_out}}
 
 
 # ============================================
@@ -638,32 +632,13 @@ class Trainer:
         self._print_config(loss_cfg)
 
     def compute_loss(self, outputs, target):
-        loss = 0
-
         main = F.interpolate(
             outputs["main"], size=target.shape[-2:],
             mode='bilinear', align_corners=False
         )
         ce_loss = self.ce(main, target)
         dice_loss = self.dice(main, target)
-
-        loss += self.ce_weight * ce_loss
-        loss += self.dice_weight * dice_loss
-
-        if "aux_h4" in outputs:
-            aux_h4 = F.interpolate(
-                outputs["aux_h4"], size=target.shape[-2:],
-                mode='bilinear', align_corners=False
-            )
-            loss += 0.4 * self.ce(aux_h4, target)
-
-        if "aux_h2" in outputs:
-            aux_h2 = F.interpolate(
-                outputs["aux_h2"], size=target.shape[-2:],
-                mode='bilinear', align_corners=False
-            )
-            loss += 0.4 * self.ce(aux_h2, target)
-
+        loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
         return loss, ce_loss, dice_loss
     
     def set_loss_phase(self, phase: str):
