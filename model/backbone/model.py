@@ -230,9 +230,10 @@ class GCBlock(nn.Module):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 stride=stride,
-                padding=padding,
+                padding=2,       # padding = dilation khi kernel=3
                 bias=False,
                 norm_cfg=norm_cfg,
+                dilation=2,      # thêm param này
             )
             self.path_1x1 = Block1x1(
                 in_channels=in_channels,
@@ -369,7 +370,7 @@ def _partition_windows(x: Tensor, ws: int) -> Tuple[Tensor, Tuple[int, int]]:
     # (B, C, nH, ws, nW, ws) â†’ (B, nH, nW, C, ws, ws) â†’ (B*nH*nW, C, ws, ws)
     x = x.view(B, C, nH, ws, nW, ws)
     x = x.permute(0, 2, 4, 1, 3, 5).contiguous()
-    windows = x.view(B * nH * nW, C, ws, ws)
+    windows = x.reshape(B * nH * nW, C, ws, ws)
     return windows, (nH, nW)
 
 
@@ -382,9 +383,9 @@ def _merge_windows(windows: Tensor, nH: int, nW: int, B: int) -> Tensor:
         x      : (B, C, nH*ws, nW*ws)
     """
     _, C, ws, _ = windows.shape
-    x = windows.view(B, nH, nW, C, ws, ws)
+    x = windows.reshape(B, nH, nW, C, ws, ws)
     x = x.permute(0, 3, 1, 4, 2, 5).contiguous()
-    return x.view(B, C, nH * ws, nW * ws)
+    return x.reshape(B, C, nH * ws, nW * ws)
 
 
 class DWSABlock(nn.Module):
@@ -475,7 +476,6 @@ class DWSABlock(nn.Module):
         q, k, v = split_heads(q), split_heads(k), split_heads(v)
 
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
@@ -567,7 +567,7 @@ class MultiScaleContextModule(nn.Module):
                     nn.Sequential(
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
                         nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
+                        nn.ReLU(inplace=False),
                     )
                 )
             else:
@@ -576,7 +576,7 @@ class MultiScaleContextModule(nn.Module):
                         nn.AvgPool2d(kernel_size=s, stride=s),
                         nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
                         nn.BatchNorm2d(c_out),
-                        nn.ReLU(inplace=True),
+                        nn.ReLU(inplace=False),
                     )
                 )
 
@@ -587,12 +587,12 @@ class MultiScaleContextModule(nn.Module):
                 groups=fused_channels, bias=False,
             ),
             nn.BatchNorm2d(fused_channels),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False),
             nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
         )
 
-        self.alpha = nn.Parameter(torch.tensor(alpha))
+        self.alpha_raw = nn.Parameter(torch.tensor(math.log(alpha / (1 - alpha))))
 
         if in_channels != out_channels:
             self.proj = nn.Sequential(
@@ -615,7 +615,7 @@ class MultiScaleContextModule(nn.Module):
         out = self.fusion(fused)
 
         x_proj = self.proj(x) if self.proj is not None else x
-        alpha = self.alpha.clamp(0.0, 1.0)
+        alpha = torch.sigmoid(self.alpha_raw)
         return x_proj + alpha * out
 
 
@@ -634,7 +634,7 @@ class GCNetCore(BaseModule):
                  num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
@@ -920,7 +920,7 @@ class GCNetWithEnhance(BaseModule):
                  ms_alpha: float = 0.1,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
                  init_cfg: OptConfigType = None,
                  deploy: bool = False):
         super().__init__(init_cfg)
@@ -1032,7 +1032,7 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa4 is not None:
             x_s4 = self.dwsa4(x_s4)
 
-        # â”€â”€ Stage 5 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+       
         x_s5, x_d5 = bb.forward_stage5(x_s4, x_d4, out_size)
 
         # DWSA5: enhance x_s5 â†’ stage6 nháº­n semantic context tá»‘t hÆ¡n
@@ -1040,7 +1040,7 @@ class GCNetWithEnhance(BaseModule):
         if self.dwsa5 is not None:
             x_s5 = self.dwsa5(x_s5)
 
-        # â”€â”€ Stage 6 â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+       
         x_s6, x_d6 = bb.forward_stage6(x_s5, x_d5)
 
         # DWSA6: enhance x_s6 ngay trÆ°á»›c SPP â€” spatial self-attention
@@ -1050,7 +1050,7 @@ class GCNetWithEnhance(BaseModule):
 
         # â”€â”€ SPP (má»™t láº§n duy nháº¥t, trÃªn x_s6 Ä‘Ã£ enhanced) â”€â”€â”€â”€â”€â”€â”€
         x_spp = bb.spp(x_s6)
-        x_spp = resize(x_spp, size=out_size, mode='bilinear', align_corners=self.align_corners)
+        x_spp = resize(x_spp, size=x_d6.shape[-2:], mode='bilinear', align_corners=self.align_corners)
 
         # Lightweight multi-scale refinement sau SPP
         if self.ms_context is not None:
