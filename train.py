@@ -677,7 +677,7 @@ class Trainer:
         total_ce = 0.0
         total_dice = 0.0
         total_norm_epoch = 0.0
-    
+        total_norm = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
     
         for batch_idx, (imgs, masks) in enumerate(pbar):
