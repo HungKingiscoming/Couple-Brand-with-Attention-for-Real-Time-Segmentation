@@ -230,10 +230,9 @@ class GCBlock(nn.Module):
                 in_channels=in_channels,
                 out_channels=out_channels,
                 stride=stride,
-                padding=2,       # padding = dilation khi kernel=3
+                padding=padding,       
                 bias=False,
                 norm_cfg=norm_cfg,
-                dilation=2,      # thêm param này
             )
             self.path_1x1 = Block1x1(
                 in_channels=in_channels,
