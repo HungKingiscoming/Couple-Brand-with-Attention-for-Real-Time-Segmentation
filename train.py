@@ -1165,13 +1165,13 @@ def main():
     )
     
     if args.resume:
-        reset_epoch = (args.resume_mode == "transfer")
-        trainer.load_checkpoint(
-            args.resume,
-            reset_epoch=True,
-            load_optimizer=False,
-            reset_best_metric=True,
-        )
+    reset_epoch = (args.resume_mode == "transfer")
+    trainer.load_checkpoint(
+        args.resume,
+        reset_epoch=reset_epoch,
+        load_optimizer=(args.resume_mode == "continue"),
+        reset_best_metric=args.reset_best_metric,
+    )
     
     # Training loop
     print(f"\n{'='*70}")
