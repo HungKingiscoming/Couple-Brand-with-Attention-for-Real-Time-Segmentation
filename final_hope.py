@@ -287,6 +287,10 @@ def load_checkpoint(ckpt_path, num_classes, device, deploy=False):
                 m.switch_to_deploy()
         print(f"  Converted to deploy mode")
     print(f"  OK (deploy={'ON' if (is_deployed or deploy) else 'OFF'})")
+    if hasattr(torch, 'compile'):
+        print("  Compiling model (lần đầu chậm ~30s, từ lần 2 nhanh hơn 15-25%)...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print("  torch.compile enabled")
     return model
 
 
