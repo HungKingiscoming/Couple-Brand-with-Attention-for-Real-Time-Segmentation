@@ -45,36 +45,6 @@ class GatedFusion(nn.Module):
         return gate * skip + (1.0 - gate) * dec
 
 
-class DWConvModule(nn.Module):
-    """Depthwise-Separable Conv: nháº¹ hÆ¡n 3Ã—3 conv thÆ°á»ng ~8-9Ã—."""
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int = 3,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-    ):
-        super().__init__()
-        self.dw = ConvModule(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-            groups=channels,
-            norm_cfg=norm_cfg,
-            act_cfg=None,
-        )
-        self.pw = ConvModule(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-        )
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.pw(self.dw(x))
-
 
 class ResidualBlock(nn.Module):
     """Standard pre-act residual block (BNâ†’ReLUâ†’ConvÃ—2 + identity)."""
@@ -108,18 +78,24 @@ class ResidualBlock(nn.Module):
 
 
 class EnhancedDecoder(nn.Module):
+    """
+    Decoder 2-stage: H/8 → H/4, output (B, D//2, H/4, W/4).
 
+    Stage 0 (H/8): refine c5 → GatedFusion với c4 skip (cùng resolution)
+    Stage 1 (H/4): upsample ×2 → refine → GatedFusion với c2 skip
+
+    Bỏ stage 2 (H/2) so với phiên bản cũ → tiết kiệm ~27 GFLOPs tại 1024×1024.
+    Trainer upsample logits từ H/4 lên full res (×4 thay vì ×2).
+    """
 
     def __init__(
         self,
         # c5 channels = C*4 = 128
         in_channels: int = 128,
-        # c4 channels = C*2 = 64  (detail branch stage4)
+        # c4 channels = C*2 = 64  (detail branch stage4, cùng H/8)
         c4_channels: int = 64,
-        # c2 channels = C = 32    (stem layer 1)
+        # c2 channels = C = 32    (stem layer 1, H/4)
         c2_channels: int = 32,
-        # c1 channels = C = 32    (stem layer 0)
-        c1_channels: int = 32,
         decoder_channels: int = 128,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
@@ -128,11 +104,10 @@ class EnhancedDecoder(nn.Module):
     ):
         super().__init__()
         self.use_gated_fusion = use_gated_fusion
-        D = decoder_channels      # 128
+        D  = decoder_channels       # 128
         D2 = decoder_channels // 2  # 64
 
-        
-
+        # --- Stage 0: H/8 ---
         self.refine0 = nn.Sequential(
             ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(in_channels, D, kernel_size=3, padding=1,
@@ -147,7 +122,7 @@ class EnhancedDecoder(nn.Module):
             self.fusion0 = ConvModule(D * 2, D, kernel_size=1,
                                       norm_cfg=norm_cfg, act_cfg=act_cfg)
 
-
+        # --- Stage 1: H/8 → H/4 ---
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine1 = nn.Sequential(
             ResidualBlock(D, norm_cfg=norm_cfg, act_cfg=act_cfg),
@@ -163,37 +138,22 @@ class EnhancedDecoder(nn.Module):
             self.fusion1 = ConvModule(D2 * 2, D2, kernel_size=1,
                                       norm_cfg=norm_cfg, act_cfg=act_cfg)
 
-
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.refine2 = nn.Sequential(
-            DWConvModule(D2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            DWConvModule(D2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
-        )
-        self.c1_proj = ConvModule(c1_channels, D2, kernel_size=1,
-                                  norm_cfg=norm_cfg, act_cfg=None) \
-                       if c1_channels != D2 else nn.Identity()
-        if use_gated_fusion:
-            self.fusion2 = GatedFusion(D2, norm_cfg=norm_cfg, act_cfg=act_cfg)
-        else:
-            self.fusion2 = ConvModule(D2 * 2, D2, kernel_size=1,
-                                      norm_cfg=norm_cfg, act_cfg=act_cfg)
-
-        
+        # --- Output projection ---
         self.final_proj = ConvModule(D2, D2, kernel_size=1,
                                      norm_cfg=norm_cfg, act_cfg=act_cfg)
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
 
-    def forward(self, c5: Tensor, c4: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
+    def forward(self, c5: Tensor, c4: Tensor, c2: Tensor) -> Tensor:
         """
         Args:
-            c5: (B, C*4, H/8, W/8)   = (B, 128, H/8, W/8)
-            c4: (B, C*2, H/8, W/8)   = (B,  64, H/8, W/8)  â† same spatial as c5
-            c2: (B, C,   H/4, W/4)   = (B,  32, H/4, W/4)
-            c1: (B, C,   H/2, W/2)   = (B,  32, H/2, W/2)
+            c5: (B, C*4, H/8, W/8) = (B, 128, H/8, W/8)
+            c4: (B, C*2, H/8, W/8) = (B,  64, H/8, W/8)  <- cung resolution voi c5
+            c2: (B, C,   H/4, W/4) = (B,  32, H/4, W/4)
         Returns:
-            (B, D//2, H/2, W/2) = (B, 64, H/2, W/2)
+            (B, D//2, H/4, W/4) = (B, 64, H/4, W/4)
+            -- Trainer upsample x4 len full res thay vi x2 nhu truoc
         """
-        # Stage 0: refine c5, fuse c4 (cÃ¹ng resolution H/8)
+        # Stage 0: refine c5, fuse c4 tai H/8
         x = self.refine0(c5)
         c4p = self.c4_proj(c4)
         if self.use_gated_fusion:
@@ -201,7 +161,7 @@ class EnhancedDecoder(nn.Module):
         else:
             x = self.fusion0(torch.cat([c4p, x], dim=1))
 
-        # Stage 1: H/8 â†’ H/4, fuse c2
+        # Stage 1: H/8 -> H/4, fuse c2
         x = self.up1(x)
         x = self.refine1(x)
         c2p = self.c2_proj(c2)
@@ -210,18 +170,9 @@ class EnhancedDecoder(nn.Module):
         else:
             x = self.fusion1(torch.cat([c2p, x], dim=1))
 
-        # Stage 2: H/4 â†’ H/2, fuse c1
-        x = self.up2(x)
-        x = self.refine2(x)
-        c1p = self.c1_proj(c1)
-        if self.use_gated_fusion:
-            x = self.fusion2(c1p, x)
-        else:
-            x = self.fusion2(torch.cat([c1p, x], dim=1))
-
         x = self.final_proj(x)
         x = self.dropout(x)
-        return x   # (B, 64, H/2, W/2)
+        return x   # (B, 64, H/4, W/4)
 
 
 
@@ -267,20 +218,16 @@ class GCNetHead(nn.Module):
     """
     Main segmentation head.
 
-    Nháº­n dict tá»« GCNetWithEnhance:
-        {c1, c2, c4, c5}
+    Nhan dict tu GCNetWithEnhance: {c2, c4, c5}
+    (c1 da bi bo -- stage2 H/2 qua dat FLOPs)
 
     Pipeline:
-        c5 (H/8,  128) â”€â”
-        c4 (H/8,   64) â”€â”¤â†’ EnhancedDecoder â†’ (H/2, 64) â†’ conv_seg â†’ logits
-        c2 (H/4,   32) â”€â”¤
-        c1 (H/2,   32) â”€â”˜
+        c5 (H/8, 128) --\
+        c4 (H/8,  64) --+-> EnhancedDecoder -> (H/4, 64) -> conv_seg -> logits
+        c2 (H/4,  32) --/
 
-    channels=32 (default):
-        in_channels  = C*4 = 128
-        c4_channels  = C*2 = 64
-        c2_channels  = C   = 32
-        c1_channels  = C   = 32
+    channels=32: in=128, c4=64, c2=32, out H/4
+    Trainer upsample logits x4 len full res.
     """
 
     def __init__(
@@ -295,7 +242,6 @@ class GCNetHead(nn.Module):
         use_gated_fusion: bool = True,
         c4_channels: int = 64,       # C*2
         c2_channels: int = 32,       # C
-        c1_channels: int = 32,       # C
     ):
         super().__init__()
         self.align_corners = align_corners
@@ -304,7 +250,6 @@ class GCNetHead(nn.Module):
             in_channels=in_channels,
             c4_channels=c4_channels,
             c2_channels=c2_channels,
-            c1_channels=c1_channels,
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
@@ -321,16 +266,14 @@ class GCNetHead(nn.Module):
     def forward(self, feats: Dict[str, Tensor]) -> Tensor:
         """
         Args:
-            feats: dict vá»›i keys {c1, c2, c4, c5}
+            feats: dict voi keys {c2, c4, c5}  (c1 khong con dung)
         Returns:
-            logits: (B, num_classes, H/2, W/2)
-            â€” sáº½ Ä‘Æ°á»£c interpolate lÃªn full resolution trong Trainer
+            logits: (B, num_classes, H/4, W/4)
+            -- Trainer upsample x4 len full res
         """
-        c1 = feats['c1']
         c2 = feats['c2']
         c4 = feats['c4']
         c5 = feats['c5']
 
-        # c4 Ä‘Æ°á»£c Ä‘Æ°a vÃ o decoder nhÆ° skip connection thá»±c sá»±
-        x = self.decoder(c5, c4, c2, c1)
+        x = self.decoder(c5, c4, c2)
         return self.conv_seg(x)
