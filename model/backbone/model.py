@@ -750,13 +750,6 @@ class GCNetCore(BaseModule):
         x_d6 = self.detail_branch_layers[2](self.relu(x_d5))
         x_s6 = self.semantic_branch_layers[2](self.relu(x_s5))
 
-        x_spp = self.spp(x_s6)
-        x_spp = resize(
-            x_spp, size=out_size,
-            mode='bilinear', align_corners=self.align_corners)
-
-        out = x_d6 + x_spp
-
         return dict(
             c1=c1,
             c2=c2,
@@ -765,8 +758,6 @@ class GCNetCore(BaseModule):
             s5=x_s5,
             s6=x_s6,
             x_d6=x_d6,
-            spp=x_spp,
-            out=out,
         )
 
 
