@@ -611,9 +611,12 @@ class Trainer:
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-    
+            if batch_idx == 0:
+               print(f"Sau load batch: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
+                if batch_idx == 0:
+                    print(f"Sau forward:    {torch.cuda.memory_allocated()/1024**3:.2f}GB")
                 logits = outputs["main"]
                 logits = F.interpolate(
                     logits,
@@ -623,7 +626,8 @@ class Trainer:
                 )
     
                 ce_loss = self.ce(logits, masks)
-    
+                if batch_idx == 0:
+                    print(f"Sau CE loss:    {torch.cuda.memory_allocated()/1024**3:.2f}GB")
                 if self.dice_weight > 0:
                     dice_loss = self.dice(logits, masks)
                 else:
@@ -643,7 +647,8 @@ class Trainer:
                     aux_ce_loss = self.ce(aux_logits, masks)
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_ce_loss
-    
+                if batch_idx == 0:
+                   print(f"Sau all loss:   {torch.cuda.memory_allocated()/1024**3:.2f}GB")
                 loss = loss / self.args.accumulation_steps
     
             # FIX 1: Check NaN BEFORE backward
@@ -652,8 +657,11 @@ class Trainer:
                 print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            
+            if batch_idx == 0:
+               print(f"Trước backward: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
             self.scaler.scale(loss).backward()
+            if batch_idx == 0:
+                print(f"Sau backward:   {torch.cuda.memory_allocated()/1024**3:.2f}GB")
             
             # FIX 2: ALWAYS clip gradients (khÃ´ng phá»¥ thuá»™c accumulation)
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
