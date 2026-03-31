@@ -554,7 +554,7 @@ class Trainer:
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'
         
-        self.scaler = GradScaler(enabled=args.use_amp)
+        self.scaler = GradScaler(enabled=args.)
         
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -894,7 +894,7 @@ def main():
     
     # System
     parser.add_argument("--use_amp", action="store_true", default=True)
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--save_dir", default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--resume_mode", type=str, default="transfer", 
