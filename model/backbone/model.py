@@ -18,7 +18,9 @@ from components.components import (
 )
 
 
-
+# ===========================
+# GCBlock classes (giá»¯ nguyÃªn tá»« code gá»‘c)
+# ===========================
 
 class Block1x1(BaseModule):
     def __init__(self,
@@ -169,153 +171,8 @@ class Block3x3(BaseModule):
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
-def window_partition(x: torch.Tensor, window_size: int):
-    """
-    x: (B, C, H, W)
-    return: (num_windows*B, C, window_size, window_size)
-    """
-    B, C, H, W = x.shape
-    x = x.view(B, C, H // window_size, window_size, 
-                      W // window_size, window_size)
-    # (B, C, nH, ws, nW, ws) → (B, nH, nW, ws, ws, C)
-    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
-    windows = x.view(-1, window_size * window_size, C)
-    return windows  # (B*nH*nW, ws*ws, C)
 
 
-def window_reverse(windows: torch.Tensor, window_size: int, 
-                   H: int, W: int, C: int):
-    """
-    windows: (B*nH*nW, ws*ws, C)
-    return: (B, C, H, W)
-    """
-    nH = H // window_size
-    nW = W // window_size
-    B = windows.shape[0] // (nH * nW)
-    x = windows.view(B, nH, nW, window_size, window_size, C)
-    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
-    x = x.view(B, C, H, W)
-    return x
-
-
-class WindowDWSABlock(nn.Module):
-    def __init__(self, channels, num_heads=4, window_size=8,
-                 reduction=4, qk_sharing=True, groups=4,
-                 drop=0.1, alpha=0.1):
-        super().__init__()
-        self.channels = channels
-        self.window_size = window_size
-        self.num_heads = num_heads
-
-        reduced = channels // reduction
-        mid = max(reduced // 2, num_heads)
-        self.reduced = reduced
-        self.mid = mid
-
-        # ✅ Giữ nguyên tên và kiểu như DWSABlock
-        self.ln = nn.LayerNorm(channels)
-        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
-        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
-
-        g = _get_valid_groups(reduced, groups)
-
-        self.qk_sharing = qk_sharing
-        if qk_sharing:
-            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
-            self.q_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
-            self.k_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
-        else:
-            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-
-        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
-        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
-
-        self.attn_drop = nn.Dropout(drop)
-
-        head_dim = mid // num_heads
-        self.scale = head_dim ** -0.5
-        self.alpha = nn.Parameter(torch.tensor(alpha))
-
-    def _pad_if_needed(self, x):
-        B, C, H, W = x.shape
-        ws = self.window_size
-        pad_h = (ws - H % ws) % ws
-        pad_w = (ws - W % ws) % ws
-        if pad_h > 0 or pad_w > 0:
-            x = F.pad(x, (0, pad_w, 0, pad_h))
-        return x, H, W
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        identity = x
-        ws = self.window_size
-
-        # LayerNorm
-        x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-
-        # Pad nếu cần
-        x_pad, H_orig, W_orig = self._pad_if_needed(x_ln)
-        _, _, H_pad, W_pad = x_pad.shape
-        nH = H_pad // ws
-        nW = W_pad // ws
-
-        # in_proj: (B, C, H, W) → (B, reduced, H, W)
-        x_red = self.in_proj(x_pad)
-
-        # Chia thành windows: (B, reduced, H, W)
-        # → (B*nH*nW, reduced, ws, ws)
-        x_red = x_red.view(B, self.reduced, nH, ws, nW, ws)
-        x_red = x_red.permute(0, 2, 4, 1, 3, 5).contiguous()
-        x_win = x_red.view(B * nH * nW, self.reduced, ws * ws)
-        # x_win: (B*nW*nH, reduced, ws²)
-
-        # QKV — dùng Conv1d giống DWSABlock
-        if self.qk_sharing:
-            base = self.qk_base(x_win)
-            q = self.q_head(base)
-            k = self.k_head(base)
-        else:
-            q = self.q_proj(x_win)
-            k = self.k_proj(x_win)
-        v = self.v_proj(x_win)
-
-        # Split heads
-        def split_heads(t):
-            Bw, Cm, N = t.shape
-            head_dim = Cm // self.num_heads
-            return t.view(Bw, self.num_heads, head_dim, N)
-
-        q = split_heads(q).permute(0, 1, 3, 2)  # (Bw, heads, N, head_dim)
-        k = split_heads(k).permute(0, 1, 3, 2)
-        v = split_heads(v).permute(0, 1, 3, 2)
-
-        # Attention trong window
-        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)
-        attn = F.softmax(attn, dim=-1)
-        attn = self.attn_drop(attn)
-
-        out = torch.matmul(attn, v)  # (Bw, heads, N, head_dim)
-        out = out.permute(0, 1, 3, 2).contiguous()
-        Bw = out.shape[0]
-        out = out.view(Bw, self.mid, ws * ws)
-
-        out = self.o_proj(out)  # (Bw, reduced, ws²)
-
-        # Reverse windows → feature map
-        out = out.view(B, nH, nW, self.reduced, ws, ws)
-        out = out.permute(0, 3, 1, 4, 2, 5).contiguous()
-        out = out.view(B, self.reduced, H_pad, W_pad)
-
-        # out_proj: (B, reduced, H, W) → (B, C, H, W)
-        out = self.out_proj(out)
-
-        # Crop nếu đã pad
-        if H_pad != H_orig or W_pad != W_orig:
-            out = out[:, :, :H_orig, :W_orig]
-
-        return identity + self.alpha * out
 class GCBlock(nn.Module):
     def __init__(self,
                  in_channels: int,
@@ -963,13 +820,14 @@ class GCNetWithEnhance(BaseModule):
 
         for stage in dwsa_stages:
             if stage == 'stage4':
-                self.dwsa4 = WindowDWSABlock(
-                    C * 4,           # 128ch
-                    num_heads=4,
-                    window_size=8,   # 64/8=8 windows theo H
-                    reduction=4,
-                    drop=0.1,
-                    alpha=0.1,
+                self.dwsa4 = DWSABlock(
+                    C * 4,
+                    num_heads=dwsa_num_heads,
+                    reduction=dwsa_reduction,
+                    qk_sharing=dwsa_qk_sharing,
+                    groups=dwsa_groups,
+                    drop=dwsa_drop,
+                    alpha=dwsa_alpha,
                 )
             elif stage == 'stage5':
                 self.dwsa5 = DWSABlock(
