@@ -169,7 +169,141 @@ class Block3x3(BaseModule):
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
+def window_partition(x: torch.Tensor, window_size: int):
+    """
+    x: (B, C, H, W)
+    return: (num_windows*B, C, window_size, window_size)
+    """
+    B, C, H, W = x.shape
+    x = x.view(B, C, H // window_size, window_size, 
+                      W // window_size, window_size)
+    # (B, C, nH, ws, nW, ws) → (B, nH, nW, ws, ws, C)
+    x = x.permute(0, 2, 4, 3, 5, 1).contiguous()
+    windows = x.view(-1, window_size * window_size, C)
+    return windows  # (B*nH*nW, ws*ws, C)
 
+
+def window_reverse(windows: torch.Tensor, window_size: int, 
+                   H: int, W: int, C: int):
+    """
+    windows: (B*nH*nW, ws*ws, C)
+    return: (B, C, H, W)
+    """
+    nH = H // window_size
+    nW = W // window_size
+    B = windows.shape[0] // (nH * nW)
+    x = windows.view(B, nH, nW, window_size, window_size, C)
+    x = x.permute(0, 5, 1, 3, 2, 4).contiguous()
+    x = x.view(B, C, H, W)
+    return x
+
+
+class WindowDWSABlock(nn.Module):
+    """
+    Window Attention thay thế DWSABlock.
+    Giữ nguyên interface: input/output shape (B, C, H, W)
+    """
+    def __init__(self, channels, num_heads=4, window_size=8,
+                 reduction=4, drop=0.1, alpha=0.1):
+        super().__init__()
+        self.channels = channels
+        self.window_size = window_size
+        self.num_heads = num_heads
+
+        reduced = channels // reduction
+        self.reduced = reduced
+
+        # Giữ nguyên cấu trúc projection của DWSABlock
+        self.ln = nn.LayerNorm(channels)
+        self.in_proj = nn.Linear(channels, reduced, bias=False)
+        self.out_proj = nn.Linear(reduced, channels, bias=False)
+
+        # Multi-head attention trong window
+        head_dim = reduced // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.q = nn.Linear(reduced, reduced, bias=True)
+        self.k = nn.Linear(reduced, reduced, bias=True)
+        self.v = nn.Linear(reduced, reduced, bias=True)
+        self.proj = nn.Linear(reduced, reduced, bias=True)
+
+        self.attn_drop = nn.Dropout(drop)
+        self.alpha = nn.Parameter(torch.tensor(alpha))
+
+    def _pad_if_needed(self, x):
+        """Pad H, W để chia hết cho window_size"""
+        B, C, H, W = x.shape
+        ws = self.window_size
+        pad_h = (ws - H % ws) % ws
+        pad_w = (ws - W % ws) % ws
+        if pad_h > 0 or pad_w > 0:
+            x = F.pad(x, (0, pad_w, 0, pad_h))
+        return x, H, W  # trả về H, W gốc để crop sau
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        identity = x
+        ws = self.window_size
+
+        # Pad nếu cần
+        x_pad, H_orig, W_orig = self._pad_if_needed(x)
+        _, _, H_pad, W_pad = x_pad.shape
+
+        # LayerNorm
+        x_ln = self.ln(x_pad.permute(0, 2, 3, 1))  # (B,H,W,C)
+        x_ln = x_ln.permute(0, 3, 1, 2)             # (B,C,H,W)
+
+        # Project xuống reduced channels
+        # (B,C,H,W) → (B,H,W,C) → (B,H,W,reduced)
+        x_red = self.in_proj(
+            x_ln.permute(0, 2, 3, 1)
+        )  # (B, H_pad, W_pad, reduced)
+
+        # Partition thành windows
+        x_red = x_red.view(
+            B, H_pad // ws, ws, W_pad // ws, ws, self.reduced
+        ).permute(0, 1, 3, 2, 4, 5).contiguous()
+        x_win = x_red.view(-1, ws * ws, self.reduced)
+        # x_win: (B*nH*nW, ws², reduced)
+
+        # Multi-head attention
+        N_win, L, D = x_win.shape
+        q = self.q(x_win)
+        k = self.k(x_win)
+        v = self.v(x_win)
+
+        # Reshape thành heads
+        q = q.view(N_win, L, self.num_heads, D // self.num_heads).transpose(1, 2)
+        k = k.view(N_win, L, self.num_heads, D // self.num_heads).transpose(1, 2)
+        v = v.view(N_win, L, self.num_heads, D // self.num_heads).transpose(1, 2)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.clamp(-10, 10)
+        attn = F.softmax(attn, dim=-1)
+        attn = self.attn_drop(attn)
+
+        out = (attn @ v).transpose(1, 2).contiguous()
+        out = out.view(N_win, L, D)
+        out = self.proj(out)
+
+        # Reverse windows → feature map
+        nH = H_pad // ws
+        nW = W_pad // ws
+        out = out.view(B, nH, nW, ws, ws, self.reduced)
+        out = out.permute(0, 5, 1, 3, 2, 4).contiguous()
+        out = out.view(B, self.reduced, H_pad, W_pad)
+
+        # Project về channels gốc
+        out = self.out_proj(
+            out.permute(0, 2, 3, 1)
+        ).permute(0, 3, 1, 2)  # (B, C, H_pad, W_pad)
+
+        # Crop về size gốc nếu đã pad
+        if H_pad != H_orig or W_pad != W_orig:
+            out = out[:, :, :H_orig, :W_orig]
+
+        # Scaled residual — giống DWSABlock
+        return identity + self.alpha * out
 
 class GCBlock(nn.Module):
     def __init__(self,
@@ -818,14 +952,13 @@ class GCNetWithEnhance(BaseModule):
 
         for stage in dwsa_stages:
             if stage == 'stage4':
-                self.dwsa4 = DWSABlock(
-                    C * 4,
-                    num_heads=dwsa_num_heads,
-                    reduction=dwsa_reduction,
-                    qk_sharing=dwsa_qk_sharing,
-                    groups=dwsa_groups,
-                    drop=dwsa_drop,
-                    alpha=dwsa_alpha,
+                self.dwsa4 = WindowDWSABlock(
+                    C * 4,           # 128ch
+                    num_heads=4,
+                    window_size=8,   # 64/8=8 windows theo H
+                    reduction=4,
+                    drop=0.1,
+                    alpha=0.1,
                 )
             elif stage == 'stage5':
                 self.dwsa5 = DWSABlock(
