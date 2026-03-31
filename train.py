@@ -594,7 +594,10 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-        
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"Memory trước khi train: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
