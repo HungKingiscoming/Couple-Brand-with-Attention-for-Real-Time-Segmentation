@@ -143,33 +143,33 @@ def build_optimizer(model, args):
 # ============================================
 
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
+    def __init__(self, smooth=1e-5, ignore_index=255):
         super().__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
-        self.reduction = reduction
-    
+
     def forward(self, logits, targets):
         B, C, H, W = logits.shape
-        
-        valid_mask = (targets != self.ignore_index).float()
-        targets_one_hot = F.one_hot(
-            targets.clamp(0, C - 1), num_classes=C
-        ).permute(0, 3, 1, 2).float()
-        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1)
-        
-        probs = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1)
-        
-        probs_flat = probs.reshape(B, C, -1)
-        targets_flat = targets_one_hot.reshape(B, C, -1)
-        
-        intersection = (probs_flat * targets_flat).sum(dim=2)
-        union = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)
-        
-        dice = (2.0 * intersection + self.smooth) / (union + self.smooth)
-        dice_loss = 1.0 - dice.mean(dim=1)
-        
-        return dice_loss.mean()
+
+        valid_mask = (targets != self.ignore_index)  # (B, H, W)
+        probs = F.softmax(logits, dim=1)             # (B, C, H, W)
+
+        dice_loss = 0.0
+        for c in range(C):
+            # ✅ Tính từng class — không cần one_hot toàn bộ
+            prob_c = probs[:, c, :, :]               # (B, H, W)
+            target_c = (targets == c).float()        # (B, H, W)
+
+            # Chỉ tính trên valid pixels
+            prob_c = prob_c * valid_mask
+            target_c = target_c * valid_mask
+
+            intersection = (prob_c * target_c).sum()
+            union = prob_c.sum() + target_c.sum()
+
+            dice_loss += 1.0 - (2.0 * intersection + self.smooth) / (union + self.smooth)
+
+        return dice_loss / C
 
 
 class FocalLoss(nn.Module):
