@@ -402,7 +402,7 @@ class GCNetHead(nn.Module):
         use_gated_fusion: bool = True,
         # âœ… NEW: Accept flexible c1, c2 channels from backbone
         c1_channels: int = 32,
-        c2_channels: int = 64
+        c2_channels: int = 32
     ):
         super().__init__()
         
