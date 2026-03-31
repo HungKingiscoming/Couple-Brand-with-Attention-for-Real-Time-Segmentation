@@ -559,7 +559,6 @@ class ModelConfig:
                 "in_channels":    C * 4,   # 128 â€” c5
                 "c4_channels":    C * 2,   #  64 â€” c4 (detail branch stage4)
                 "c2_channels":    C,       #  32 â€” c2 (stem layer 1)
-                "c1_channels":    C,       #  32 â€” c1 (stem layer 0)
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
