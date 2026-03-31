@@ -123,9 +123,9 @@ class EnhancedDecoder(nn.Module):
     """
     def __init__(
         self,
-        in_channels: int,         # c5 channels, vÃƒÂ­ dÃ¡Â»Â¥ 128
-        c2_channels: int,         # vÃƒÂ­ dÃ¡Â»Â¥ 64
-        c1_channels: int,         # vÃƒÂ­ dÃ¡Â»Â¥ 32
+        in_channels: int,         # c5 channels, vÃ­ dá»¥ 128
+        c2_channels: int,         # vÃ­ dá»¥ 64
+        c1_channels: int,         # vÃ­ dá»¥ 32
         decoder_channels: int = 128,
         norm_cfg: dict = dict(type='BN', requires_grad=True),
         act_cfg: dict = dict(type='ReLU', inplace=False),
@@ -135,7 +135,7 @@ class EnhancedDecoder(nn.Module):
         super().__init__()
         self.use_gated_fusion = use_gated_fusion
 
-        # Stage 1: H/8 (c5) Ã¢â€ â€™ H/4, fuse vÃ¡Â»â€ºi c2
+        # Stage 1: H/8 (c5) â†’ H/4, fuse vá»›i c2
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine1 = nn.Sequential(
             ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
@@ -166,7 +166,7 @@ class EnhancedDecoder(nn.Module):
                 act_cfg=act_cfg
             )
 
-        # Stage 2: H/4 Ã¢â€ â€™ H/2, fuse vÃ¡Â»â€ºi c1
+        # Stage 2: H/4 â†’ H/2, fuse vá»›i c1
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine2 = nn.Sequential(
             ResidualBlock(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
@@ -197,7 +197,7 @@ class EnhancedDecoder(nn.Module):
                 act_cfg=act_cfg
             )
 
-        # Stage 3: H/2 Ã¢â€ â€™ H/2 (refine)
+        # Stage 3: H/2 â†’ H/2 (refine)
         self.refine3 = nn.Sequential(
             DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
             DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
@@ -212,7 +212,7 @@ class EnhancedDecoder(nn.Module):
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
 
     def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
-        # Stage 1: H/8 Ã¢â€ â€™ H/4
+        # Stage 1: H/8 â†’ H/4
         x = self.up1(c5)
         x = self.refine1(x)
         c2_proj = self.c2_proj(c2)
@@ -221,7 +221,7 @@ class EnhancedDecoder(nn.Module):
         else:
             x = self.fusion1(torch.cat([x, c2_proj], dim=1))
 
-        # Stage 2: H/4 Ã¢â€ â€™ H/2
+        # Stage 2: H/4 â†’ H/2
         x = self.up2(x)
         x = self.refine2(x)
         c1_proj = self.c1_proj(c1)
