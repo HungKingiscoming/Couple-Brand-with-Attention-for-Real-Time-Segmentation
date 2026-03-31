@@ -199,112 +199,123 @@ def window_reverse(windows: torch.Tensor, window_size: int,
 
 
 class WindowDWSABlock(nn.Module):
-    """
-    Window Attention thay thế DWSABlock.
-    Giữ nguyên interface: input/output shape (B, C, H, W)
-    """
     def __init__(self, channels, num_heads=4, window_size=8,
-                 reduction=4, drop=0.1, alpha=0.1):
+                 reduction=4, qk_sharing=True, groups=4,
+                 drop=0.1, alpha=0.1):
         super().__init__()
         self.channels = channels
         self.window_size = window_size
         self.num_heads = num_heads
 
         reduced = channels // reduction
+        mid = max(reduced // 2, num_heads)
         self.reduced = reduced
+        self.mid = mid
 
-        # Giữ nguyên cấu trúc projection của DWSABlock
+        # ✅ Giữ nguyên tên và kiểu như DWSABlock
         self.ln = nn.LayerNorm(channels)
-        self.in_proj = nn.Linear(channels, reduced, bias=False)
-        self.out_proj = nn.Linear(reduced, channels, bias=False)
+        self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
+        self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
 
-        # Multi-head attention trong window
-        head_dim = reduced // num_heads
-        self.scale = head_dim ** -0.5
+        g = _get_valid_groups(reduced, groups)
 
-        self.q = nn.Linear(reduced, reduced, bias=True)
-        self.k = nn.Linear(reduced, reduced, bias=True)
-        self.v = nn.Linear(reduced, reduced, bias=True)
-        self.proj = nn.Linear(reduced, reduced, bias=True)
+        self.qk_sharing = qk_sharing
+        if qk_sharing:
+            self.qk_base = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=False)
+            self.q_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+            self.k_head = nn.Conv1d(mid, mid, kernel_size=1, bias=True)
+        else:
+            self.q_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+            self.k_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+
+        self.v_proj = nn.Conv1d(reduced, mid, kernel_size=1, groups=g, bias=True)
+        self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
 
         self.attn_drop = nn.Dropout(drop)
+
+        head_dim = mid // num_heads
+        self.scale = head_dim ** -0.5
         self.alpha = nn.Parameter(torch.tensor(alpha))
 
     def _pad_if_needed(self, x):
-        """Pad H, W để chia hết cho window_size"""
         B, C, H, W = x.shape
         ws = self.window_size
         pad_h = (ws - H % ws) % ws
         pad_w = (ws - W % ws) % ws
         if pad_h > 0 or pad_w > 0:
             x = F.pad(x, (0, pad_w, 0, pad_h))
-        return x, H, W  # trả về H, W gốc để crop sau
+        return x, H, W
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x):
         B, C, H, W = x.shape
         identity = x
         ws = self.window_size
 
-        # Pad nếu cần
-        x_pad, H_orig, W_orig = self._pad_if_needed(x)
-        _, _, H_pad, W_pad = x_pad.shape
-
         # LayerNorm
-        x_ln = self.ln(x_pad.permute(0, 2, 3, 1))  # (B,H,W,C)
-        x_ln = x_ln.permute(0, 3, 1, 2)             # (B,C,H,W)
+        x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
-        # Project xuống reduced channels
-        # (B,C,H,W) → (B,H,W,C) → (B,H,W,reduced)
-        x_red = self.in_proj(
-            x_ln.permute(0, 2, 3, 1)
-        )  # (B, H_pad, W_pad, reduced)
+        # Pad nếu cần
+        x_pad, H_orig, W_orig = self._pad_if_needed(x_ln)
+        _, _, H_pad, W_pad = x_pad.shape
+        nH = H_pad // ws
+        nW = W_pad // ws
 
-        # Partition thành windows
-        x_red = x_red.view(
-            B, H_pad // ws, ws, W_pad // ws, ws, self.reduced
-        ).permute(0, 1, 3, 2, 4, 5).contiguous()
-        x_win = x_red.view(-1, ws * ws, self.reduced)
-        # x_win: (B*nH*nW, ws², reduced)
+        # in_proj: (B, C, H, W) → (B, reduced, H, W)
+        x_red = self.in_proj(x_pad)
 
-        # Multi-head attention
-        N_win, L, D = x_win.shape
-        q = self.q(x_win)
-        k = self.k(x_win)
-        v = self.v(x_win)
+        # Chia thành windows: (B, reduced, H, W)
+        # → (B*nH*nW, reduced, ws, ws)
+        x_red = x_red.view(B, self.reduced, nH, ws, nW, ws)
+        x_red = x_red.permute(0, 2, 4, 1, 3, 5).contiguous()
+        x_win = x_red.view(B * nH * nW, self.reduced, ws * ws)
+        # x_win: (B*nW*nH, reduced, ws²)
 
-        # Reshape thành heads
-        q = q.view(N_win, L, self.num_heads, D // self.num_heads).transpose(1, 2)
-        k = k.view(N_win, L, self.num_heads, D // self.num_heads).transpose(1, 2)
-        v = v.view(N_win, L, self.num_heads, D // self.num_heads).transpose(1, 2)
+        # QKV — dùng Conv1d giống DWSABlock
+        if self.qk_sharing:
+            base = self.qk_base(x_win)
+            q = self.q_head(base)
+            k = self.k_head(base)
+        else:
+            q = self.q_proj(x_win)
+            k = self.k_proj(x_win)
+        v = self.v_proj(x_win)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
+        # Split heads
+        def split_heads(t):
+            Bw, Cm, N = t.shape
+            head_dim = Cm // self.num_heads
+            return t.view(Bw, self.num_heads, head_dim, N)
+
+        q = split_heads(q).permute(0, 1, 3, 2)  # (Bw, heads, N, head_dim)
+        k = split_heads(k).permute(0, 1, 3, 2)
+        v = split_heads(v).permute(0, 1, 3, 2)
+
+        # Attention trong window
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = attn.clamp(-10, 10)
         attn = F.softmax(attn, dim=-1)
         attn = self.attn_drop(attn)
 
-        out = (attn @ v).transpose(1, 2).contiguous()
-        out = out.view(N_win, L, D)
-        out = self.proj(out)
+        out = torch.matmul(attn, v)  # (Bw, heads, N, head_dim)
+        out = out.permute(0, 1, 3, 2).contiguous()
+        Bw = out.shape[0]
+        out = out.view(Bw, self.mid, ws * ws)
+
+        out = self.o_proj(out)  # (Bw, reduced, ws²)
 
         # Reverse windows → feature map
-        nH = H_pad // ws
-        nW = W_pad // ws
-        out = out.view(B, nH, nW, ws, ws, self.reduced)
-        out = out.permute(0, 5, 1, 3, 2, 4).contiguous()
+        out = out.view(B, nH, nW, self.reduced, ws, ws)
+        out = out.permute(0, 3, 1, 4, 2, 5).contiguous()
         out = out.view(B, self.reduced, H_pad, W_pad)
 
-        # Project về channels gốc
-        out = self.out_proj(
-            out.permute(0, 2, 3, 1)
-        ).permute(0, 3, 1, 2)  # (B, C, H_pad, W_pad)
+        # out_proj: (B, reduced, H, W) → (B, C, H, W)
+        out = self.out_proj(out)
 
-        # Crop về size gốc nếu đã pad
+        # Crop nếu đã pad
         if H_pad != H_orig or W_pad != W_orig:
             out = out[:, :, :H_orig, :W_orig]
 
-        # Scaled residual — giống DWSABlock
         return identity + self.alpha * out
-
 class GCBlock(nn.Module):
     def __init__(self,
                  in_channels: int,
