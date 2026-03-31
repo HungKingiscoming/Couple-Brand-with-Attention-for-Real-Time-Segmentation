@@ -143,7 +143,7 @@ def build_optimizer(model, args):
 # ============================================
 
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, ignore_index=255):
+    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
         super().__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
