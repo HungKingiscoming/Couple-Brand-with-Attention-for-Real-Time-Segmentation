@@ -253,7 +253,7 @@ def build_model(num_classes=19, device='cuda', deploy=False):
     ).to(device)
 
     head = GCNetHead(
-        in_channels=128, c4_channels=64, c2_channels=32, c1_channels=32,
+        in_channels=128, c2_channels=32, c1_channels=32,
         decoder_channels=128, num_classes=num_classes, dropout_ratio=0.1,
         use_gated_fusion=True, 
         norm_cfg=dict(type='BN', requires_grad=True),
