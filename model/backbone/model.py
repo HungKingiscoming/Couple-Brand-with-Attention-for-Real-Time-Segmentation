@@ -409,6 +409,7 @@ class GCNet(BaseModule):
         # ---- Stage 6 ---------------------------------------------------- #
         x_d = self.detail_branch_layers[2](self.relu(x_d))    # 1/8,  channels*4
         x_s = self.semantic_branch_layers[2](self.relu(x_s))  # 1/64, channels*16
+        print(f"Shape before SPP: {x_s.shape}")
         x_s = self.spp(x_s)                                    # DAPPM context
         x_s = resize(x_s, size=out_size,
                      mode='bilinear', align_corners=self.align_corners)
