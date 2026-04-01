@@ -218,13 +218,13 @@ class GCNetHead(nn.Module):
 
         self.decoder = EnhancedDecoder(
             in_channels=in_channels,
+            c4_channels=c4_channels,
             c2_channels=c2_channels,
             c1_channels=c1_channels,
             decoder_channels=decoder_channels,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-            dropout_ratio=dropout_ratio,
-            use_gated_fusion=use_gated_fusion,
+            norm_cfg=norm_cfg, # Bây giờ tham số này đã được EnhancedDecoder chấp nhận
+            act_cfg=act_cfg,   # Đảm bảo truyền cả act_cfg nếu có
+            dropout_ratio=dropout_ratio
         )
 
         output_channels = decoder_channels // 2   # 64
