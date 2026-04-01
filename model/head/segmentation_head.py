@@ -210,6 +210,7 @@ class GCNetHead(nn.Module):
         align_corners: bool = False,
         use_gated_fusion: bool = True,
         c1_channels: int = 32,
+        c4_channels: int = 64,
         c2_channels: int = 32,
     ):
         super().__init__()
