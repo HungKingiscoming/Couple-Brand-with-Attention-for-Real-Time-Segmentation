@@ -83,31 +83,38 @@ class DWConvModule(nn.Module):
 
 
 class EnhancedDecoder(nn.Module):
-    def __init__(self, in_channels=128, c4_channels=64, c2_channels=32, c1_channels=32, decoder_channels=128):
+    def __init__(self, 
+                 in_channels=128, 
+                 c4_channels=64, 
+                 c2_channels=32, 
+                 c1_channels=32, 
+                 decoder_channels=128,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True), # Thêm dòng này
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),     # Thêm dòng này
+                 dropout_ratio: float = 0.1):
         super().__init__()
         D = decoder_channels
-        D2 = D // 2 # 64 channels
+        D2 = D // 2 
 
-        # Stage 0 (H/8): Giữ Gated Fusion vì đây là tầng quan trọng nhất để lọc nhiễu
-        self.refine0 = ConvModule(in_channels, D, kernel_size=3, padding=1)
-        self.fusion0 = LiteGatedFusion(D)
+        # Gated Fusion ở tầng sâu
+        self.refine0 = ConvModule(in_channels, D, kernel_size=3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg)
+        self.fusion0 = LiteGatedFusion(D, norm_cfg=norm_cfg)
 
-        # Stage 1 (H/4): Dùng phép cộng (Addition) thay vì Gate để tăng FPS
+        # Stage 1: H/8 -> H/4
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.refine1 = ConvModule(D, D2, kernel_size=3, padding=1)
-        self.c2_proj = nn.Conv2d(c2_channels, D2, kernel_size=1) # Đưa c2 về 64 channels
+        self.refine1 = ConvModule(D, D2, kernel_size=3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg)
+        self.c2_proj = nn.Conv2d(c2_channels, D2, kernel_size=1) 
 
-        # Stage 2 (H/2): Dùng DWConv (rất nhẹ) để giữ độ sắc nét của biên đối tượng
+        # Stage 2: H/4 -> H/2
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine2 = nn.Sequential(
-            nn.Conv2d(D2, D2, kernel_size=3, padding=1, groups=D2), # Depthwise
-            nn.Conv2d(D2, D2, kernel_size=1), # Pointwise
-            nn.BatchNorm2d(D2),
-            nn.ReLU(inplace=True)
+            nn.Conv2d(D2, D2, kernel_size=3, padding=1, groups=D2),
+            nn.Conv2d(D2, D2, kernel_size=1),
+            build_norm_layer(norm_cfg, D2)[1],
+            build_activation_layer(act_cfg)
         )
         self.c1_proj = nn.Conv2d(c1_channels, D2, kernel_size=1)
-
-        self.final_proj = ConvModule(D2, D2, kernel_size=1)
+        self.final_proj = ConvModule(D2, D2, kernel_size=1, norm_cfg=norm_cfg, act_cfg=act_cfg)
 
     def forward(self, c5, c4, c2, c1):
         # H/8: Gated Fusion (Accuracy)
