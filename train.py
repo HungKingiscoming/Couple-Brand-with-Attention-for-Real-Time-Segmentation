@@ -18,7 +18,7 @@ import json
 import time
 import gc
 import warnings
-
+from torch.optim.lr_scheduler import LambdaLR
 warnings.filterwarnings('ignore')
 
 # ============================================
@@ -99,7 +99,7 @@ def load_pretrained_gcnet_core(model, ckpt_path, strict_match=False):
     missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
 
     if missing:
-        print(f"\nâš ï¸  Missing keys in model ({len(missing)}):")
+        print(f"\nÃƒÂ¢Ã…Â¡ ÃƒÂ¯Ã‚Â¸Ã‚Â  Missing keys in model ({len(missing)}):")
         for key in missing[:10]:
             print(f"   - {key}")
         if len(missing) > 10:
@@ -115,7 +115,7 @@ def build_optimizer(model, args):
     for name, param in model.named_parameters():
 
         if not param.requires_grad:
-            continue  # bỏ qua param đang freeze
+            continue  # bÃ¡Â»Â qua param Ã„â€˜ang freeze
 
         if "backbone" in name:
             backbone_params.append(param)
@@ -143,33 +143,75 @@ def build_optimizer(model, args):
 # ============================================
 
 class DiceLoss(nn.Module):
-    def __init__(self, smooth=1e-5, ignore_index=255, reduction='mean'):
+    def __init__(
+        self,
+        smooth: float = 1e-5,
+        ignore_index: int = 255,
+        reduction: str = 'mean',
+        log_loss: bool = False,       # dÃƒÂ¹ng -log(dice) thay vÃƒÂ¬ 1-dice Ã¢â‚¬â€ gradient lÃ¡Â»â€ºn hÃ†Â¡n khi dice thÃ¡ÂºÂ¥p
+        class_weights: torch.Tensor = None,  # optional per-class weight
+    ):
         super().__init__()
         self.smooth = smooth
         self.ignore_index = ignore_index
+        self.reduction = reduction
+        self.log_loss = log_loss
+        self.register_buffer(
+            'class_weights',
+            class_weights if class_weights is not None else None
+        )
 
-    def forward(self, logits, targets):
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            logits : (B, C, H, W) Ã¢â‚¬â€ KHÃƒâ€NG upsample, dÃƒÂ¹ng resolution gÃ¡Â»â€˜c H/2
+            targets: (B, H, W)    Ã¢â‚¬â€ Ã„â€˜ÃƒÂ£ downsample bÃ¡ÂºÂ±ng nearest xuÃ¡Â»â€˜ng H/2
+        """
         B, C, H, W = logits.shape
 
-        valid_mask = (targets != self.ignore_index)  # (B, H, W)
-        probs = F.softmax(logits, dim=1)             # (B, C, H, W)
+        # Valid mask Ã¢â‚¬â€ bÃ¡Â»Â ignore_index
+        valid_mask = (targets != self.ignore_index)                  # (B, H, W) bool
 
-        dice_loss = 0.0
-        for c in range(C):
-            # ✅ Tính từng class — không cần one_hot toàn bộ
-            prob_c = probs[:, c, :, :]               # (B, H, W)
-            target_c = (targets == c).float()        # (B, H, W)
+        # One-hot targets Ã¢â‚¬â€ chÃ¡Â»â€° tÃƒÂ­nh trÃƒÂªn valid pixels
+        targets_clamped = targets.clamp(0, C - 1)
+        targets_one_hot = F.one_hot(targets_clamped, num_classes=C)  # (B, H, W, C)
+        targets_one_hot = targets_one_hot.permute(0, 3, 1, 2).float()  # (B, C, H, W)
+        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1).float()
 
-            # Chỉ tính trên valid pixels
-            prob_c = prob_c * valid_mask
-            target_c = target_c * valid_mask
+        # Softmax probs Ã¢â‚¬â€ zero out invalid pixels
+        probs = F.softmax(logits, dim=1)                             # (B, C, H, W)
+        probs = probs * valid_mask.unsqueeze(1).float()
 
-            intersection = (prob_c * target_c).sum()
-            union = prob_c.sum() + target_c.sum()
+        # Flatten spatial
+        probs_flat   = probs.reshape(B, C, -1)           # (B, C, N)
+        targets_flat = targets_one_hot.reshape(B, C, -1) # (B, C, N)
 
-            dice_loss += 1.0 - (2.0 * intersection + self.smooth) / (union + self.smooth)
+        # Dice per class per batch
+        intersection = (probs_flat * targets_flat).sum(dim=2)        # (B, C)
+        cardinality  = probs_flat.sum(dim=2) + targets_flat.sum(dim=2)  # (B, C)
 
-        return dice_loss / C
+        dice_score = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)  # (B, C)
+
+        if self.log_loss:
+            # -log(dice): gradient explodes khi dice Ã¢â€ â€™ 0 (khÃƒÂ³ class)
+            # Ã¢â€ â€™ model bÃ¡Â»â€¹ ÃƒÂ©p hÃ¡Â»Âc hard class mÃ¡ÂºÂ¡nh hÃ†Â¡n
+            dice_loss = -torch.log(dice_score.clamp(min=self.smooth))
+        else:
+            dice_loss = 1.0 - dice_score  # (B, C)
+
+        # Per-class weighting nÃ¡ÂºÂ¿u cÃƒÂ³
+        if self.class_weights is not None:
+            dice_loss = dice_loss * self.class_weights.unsqueeze(0)  # (B, C)
+
+        # ChÃ¡Â»â€° tÃƒÂ­nh trung bÃƒÂ¬nh trÃƒÂªn cÃƒÂ¡c class cÃƒÂ³ pixel trong batch
+        # (trÃƒÂ¡nh class khÃƒÂ´ng xuÃ¡ÂºÂ¥t hiÃ¡Â»â€¡n kÃƒÂ©o loss vÃ¡Â»Â 0)
+        class_present = targets_flat.sum(dim=2) > 0  # (B, C) bool
+        dice_loss = dice_loss * class_present.float()
+
+        n_present = class_present.float().sum(dim=1).clamp(min=1)  # (B,)
+        dice_loss = dice_loss.sum(dim=1) / n_present                # (B,)
+
+        return dice_loss.mean()
 
 
 class FocalLoss(nn.Module):
@@ -202,6 +244,37 @@ class FocalLoss(nn.Module):
         return focal_loss.mean() if self.reduction == 'mean' else focal_loss
 
 
+
+class OHEMLoss(nn.Module):
+    def __init__(self, ignore_index=255, keep_ratio=0.3, min_kept=100000, class_weights=None):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.keep_ratio = keep_ratio
+        self.min_kept = min_kept
+        self.class_weights = class_weights
+
+    def forward(self, logits, labels):
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        loss_per_pixel = F.cross_entropy(
+            logits, labels, weight=weight,
+            ignore_index=self.ignore_index, reduction='none'
+        ).view(-1)
+        valid_mask = (labels.view(-1) != self.ignore_index)
+        valid_losses = loss_per_pixel[valid_mask]
+        n_valid = valid_losses.numel()
+        if n_valid == 0:
+            return logits.sum() * 0
+        n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
+        n_keep = min(n_keep, n_valid)
+        if n_keep < n_valid:
+            sorted_losses, _ = torch.sort(valid_losses, descending=True)
+            threshold = sorted_losses[n_keep - 1].detach()
+            hard_losses = valid_losses[valid_losses >= threshold]
+        else:
+            hard_losses = valid_losses
+        return hard_losses.mean()
+
+
 # ============================================
 # UTILITIES
 # ============================================
@@ -222,15 +295,15 @@ def setup_memory_efficient_training():
 
 def freeze_backbone(model):
     """
-    Freeze toàn bộ backbone + khóa BatchNorm running stats
+    Freeze toÃƒ n bÃ¡Â»â„¢ backbone + khÃƒÂ³a BatchNorm running stats
     """
-    print("🔒 Freezing backbone (with BN locked)...")
+    print("Ã°Å¸â€â€™ Freezing backbone (with BN locked)...")
 
-    # 1️⃣ Freeze tất cả parameters
+    # 1Ã¯Â¸ÂÃ¢Æ’Â£ Freeze tÃ¡ÂºÂ¥t cÃ¡ÂºÂ£ parameters
     for param in model.backbone.parameters():
         param.requires_grad = False
 
-    # 2️⃣ Lock toàn bộ BatchNorm trong backbone
+    # 2Ã¯Â¸ÂÃ¢Æ’Â£ Lock toÃƒ n bÃ¡Â»â„¢ BatchNorm trong backbone
     bn_count = 0
     for m in model.backbone.modules():
         if isinstance(m, nn.BatchNorm2d):
@@ -241,8 +314,8 @@ def freeze_backbone(model):
                 m.bias.requires_grad = False
             bn_count += 1
 
-    print(f"   → {bn_count} BatchNorm layers locked")
-    print("✅ Backbone frozen completely\n")
+    print(f"   Ã¢â€ â€™ {bn_count} BatchNorm layers locked")
+    print("Ã¢Å“â€¦ Backbone frozen completely\n")
 def print_backbone_structure(model):
     """In ra  backbone debug"""
     print(f"\n{'='*70}")
@@ -319,7 +392,7 @@ def unfreeze_backbone_progressive(model, stage_names):
                 unfrozen_params += 1
                 param_count += 1
         
-        # 🔥 BẬT LẠI BatchNorm trong stage này
+        # Ã°Å¸â€Â¥ BÃ¡ÂºÂ¬T LÃ¡Âº I BatchNorm trong stage nÃƒ y
         for m in module.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.train()  # allow running stats update
@@ -399,27 +472,41 @@ def count_trainable_params(model):
     return trainable, frozen
 
 
-def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4):
-    backbone_params = [p for n, p in model.named_parameters() 
-                      if 'backbone' in n and p.requires_grad]
-    head_params = [p for n, p in model.named_parameters() 
-                  if 'backbone' not in n and p.requires_grad]
-    
-    if len(backbone_params) == 0:
-        optimizer = torch.optim.AdamW(head_params, lr=base_lr, weight_decay=weight_decay)
-        print(f"âš™ï¸  Optimizer: AdamW (lr={base_lr}) - head only")
-    else:
-        backbone_lr = base_lr * backbone_lr_factor
-        param_groups = [
-            {'params': backbone_params, 'lr': backbone_lr, 'name': 'backbone'},
-            {'params': head_params, 'lr': base_lr, 'name': 'head'}
-        ]
-        optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
-        
-        print(f"Optimizer: AdamW (Discriminative LR)")
-        print(f"Backbone LR: {backbone_lr:.2e} ({len(backbone_params):,} params)")
-        print(f"Head LR:     {base_lr:.2e} ({len(head_params):,} params)")
-    
+def setup_discriminative_lr(model, base_lr, backbone_lr_factor=0.1, weight_decay=1e-4, alpha_lr_factor=0.01):
+    backbone_params = []
+    head_params = []
+    alpha_params = []
+
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        # heuristic: parameter name containing 'alpha' (tÃƒÂ¹y tÃƒÂªn model bÃ¡ÂºÂ¡n dÃƒÂ¹ng)
+        if 'alpha' in n:
+            alpha_params.append(p)
+        elif 'backbone' in n:
+            backbone_params.append(p)
+        else:
+            head_params.append(p)
+
+    param_groups = []
+    if len(backbone_params) > 0:
+        param_groups.append({'params': backbone_params, 'lr': base_lr * backbone_lr_factor, 'name': 'backbone'})
+    if len(head_params) > 0:
+        param_groups.append({'params': head_params, 'lr': base_lr, 'name': 'head'})
+    if len(alpha_params) > 0:
+        # very small LR for alpha
+        param_groups.append({'params': alpha_params, 'lr': base_lr * alpha_lr_factor, 'name': 'alpha'})
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+
+    # attach initial_lr for warmup/restore
+    for g in optimizer.param_groups:
+        g.setdefault('initial_lr', g['lr'])
+
+    print(f"Optimizer: AdamW (Discriminative LR)")
+    for g in optimizer.param_groups:
+        print(f"  group '{g.get('name','?')}' lr={g['lr']:.2e} params={len(g['params'])}")
+
     return optimizer
 
 
@@ -453,10 +540,11 @@ def check_gradients(model, threshold=10.0):
 class ModelConfig:
     @staticmethod
     def get_config():
+        C = 32
         return {
             "backbone": {
                 "in_channels": 3,
-                "channels": 32,
+                "channels": C,
                 "ppm_channels": 128,
                 "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
                 "dwsa_stages": ['stage4','stage5', 'stage6'],
@@ -472,7 +560,11 @@ class ModelConfig:
                 "deploy": False
             },
             "head": {
-                "in_channels": 64,
+                # c5 = C*4, c4 = C*2, c2 = C, c1 = C
+                "in_channels":    C * 4,   # 128 Ã¢â‚¬â€ c5
+                "c4_channels":    C * 2,   #  64 Ã¢â‚¬â€ c4 (detail branch stage4)
+                "c2_channels":    C,       #  32 Ã¢â‚¬â€ c2 (stem layer 1)
+                "c1_channels":    C,       #  32 Ã¢â‚¬â€ c1 (stem layer 0)
                 "decoder_channels": 128,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
@@ -480,8 +572,8 @@ class ModelConfig:
                 "act_cfg": {'type': 'ReLU', 'inplace': False}
             },
             "aux_head": {
-                "in_channels": 128,
-                "channels": 96,
+                "in_channels": C * 2,
+                "mid_channels": 64,
                 "dropout_ratio": 0.1,
                 "align_corners": False,
                 "norm_cfg": {'type': 'BN', 'requires_grad': True},
@@ -489,7 +581,7 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight": 1.0,
-                "dice_weight": 0.3,
+                "dice_weight": 0.5,
                 "focal_weight": 0.0,
                 "focal_alpha": 0.25,
                 "focal_gamma": 2.0,
@@ -548,12 +640,17 @@ class Trainer:
             ignore_index=args.ignore_index,
             reduction='mean'
         )
+        self.ohem = OHEMLoss(
+            ignore_index=args.ignore_index,
+            keep_ratio=0.3,
+            min_kept=100000,
+            class_weights=class_weights,
+        )
         
         self.ce_weight = loss_cfg['ce_weight']
         self.dice_weight = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
         self.loss_phase = 'full'
-        
         self.scaler = GradScaler(enabled=args.use_amp)
         
         self.save_dir = Path(args.save_dir)
@@ -594,10 +691,7 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-        if torch.cuda.is_available():
-            allocated = torch.cuda.memory_allocated() / 1024**3
-            reserved = torch.cuda.memory_reserved() / 1024**3
-            print(f"Memory trước khi train: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+        
         total_loss = 0.0
         total_ce = 0.0
         total_dice = 0.0
@@ -611,92 +705,85 @@ class Trainer:
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-            if batch_idx == 0:
-               print(f"Sau load batch: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+    
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-                if batch_idx == 0:
-                    print(f"Sau forward:    {torch.cuda.memory_allocated()/1024**3:.2f}GB")
-                logits = outputs["main"]
-                logits = F.interpolate(
+                logits = outputs["main"]    # (B, C, H/2, W/2) Ã¢â‚¬â€ giÃ¡Â»Â¯ nguyÃƒÂªn resolution thÃ¡ÂºÂ¥p
+            
+                # Ã¢â€â‚¬Ã¢â€â‚¬ CE: upsample logit lÃƒÂªn full resolution Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
+                logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
-                    mode="bilinear",
+                    mode='bilinear',
                     align_corners=False
                 )
-    
-                ce_loss = self.ce(logits, masks)
-                if batch_idx == 0:
-                    print(f"Sau CE loss:    {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+                ce_loss = self.ce(logits_full, masks)
+                ohem_loss = self.ohem(logits_full, masks)
+            
+                # Ã¢â€â‚¬Ã¢â€â‚¬ Dice: giÃ¡Â»Â¯ logit H/2, downsample mask xuÃ¡Â»â€˜ng cÃƒÂ¹ng size Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 if self.dice_weight > 0:
-                    dice_loss = self.dice(logits, masks)
+                    # nearest-exact: chÃƒÂ­nh xÃƒÂ¡c hÃ†Â¡n 'nearest' vÃ¡Â»â€ºi kÃƒÂ­ch thÃ†Â°Ã¡Â»â€ºc lÃ¡ÂºÂ»
+                    # khÃƒÂ´ng dÃƒÂ¹ng bilinear vÃƒÂ¬ mask lÃƒ  class label (integer), khÃƒÂ´ng nÃ¡Â»â„¢i suy Ã„â€˜Ã†Â°Ã¡Â»Â£c
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),
+                        size=logits.shape[-2:],
+                        mode='nearest'
+                    ).squeeze(1).long()
+                    dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-    
+            
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-    
+            
+                # Ã¢â€â‚¬Ã¢â€â‚¬ Aux: chÃ¡Â»â€° CE lÃƒ  Ã„â€˜Ã¡Â»Â§, Dice khÃƒÂ´ng cÃ¡ÂºÂ§n thiÃ¡ÂºÂ¿t Ã¡Â»Å¸ aux head Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
                 if "aux" in outputs and self.args.aux_weight > 0:
-                    aux_logits = outputs["aux"]
                     aux_logits = F.interpolate(
-                        aux_logits,
+                        outputs["aux"],
                         size=masks.shape[-2:],
-                        mode="bilinear",
+                        mode='bilinear',
                         align_corners=False
                     )
-                    # ✅ Chỉ dùng CE cho aux — không Dice
                     aux_ce_loss = self.ce(aux_logits, masks)
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss = loss + aux_weight * aux_ce_loss
-                if batch_idx == 0:
-                   print(f"Sau all loss:   {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+            
                 loss = loss / self.args.accumulation_steps
     
             # FIX 1: Check NaN BEFORE backward
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"\nNaN/Inf loss at epoch {epoch}, batch {batch_idx}")
-                print(f"   CE: {ce_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
+                print(f"   OHEM: {ohem_loss.item():.4f}, Dice: {dice_loss.item():.4f}")
                 self.optimizer.zero_grad(set_to_none=True)
                 continue
-            if batch_idx == 0:
-               print(f"Trước backward: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
-            self.scaler.scale(loss).backward()
-            if batch_idx == 0:
-                print(f"Sau backward:   {torch.cuda.memory_allocated()/1024**3:.2f}GB")
             
-            # FIX 2: ALWAYS clip gradients (khÃ´ng phá»¥ thuá»™c accumulation)
+            self.scaler.scale(loss).backward()
+            
+
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                
-                # FIX 3: Monitor gradients
                 max_grad, total_norm = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
-                
-                # FIX 4: ALWAYS apply gradient clipping
                 if self.args.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.model.parameters(), 
-                        max_norm=self.args.grad_clip
-                    )
-                
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
             
-            if self.scheduler and self.args.scheduler == 'onecycle':
-                self.scheduler.step()
-            
+                if self.scheduler and self.args.scheduler == 'onecycle':   # Ã¢â€ Â VÃƒâ‚¬O TRONG
+                    self.scheduler.step()
+                        
             total_loss += loss.item() * self.args.accumulation_steps
-            total_ce += ce_loss.item()
+            total_ce += ohem_loss.item()
             total_dice += dice_loss.item()
             
             current_lr = self.optimizer.param_groups[0]['lr']
             pbar.set_postfix({
                 'loss': f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ce': f'{ce_loss.item():.4f}',
+                'ohem': f'{ohem_loss.item():.4f}',
                 'dice': f'{dice_loss.item():.4f}',
                 'lr': f'{current_lr:.6f}',
-                'max_grad': f'{max_grad:.2f}'  # â† Monitor
+                'max_grad': f'{max_grad:.2f}'  # ÃƒÂ¢Ã¢â‚¬ Ã‚Â Monitor
             })
             
             if batch_idx % 50 == 0:
@@ -704,20 +791,18 @@ class Trainer:
             
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/total_loss', loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ce_loss', ce_loss.item(), self.global_step)
+                self.writer.add_scalar('train/ohem_loss', ohem_loss.item(), self.global_step)
                 self.writer.add_scalar('train/dice_loss', dice_loss.item(), self.global_step)
                 self.writer.add_scalar('train/lr', current_lr, self.global_step)
-                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # â† Log
-    
-        if self.scheduler and self.args.scheduler != 'onecycle':
-            self.scheduler.step()
+                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)  # ÃƒÂ¢Ã¢â‚¬ Ã‚Â Log
     
         avg_loss = total_loss / len(loader)
         avg_ce = total_ce / len(loader)
         avg_dice = total_dice / len(loader)
-        
         print(f"\nEpoch {epoch+1} Summary: Max Gradient = {max_grad_epoch:.2f}")
-        
+        torch.cuda.empty_cache()
+        if self.scheduler and self.args.scheduler != 'onecycle':
+            self.scheduler.step()
         return {'loss': avg_loss, 'ce': avg_ce, 'dice': avg_dice, 'focal': 0.0}
 
     @torch.no_grad()
@@ -728,56 +813,68 @@ class Trainer:
         num_classes = self.args.num_classes
         confusion_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         
-        pbar = tqdm(loader, desc=f"Validation")
+        pbar = tqdm(loader, desc="Validation")
         
         for batch_idx, (imgs, masks) in enumerate(pbar):
-            imgs = imgs.to(self.device, non_blocking=True)
+            imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
             
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
+    
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)
-                logits = F.interpolate(
+                logits = self.model(imgs)          # (B, C, H/2, W/2) Ã¢â‚¬â€ giÃ¡Â»Â¯ nguyÃƒÂªn
+    
+                # CE: upsample logit lÃƒÂªn full resolution
+                logits_full = F.interpolate(
                     logits,
                     size=masks.shape[-2:],
-                    mode="bilinear",
+                    mode='bilinear',
                     align_corners=False
                 )
-            
-                ce_loss = self.ce(logits, masks)
+                ce_loss = self.ce(logits_full, masks)
+    
+                # Dice: giÃ¡Â»Â¯ logit H/2, downsample mask Ã¢â‚¬â€ nhÃ¡ÂºÂ¥t quÃƒÂ¡n vÃ¡Â»â€ºi train_epoch
                 if self.dice_weight > 0:
-                    dice_loss = self.dice(logits, masks)
+                    masks_small = F.interpolate(
+                        masks.unsqueeze(1).float(),   # cÃ¡ÂºÂ§n unsqueeze + float cho interpolate
+                        size=logits.shape[-2:],        # H/2, W/2 Ã¢â‚¬â€ KHÃƒâ€NG phÃ¡ÂºÂ£i logits_full
+                        mode='nearest'
+                    ).squeeze(1).long()               # trÃ¡ÂºÂ£ vÃ¡Â»Â (B, H/2, W/2) long
+                    dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=logits.device)
-            
+    
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-            
+    
             total_loss += loss.item()
-            
-            pred = logits.argmax(1).cpu().numpy()
+    
+            # mIoU dÃƒÂ¹ng logits_full Ã¢â‚¬â€ full resolution Ã„â€˜Ã¡Â»Æ’ Ã„â€˜Ã¡ÂºÂ¿m pixel chÃƒÂ­nh xÃƒÂ¡c
+            pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             
-            mask = (target >= 0) & (target < num_classes)
-            label = num_classes * target[mask].astype('int') + pred[mask]
-            count = np.bincount(label, minlength=num_classes**2)
+            mask_valid = (target >= 0) & (target < num_classes)
+            label  = num_classes * target[mask_valid].astype('int') + pred[mask_valid]
+            count  = np.bincount(label, minlength=num_classes**2)
             confusion_matrix += count.reshape(num_classes, num_classes)
             
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             
             if batch_idx % 20 == 0:
                 clear_gpu_memory()
-
+    
         intersection = np.diag(confusion_matrix)
-        union = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
-        iou = intersection / (union + 1e-10)
-        miou = np.nanmean(iou)
-        
-        acc = intersection.sum() / (confusion_matrix.sum() + 1e-10)
-        avg_loss = total_loss / len(loader)
-        
-        return {'loss': avg_loss, 'miou': miou, 'accuracy': acc, 'per_class_iou': iou}
+        union        = confusion_matrix.sum(1) + confusion_matrix.sum(0) - intersection
+        iou          = intersection / (union + 1e-10)
+        miou         = np.nanmean(iou)
+        acc          = intersection.sum() / (confusion_matrix.sum() + 1e-10)
+    
+        return {
+            'loss'         : total_loss / len(loader),
+            'miou'         : miou,
+            'accuracy'     : acc,
+            'per_class_iou': iou,
+        }
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
         checkpoint = {
@@ -839,26 +936,6 @@ class Trainer:
             print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
-def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
-    backbone.eval()
-    with torch.no_grad():
-        sample = torch.randn(1, 3, *img_size).to(device)
-        feats = backbone(sample)
-        
-        channels = {}
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in feats:
-                channels[key] = feats[key].shape[1]
-        
-        print(f"\n{'='*70}")
-        print("BACKBONE CHANNEL DETECTION")
-        print(f"{'='*70}")
-        for key in ['c1', 'c2', 'c3', 'c4', 'c5']:
-            if key in channels:
-                print(f"   {key}: {channels[key]} channels")
-        print(f"{'='*70}\n")
-        
-        return channels
 
 
 # ============================================
@@ -866,7 +943,7 @@ def detect_backbone_channels(backbone, device, img_size=(512, 1024)):
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ðŸš€ GCNetWithEnhance Training - FIXED")
+    parser = argparse.ArgumentParser(description="ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ GCNetWithEnhance Training - FIXED")
     
     # Transfer Learning
     parser.add_argument("--pretrained_weights", type=str, default=None)
@@ -890,17 +967,22 @@ def main():
     parser.add_argument("--accumulation_steps", type=int, default=2)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
-    parser.add_argument("--grad_clip", type=float, default=5.0)  # â† INCREASED from 1.0
+    parser.add_argument("--grad_clip", type=float, default=5.0)  # ÃƒÂ¢Ã¢â‚¬ Ã‚Â INCREASED from 1.0
     parser.add_argument("--aux_weight", type=float, default=1.0)
     parser.add_argument("--scheduler", default="onecycle", choices=["onecycle", "poly", "cosine"])
-    
+    parser.add_argument("--alpha_lr_factor", type=float, default=0.01,
+                        help="learning rate factor for learnable alpha params in DWSA (very small)")
+    parser.add_argument("--final_dice_weight", type=float, default=0.5,
+                        help="target dice weight when ramping to full loss")
+    parser.add_argument("--dice_ramp_epochs", type=int, default=5,
+                        help="number of epochs over which to ramp dice from 0->final_dice_weight")
     # Data
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
     
     # System
     parser.add_argument("--use_amp", action="store_true", default=True)
-    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--save_dir", default="./checkpoints")
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--resume_mode", type=str, default="transfer", 
@@ -933,7 +1015,7 @@ def main():
     print(f"Image size: {args.img_h}x{args.img_w}")
     print(f"Epochs: {args.epochs}")
     print(f"Scheduler: {args.scheduler}")
-    print(f"Gradient clipping: {args.grad_clip}")  # â† SHOW
+    print(f"Gradient clipping: {args.grad_clip}")  
     print(f"Freeze backbone: {args.freeze_backbone}")
     if args.unfreeze_schedule:
         print(f"Unfreeze schedule: {args.unfreeze_schedule}")
@@ -944,7 +1026,7 @@ def main():
     cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
     
-    print(f"ðŸ”§ Model Config:")
+    print(f" Model Config:")
     print(f"DWSA alpha: {cfg['backbone']['dwsa_alpha']}")
     print(f"DWSA drop: {cfg['backbone']['dwsa_drop']}")
     print(f"MS alpha: {cfg['backbone']['ms_alpha']}\n")
@@ -969,31 +1051,22 @@ def main():
     print(f"{'='*70}\n")
     
     backbone = GCNetWithEnhance(**cfg["backbone"]).to(device)
+
     
-    detected_channels = detect_backbone_channels(backbone, device, (args.img_h, args.img_w))
-    
-    head_cfg = {
+    head = GCNetHead(
         **cfg["head"],
-        "in_channels": detected_channels['c5'],
-        "c1_channels": detected_channels['c1'],
-        "c2_channels": detected_channels['c2'],
-        "num_classes": args.num_classes,
-    }
-    
-    aux_head_cfg = {
-        **cfg["aux_head"],
-        "in_channels": detected_channels['c4'],
-        "num_classes": args.num_classes,
-    }
-    
-    model = Segmentor(
-        backbone=backbone,
-        head=GCNetHead(**head_cfg),
-        aux_head=GCNetAuxHead(**aux_head_cfg),
+        num_classes=args.num_classes,
     )
     
+    aux_head = GCNetAuxHead(
+        **cfg["aux_head"],
+        num_classes=args.num_classes,
+    )
+    
+    model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
+    
     print("\nApplying Optimizations...")
-    # print("Converting BN â†’ GN")
+    # print("Converting BN ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ GN")
     # model = replace_bn_with_gn(model)
     
     print("Kaiming Init")
@@ -1022,7 +1095,7 @@ def main():
     # Test forward
     model = model.to(device)
     with torch.no_grad():
-        sample = torch.randn(1, 3, args.img_h, args.img_w).to(device)
+        sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
             outputs = model.forward_train(sample)
             print(f"Forward pass successful!")
@@ -1082,7 +1155,10 @@ def main():
         print(f"Polynomial LR decay")
         def poly_lr_lambda(epoch):
             return (1 - epoch / args.epochs) ** 0.9
-        scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=poly_lr_lambda)
+        scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer,
+            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
+        )
     else:
         print(f"Cosine Annealing LR")
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
@@ -1103,9 +1179,9 @@ def main():
         reset_epoch = (args.resume_mode == "transfer")
         trainer.load_checkpoint(
             args.resume,
-            reset_epoch=reset_epoch,
+            reset_epoch=True,
             load_optimizer=False,
-            reset_best_metric=args.reset_best_metric,
+            reset_best_metric=True,
         )
     
     # Training loop
@@ -1127,49 +1203,75 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
-        # Phase 1: Freeze backbone
-        if epoch < args.freeze_epochs:
-            freeze_backbone(model)
-            trainer.set_loss_phase('full')
-
-        # Phase 2+: Progressive unfreezing
+        past_epochs = [e for e in unfreeze_epochs if e <= epoch]
+        k = len(past_epochs)
+        
+        targets = []
+        
+        # Ã°Å¸â€â€œ cumulative unfreeze 6 Ã¢â€ â€™ 5 Ã¢â€ â€™ 4
+        if k >= 1:
+            targets += ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa6']
+        if k >= 2:
+            targets += ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
+        if k >= 3:
+            targets += ['semantic_branch_layers.0', 'detail_branch_layers.0', 'dwsa4']
+        if k >= 4:
+            targets += ['stem']
+        
+        # Ã°Å¸â€Â¥ LUÃƒâ€N Ã„â€˜Ã¡ÂºÂ£m bÃ¡ÂºÂ£o stage Ã„â€˜ÃƒÂºng trÃ¡ÂºÂ¡ng thÃƒÂ¡i
+        if targets:
+            unfreeze_backbone_progressive(model, targets)
+        
+        # Ã°Å¸â€Â CHÃ¡Â»Ë† rebuild optimizer khi Ã„â€˜ÃƒÂºng mÃ¡Â»â€˜c unfreeze
         if epoch in unfreeze_epochs:
-            k = len([e for e in unfreeze_epochs if e <= epoch])
-
-            if k == 1:
-                targets = ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa6']
-            elif k == 2:
-                targets = ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa5']
-            elif k == 3:
-                targets = ['semantic_branch_layers.0', 'detail_branch_layers.0', 'stem']
+        
+            trainer.set_loss_phase('full')
+        
+            if args.use_discriminative_lr:
+                optimizer = setup_discriminative_lr(
+                    model,
+                    base_lr=args.lr,
+                    backbone_lr_factor=args.backbone_lr_factor,
+                    weight_decay=args.weight_decay,
+                    alpha_lr_factor=args.alpha_lr_factor
+                )
             else:
-                targets = []
-
-            if targets:
-                unfreeze_backbone_progressive(model, targets)
-                trainer.set_loss_phase('ce_only')
-                if args.use_discriminative_lr:
-                    optimizer = setup_discriminative_lr(
-                        model,
-                        base_lr=args.lr,
-                        backbone_lr_factor=args.backbone_lr_factor,
-                        weight_decay=args.weight_decay
-                    )
-                else:
-                    optimizer = optim.AdamW(
-                        [p for p in model.parameters() if p.requires_grad],
-                        lr=args.lr,
-                        weight_decay=args.weight_decay
-                    )
-            
-                trainer.optimizer = optimizer
-                print(f"\n{'='*70}")
-                print(f"Learning Rates after unfreezing:")
-                print(f"{'='*70}")
-                for i, group in enumerate(optimizer.param_groups):
-                    name = group.get('name', f'group_{i}')
-                    print(f"   {name}: {group['lr']:.2e}")
-                print(f"{'='*70}\n")
+                head_params = []
+                backbone_params = []
+                alpha_params = []
+        
+                for n, p in model.named_parameters():
+                    if not p.requires_grad:
+                        continue
+                    if 'alpha' in n:
+                        alpha_params.append(p)
+                    elif 'backbone' in n:
+                        backbone_params.append(p)
+                    else:
+                        head_params.append(p)
+        
+                groups = []
+                if head_params:
+                    groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
+                if backbone_params:
+                    groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+                if alpha_params:
+                    groups.append({'params': alpha_params, 'lr': args.lr * args.alpha_lr_factor, 'name': 'alpha'})
+        
+                optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+        
+                for g in optimizer.param_groups:
+                    g.setdefault('initial_lr', g['lr'])
+        
+            trainer.optimizer = optimizer
+            trainer.scheduler  = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
+            print("\n" + "="*70)
+            print("Learning Rates after unfreezing:")
+            print("="*70)
+            for i, group in enumerate(optimizer.param_groups):
+                name = group.get('name', f'group_{i}')
+                print(f"   {name}: {group['lr']:.2e}")
+            print("="*70 + "\n")
 
         # Switch back to full loss
         if unfreeze_epochs:
