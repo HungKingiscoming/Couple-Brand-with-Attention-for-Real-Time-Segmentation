@@ -26,6 +26,7 @@ class LiteGatedFusion(nn.Module):
     """Giảm số lượng Conv từ 2 xuống 1 để tăng tốc độ xử lý gate"""
     def __init__(self, channels: int):
         super().__init__()
+        _, norm_layer = build_norm_layer(norm_cfg, channels)
         self.gate_conv = nn.Sequential(
             nn.Conv2d(channels * 2, channels, kernel_size=1),
             nn.BatchNorm2d(channels),
