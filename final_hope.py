@@ -162,11 +162,21 @@ def load_checkpoint(ckpt_path: str, num_classes: int, device: str,
     status = 'ON' if (is_deployed or deploy) else 'OFF'
     print(f"  Loaded OK  (deploy={status})")
 
-    # torch.compile nếu có (PyTorch >= 2.0)
-    if hasattr(torch, 'compile'):
-        print("  Compiling model (lần đầu ~30s, từ lần 2 nhanh hơn 15-25%)...")
-        model = torch.compile(model, mode='reduce-overhead')
-        print("  torch.compile enabled")
+    # torch.compile chỉ hỗ trợ CUDA Capability >= 7.0 (Volta+)
+    # P100=6.0, T4=7.5, A100=8.0, ...
+    if hasattr(torch, 'compile') and device == 'cuda' and torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        gpu_name = torch.cuda.get_device_name()
+        if major >= 7:
+            try:
+                print(f"  Compiling model on {gpu_name} (sm_{major}{minor})...")
+                model = torch.compile(model, mode='reduce-overhead')
+                print("  torch.compile enabled (+15-25% speed)")
+            except Exception as e:
+                print(f"  torch.compile failed ({e}), skipping.")
+        else:
+            print(f"  torch.compile skipped: {gpu_name} is sm_{major}{minor} "
+                  f"(requires sm_70+, i.e. Volta/Turing/Ampere)")
 
     return model
 
