@@ -3,6 +3,23 @@ Evaluation Script: Normal / Flip-TTA / Full-TTA + Speed Benchmark
 - Normal    : 1 forward pass  (~60 FPS)
 - Flip-TTA  : 2 forward passes (~30 FPS, borderline realtime)
 - Full-TTA  : 6 forward passes (~10 FPS, offline only)
+
+Model config (channels=32):
+  backbone  : GCNetWithEnhance
+    - stem          : [ConvModule x2] + [GCBlock x4 @32ch] + [GCBlock stride2 32→64] + [GCBlock x3 @64ch]
+    - semantic      : 3 stages → 128 / 256 / 512 ch
+    - detail        : 3 stages → 64 / 64 / 128 ch
+    - dwsa4/5/6     : DWSABlock on C*4=128 / C*8=256 / C*16=512
+    - ms_context    : MultiScaleContextModule, C*4=128, branch_ratio=8
+    - final_proj    : 128→128
+    - c5 output     : 128 ch  (x_d6 + x_spp)
+  decode_head: GCNetHead
+    - c5=128, c2=32 (stem[1]), c1=32 (stem[0])
+    - decoder_channels=128  →  output 64ch
+    - num_classes=19
+  aux_head   : GCNetAuxHead
+    - in_channels=64 (c4 = detail_branch stage0 output = C*2 = 64)
+    - channels=96, num_classes=19
 """
 import os
 import time
@@ -25,45 +42,164 @@ from data.custom import create_dataloaders
 
 # ============================================================
 # SEGMENTOR
+# Wraps backbone + decode_head + aux_head thành một module.
+# Key mapping trong checkpoint:
+#   backbone.*      → self.backbone
+#   decode_head.*   → self.decode_head
+#   aux_head.*      → self.aux_head
 # ============================================================
 class Segmentor(nn.Module):
-    def __init__(self, backbone, head, aux_head=None):
+    def __init__(self, backbone: nn.Module, head: nn.Module, aux_head: nn.Module = None):
         super().__init__()
-        self.backbone = backbone
+        self.backbone   = backbone
         self.decode_head = head
-        self.aux_head = aux_head
+        self.aux_head   = aux_head
 
-    def forward(self, x):
-        feats = self.backbone(x)
-        return self.decode_head(feats)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        feats = self.backbone(x)          # dict: c1, c2, c4, c5
+        return self.decode_head(feats)    # logits
+
+
+# ============================================================
+# BUILD MODEL
+# Tất cả hyper-params khớp với weight đã lưu.
+# ============================================================
+def build_model(num_classes: int = 19, device: str = 'cuda', deploy: bool = False) -> Segmentor:
+    """
+    channels=32  →  C*4=128 (c5), C*2=64 (c4/aux), C=32 (c1,c2)
+    ms_branch_ratio=8  →  total_branch=128//8=16, per_branch=[8,8] → fused=16
+    """
+    backbone = GCNetWithEnhance(
+        in_channels=3,
+        channels=32,
+        ppm_channels=128,
+        num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
+        dwsa_stages=['stage4', 'stage5', 'stage6'],
+        dwsa_num_heads=4,
+        dwsa_reduction=4,
+        dwsa_qk_sharing=True,
+        dwsa_groups=4,
+        dwsa_drop=0.1,
+        dwsa_alpha=0.1,
+        use_multi_scale_context=True,
+        ms_scales=(1, 2),
+        ms_branch_ratio=8,          # ← 128//8=16 total branch ch, khớp weight
+        ms_alpha=0.1,
+        align_corners=False,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        act_cfg=dict(type='ReLU', inplace=True),
+        deploy=deploy,
+    )
+
+    head = GCNetHead(
+        in_channels=128,            # c5 = C*4
+        c2_channels=32,             # stem[1] output = C
+        c1_channels=32,             # stem[0] output = C
+        decoder_channels=128,
+        num_classes=num_classes,
+        dropout_ratio=0.1,
+        use_gated_fusion=True,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        act_cfg=dict(type='ReLU', inplace=False),
+        align_corners=False,
+    )
+
+    aux_head = GCNetAuxHead(
+        in_channels=64,             # c4 = detail_branch[0] output = C*2
+        channels=96,
+        num_classes=num_classes,
+        dropout_ratio=0.1,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        act_cfg=dict(type='ReLU', inplace=False),
+        align_corners=False,
+    )
+
+    model = Segmentor(backbone, head, aux_head)
+    return model.to(device)
+
+
+# ============================================================
+# LOAD CHECKPOINT
+# ============================================================
+def load_checkpoint(ckpt_path: str, num_classes: int, device: str,
+                    deploy: bool = False) -> Segmentor:
+    print(f"Loading: {ckpt_path}")
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Hỗ trợ nhiều định dạng checkpoint
+    if isinstance(ckpt, dict):
+        state = ckpt.get('model', ckpt.get('state_dict', ckpt))
+    else:
+        state = ckpt
+
+    # Kiểm tra xem checkpoint đã ở deploy mode chưa
+    is_deployed = any('reparam_3x3' in k for k in state.keys())
+
+    model = build_model(num_classes, device, deploy=is_deployed)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    if missing:
+        print(f"  Missing   : {len(missing)} keys")
+        for k in missing[:5]:
+            print(f"    - {k}")
+        if len(missing) > 5:
+            print(f"    ... (+{len(missing)-5} more)")
+
+    if unexpected:
+        print(f"  Unexpected: {len(unexpected)} keys")
+        for k in unexpected[:5]:
+            print(f"    - {k}")
+        if len(unexpected) > 5:
+            print(f"    ... (+{len(unexpected)-5} more)")
+
+    # Chuyển sang deploy mode nếu cần
+    if not is_deployed and deploy:
+        for m in model.modules():
+            if hasattr(m, 'switch_to_deploy'):
+                m.switch_to_deploy()
+        print("  Converted to deploy mode")
+
+    status = 'ON' if (is_deployed or deploy) else 'OFF'
+    print(f"  Loaded OK  (deploy={status})")
+
+    # torch.compile nếu có (PyTorch >= 2.0)
+    if hasattr(torch, 'compile'):
+        print("  Compiling model (lần đầu ~30s, từ lần 2 nhanh hơn 15-25%)...")
+        model = torch.compile(model, mode='reduce-overhead')
+        print("  torch.compile enabled")
+
+    return model
 
 
 # ============================================================
 # SPEED BENCHMARK
 # ============================================================
-def measure_speed(model, input_size=(1, 3, 512, 1024),
-                  num_warmup=20, num_iterations=200,
-                  device='cuda', mode='normal'):
+def measure_speed(model: nn.Module,
+                  input_size: tuple = (1, 3, 512, 1024),
+                  num_warmup: int = 20,
+                  num_iterations: int = 200,
+                  device: str = 'cuda',
+                  mode: str = 'normal') -> dict:
     """
-    Do FPS va latency cho 3 mode inference:
+    Đo FPS và latency cho 3 chế độ inference:
       normal   : 1 forward pass
       flip_tta : 2 forward passes (original + hflip)
-      full_tta : 6 forward passes (original + hflip + scale0.75x2 + scale1.25x2)
+      full_tta : 6 forward passes (original + hflip + scale×0.75×2 + scale×1.25×2)
     """
     model.eval()
     dummy = torch.randn(input_size).to(device)
     H, W = input_size[2], input_size[3]
 
-    def run_once(img):
+    def run_once(img: torch.Tensor) -> torch.Tensor:
         if mode == 'normal':
             out = model(img)
-            out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
-            return out
+            return F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
 
         elif mode == 'flip_tta':
             out = model(img)
             out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
             prob = F.softmax(out, dim=1)
+
             img_f = torch.flip(img, dims=[3])
             out_f = model(img_f)
             out_f = F.interpolate(out_f, size=(H, W), mode='bilinear', align_corners=False)
@@ -80,6 +216,7 @@ def measure_speed(model, input_size=(1, 3, 512, 1024),
                 if flip:
                     out = torch.flip(out, dims=[3])
                 preds.append(F.softmax(out, dim=1))
+
             for scale in [0.75, 1.25]:
                 h2, w2 = int(H * scale), int(W * scale)
                 for flip in [False, True]:
@@ -113,18 +250,21 @@ def measure_speed(model, input_size=(1, 3, 512, 1024),
                 torch.cuda.synchronize()
             times.append(time.perf_counter() - t0)
 
-    times = np.array(times)
-    passes = {'normal': 1, 'flip_tta': 2, 'full_tta': 6}[mode]
+    times_arr = np.array(times)
+    passes_map = {'normal': 1, 'flip_tta': 2, 'full_tta': 6}
+    fps = 1.0 / times_arr.mean()
     return {
-        'fps': 1.0 / times.mean(),
-        'latency_ms': times.mean() * 1000,
-        'latency_std_ms': times.std() * 1000,
-        'forward_passes': passes,
-        'realtime': (1.0 / times.mean()) >= 30,
+        'fps':             fps,
+        'latency_ms':      times_arr.mean() * 1000,
+        'latency_std_ms':  times_arr.std()  * 1000,
+        'forward_passes':  passes_map[mode],
+        'realtime':        fps >= 30.0,
     }
 
 
-def calculate_flops(model, input_size=(1, 3, 512, 1024), device='cuda'):
+def calculate_flops(model: nn.Module,
+                    input_size: tuple = (1, 3, 512, 1024),
+                    device: str = 'cuda') -> dict:
     try:
         from thop import profile, clever_format
         model.eval()
@@ -134,88 +274,95 @@ def calculate_flops(model, input_size=(1, 3, 512, 1024), device='cuda'):
         gflops, pstr = clever_format([flops, params], "%.3f")
         return {'gflops': gflops, 'gflops_raw': flops / 1e9, 'params': pstr}
     except ImportError:
-        return {'gflops': '~4.85G (est)', 'gflops_raw': 4.85,
-                'params': '~21M (est)', 'note': 'pip install thop for exact values'}
+        return {
+            'gflops': '~4.85G (est)',
+            'gflops_raw': 4.85,
+            'params': '~21M (est)',
+            'note': 'pip install thop để có số chính xác',
+        }
 
 
 # ============================================================
 # METRICS
 # ============================================================
 class MetricsCalculator:
-    def __init__(self, num_classes):
+    def __init__(self, num_classes: int):
         self.num_classes = num_classes
         self.reset()
 
     def reset(self):
         self.cm = np.zeros((self.num_classes, self.num_classes), dtype=np.int64)
 
-    def update(self, pred, target):
-        mask = (target >= 0) & (target < self.num_classes)
+    def update(self, pred: np.ndarray, target: np.ndarray):
+        mask  = (target >= 0) & (target < self.num_classes)
         label = self.num_classes * target[mask].astype(int) + pred[mask]
         count = np.bincount(label, minlength=self.num_classes ** 2)
         self.cm += count.reshape(self.num_classes, self.num_classes)
 
-    def get(self):
+    def get(self) -> dict:
         inter = np.diag(self.cm)
         union = self.cm.sum(1) + self.cm.sum(0) - inter
-        iou = inter / (union + 1e-10)
+        iou   = inter / (union + 1e-10)
         valid = union > 0
-        dice = 2 * inter / (self.cm.sum(0) + self.cm.sum(1) + 1e-10)
+        dice  = 2 * inter / (self.cm.sum(0) + self.cm.sum(1) + 1e-10)
         return {
-            'miou': np.mean(iou[valid]),
-            'accuracy': inter.sum() / (self.cm.sum() + 1e-10),
-            'dice': np.mean(dice[valid]),
-            'per_class_iou': iou,
+            'miou':           np.mean(iou[valid]),
+            'accuracy':       inter.sum() / (self.cm.sum() + 1e-10),
+            'dice':           np.mean(dice[valid]),
+            'per_class_iou':  iou,
             'per_class_dice': dice,
         }
 
 
 # ============================================================
-# INFERENCE
+# INFERENCE / EVAL LOOP
 # ============================================================
 @torch.no_grad()
-def run_eval(model, dataloader, num_classes, device, mode):
+def run_eval(model: nn.Module, dataloader, num_classes: int,
+             device: str, mode: str) -> dict:
     model.eval()
     calc = MetricsCalculator(num_classes)
     mode_label = {
-        'normal': 'Normal (1 pass)',
+        'normal':   'Normal (1 pass)',
         'flip_tta': 'Flip-TTA (2 passes)',
         'full_tta': 'Full-TTA (6 passes)',
     }
     pbar = tqdm(dataloader, desc=f"Eval [{mode_label[mode]}]")
 
     for imgs, masks in pbar:
-        imgs = imgs.to(device, non_blocking=True)
+        imgs  = imgs.to(device, non_blocking=True)
         masks = masks.cpu().numpy()
         if masks.ndim == 4:
             masks = masks.squeeze(1)
         H, W = masks.shape[-2:]
 
         if mode == 'normal':
-            out = model(imgs)
-            out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+            out  = model(imgs)
+            out  = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
             pred = out.argmax(1).cpu().numpy()
 
         elif mode == 'flip_tta':
-            out = model(imgs)
-            out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
+            out  = model(imgs)
+            out  = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
             prob = F.softmax(out, dim=1)
+
             imgs_f = torch.flip(imgs, dims=[3])
-            out_f = model(imgs_f)
-            out_f = F.interpolate(out_f, size=(H, W), mode='bilinear', align_corners=False)
-            out_f = torch.flip(out_f, dims=[3])
+            out_f  = model(imgs_f)
+            out_f  = F.interpolate(out_f, size=(H, W), mode='bilinear', align_corners=False)
+            out_f  = torch.flip(out_f, dims=[3])
             prob_f = F.softmax(out_f, dim=1)
-            pred = ((prob + prob_f) / 2).argmax(1).cpu().numpy()
+            pred   = ((prob + prob_f) / 2).argmax(1).cpu().numpy()
 
         elif mode == 'full_tta':
             preds = []
             for flip in [False, True]:
-                x = torch.flip(imgs, dims=[3]) if flip else imgs
+                x   = torch.flip(imgs, dims=[3]) if flip else imgs
                 out = model(x)
                 out = F.interpolate(out, size=(H, W), mode='bilinear', align_corners=False)
                 if flip:
                     out = torch.flip(out, dims=[3])
                 preds.append(F.softmax(out, dim=1))
+
             for scale in [0.75, 1.25]:
                 h2, w2 = int(H * scale), int(W * scale)
                 for flip in [False, True]:
@@ -231,67 +378,11 @@ def run_eval(model, dataloader, num_classes, device, mode):
 
         for i in range(pred.shape[0]):
             calc.update(pred[i], masks[i])
+
         m = calc.get()
         pbar.set_postfix({'mIoU': f"{m['miou']:.4f}"})
 
     return calc.get()
-
-
-# ============================================================
-# MODEL
-# ============================================================
-def build_model(num_classes=19, device='cuda', deploy=False):
-    backbone = GCNetWithEnhance(
-        in_channels=3, channels=32, ppm_channels=128,
-        num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
-        dwsa_stages=['stage4', 'stage5', 'stage6'],
-        dwsa_num_heads=4, dwsa_reduction=4, dwsa_qk_sharing=True,
-        dwsa_groups=4, dwsa_drop=0.1, dwsa_alpha=0.1,
-        use_multi_scale_context=True, ms_scales=(1, 2),
-        ms_branch_ratio=16, ms_alpha=0.1,
-        align_corners=False, deploy=deploy,
-    ).to(device)
-
-    head = GCNetHead(
-        in_channels=128, c2_channels=32, c1_channels=32,
-        decoder_channels=128, num_classes=num_classes, dropout_ratio=0.1,
-        use_gated_fusion=True, 
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU', inplace=False), align_corners=False,
-    )
-    aux_head = GCNetAuxHead(
-        in_channels=64,  num_classes=num_classes,
-        dropout_ratio=0.1,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU', inplace=False), align_corners=False,
-    )
-    return Segmentor(backbone, head, aux_head).to(device)
-
-
-def load_checkpoint(ckpt_path, num_classes, device, deploy=False):
-    print(f"Loading: {ckpt_path}")
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    state = ckpt.get('model', ckpt.get('state_dict', ckpt))
-    is_deployed = any('reparam_3x3' in k for k in state.keys())
-    model = build_model(num_classes, device, deploy=is_deployed)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-    if missing:
-        print(f"  Missing: {len(missing)} keys (e.g. aux_h4/h2 — OK if new)")
-    if unexpected:
-        print(f"  Unexpected: {len(unexpected)} keys")
-    if not is_deployed and deploy:
-        count = sum(1 for m in model.modules() if hasattr(m, 'switch_to_deploy')
-                    and m.switch_to_deploy() is not None or hasattr(m, 'switch_to_deploy'))
-        for m in model.modules():
-            if hasattr(m, 'switch_to_deploy'):
-                m.switch_to_deploy()
-        print(f"  Converted to deploy mode")
-    print(f"  OK (deploy={'ON' if (is_deployed or deploy) else 'OFF'})")
-    if hasattr(torch, 'compile'):
-        print("  Compiling model (lần đầu chậm ~30s, từ lần 2 nhanh hơn 15-25%)...")
-        model = torch.compile(model, mode='reduce-overhead')
-        print("  torch.compile enabled")
-    return model
 
 
 # ============================================================
@@ -300,11 +391,11 @@ def load_checkpoint(ckpt_path, num_classes, device, deploy=False):
 CLASS_NAMES = [
     'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
     'traffic light', 'traffic sign', 'vegetation', 'terrain', 'sky',
-    'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
+    'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle',
 ]
 
 
-def print_per_class(metrics, title):
+def print_per_class(metrics: dict, title: str):
     print(f"\n{'='*68}")
     print(f"  {title}")
     print(f"{'='*68}")
@@ -315,7 +406,7 @@ def print_per_class(metrics, title):
     print(f"  {'Class':<16} {'IoU':>8}  {'Dice':>8}  {'Note'}")
     print(f"  {'─'*60}")
     for i, name in enumerate(CLASS_NAMES):
-        iou = metrics['per_class_iou'][i]
+        iou  = metrics['per_class_iou'][i]
         dice = metrics['per_class_dice'][i]
         note = " ← LOW" if iou < 0.50 else (" ← MID" if iou < 0.65 else "")
         print(f"  {name:<16} {iou*100:>7.2f}%  {dice*100:>7.2f}%  {note}")
@@ -326,25 +417,32 @@ def print_per_class(metrics, title):
 # MAIN
 # ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="Eval + Speed: Normal / Flip-TTA / Full-TTA")
-    parser.add_argument("--checkpoint", required=True)
-    parser.add_argument("--val_txt", required=True)
-    parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
-    parser.add_argument("--num_classes", type=int, default=19)
-    parser.add_argument("--ignore_index", type=int, default=255)
-    parser.add_argument("--batch_size", type=int, default=8)
-    parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--img_h", type=int, default=512)
-    parser.add_argument("--img_w", type=int, default=1024)
-    parser.add_argument("--deploy", action="store_true")
-    parser.add_argument("--modes", nargs='+',
+    parser = argparse.ArgumentParser(
+        description="Eval + Speed: Normal / Flip-TTA / Full-TTA"
+    )
+    parser.add_argument("--checkpoint",      required=True,
+                        help="Path to .pth checkpoint file")
+    parser.add_argument("--val_txt",         required=True,
+                        help="Text file listing validation images")
+    parser.add_argument("--dataset_type",    default="foggy",
+                        choices=["normal", "foggy"])
+    parser.add_argument("--num_classes",     type=int,   default=19)
+    parser.add_argument("--ignore_index",    type=int,   default=255)
+    parser.add_argument("--batch_size",      type=int,   default=8)
+    parser.add_argument("--num_workers",     type=int,   default=4)
+    parser.add_argument("--img_h",           type=int,   default=512)
+    parser.add_argument("--img_w",           type=int,   default=1024)
+    parser.add_argument("--deploy",          action="store_true",
+                        help="Fuse BN into conv (faster inference)")
+    parser.add_argument("--modes",           nargs='+',
                         default=['normal', 'flip_tta', 'full_tta'],
                         choices=['normal', 'flip_tta', 'full_tta'])
-    parser.add_argument("--num_warmup", type=int, default=20)
-    parser.add_argument("--num_speed_iters", type=int, default=200)
-    parser.add_argument("--skip_eval", action="store_true",
+    parser.add_argument("--num_warmup",      type=int,   default=20)
+    parser.add_argument("--num_speed_iters", type=int,   default=200)
+    parser.add_argument("--skip_eval",       action="store_true",
                         help="Only run speed benchmark, skip accuracy eval")
-    parser.add_argument("--save_results", type=str, default=None)
+    parser.add_argument("--save_results",    type=str,   default=None,
+                        help="Optional path to save JSON results")
     args = parser.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -354,26 +452,26 @@ def main():
     print(f"{'='*68}")
     print(f"  Checkpoint : {args.checkpoint}")
     print(f"  Val data   : {args.val_txt} ({args.dataset_type})")
-    print(f"  Image size : {args.img_h}x{args.img_w}")
+    print(f"  Image size : {args.img_h}×{args.img_w}")
+    print(f"  Device     : {device}")
     print(f"  Deploy     : {'ON' if args.deploy else 'OFF'}")
     print(f"  Modes      : {args.modes}")
     print(f"{'='*68}\n")
 
-    # Load
+    # ── Load model ───────────────────────────────────────────────────
     model = load_checkpoint(args.checkpoint, args.num_classes, device, args.deploy)
     model.eval()
 
-    # Stats
     total = sum(p.numel() for p in model.parameters())
-    print(f"\nParameters: {total/1e6:.2f}M")
+    print(f"\nParameters : {total/1e6:.2f}M")
     perf = calculate_flops(model, (1, 3, args.img_h, args.img_w), device)
-    print(f"GFLOPs    : {perf['gflops']}")
+    print(f"GFLOPs     : {perf['gflops']}")
     if 'note' in perf:
         print(f"  ({perf['note']})")
 
-    # ── SPEED BENCHMARK ──────────────────────────────────────────────
+    # ── Speed benchmark ───────────────────────────────────────────────
     print(f"\n{'='*68}")
-    print("  SPEED BENCHMARK  (batch=1, single image, 512x1024)")
+    print("  SPEED BENCHMARK  (batch=1, 512×1024)")
     print(f"{'='*68}")
     print(f"  {'Mode':<20} {'FPS':>8}  {'Latency':>14}  {'Passes':>7}  {'Realtime'}")
     print(f"  {'─'*65}")
@@ -395,7 +493,7 @@ def main():
               f"{s['forward_passes']:>5}x  {rt}")
     print(f"{'='*68}")
 
-    # ── ACCURACY EVALUATION ──────────────────────────────────────────
+    # ── Accuracy evaluation ───────────────────────────────────────────
     all_metrics = {}
     if not args.skip_eval:
         print(f"\n{'='*68}")
@@ -424,35 +522,43 @@ def main():
             all_metrics[mode] = metrics
             print_per_class(metrics, mode_titles[mode])
 
-    # ── FINAL SUMMARY ────────────────────────────────────────────────
+    # ── Final summary ─────────────────────────────────────────────────
     print(f"\n{'='*68}")
     print("  SUMMARY")
     print(f"{'='*68}")
     print(f"  {'Mode':<20} {'mIoU':>8}  {'FPS':>8}  {'Realtime':>10}  {'Passes'}")
     print(f"  {'─'*65}")
     for mode in args.modes:
-        s = speed_results[mode]
+        s        = speed_results[mode]
         miou_str = f"{all_metrics[mode]['miou']*100:.2f}%" if mode in all_metrics else "  N/A  "
-        rt = "YES" if s['realtime'] else "NO"
+        rt       = "YES" if s['realtime'] else "NO"
         print(f"  {mode:<20} {miou_str:>8}  {s['fps']:>7.1f}  {rt:>10}  {s['forward_passes']}x")
     print(f"{'='*68}\n")
 
-    # Save
+    # ── Save JSON ─────────────────────────────────────────────────────
     if args.save_results:
         out = {
             'checkpoint': args.checkpoint,
-            'deploy': args.deploy,
-            'speed': {k: {kk: float(vv) for kk, vv in v.items() if isinstance(vv, (int, float))}
-                      for k, v in speed_results.items()},
+            'deploy':     args.deploy,
+            'image_size': f"{args.img_h}x{args.img_w}",
+            'speed': {
+                k: {kk: float(vv)
+                    for kk, vv in v.items()
+                    if isinstance(vv, (int, float, bool))}
+                for k, v in speed_results.items()
+            },
             'accuracy': {
                 mode: {
-                    'miou': float(all_metrics[mode]['miou']),
-                    'accuracy': float(all_metrics[mode]['accuracy']),
-                    'per_class_iou': {CLASS_NAMES[i]: float(all_metrics[mode]['per_class_iou'][i])
-                                      for i in range(args.num_classes)}
+                    'miou':          float(all_metrics[mode]['miou']),
+                    'accuracy':      float(all_metrics[mode]['accuracy']),
+                    'dice':          float(all_metrics[mode]['dice']),
+                    'per_class_iou': {
+                        CLASS_NAMES[i]: float(all_metrics[mode]['per_class_iou'][i])
+                        for i in range(args.num_classes)
+                    },
                 }
                 for mode in args.modes if mode in all_metrics
-            }
+            },
         }
         Path(args.save_results).parent.mkdir(parents=True, exist_ok=True)
         with open(args.save_results, 'w') as f:
