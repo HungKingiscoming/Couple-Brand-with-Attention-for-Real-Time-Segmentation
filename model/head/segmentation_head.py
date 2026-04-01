@@ -242,13 +242,19 @@ class GCNetHead(nn.Module):
         )
 
     def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
+        # 1. Trích xuất đầy đủ 4 tầng đặc trưng
         if isinstance(inputs, dict):
             c1 = inputs['c1']
             c2 = inputs['c2']
+            c4 = inputs['c4'] # Thêm c4
             c5 = inputs['c5']
         else:
-            c1, c2, c5 = inputs[0], inputs[1], inputs[2]
+            # Nếu đầu vào là list/tuple, hãy đảm bảo thứ tự truyền vào khớp với backbone
+            c1, c2, c4, c5 = inputs[0], inputs[1], inputs[2], inputs[3]
 
-        x = self.decoder(c5, c2, c1)
+        # 2. Truyền ĐỦ 4 tham số vào decoder (theo đúng thứ tự khai báo của EnhancedDecoder)
+        # Thứ tự thường là: c5 (sâu nhất) -> c4 -> c2 -> c1 (nông nhất)
+        x = self.decoder(c5, c4, c2, c1) 
+        
         x = self.conv_seg(x)
         return x
