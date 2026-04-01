@@ -19,7 +19,7 @@ from components.components import (
 
 
 # ===========================
-# GCBlock classes (giá»¯ nguyÃªn tá»« code gá»‘c)
+# Block1x1
 # ===========================
 
 class Block1x1(BaseModule):
@@ -97,6 +97,10 @@ class Block1x1(BaseModule):
         self.deploy = True
 
 
+# ===========================
+# Block3x3
+# ===========================
+
 class Block3x3(BaseModule):
     def __init__(self,
                  in_channels: int,
@@ -173,6 +177,10 @@ class Block3x3(BaseModule):
         self.deploy = True
 
 
+# ===========================
+# GCBlock
+# ===========================
+
 class GCBlock(nn.Module):
     def __init__(self,
                  in_channels: int,
@@ -196,7 +204,7 @@ class GCBlock(nn.Module):
         assert kernel_size == 3
         assert padding == 1
 
-        padding_11 = padding - kernel_size // 2
+        padding_11 = padding - kernel_size // 2  # = 0
 
         if act:
             self.relu = build_activation_layer(act_cfg)
@@ -213,6 +221,7 @@ class GCBlock(nn.Module):
                 bias=True,
                 padding_mode=padding_mode)
         else:
+            # path_residual only when in_channels == out_channels and stride == 1
             if (out_channels == in_channels) and stride == 1:
                 self.path_residual = build_norm_layer(norm_cfg, num_features=in_channels)[1]
             else:
@@ -340,11 +349,11 @@ class GCBlock(nn.Module):
 
 
 # ===========================
-# FIXED DWSA + MultiScale
+# Helper
 # ===========================
 
 def _get_valid_groups(channels, desired_groups):
-    """TÃ¬m sá»‘ group lá»›n nháº¥t chia háº¿t cho channels."""
+    """Find largest group count that divides channels evenly."""
     if desired_groups <= 1:
         return 1
     g = min(desired_groups, channels)
@@ -355,9 +364,19 @@ def _get_valid_groups(channels, desired_groups):
     return 1
 
 
+# ===========================
+# DWSABlock
+# Weight keys produced:
+#   alpha, ln.weight, ln.bias,
+#   in_proj.weight, out_proj.weight,
+#   qk_base.weight, q_head.weight, q_head.bias,
+#   k_head.weight, k_head.bias,
+#   v_proj.weight, v_proj.bias,
+#   o_proj.weight, o_proj.bias
+# ===========================
+
 class DWSABlock(nn.Module):
-    """FIXED VERSION vá»›i stability improvements"""
-    def __init__(self, channels, num_heads=2, drop=0.0, reduction=4, 
+    def __init__(self, channels, num_heads=4, drop=0.0, reduction=4,
                  qk_sharing=True, groups=4, alpha=0.1):
         super().__init__()
         assert channels % reduction == 0
@@ -369,18 +388,12 @@ class DWSABlock(nn.Module):
         self.reduced = reduced
         self.mid = mid
 
-        # FIX 1: Layer Norm cho stability
         self.ln = nn.LayerNorm(channels)
-        
+
         self.in_proj = nn.Conv2d(channels, reduced, kernel_size=1, bias=False)
         self.out_proj = nn.Conv2d(reduced, channels, kernel_size=1, bias=False)
 
         g = _get_valid_groups(reduced, groups)
-        if g != groups:
-            import warnings
-            warnings.warn(
-                f"DWSABlock: adjusted groups from {groups} to {g} for channels={reduced}"
-            )
 
         self.qk_sharing = qk_sharing
         if qk_sharing:
@@ -395,21 +408,18 @@ class DWSABlock(nn.Module):
         self.o_proj = nn.Conv1d(mid, reduced, kernel_size=1, groups=g, bias=True)
 
         self.drop = nn.Dropout(drop)
-        
-        # FIX 2: Improved scaling
+
         head_dim = mid // num_heads
         self.scale = head_dim ** -0.5
-        
-        # FIX 3: Learnable alpha (khá»Ÿi táº¡o nhá»)
+
         self.alpha = nn.Parameter(torch.tensor(alpha))
 
     def forward(self, x):
         B, C, H, W = x.shape
         identity = x
 
-        # FIX 4: Layer norm TRÆ¯á»šC process
         x_ln = self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        
+
         x_red = self.in_proj(x_ln)
         B, C2, H, W = x_red.shape
         N = H * W
@@ -434,9 +444,8 @@ class DWSABlock(nn.Module):
         k = split_heads(k).permute(0, 1, 3, 2)
         v = split_heads(v).permute(0, 1, 3, 2)
 
-        # FIX 5: Clamp attention scores
         attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
-        attn = attn.clamp(-10, 10)  # Prevent overflow
+        attn = attn.clamp(-10, 10)
         attn = F.softmax(attn, dim=-1)
         attn = self.drop(attn)
 
@@ -449,13 +458,24 @@ class DWSABlock(nn.Module):
         out = out.view(B, C2, H, W)
         out = self.out_proj(out)
 
-        # FIX 6: Scaled residual
         return identity + self.alpha * out
 
 
+# ===========================
+# MultiScaleContextModule
+# Weight keys produced:
+#   alpha,
+#   scale_branches.0.0.weight, scale_branches.0.1.{weight,bias,running_mean,running_var,...}
+#   scale_branches.1.1.weight, scale_branches.1.2.{weight,bias,running_mean,running_var,...}
+#   fusion.0.weight, fusion.1.{weight,...}, fusion.3.weight, fusion.4.{weight,...}
+#
+# scale_branches.0 → scale==1: Sequential(Conv2d[0], BN[1], ReLU[2])
+# scale_branches.1 → scale==2: Sequential(AvgPool2d[0], Conv2d[1], BN[2], ReLU[3])
+# fusion: Sequential(DWConv[0], BN[1], ReLU[2], Conv1x1[3], BN[4])
+# ===========================
+
 class MultiScaleContextModule(nn.Module):
-    """FIXED VERSION vá»›i BatchNorm"""
-    def __init__(self, in_channels, out_channels, scales=(1, 2), 
+    def __init__(self, in_channels, out_channels, scales=(1, 2),
                  branch_ratio=8, alpha=0.1):
         super().__init__()
         self.scales = scales
@@ -472,51 +492,44 @@ class MultiScaleContextModule(nn.Module):
             per_branch_list.append(max(c, 1))
         fused_channels = sum(per_branch_list)
 
-        # FIX 7: ThÃªm BatchNorm vÃ o táº¥t cáº£ branches
         self.scale_branches = nn.ModuleList()
         for s, c_out in zip(scales, per_branch_list):
             if s == 1:
+                # keys: .0.weight  .1.weight .1.bias .1.running_mean .1.running_var ...
                 self.scale_branches.append(
                     nn.Sequential(
-                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),  # â† THÃŠM
-                        nn.ReLU(inplace=True),
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),  # [0]
+                        nn.BatchNorm2d(c_out),                                      # [1]
+                        nn.ReLU(inplace=True),                                      # [2]
                     )
                 )
             else:
+                # keys: .0 (AvgPool no params)  .1.weight  .2.weight .2.bias ...
                 self.scale_branches.append(
                     nn.Sequential(
-                        nn.AvgPool2d(kernel_size=s, stride=s),
-                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),
-                        nn.BatchNorm2d(c_out),  # â† THÃŠM
-                        nn.ReLU(inplace=True),
+                        nn.AvgPool2d(kernel_size=s, stride=s),                      # [0]
+                        nn.Conv2d(in_channels, c_out, kernel_size=1, bias=False),   # [1]
+                        nn.BatchNorm2d(c_out),                                      # [2]
+                        nn.ReLU(inplace=True),                                      # [3]
                     )
                 )
 
-        # FIX 8: BatchNorm trong fusion
+        # fusion keys: .0.weight  .1.weight .1.bias ...  .3.weight  .4.weight .4.bias ...
         self.fusion = nn.Sequential(
-            nn.Conv2d(
-                fused_channels,
-                fused_channels,
-                kernel_size=3,
-                padding=1,
-                groups=fused_channels,
-                bias=False,
-            ),
-            nn.BatchNorm2d(fused_channels),  # â† THÃŠM
-            nn.ReLU(inplace=True),
-            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),
-            nn.BatchNorm2d(out_channels),  # â† THÃŠM
+            nn.Conv2d(fused_channels, fused_channels, kernel_size=3,
+                      padding=1, groups=fused_channels, bias=False),  # [0] depthwise
+            nn.BatchNorm2d(fused_channels),                           # [1]
+            nn.ReLU(inplace=True),                                    # [2]
+            nn.Conv2d(fused_channels, out_channels, kernel_size=1, bias=False),  # [3]
+            nn.BatchNorm2d(out_channels),                             # [4]
         )
 
-        # FIX 9: Learnable alpha nhá»
         self.alpha = nn.Parameter(torch.tensor(alpha))
-        
-        # FIX 10: BatchNorm cho projection
+
         if in_channels != out_channels:
             self.proj = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False),
-                nn.BatchNorm2d(out_channels),  # â† THÃŠM
+                nn.BatchNorm2d(out_channels),
             )
         else:
             self.proj = None
@@ -538,12 +551,17 @@ class MultiScaleContextModule(nn.Module):
         else:
             x_proj = x
 
-        # Scaled residual
         return x_proj + self.alpha * out
 
 
 # ===========================
-# GCNetCore (giá»¯ nguyÃªn)
+# GCNetCore
+# Stem layout (channels=32):
+#   stem[0]  → ConvModule(3→32, stride=2)        → c1 captured
+#   stem[1]  → ConvModule(32→32, stride=2)       → c2 captured
+#   stem[2~5]→ 4x GCBlock(32→32, stride=1)       (path_residual present)
+#   stem[6]  → GCBlock(32→64, stride=2)           (no path_residual)
+#   stem[7~9]→ 3x GCBlock(64→64, stride=1)        (path_residual present)
 # ===========================
 
 class GCNetCore(BaseModule):
@@ -551,7 +569,7 @@ class GCNetCore(BaseModule):
                  in_channels: int = 3,
                  channels: int = 32,
                  ppm_channels: int = 128,
-                 num_blocks_per_stage: List[int] = [4, 4, [5, 4], [5, 4], [2, 2]],
+                 num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
@@ -568,8 +586,14 @@ class GCNetCore(BaseModule):
         self.act_cfg = act_cfg
         self.deploy = deploy
 
+        # ---- stem ----
+        # stem[0]: ConvModule 3→C  (c1 output)
+        # stem[1]: ConvModule C→C  (c2 output)
+        # stem[2..2+nbs[0]-1]: nbs[0] GCBlocks C→C
+        # stem[2+nbs[0]]: GCBlock C→C*2 stride=2
+        # stem[2+nbs[0]+1..end]: nbs[1]-1 GCBlocks C*2→C*2
         self.stem = nn.Sequential(
-            ConvModule(
+            ConvModule(                          # [0]  → c1
                 in_channels=in_channels,
                 out_channels=channels,
                 kernel_size=3,
@@ -577,7 +601,7 @@ class GCNetCore(BaseModule):
                 padding=1,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg),
-            ConvModule(
+            ConvModule(                          # [1]  → c2
                 in_channels=channels,
                 out_channels=channels,
                 kernel_size=3,
@@ -585,7 +609,7 @@ class GCNetCore(BaseModule):
                 padding=1,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg),
-            *[GCBlock(
+            *[GCBlock(                           # [2..2+nbs[0]-1]
                 in_channels=channels,
                 out_channels=channels,
                 stride=1,
@@ -593,14 +617,14 @@ class GCNetCore(BaseModule):
                 act_cfg=act_cfg,
                 deploy=deploy
             ) for _ in range(num_blocks_per_stage[0])],
-            GCBlock(
+            GCBlock(                             # [2+nbs[0]] stride-2, no path_residual
                 in_channels=channels,
                 out_channels=channels * 2,
                 stride=2,
                 norm_cfg=norm_cfg,
                 act_cfg=act_cfg,
                 deploy=deploy),
-            *[GCBlock(
+            *[GCBlock(                           # remaining nbs[1]-1 blocks
                 in_channels=channels * 2,
                 out_channels=channels * 2,
                 stride=1,
@@ -611,6 +635,7 @@ class GCNetCore(BaseModule):
         )
         self.relu = build_activation_layer(act_cfg)
 
+        # ---- semantic branch ----
         self.semantic_branch_layers = nn.ModuleList()
         self.semantic_branch_layers.append(
             nn.Sequential(
@@ -646,6 +671,7 @@ class GCNetCore(BaseModule):
             )
         )
 
+        # ---- detail branch ----
         self.detail_branch_layers = nn.ModuleList()
         self.detail_branch_layers.append(
             nn.Sequential(
@@ -677,6 +703,7 @@ class GCNetCore(BaseModule):
             )
         )
 
+        # ---- fusion convs ----
         self.compression_1 = ConvModule(
             channels * 4, channels * 2, kernel_size=1,
             norm_cfg=norm_cfg, act_cfg=None)
@@ -697,6 +724,7 @@ class GCNetCore(BaseModule):
                 kernel_size=3, stride=2, padding=1,
                 norm_cfg=norm_cfg, act_cfg=None))
 
+        # ---- SPP ----
         self.spp = DAPPM(
             in_channels=channels * 16,
             branch_channels=ppm_channels,
@@ -728,9 +756,9 @@ class GCNetCore(BaseModule):
         for i, layer in enumerate(self.stem):
             feat = layer(feat)
             if i == 0:
-                c1 = feat
+                c1 = feat   # (B, C, H/2, W/2)
             if i == 1:
-                c2 = feat
+                c2 = feat   # (B, C, H/4, W/4)
         x = feat
 
         x_s4 = self.semantic_branch_layers[0](x)
@@ -764,28 +792,39 @@ class GCNetCore(BaseModule):
 
 
 # ===========================
-# Enhanced Backbone vá»›i táº¥t cáº£ fixes
+# GCNetWithEnhance  (= backbone wrapper)
+# Registered under key "backbone" in the full model.
 # ===========================
 
 class GCNetWithEnhance(BaseModule):
-    """FIXED VERSION - Complete vá»›i gradient clipping"""
-    
+    """
+    Full backbone.
+    Weight prefix in checkpoint: backbone.*
+    Sub-module prefixes:
+        backbone.backbone.*   → GCNetCore
+        backbone.dwsa4.*      → DWSABlock on C*4  (stage4)
+        backbone.dwsa5.*      → DWSABlock on C*8  (stage5)
+        backbone.dwsa6.*      → DWSABlock on C*16 (stage6)
+        backbone.ms_context.* → MultiScaleContextModule
+        backbone.final_proj.* → ConvModule
+    """
+
     def __init__(self,
                  in_channels: int = 3,
                  channels: int = 32,
                  ppm_channels: int = 128,
                  num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
-                 dwsa_stages: List[str] = ('stage4','stage5', 'stage6'),
+                 dwsa_stages: List[str] = ('stage4', 'stage5', 'stage6'),
                  dwsa_num_heads: int = 4,
                  dwsa_reduction: int = 4,
                  dwsa_qk_sharing: bool = True,
                  dwsa_groups: int = 4,
-                 dwsa_drop: float = 0.1,  # â† Default 0.1 cho regularization
-                 dwsa_alpha: float = 0.1,  # â† Learnable residual weight
+                 dwsa_drop: float = 0.1,
+                 dwsa_alpha: float = 0.1,
                  use_multi_scale_context: bool = True,
                  ms_scales: Tuple[int, ...] = (1, 2),
                  ms_branch_ratio: int = 8,
-                 ms_alpha: float = 0.1,  # â† Learnable residual weight
+                 ms_alpha: float = 0.1,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
