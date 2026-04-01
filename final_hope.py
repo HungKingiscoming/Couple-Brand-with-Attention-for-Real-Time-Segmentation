@@ -260,7 +260,7 @@ def build_model(num_classes=19, device='cuda', deploy=False):
         act_cfg=dict(type='ReLU', inplace=False), align_corners=False,
     )
     aux_head = GCNetAuxHead(
-        in_channels=64, mid_channels=64, num_classes=num_classes,
+        in_channels=64,  num_classes=num_classes,
         dropout_ratio=0.1,
         norm_cfg=dict(type='BN', requires_grad=True),
         act_cfg=dict(type='ReLU', inplace=False), align_corners=False,
