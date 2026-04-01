@@ -89,27 +89,35 @@ class DWConvModule(nn.Module):
 
 
 class EnhancedDecoder(nn.Module):
-    def __init__(self, 
-                 in_channels=128, 
-                 c4_channels=64, 
-                 c2_channels=32, 
-                 c1_channels=32, 
-                 decoder_channels=128,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True), # Thêm dòng này
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),     # Thêm dòng này
-                 dropout_ratio: float = 0.1):
+    def __init__(
+        self, 
+        in_channels=128, 
+        c4_channels=64, 
+        c2_channels=32, 
+        c1_channels=32, 
+        decoder_channels=128,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        act_cfg=dict(type='ReLU', inplace=True),
+        **kwargs
+    ):
         super().__init__()
-        D = decoder_channels
-        D2 = D // 2 
+        D = decoder_channels # 128
+        D2 = D // 2          # 64
 
-        # Gated Fusion ở tầng sâu
+        # Stage 0: Cần đưa c4 từ 64 lên 128 trước khi Fuse
         self.refine0 = ConvModule(in_channels, D, kernel_size=3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg)
+        
+        # ĐÂY LÀ LỚP QUAN TRỌNG: Đưa c4 (64) -> D (128)
+        self.c4_proj = ConvModule(c4_channels, D, kernel_size=1, norm_cfg=norm_cfg, act_cfg=None)
+        
         self.fusion0 = LiteGatedFusion(D, norm_cfg=norm_cfg)
 
         # Stage 1: H/8 -> H/4
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.refine1 = ConvModule(D, D2, kernel_size=3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg)
-        self.c2_proj = nn.Conv2d(c2_channels, D2, kernel_size=1) 
+        
+        # Đưa c2 (32) -> D2 (64)
+        self.c2_proj = ConvModule(c2_channels, D2, kernel_size=1, norm_cfg=norm_cfg, act_cfg=None)
 
         # Stage 2: H/4 -> H/2
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
@@ -119,26 +127,30 @@ class EnhancedDecoder(nn.Module):
             build_norm_layer(norm_cfg, D2)[1],
             build_activation_layer(act_cfg)
         )
-        self.c1_proj = nn.Conv2d(c1_channels, D2, kernel_size=1)
+        # Đưa c1 (32) -> D2 (64)
+        self.c1_proj = ConvModule(c1_channels, D2, kernel_size=1, norm_cfg=norm_cfg, act_cfg=None)
+        
         self.final_proj = ConvModule(D2, D2, kernel_size=1, norm_cfg=norm_cfg, act_cfg=act_cfg)
 
     def forward(self, c5, c4, c2, c1):
-        # H/8: Gated Fusion (Accuracy)
-        x = self.refine0(c5)
-        x = self.fusion0(c4, x)
+        # Stage 0
+        x = self.refine0(c5)          # ra 128 channels
+        c4_p = self.c4_proj(c4)       # từ 64 lên 128 channels
+        x = self.fusion0(c4_p, x)     # 128 + 128 = 256 (Khớp với weight)
 
-        # H/4: Addition (Speed)
+        # Stage 1
         x = self.up1(x)
-        x = self.refine1(x)
-        x = x + F.interpolate(self.c2_proj(c2), size=x.shape[2:])
+        x = self.refine1(x)           # ra 64 channels
+        c2_p = self.c2_proj(c2)       # từ 32 lên 64 channels
+        x = x + c2_p                  # Cộng trực tiếp (phải cùng 64 channels)
 
-        # H/2: Addition (Speed)
+        # Stage 2
         x = self.up2(x)
-        x = self.refine2(x)
-        x = x + F.interpolate(self.c1_proj(c1), size=x.shape[2:])
+        x = self.refine2(x)           # ra 64 channels
+        c1_p = self.c1_proj(c1)       # từ 32 lên 64 channels
+        x = x + c1_p                  # Cộng trực tiếp
 
         return self.final_proj(x)
-
 
 
 
