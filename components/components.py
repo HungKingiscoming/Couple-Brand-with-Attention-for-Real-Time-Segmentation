@@ -5,7 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import warnings
+from abc import ABCMeta, abstractmethod
+from typing import List, Tuple, Union, Optional
+from torch import Tensor
 # Type aliases
 OptConfigType = Optional[Dict]
 SampleList = List[Dict]
@@ -922,3 +925,143 @@ class Accuracy(nn.Module):
         """
         return accuracy(pred, target, self.topk, self.thresh,
                         self.ignore_index)
+
+
+class BaseDecodeHead(nn.Module, metaclass=ABCMeta):
+    """Base class for BaseDecodeHead dùng thuần PyTorch."""
+
+    def __init__(self,
+                 in_channels: Union[int, List[int], Tuple[int]],
+                 channels: int,
+                 *,
+                 num_classes: int,
+                 out_channels: Optional[int] = None,
+                 threshold: Optional[float] = None,
+                 dropout_ratio: float = 0.1,
+                 in_index: Union[int, List[int], Tuple[int]] = -1,
+                 input_transform: Optional[str] = None,
+                 ignore_index: int = 255,
+                 align_corners: bool = False):
+        super().__init__()
+        
+        self._init_inputs(in_channels, in_index, input_transform)
+        self.channels = channels
+        self.num_classes = num_classes
+        self.in_index = in_index
+        self.ignore_index = ignore_index
+        self.align_corners = align_corners
+
+        # Xử lý out_channels cho bài toán binary hoặc multiclass
+        if out_channels is None:
+            if num_classes == 2:
+                warnings.warn('For binary segmentation, we suggest using out_channels=1')
+            out_channels = num_classes
+
+        if out_channels == 1 and threshold is None:
+            threshold = 0.3
+            warnings.warn('threshold is not defined for binary, and defaults to 0.3')
+            
+        self.out_channels = out_channels
+        self.threshold = threshold
+
+        # Segmentor layer (1x1 Conv)
+        self.conv_seg = nn.Conv2d(channels, self.out_channels, kernel_size=1)
+        
+        # Dropout layer
+        if dropout_ratio > 0:
+            self.dropout = nn.Dropout2d(dropout_ratio)
+        else:
+            self.dropout = None
+
+    def _init_inputs(self, in_channels, in_index, input_transform):
+        """Khởi tạo cấu trúc đầu vào tương tự MMCV."""
+        if input_transform is not None:
+            assert input_transform in ['resize_concat', 'multiple_select']
+        self.input_transform = input_transform
+        
+        if input_transform is not None:
+            assert isinstance(in_channels, (list, tuple))
+            assert isinstance(in_index, (list, tuple))
+            assert len(in_channels) == len(in_index)
+            if input_transform == 'resize_concat':
+                self.in_channels = sum(in_channels)
+            else:
+                self.in_channels = in_channels
+        else:
+            assert isinstance(in_channels, int)
+            assert isinstance(in_index, int)
+            self.in_channels = in_channels
+
+    def _transform_inputs(self, inputs: List[Tensor]) -> Tensor:
+        """Biến đổi các feature maps từ backbone."""
+        if self.input_transform == 'resize_concat':
+            # Lấy các features theo index
+            feat_list = [inputs[i] for i in self.in_index]
+            # Resize tất cả về kích thước của feature đầu tiên trong list
+            upsampled_inputs = [
+                resize(
+                    input=x,
+                    size=feat_list[0].shape[2:],
+                    mode='bilinear',
+                    align_corners=self.align_corners) for x in feat_list
+            ]
+            inputs = torch.cat(upsampled_inputs, dim=1)
+        elif self.input_transform == 'multiple_select':
+            inputs = [inputs[i] for i in self.in_index]
+        else:
+            # Chỉ lấy 1 feature map duy nhất
+            inputs = inputs[self.in_index]
+
+        return inputs
+
+    @abstractmethod
+    def forward(self, inputs):
+        """Hàm forward trừu tượng."""
+        pass
+
+    def cls_seg(self, feat: Tensor) -> Tensor:
+        """Tầng phân loại pixel cuối cùng."""
+        if self.dropout is not None:
+            feat = self.dropout(feat)
+        output = self.conv_seg(feat)
+        return output
+
+    def predict(self, inputs: List[Tensor], img_metas: List[dict]) -> Tensor:
+        """Hàm dự đoán, tự động resize về kích thước ảnh gốc."""
+        seg_logits = self.forward(inputs)
+        
+        # Lấy kích thước ảnh cần resize về (từ meta info hoặc pad shape)
+        if 'pad_shape' in img_metas[0]:
+            size = img_metas[0]['pad_shape'][:2]
+        else:
+            size = img_metas[0]['img_shape'][:2]
+
+        return resize(
+            input=seg_logits,
+            size=size,
+            mode='bilinear',
+            align_corners=self.align_corners)
+
+    def loss(self, seg_logits: Tensor, batch_gt: Tensor) -> dict:
+        """
+        Hàm tính loss đơn giản hóa. 
+        Trong PyTorch thuần, bạn nên truyền trực tiếp nhãn (GT) vào.
+        """
+        # Resize logits về bằng kích thước nhãn
+        seg_logits = resize(
+            input=seg_logits,
+            size=batch_gt.shape[2:],
+            mode='bilinear',
+            align_corners=self.align_corners)
+        
+        # Ở đây bạn có thể gọi nn.CrossEntropyLoss() hoặc các hàm loss khác
+        # Ví dụ:
+        # loss_val = F.cross_entropy(seg_logits, batch_gt.squeeze(1), ignore_index=self.ignore_index)
+        # return {'loss_seg': loss_val}
+        raise NotImplementedError("Hãy định nghĩa hàm loss cụ thể cho Head của bạn.")
+
+    def extra_repr(self) -> str:
+        s = f'input_transform={self.input_transform}, ' \
+            f'ignore_index={self.ignore_index}, ' \
+            f'align_corners={self.align_corners}'
+        return s
