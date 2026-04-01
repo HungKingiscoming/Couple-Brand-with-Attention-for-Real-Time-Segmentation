@@ -10,9 +10,7 @@ from abc import ABCMeta, abstractmethod
 from typing import List, Tuple, Union, Optional
 from torch import Tensor
 import numpy as np
-from mmengine.model import BaseModule, ModuleList, Sequential
-# Giả sử ConvModule cũng từ mmengine hoặc mmcv
-from mmcv.cnn import ConvModule
+
 # Type aliases
 OptConfigType = Optional[Dict]
 SampleList = List[Dict]
@@ -292,17 +290,17 @@ class DAPPM(BaseModule):
                  conv_cfg: Dict = dict(
                      order=('norm', 'act', 'conv'), bias=False),
                  upsample_mode: str = 'bilinear',
-                 init_cfg: Dict = None):
+                 init_cfg: Optional[Dict] = None):
         super().__init__(init_cfg=init_cfg)
 
         self.num_scales = num_scales
-        self.upsample_mode = upsample_mode # Sửa lỗi chính tả unsample -> upsample
+        self.upsample_mode = upsample_mode
         self.in_channels = in_channels
         self.branch_channels = branch_channels
         self.out_channels = out_channels
 
-        # Khởi tạo scales bằng ModuleList của MMEngine
-        self.scales = ModuleList([
+        # Dùng nn.ModuleList của PyTorch (có sẵn trong torch.nn)
+        self.scales = nn.ModuleList([
             ConvModule(
                 in_channels,
                 branch_channels,
@@ -313,8 +311,9 @@ class DAPPM(BaseModule):
         ])
 
         for i in range(1, num_scales - 1):
+            # Dùng nn.Sequential thay vì Sequential của mmengine
             self.scales.append(
-                Sequential(
+                nn.Sequential(
                     nn.AvgPool2d(
                         kernel_size=kernel_sizes[i - 1],
                         stride=strides[i - 1],
@@ -329,7 +328,7 @@ class DAPPM(BaseModule):
                 ))
 
         self.scales.append(
-            Sequential(
+            nn.Sequential(
                 nn.AdaptiveAvgPool2d((1, 1)),
                 ConvModule(
                     in_channels,
@@ -340,7 +339,7 @@ class DAPPM(BaseModule):
                     **conv_cfg)
             ))
 
-        self.processes = ModuleList()
+        self.processes = nn.ModuleList()
         for i in range(num_scales - 1):
             self.processes.append(
                 ConvModule(
@@ -370,10 +369,8 @@ class DAPPM(BaseModule):
 
     def forward(self, inputs: Tensor):
         feats = []
-        # Scale đầu tiên
         feats.append(self.scales[0](inputs))
 
-        # Các scale tiếp theo kết hợp với nội suy (upsample)
         for i in range(1, self.num_scales):
             feat_out = self.scales[i](inputs)
             feat_up = F.interpolate(
@@ -382,11 +379,9 @@ class DAPPM(BaseModule):
                 mode=self.upsample_mode,
                 align_corners=False if self.upsample_mode == 'bilinear' else None)
             
-            # Cộng residual từ scale trước đó
             feats.append(self.processes[i - 1](feat_up + feats[i - 1]))
 
         return self.compression(torch.cat(feats, dim=1)) + self.shortcut(inputs)
-
 
 # ============================================================================
 # BASE DECODE HEAD
