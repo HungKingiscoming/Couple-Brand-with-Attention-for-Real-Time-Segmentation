@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, Optional
 
 from components.components import (
     ConvModule,
@@ -11,135 +11,128 @@ from components.components import (
     build_activation_layer,
     resize,
     DAPPM,
-    OptConfigType
+    OptConfigType,
 )
 
 
+# ===========================
+# GatedFusion
+# Weight keys:
+#   gate_conv.0.conv.weight  gate_conv.0.bn.{weight,bias,running_mean,running_var,...}
+#   gate_conv.1.conv.weight  gate_conv.1.conv.bias
+# ===========================
 
 class GatedFusion(nn.Module):
-    """
-    âœ… UPGRADED: Gated Fusion with improved feature selection
-    - Learns to weight skip connections vs decoder features
-    - Prevents information loss through selective gating
-    """
     def __init__(
         self,
         channels: int,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
     ):
         super().__init__()
-        
-        # Gate mechanism: [skip, decoder] -> gate weights
+
         self.gate_conv = nn.Sequential(
-            ConvModule(
+            ConvModule(              # [0]  has BN + ReLU
                 in_channels=channels * 2,
                 out_channels=channels,
                 kernel_size=1,
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg
+                act_cfg=act_cfg,
             ),
-            ConvModule(
+            ConvModule(              # [1]  no norm, Sigmoid activation
                 in_channels=channels,
                 out_channels=channels,
                 kernel_size=1,
-                norm_cfg=None,  # No norm on gate output
-                act_cfg=dict(type='Sigmoid')
-            )
+                norm_cfg=None,
+                act_cfg=dict(type='Sigmoid'),
+            ),
         )
-    
+
     def forward(self, skip_feat: Tensor, dec_feat: Tensor) -> Tensor:
-        """
-        Args:
-            skip_feat: Features from encoder skip connection
-            dec_feat: Features from decoder upsampling
-        Returns:
-            Fused features with learned gating
-        """
         concat = torch.cat([skip_feat, dec_feat], dim=1)
         gate = self.gate_conv(concat)
-        
-        # Adaptive fusion: gate * skip + (1-gate) * dec
-        out = gate * skip_feat + (1 - gate) * dec_feat
-        return out
+        return gate * skip_feat + (1 - gate) * dec_feat
 
+
+# ===========================
+# DWConvModule
+# Weight keys:
+#   dw_conv.conv.weight  dw_conv.bn.{weight,bias,running_mean,running_var,...}
+#   pw_conv.conv.weight  pw_conv.bn.{weight,bias,running_mean,running_var,...}
+# ===========================
 
 class DWConvModule(nn.Module):
-    """
-    âœ… NEW: Depthwise Separable Convolution for efficient upsampling
-    - Reduces computation while maintaining receptive field
-    """
     def __init__(
         self,
         channels: int,
         kernel_size: int = 3,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
     ):
         super().__init__()
-        
+
         padding = kernel_size // 2
-        
-        # Depthwise convolution
+
         self.dw_conv = ConvModule(
             in_channels=channels,
             out_channels=channels,
             kernel_size=kernel_size,
             padding=padding,
-            groups=channels,  # Depthwise
+            groups=channels,
             norm_cfg=norm_cfg,
-            act_cfg=None
+            act_cfg=None,
         )
-        
-        # Pointwise convolution
+
         self.pw_conv = ConvModule(
             in_channels=channels,
             out_channels=channels,
             kernel_size=1,
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+            act_cfg=act_cfg,
         )
-    
+
     def forward(self, x: Tensor) -> Tensor:
         x = self.dw_conv(x)
         x = self.pw_conv(x)
         return x
 
 
+# ===========================
+# ResidualBlock
+# Weight keys:
+#   conv1.conv.weight  conv1.bn.{weight,bias,running_mean,running_var,...}
+#   conv2.conv.weight  conv2.bn.{weight,bias,running_mean,running_var,...}
+# ===========================
+
 class ResidualBlock(nn.Module):
-    """
-    âœ… NEW: Residual block for decoder stability
-    - Skip connection prevents gradient vanishing
-    - Improves feature propagation
-    """
     def __init__(
         self,
         channels: int,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
+        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
     ):
         super().__init__()
-        
+
         self.conv1 = ConvModule(
             in_channels=channels,
             out_channels=channels,
             kernel_size=3,
             padding=1,
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+            act_cfg=act_cfg,
         )
-        
+
         self.conv2 = ConvModule(
             in_channels=channels,
             out_channels=channels,
             kernel_size=3,
             padding=1,
             norm_cfg=norm_cfg,
-            act_cfg=None
+            act_cfg=None,
         )
-        
+
         self.act = build_activation_layer(act_cfg)
-    
+
     def forward(self, x: Tensor) -> Tensor:
         identity = x
         out = self.conv1(x)
@@ -149,250 +142,234 @@ class ResidualBlock(nn.Module):
         return out
 
 
-# ============================================
-# ENHANCED DECODER WITH FLEXIBLE CHANNELS
-# ============================================
+# ===========================
+# EnhancedDecoder
+#
+# Weight keys produced (decoder_channels=128, c2_channels=32, c1_channels=32):
+#
+#   refine1.0.conv1.*  refine1.0.conv2.*           ← ResidualBlock
+#   refine1.1.conv.*   refine1.1.bn.*              ← ConvModule 128→128
+#   c2_proj.conv.*     c2_proj.bn.*                ← ConvModule 32→128
+#   fusion1_gate.gate_conv.0.*  fusion1_gate.gate_conv.1.*
+#
+#   refine2.0.conv1.*  refine2.0.conv2.*           ← ResidualBlock
+#   refine2.1.conv.*   refine2.1.bn.*              ← ConvModule 128→64
+#   c1_proj.conv.*     c1_proj.bn.*                ← ConvModule 32→64
+#   fusion2_gate.gate_conv.0.*  fusion2_gate.gate_conv.1.*
+#
+#   refine3.0.dw_conv.* refine3.0.pw_conv.*        ← DWConvModule
+#   refine3.1.dw_conv.* refine3.1.pw_conv.*        ← DWConvModule
+#
+#   final_proj.conv.*   final_proj.bn.*
+# ===========================
 
 class EnhancedDecoder(nn.Module):
-    """
-    âœ… FIXED: Decoder with flexible channel handling
-    - No longer assumes specific c1, c2 channels
-    - Auto-projects backbone outputs to decoder needs
-    - Zero performance impact
-    """
-    
     def __init__(
         self,
-        in_channels: int = 128,        # c5 channels
-        c2_channels: int = 64,        # âœ… NEW: c2 from backbone
-        c1_channels: int = 32,        # âœ… NEW: c1 from backbone
+        in_channels: int = 128,
+        c2_channels: int = 32,
+        c1_channels: int = 32,
         decoder_channels: int = 128,
         norm_cfg: dict = dict(type='BN', requires_grad=True),
         act_cfg: dict = dict(type='ReLU', inplace=False),
         dropout_ratio: float = 0.1,
-        use_gated_fusion: bool = True
+        use_gated_fusion: bool = True,
     ):
         super().__init__()
-        
+
         self.use_gated_fusion = use_gated_fusion
         self.decoder_channels = decoder_channels
-        
-        # ======================================
-        # STAGE 1: c5 (H/16) â†’ H/8
-        # ======================================
+
+        # Stage 1: H/16 → H/8
         self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
+
         self.refine1 = nn.Sequential(
-            ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(
+            ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),  # [0]
+            ConvModule(                                                        # [1]
                 in_channels=in_channels,
                 out_channels=decoder_channels,
                 kernel_size=3,
                 padding=1,
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
+                act_cfg=act_cfg,
+            ),
         )
-        
-        # âœ… NEW: Project c2 to decoder_channels (flexible)
+
+        # c2 projection: 32 → 128
         self.c2_proj = ConvModule(
             in_channels=c2_channels,
             out_channels=decoder_channels,
             kernel_size=1,
             norm_cfg=norm_cfg,
-            act_cfg=None
+            act_cfg=None,
         ) if c2_channels != decoder_channels else nn.Identity()
-        
-        # Skip fusion: project c2 before fusion
+
         if use_gated_fusion:
             self.fusion1_gate = GatedFusion(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion1 = ConvModule(
-                in_channels=decoder_channels + decoder_channels,
+                in_channels=decoder_channels * 2,
                 out_channels=decoder_channels,
                 kernel_size=1,
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg
+                act_cfg=act_cfg,
             )
-        
-        # ======================================
-        # STAGE 2: H/8 â†’ H/4
-        # ======================================
+
+        # Stage 2: H/8 → H/4
         self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
+
         self.refine2 = nn.Sequential(
-            ResidualBlock(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(
+            ResidualBlock(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),  # [0]
+            ConvModule(                                                              # [1]
                 in_channels=decoder_channels,
                 out_channels=decoder_channels // 2,
                 kernel_size=3,
                 padding=1,
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
+                act_cfg=act_cfg,
+            ),
         )
-        
-        # âœ… NEW: Project c1 to decoder_channels//2 (flexible)
+
+        # c1 projection: 32 → 64
         self.c1_proj = ConvModule(
             in_channels=c1_channels,
             out_channels=decoder_channels // 2,
             kernel_size=1,
             norm_cfg=norm_cfg,
-            act_cfg=None
+            act_cfg=None,
         ) if c1_channels != (decoder_channels // 2) else nn.Identity()
-        
-        # Skip fusion: project c1 before fusion
+
         if use_gated_fusion:
             self.fusion2_gate = GatedFusion(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg)
         else:
             self.fusion2 = ConvModule(
-                in_channels=(decoder_channels // 2) + (decoder_channels // 2),
+                in_channels=decoder_channels,
                 out_channels=decoder_channels // 2,
                 kernel_size=1,
                 norm_cfg=norm_cfg,
-                act_cfg=act_cfg
+                act_cfg=act_cfg,
             )
-        
-        # ======================================
-        # STAGE 3: H/4 â†’ H/2
-        # ======================================
+
+        # Stage 3: H/4 → H/2
         self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
+
         self.refine3 = nn.Sequential(
-            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg)
+            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),  # [0]
+            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),  # [1]
         )
-        
-        # ======================================
-        # FINAL: Output projection
-        # ======================================
+
+        # Final projection
         self.final_proj = ConvModule(
             in_channels=decoder_channels // 2,
             out_channels=decoder_channels // 2,
             kernel_size=1,
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+            act_cfg=act_cfg,
         )
-        
+
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
-    
+
     def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
-        """
-        Args:
-            c5: (B, in_channels, H/16, W/16)
-            c2: (B, c2_channels, H/4, W/4) - flexible channels
-            c1: (B, c1_channels, H/2, W/2) - flexible channels
-        Returns:
-            (B, 64, H/2, W/2)
-        """
-        
-        # Stage 1: H/16 â†’ H/8
+        # Stage 1: H/16 → H/8
         x = self.up1(c5)
         x = self.refine1(x)
-        
-        # âœ… Project c2 before fusion
+
         c2_proj = self.c2_proj(c2)
-        
+
         if self.use_gated_fusion:
             x = self.fusion1_gate(c2_proj, x)
         else:
             x = torch.cat([x, c2_proj], dim=1)
             x = self.fusion1(x)
-        
-        # Stage 2: H/8 â†’ H/4
+
+        # Stage 2: H/8 → H/4
         x = self.up2(x)
         x = self.refine2(x)
-        
-        # âœ… Project c1 before fusion
+
         c1_proj = self.c1_proj(c1)
-        
+
         if self.use_gated_fusion:
             x = self.fusion2_gate(c1_proj, x)
         else:
             x = torch.cat([x, c1_proj], dim=1)
             x = self.fusion2(x)
-        
-        # Stage 3: H/4 â†’ H/2
+
+        # Stage 3: H/4 → H/2
         x = self.up3(x)
         x = self.refine3(x)
-        
-        # Final projection
+
         x = self.final_proj(x)
         x = self.dropout(x)
-        
+
         return x
 
 
-# ============================================
-# AUXILIARY HEAD
-# ============================================
+# ===========================
+# GCNetAuxHead
+# Weight keys:
+#   conv1.conv.weight  conv1.bn.{weight,bias,running_mean,running_var,...}
+#   conv_seg.1.weight  conv_seg.1.bias
+# ===========================
 
 class GCNetAuxHead(nn.Module):
-    """
-    âœ… UPDATED: Auxiliary head for early supervision
-    - Applied to c4 features for multi-scale training
-    - Improves gradient flow in early stages
-    """
     def __init__(
         self,
-        in_channels: int = 192,  # c4 = channels * 4 = 48 * 4
+        in_channels: int = 64,       # c4 = channels * 2 = 32*2 = 64
         channels: int = 96,
         num_classes: int = 19,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         dropout_ratio: float = 0.1,
-        align_corners: bool = False
+        align_corners: bool = False,
     ):
         super().__init__()
-        
+
         self.align_corners = align_corners
-        
-        # Feature extraction
+
         self.conv1 = ConvModule(
             in_channels=in_channels,
             out_channels=channels,
             kernel_size=3,
             padding=1,
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+            act_cfg=act_cfg,
         )
-        
-        # Segmentation head
+
         self.conv_seg = nn.Sequential(
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(channels, num_classes, kernel_size=1)
+            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),  # [0]
+            nn.Conv2d(channels, num_classes, kernel_size=1),                        # [1]
         )
-    
+
     def forward(self, x: Tensor) -> Tensor:
-        """Handle both dict and tensor input"""
         if isinstance(x, dict):
             x = x['c4']
-        
         x = self.conv1(x)
         return self.conv_seg(x)
 
 
-# ============================================
-# MAIN SEGMENTATION HEAD
-# ============================================
+# ===========================
+# GCNetHead  (= decode_head in checkpoint)
+# Weight keys:
+#   decoder.*    ← EnhancedDecoder
+#   conv_seg.1.weight  conv_seg.1.bias
+# ===========================
 
 class GCNetHead(nn.Module):
     """
-    âœ… FINAL VERSION: Main segmentation head with flexible channels
-    
-    Pipeline:
-    c5 (96ch) â†’ Decoder â†’ (64ch, H/2) â†’ Segmentation
-    
-    Components:
-    - Enhanced decoder with gated fusion
-    - Residual blocks for stability
-    - Dropout for regularization
-    - Flexible channel handling for any backbone
+    Main segmentation head.
+    Checkpoint key prefix: decode_head.*
+
+    Default values match the saved weight shapes:
+        in_channels=128   (c5 channels = C*4 = 32*4)
+        c2_channels=32    (stem[1] output = C = 32)
+        c1_channels=32    (stem[0] output = C = 32)
+        decoder_channels=128
+        num_classes=19
     """
-    
+
     def __init__(
         self,
-        in_channels: int = 128,  # c5
+        in_channels: int = 128,
         num_classes: int = 19,
         decoder_channels: int = 128,
         dropout_ratio: float = 0.1,
@@ -400,51 +377,38 @@ class GCNetHead(nn.Module):
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         align_corners: bool = False,
         use_gated_fusion: bool = True,
-        # âœ… NEW: Accept flexible c1, c2 channels from backbone
         c1_channels: int = 32,
-        c2_channels: int = 32
+        c2_channels: int = 32,
     ):
         super().__init__()
-        
+
         self.align_corners = align_corners
-        
-        # âœ… Pass detected channels to decoder
+
         self.decoder = EnhancedDecoder(
             in_channels=in_channels,
-            c2_channels=c2_channels,      # From backbone
-            c1_channels=c1_channels,      # From backbone
+            c2_channels=c2_channels,
+            c1_channels=c1_channels,
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
             dropout_ratio=dropout_ratio,
-            use_gated_fusion=use_gated_fusion
+            use_gated_fusion=use_gated_fusion,
         )
-        
-        # Segmentation head
-        output_channels = decoder_channels // 2
+
+        output_channels = decoder_channels // 2   # 64
         self.conv_seg = nn.Sequential(
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(output_channels, num_classes, kernel_size=1)
+            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),  # [0]
+            nn.Conv2d(output_channels, num_classes, kernel_size=1),                # [1]
         )
-    
+
     def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
-        """
-        Args:
-            inputs: Dictionary containing c1, c2, c5 tensors
-        Returns:
-            Segmentation logits
-        """
-        # âœ… CRITICAL: Extract tensors from dict FIRST
         if isinstance(inputs, dict):
             c1 = inputs['c1']
             c2 = inputs['c2']
             c5 = inputs['c5']
         else:
-            # Fallback for tuple input
             c1, c2, c5 = inputs[0], inputs[1], inputs[2]
-        
-        # Now pass individual tensors (NOT dict!)
+
         x = self.decoder(c5, c2, c1)
         x = self.conv_seg(x)
-        
         return x
