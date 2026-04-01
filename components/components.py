@@ -9,6 +9,7 @@ import warnings
 from abc import ABCMeta, abstractmethod
 from typing import List, Tuple, Union, Optional
 from torch import Tensor
+import numpy as np
 # Type aliases
 OptConfigType = Optional[Dict]
 SampleList = List[Dict]
