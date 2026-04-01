@@ -155,6 +155,7 @@ class GCNetAuxHead(nn.Module):
         in_channels: int = 64,       # c4 = channels * 2 = 32*2 = 64
         channels: int = 96,
         num_classes: int = 19,
+        mid_channels: int = 64,
         norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
         act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
         dropout_ratio: float = 0.1,
