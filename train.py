@@ -143,37 +143,64 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     total  = len(model_state)
     rate   = 100 * loaded / total if total > 0 else 0.0
 
-    # Phân loại skip
-    new_module_markers = ('dwsa_stage', 'foggy', 'alpha', 'in_.')
-    truly_new  = [k for k in skipped if any(s in k for s in new_module_markers)]
-    other_skip = [k for k in skipped if k not in truly_new]
+    # ------------------------------------------------------------------ #
+    # Phân loại skip                                                       #
+    #                                                                      #
+    # "Expected skip" gồm 3 loại:                                         #
+    # 1. DWSA / FoggyAwareNorm — module hoàn toàn mới                     #
+    # 2. DAPPM (spp) BN shape mismatch — checkpoint dùng conv_cfg         #
+    #    order=(norm,act,conv) → BN(in_channels), v3 dùng                 #
+    #    order=(conv,norm,act) → BN(out_channels). Key tên giống nhau     #
+    #    nhưng shape khác → không load được, init random là đúng.         #
+    # 3. stem_conv1/2 BN — FoggyAwareNorm.bn là module mới, không có      #
+    #    trong checkpoint gốc → expected missing.                          #
+    # ------------------------------------------------------------------ #
+    expected_skip_markers = (
+        'dwsa_stage', 'foggy', 'alpha', 'in_.',   # module mới
+        '.spp.',                                    # DAPPM BN shape mismatch
+        'backbone.spp.',                            # với prefix
+    )
+    truly_expected = [k for k in skipped if any(s in k for s in expected_skip_markers)]
+    truly_unmatched = [k for k in skipped if k not in truly_expected]
 
     sep = '=' * 70
     print(f"\n{sep}")
     print("WEIGHT LOADING SUMMARY")
     print(sep)
-    print(f"Loaded:              {loaded:>5} / {total} ({rate:.1f}%)")
-    print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm ✓)")
-    print(f"Skipped total:       {len(skipped):>5}")
-    if other_skip:
-        print(f"  Unmatched:         {len(other_skip):>5}  ← cần kiểm tra")
-        for k in other_skip[:5]:
-            print(f"    {k}")
-    print(f"  New modules:       {len(truly_new):>5}  (DWSA/FoggyAwareNorm → init random ✓)")
+    print(f"Loaded:                  {loaded:>5} / {total} ({rate:.1f}%)")
+    print(f"BN dropped (expected):   {len(bn_dropped):>5}  (stem BN → FoggyAwareNorm ✓)")
+    print(f"Skipped total:           {len(skipped):>5}")
+    print(f"  Expected (shape/new):  {len(truly_expected):>5}  (DWSA / FoggyNorm / DAPPM BN order ✓)")
+    if truly_unmatched:
+        print(f"  Unmatched:             {len(truly_unmatched):>5}  ← cần kiểm tra")
+        for k in truly_unmatched[:5]:
+            print(f"      {k}")
     print(sep + "\n")
 
-    if other_skip:
-        print("WARNING: có key không match — kiểm tra checkpoint format")
+    if truly_unmatched:
+        print(f"WARNING: {len(truly_unmatched)} key không match — kiểm tra checkpoint format\n")
 
     missing, _ = model.backbone.load_state_dict(compatible, strict=False)
-    expected_missing = [k for k in missing if
-                        any(s in k for s in ('dwsa', 'alpha', 'in_.', 'foggy'))]
+
+    # Expected missing = module mới + FoggyAwareNorm.bn (không có trong ckpt)
+    # + DAPPM BN (shape mismatch → missing trong model vì không được load)
+    expected_missing_markers = (
+        'dwsa',    # DWSA modules
+        'alpha',   # FoggyAwareNorm.alpha
+        'in_.',    # FoggyAwareNorm.in_
+        'foggy',   # FoggyAwareNorm class name
+        '.1.bn.',  # FoggyAwareNorm.bn trong stem_conv1/2 (index [1])
+        'spp.',    # DAPPM BN shape mismatch
+    )
+    expected_missing   = [k for k in missing if any(s in k for s in expected_missing_markers)]
     unexpected_missing = [k for k in missing if k not in expected_missing]
+
     if unexpected_missing:
-        print(f"Unexpected missing ({len(unexpected_missing)}):")
+        print(f"Unexpected missing ({len(unexpected_missing)}) — cần kiểm tra:")
         for k in unexpected_missing[:10]:
             print(f"  - {k}")
-    print(f"Expected missing (new modules): {len(expected_missing)} keys → OK\n")
+        print()
+    print(f"Expected missing: {len(expected_missing)} keys (new modules + DAPPM BN order) → OK\n")
     return rate
 
 
