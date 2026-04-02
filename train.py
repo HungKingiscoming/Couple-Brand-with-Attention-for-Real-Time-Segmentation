@@ -111,8 +111,20 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
 
     # Tập hợp các key BN cũ bị bỏ do FoggyAwareNorm (return None từ remap)
     bn_dropped = []
+    # Các prefix không thuộc backbone — checkpoint có thể chứa head/aux
+    non_backbone_prefixes = ('decode_head.', 'aux_head.', 'head.')
 
     for ckpt_key, ckpt_val in state.items():
+        # Bỏ qua key không thuộc backbone (decode_head, aux_head, ...)
+        # Strip prefix backbone./model./module. trước khi kiểm tra
+        stripped = ckpt_key
+        for pref in ('backbone.', 'model.', 'module.'):
+            if stripped.startswith(pref):
+                stripped = stripped[len(pref):]
+                break
+        if any(stripped.startswith(p) for p in non_backbone_prefixes):
+            continue  # key thuộc head — không load vào backbone
+
         # _remap_stem_key tự strip prefix VÀ remap
         norm_ckpt = _remap_stem_key(ckpt_key)
 
@@ -409,10 +421,20 @@ def count_trainable_params(model):
 
 
 def freeze_backbone(model):
-    """Freeze toàn bộ backbone + khóa BN running stats."""
-    print("Freezing backbone...")
+    """Freeze toàn bộ backbone trừ DWSA và FoggyAwareNorm.
+
+    DWSA (gamma) và FoggyAwareNorm (alpha) là module MỚI không có trong
+    checkpoint → phải trainable ngay từ đầu để học được. Freeze chúng
+    sẽ khiến DWSA hoạt động như identity (gamma=0 cố định) và
+    FoggyAwareNorm không học được gate tối ưu cho foggy.
+    """
+    print("Freezing backbone (keeping DWSA + FoggyAwareNorm trainable)...")
+
+    # Freeze toàn bộ trước
     for p in model.backbone.parameters():
         p.requires_grad = False
+
+    # Lock BN running stats
     bn_count = 0
     for m in model.backbone.modules():
         if isinstance(m, nn.BatchNorm2d):
@@ -421,6 +443,28 @@ def freeze_backbone(model):
             if m.bias   is not None: m.bias.requires_grad   = False
             bn_count += 1
     print(f"  {bn_count} BN layers locked")
+
+    # Luôn giữ DWSA trainable — gamma=0 lúc init, cần học từ epoch 0
+    dwsa_params = 0
+    for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
+        module = getattr(model.backbone, name, None)
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad = True
+                dwsa_params += p.numel()
+    print(f"  DWSA kept trainable: {dwsa_params:,} params")
+
+    # Luôn giữ FoggyAwareNorm trainable — alpha cần học từ đầu
+    fan_params = 0
+    for name in ['stem_conv1', 'stem_conv2']:
+        module = getattr(model.backbone, name, None)
+        if module is not None:
+            # stem_conv1 = [Conv2d, FoggyAwareNorm, ReLU] → index [1]
+            if len(module) > 1 and hasattr(module[1], 'alpha'):
+                for p in module[1].parameters():
+                    p.requires_grad = True
+                    fan_params += p.numel()
+    print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
     print("Backbone frozen\n")
 
 
