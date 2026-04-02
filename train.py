@@ -35,29 +35,50 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # PRETRAINED WEIGHT LOADER
 # ============================================
 
-def _remap_stem_key(key: str) -> str:
-    """Remap stem key từ checkpoint gốc sang GCNet v3.
+def _remap_stem_key(key: str, N2: int = 4):
+    """Remap checkpoint key sang GCNet v3.
 
-    Checkpoint gốc dùng 1 stem Sequential liên tục:
-      stem.0.*  → ConvModule(stride=2, in→C)        → stem_conv1 (Conv2d tại [0])
-      stem.1.*  → ConvModule(stride=2, C→C)         → stem_conv2 (Conv2d tại [0])
-      stem.2..stem.{N2+1}.* → N2 GCBlock stage2    → stem_stage2
-      stem.{N2+2}..end.*    → GCBlock stage3        → stem_stage3
+    Xử lý hai vấn đề:
+    1. Strip prefix backbone./model./module. trước khi remap.
+    2. Stem gốc = 1 Sequential liên tục (ConvModule),
+       v3 tách thành stem_conv1/conv2 (nn.Conv2d + FoggyAwareNorm):
+         stem.0.conv.weight → stem_conv1.0.weight  (bỏ tiền tố .conv.)
+         stem.0.bn.*        → None  (BN gốc thay bằng FoggyAwareNorm)
+         stem.1.conv.weight → stem_conv2.0.weight
+         stem.2..{N2+1}.*   → stem_stage2.{0..N2-1}.*
+         stem.{N2+2}...*    → stem_stage3.{0..}.*
 
-    FoggyAwareNorm thay BN trong ConvModule gốc → BN/IN/alpha không load
-    từ checkpoint (init random), chỉ Conv2d weight được remap.
+    Returns:
+        str  — key mới, hoặc
+        None — key nên bị bỏ qua (BN gốc không dùng nữa)
     """
-    import re
-    m = re.match(r'stem\.(\d+)\.(.+)$', key)
+    import re as _re
+
+    # 1. Strip prefix
+    for pref in ['backbone.', 'model.', 'module.']:
+        if key.startswith(pref):
+            key = key[len(pref):]
+
+    # 2. Chỉ xử lý key bắt đầu bằng 'stem.'
+    m = _re.match(r'stem\.(\d+)\.(.+)$', key)
     if not m:
         return key
+
     idx  = int(m.group(1))
     rest = m.group(2)
-    N2   = 4  # num_blocks_per_stage[0] — số GCBlock ở stage 2
+
+    # stem.0 và stem.1 là ConvModule → conv.weight / bn.* / activate.*
+    # v3 dùng nn.Conv2d trực tiếp → chỉ lấy conv.weight, bỏ bn
+    def _map_convmodule(rest_str, target_prefix):
+        if rest_str.startswith('conv.'):
+            return f'{target_prefix}.{rest_str[len("conv."):].lstrip(".")}'
+        # bn.*, activate.* → drop (FoggyAwareNorm thay thế BN, ReLU không có weight)
+        return None
+
     if idx == 0:
-        return f'stem_conv1.0.{rest}'
+        return _map_convmodule(rest, 'stem_conv1.0')
     elif idx == 1:
-        return f'stem_conv2.0.{rest}'
+        return _map_convmodule(rest, 'stem_conv2.0')
     elif 2 <= idx <= 1 + N2:
         return f'stem_stage2.{idx - 2}.{rest}'
     else:
@@ -88,14 +109,17 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
                 norm = norm[len(pref):]
         model_key_map[norm] = mk
 
-    for ckpt_key, ckpt_val in state.items():
-        norm_ckpt = ckpt_key
-        for pref in ['backbone.', 'model.', 'module.']:
-            if norm_ckpt.startswith(pref):
-                norm_ckpt = norm_ckpt[len(pref):]
+    # Tập hợp các key BN cũ bị bỏ do FoggyAwareNorm (return None từ remap)
+    bn_dropped = []
 
-        # Remap stem key gốc → v3
-        norm_ckpt = _remap_stem_key(norm_ckpt)
+    for ckpt_key, ckpt_val in state.items():
+        # _remap_stem_key tự strip prefix VÀ remap
+        norm_ckpt = _remap_stem_key(ckpt_key)
+
+        # None = BN gốc của stem.0/1 đã được thay bằng FoggyAwareNorm → skip đúng ý
+        if norm_ckpt is None:
+            bn_dropped.append(ckpt_key)
+            continue
 
         matched = False
         if norm_ckpt in model_key_map:
@@ -119,25 +143,27 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     total  = len(model_state)
     rate   = 100 * loaded / total if total > 0 else 0.0
 
-    # Phân loại skip để báo cáo rõ hơn
-    new_module_markers = ('dwsa_stage', 'foggy', 'alpha', '.in_.')
+    # Phân loại skip
+    new_module_markers = ('dwsa_stage', 'foggy', 'alpha', 'in_.')
     truly_new  = [k for k in skipped if any(s in k for s in new_module_markers)]
     other_skip = [k for k in skipped if k not in truly_new]
 
-    print(f"\n{'='*70}")
+    sep = '=' * 70
+    print(f"\n{sep}")
     print("WEIGHT LOADING SUMMARY")
-    print(f"{'='*70}")
+    print(sep)
     print(f"Loaded:              {loaded:>5} / {total} ({rate:.1f}%)")
+    print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm ✓)")
     print(f"Skipped total:       {len(skipped):>5}")
     if other_skip:
         print(f"  Unmatched:         {len(other_skip):>5}  ← cần kiểm tra")
         for k in other_skip[:5]:
             print(f"    {k}")
     print(f"  New modules:       {len(truly_new):>5}  (DWSA/FoggyAwareNorm → init random ✓)")
-    print(f"{'='*70}\n")
+    print(sep + "\n")
 
-    if rate < 80 and other_skip:
-        print("WARNING: nhiều key không match — kiểm tra checkpoint format")
+    if other_skip:
+        print("WARNING: có key không match — kiểm tra checkpoint format")
 
     missing, _ = model.backbone.load_state_dict(compatible, strict=False)
     expected_missing = [k for k in missing if
