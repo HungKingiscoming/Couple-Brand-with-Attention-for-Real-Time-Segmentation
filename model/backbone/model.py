@@ -341,19 +341,15 @@ class GCNet(BaseModule):
         ))
 
         # ------------------------------------------------------------------ #
-        # DAPPM — multi-scale context ở cuối semantic branch                  #
-        #                                                                      #
-        # QUAN TRỌNG: phải truyền conv_cfg với order=('conv','norm','act').   #
-        # Default của components.DAPPM là order=('norm','act','conv') —       #
-        # tức là BN được apply TRƯỚC conv, khiến BN(out_channels) nhận        #
-        # tensor có in_channels → shape mismatch lúc runtime.                 #
+        # DAPPM — dùng default conv_cfg order=(norm,act,conv) giống ckpt gốc #
+        # ConvModule đã được fix: norm build với in_channels khi đứng trước  #
+        # conv → không còn shape mismatch, weight load được đầy đủ.          #
         # ------------------------------------------------------------------ #
         self.spp = DAPPM(
             channels * 16, ppm_channels, channels * 4,
             num_scales=5,
             norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-            conv_cfg=dict(order=('conv', 'norm', 'act'), bias=False))
+            act_cfg=act_cfg)
 
         # ------------------------------------------------------------------ #
         # DWSA modules                                                         #
