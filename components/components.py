@@ -158,22 +158,26 @@ def build_activation_layer(cfg: Union[Dict, str, None]) -> Optional[nn.Module]:
 # ============================================================================
 class ConvModule(nn.Module):
     """Convolution module with normalization and activation.
-    
+ 
+    Fix: norm_channels được xác định theo vị trí của 'norm' trong order.
+    Khi order=('norm','act','conv'): norm nhận in_channels.
+    Khi order=('conv','norm','act'): norm nhận out_channels.
+ 
     Args:
-        in_channels: Input channels
-        out_channels: Output channels
-        kernel_size: Kernel size
-        stride: Stride
-        padding: Padding
-        dilation: Dilation
-        groups: Groups
-        bias: Whether to use bias
-        conv_cfg: Convolution config
-        norm_cfg: Normalization config
-        act_cfg: Activation config
-        order: Order of conv/norm/act
+        in_channels: Input channels.
+        out_channels: Output channels.
+        kernel_size: Kernel size.
+        stride: Stride. Default: 1.
+        padding: Padding. Default: 0.
+        dilation: Dilation. Default: 1.
+        groups: Groups. Default: 1.
+        bias: Whether to use bias. Default: 'auto'.
+        conv_cfg: Convolution config. Default: None.
+        norm_cfg: Normalization config. Default: None.
+        act_cfg: Activation config. Default: dict(type='ReLU').
+        order: Order of conv/norm/act. Default: ('conv','norm','act').
     """
-    
+ 
     def __init__(
         self,
         in_channels: int,
@@ -184,60 +188,63 @@ class ConvModule(nn.Module):
         dilation: Union[int, Tuple[int, int]] = 1,
         groups: int = 1,
         bias: Union[bool, str] = 'auto',
-        conv_cfg: OptConfigType = None,
-        norm_cfg: OptConfigType = None,
-        act_cfg: OptConfigType = dict(type='ReLU'),
+        conv_cfg=None,
+        norm_cfg=None,
+        act_cfg=dict(type='ReLU'),
         order: Tuple[str, ...] = ('conv', 'norm', 'act'),
     ):
         super().__init__()
-        
+ 
+        # Import ở đây để tránh circular import
+        from components.components import build_norm_layer, build_activation_layer
+ 
         self.conv_cfg = conv_cfg
         self.norm_cfg = norm_cfg
-        self.act_cfg = act_cfg
-        self.order = order
-        
-        # Determine bias
-        if bias == 'auto':
-            bias = norm_cfg is None
-        
-        # Build convolution
-        self.with_norm = norm_cfg is not None
+        self.act_cfg  = act_cfg
+        self.order    = order
+ 
+        self.with_norm       = norm_cfg is not None
         self.with_activation = act_cfg is not None
-        
-        # Convolution layer
-        if conv_cfg is None or conv_cfg.get('type') == 'Conv2d':
-            self.conv = nn.Conv2d(
-                in_channels,
-                out_channels,
-                kernel_size,
-                stride=stride,
-                padding=padding,
-                dilation=dilation,
-                groups=groups,
-                bias=bias
-            )
-        else:
-            raise ValueError(f"Unsupported conv type: {conv_cfg.get('type')}")
-        
-        # Normalization layer
+ 
+        # Bias: tắt khi có norm (norm đứng sau conv)
+        if bias == 'auto':
+            # Nếu norm đứng sau conv → bias không cần thiết
+            norm_after_conv = (self.with_norm and
+                               order.index('norm') > order.index('conv'))
+            bias = not norm_after_conv
+ 
+        # Conv layer
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size,
+            stride=stride, padding=padding,
+            dilation=dilation, groups=groups, bias=bias
+        )
+ 
+        # Norm layer — KEY FIX:
+        # Xác định norm_channels theo vị trí của 'norm' trong order
         if self.with_norm:
-            norm_name, norm_layer = build_norm_layer(norm_cfg, out_channels)
+            norm_before_conv = order.index('norm') < order.index('conv')
+            norm_channels    = in_channels if norm_before_conv else out_channels
+            norm_name, norm_layer = build_norm_layer(norm_cfg, norm_channels)
             self.add_module(norm_name, norm_layer)
             self.norm_name = norm_name
-        
+ 
         # Activation layer
         if self.with_activation:
             self.activate = build_activation_layer(act_cfg)
-    
+ 
     @property
     def norm(self):
-        """Get normalization layer."""
         if self.with_norm:
             return getattr(self, self.norm_name)
         return None
-    
+ 
+    @property
+    def bn(self):
+        """Alias để tương thích với code dùng conv_module.bn.*"""
+        return self.norm
+ 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
         for layer_name in self.order:
             if layer_name == 'conv':
                 x = self.conv(x)
