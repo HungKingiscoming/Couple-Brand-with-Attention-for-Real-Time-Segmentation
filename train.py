@@ -25,8 +25,8 @@ warnings.filterwarnings('ignore')
 # IMPORTS — model mới, không còn mmcv/mmseg
 # ============================================
 
-from model.backbone.model import GCNet          # backbone mới
-from model.head.segmentation_head import GCNetHead      # head mới (tích hợp aux)
+from model.backbone.gcnet_v3 import GCNet          # backbone mới
+from model.head.gcnet_head_v2 import GCNetHead      # head mới (tích hợp aux)
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
@@ -557,6 +557,8 @@ class Trainer:
 
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
+        max_grad = 0.0   # khởi tạo trước vòng lặp — tránh UnboundLocalError
+                         # khi accumulation_steps > 1 và batch đầu chưa trigger update
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
