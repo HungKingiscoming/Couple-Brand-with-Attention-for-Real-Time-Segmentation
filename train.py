@@ -35,21 +35,51 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # PRETRAINED WEIGHT LOADER
 # ============================================
 
-def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
-    """Load pretrained weights vào model.backbone (GCNet).
+def _remap_stem_key(key: str) -> str:
+    """Remap stem key từ checkpoint gốc sang GCNet v3.
 
-    Tự động normalize key prefix để tương thích với nhiều checkpoint format.
+    Checkpoint gốc dùng 1 stem Sequential liên tục:
+      stem.0.*  → ConvModule(stride=2, in→C)        → stem_conv1 (Conv2d tại [0])
+      stem.1.*  → ConvModule(stride=2, C→C)         → stem_conv2 (Conv2d tại [0])
+      stem.2..stem.{N2+1}.* → N2 GCBlock stage2    → stem_stage2
+      stem.{N2+2}..end.*    → GCBlock stage3        → stem_stage3
+
+    FoggyAwareNorm thay BN trong ConvModule gốc → BN/IN/alpha không load
+    từ checkpoint (init random), chỉ Conv2d weight được remap.
+    """
+    import re
+    m = re.match(r'stem\.(\d+)\.(.+)$', key)
+    if not m:
+        return key
+    idx  = int(m.group(1))
+    rest = m.group(2)
+    N2   = 4  # num_blocks_per_stage[0] — số GCBlock ở stage 2
+    if idx == 0:
+        return f'stem_conv1.0.{rest}'
+    elif idx == 1:
+        return f'stem_conv2.0.{rest}'
+    elif 2 <= idx <= 1 + N2:
+        return f'stem_stage2.{idx - 2}.{rest}'
+    else:
+        return f'stem_stage3.{idx - (2 + N2)}.{rest}'
+
+
+def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
+    """Load pretrained weights vào model.backbone (GCNet v3).
+
+    Xử lý:
+    1. Strip prefix backbone./model./module.
+    2. Remap stem key: checkpoint gốc (stem.N.*) → v3 (stem_conv1/2/stage2/3.*)
+    3. Module mới (DWSA, FoggyAwareNorm) không có trong checkpoint → init random.
     """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    # model.backbone bây giờ là GCNet trực tiếp (không có wrapper)
-    model_state   = model.backbone.state_dict()
-    compatible    = {}
-    skipped       = []
+    model_state = model.backbone.state_dict()
+    compatible  = {}
+    skipped     = []
 
-    # Normalize model keys (bỏ prefix backbone./model./module.)
     model_key_map = {}
     for mk in model_state.keys():
         norm = mk
@@ -63,6 +93,9 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         for pref in ['backbone.', 'model.', 'module.']:
             if norm_ckpt.startswith(pref):
                 norm_ckpt = norm_ckpt[len(pref):]
+
+        # Remap stem key gốc → v3
+        norm_ckpt = _remap_stem_key(norm_ckpt)
 
         matched = False
         if norm_ckpt in model_key_map:
@@ -86,25 +119,35 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     total  = len(model_state)
     rate   = 100 * loaded / total if total > 0 else 0.0
 
+    # Phân loại skip để báo cáo rõ hơn
+    new_module_markers = ('dwsa_stage', 'foggy', 'alpha', '.in_.')
+    truly_new  = [k for k in skipped if any(s in k for s in new_module_markers)]
+    other_skip = [k for k in skipped if k not in truly_new]
+
     print(f"\n{'='*70}")
     print("WEIGHT LOADING SUMMARY")
     print(f"{'='*70}")
-    print(f"Loaded:  {loaded:>5} / {total} params ({rate:.1f}%)")
-    print(f"Skipped: {len(skipped):>5} params from checkpoint")
-    print(f"{'='*70}")
+    print(f"Loaded:              {loaded:>5} / {total} ({rate:.1f}%)")
+    print(f"Skipped total:       {len(skipped):>5}")
+    if other_skip:
+        print(f"  Unmatched:         {len(other_skip):>5}  ← cần kiểm tra")
+        for k in other_skip[:5]:
+            print(f"    {k}")
+    print(f"  New modules:       {len(truly_new):>5}  (DWSA/FoggyAwareNorm → init random ✓)")
+    print(f"{'='*70}\n")
 
-    if rate < 50:
-        print("WARNING: Less than 50% params loaded!")
-        print(f"  First 5 skipped: {skipped[:5]}")
+    if rate < 80 and other_skip:
+        print("WARNING: nhiều key không match — kiểm tra checkpoint format")
 
     missing, _ = model.backbone.load_state_dict(compatible, strict=False)
-    if missing:
-        print(f"\nMissing keys ({len(missing)}):")
-        for k in missing[:10]:
-            print(f"   - {k}")
-        if len(missing) > 10:
-            print(f"   ... and {len(missing)-10} more")
-    print()
+    expected_missing = [k for k in missing if
+                        any(s in k for s in ('dwsa', 'alpha', 'in_.', 'foggy'))]
+    unexpected_missing = [k for k in missing if k not in expected_missing]
+    if unexpected_missing:
+        print(f"Unexpected missing ({len(unexpected_missing)}):")
+        for k in unexpected_missing[:10]:
+            print(f"  - {k}")
+    print(f"Expected missing (new modules): {len(expected_missing)} keys → OK\n")
     return rate
 
 
