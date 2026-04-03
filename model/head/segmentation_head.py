@@ -144,9 +144,15 @@ class GCNetHead(BaseModule):
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+                if m is self.cls_seg or m is self.aux_cls_seg_c4:
+                    # Final classifier layer → init nhẹ hơn rất nhiều
+                    nn.init.normal_(m.weight, mean=0, std=0.001)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                else:
+                    nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
