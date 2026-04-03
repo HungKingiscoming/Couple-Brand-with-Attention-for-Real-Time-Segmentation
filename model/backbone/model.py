@@ -108,12 +108,14 @@ class DWSA(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Output projection + normalization
+        # Output projection + BN (giữ nhất quán với phần còn lại của backbone)
         self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
         _, self.norm  = build_norm_layer(norm_cfg, in_channels)
 
-        # Learnable residual scale — khởi tạo = 0 để training ổn định ban đầu
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # gamma: thay vì scalar tự do, dùng sigmoid để giới hạn output trong (0,1)
+        # tránh bùng gradient so với scalar không bị ràng buộc
+        # Khởi tạo raw=-4 → sigmoid(-4)≈0.018 ≈ gần 0, ổn định đầu training
+        self.gamma_raw = nn.Parameter(torch.full((1,), -4.0))
 
         self._init_weights()
 
@@ -152,7 +154,10 @@ class DWSA(nn.Module):
         out = self.out_proj(attended * dw)
         out = self.norm(out)
 
-        return x + self.gamma * out
+        # sigmoid(gamma_raw): bounded (0,1), gradient tự nhiên bị kiềm bởi sigmoid
+        # không cần clamp thủ công, tương thích deploy mode
+        gamma = torch.sigmoid(self.gamma_raw)
+        return x + gamma * out
 
 
 # =============================================================================
