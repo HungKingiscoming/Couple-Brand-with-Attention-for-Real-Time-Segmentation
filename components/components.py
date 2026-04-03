@@ -208,10 +208,11 @@ class ConvModule(nn.Module):
                 norm_before_conv = False
             norm_channels = in_channels if norm_before_conv else out_channels
 
-            _, norm_layer = build_norm_layer(norm_cfg, norm_channels)
-            # Dùng tên cố định '_norm_layer' thay vì tên động ('bn','gn',...)
-            # để tránh conflict với @property norm và @property bn
-            self.add_module('_norm_layer', norm_layer)
+            norm_name, norm_layer = build_norm_layer(norm_cfg, norm_channels)
+            # Giữ tên gốc (bn/gn/...) để state_dict key khớp checkpoint
+            self.add_module(norm_name, norm_layer)
+            # Lưu tên vào biến KHÔNG trùng với property nào
+            object.__setattr__(self, '_norm_key', norm_name)
 
         # ---- Activation ---- #
         if self.with_activation:
@@ -219,17 +220,16 @@ class ConvModule(nn.Module):
 
     @property
     def norm(self):
-        """Trả norm layer. Dùng trong forward và code bên ngoài."""
+        """Trả norm layer — dùng self._modules trực tiếp để tránh property loop."""
         if self.with_norm:
-            return self._norm_layer
+            return self._modules[self._norm_key]
         return None
 
     @property
     def bn(self):
-        """Alias .bn để tương thích với _fuse_bn_tensor dùng conv_module.bn.weight."""
-        # KHÔNG gọi self.norm ở đây — tránh vòng lặp norm→bn→norm
+        """Alias .bn cho _fuse_bn_tensor — dùng self._modules trực tiếp."""
         if self.with_norm:
-            return self._norm_layer
+            return self._modules[self._norm_key]
         return None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
