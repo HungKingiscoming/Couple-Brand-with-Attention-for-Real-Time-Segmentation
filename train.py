@@ -241,8 +241,9 @@ def build_optimizer(model, args):
             head_params.append(param)
 
     groups = []
+    head_lr = args.lr * getattr(args, 'head_lr_factor', 1.0)
     if head_params:
-        groups.append({'params': head_params,    'lr': args.lr,                              'name': 'head'})
+        groups.append({'params': head_params,    'lr': head_lr,   'name': 'head'})
     if backbone_params:
         groups.append({'params': backbone_params,'lr': args.lr * args.backbone_lr_factor,    'name': 'backbone'})
     if alpha_params:
@@ -695,6 +696,13 @@ class Trainer:
     def train_epoch(self, loader, epoch):
         self.model.train()
 
+        # Warmup: scale LR từ 1/10 lên full trong warmup_epochs đầu
+        warmup_epochs = getattr(self.args, 'warmup_epochs', 0)
+        if warmup_epochs > 0 and epoch < warmup_epochs:
+            warmup_factor = (epoch + 1) / warmup_epochs
+            for g in self.optimizer.param_groups:
+                g['lr'] = g['initial_lr'] * warmup_factor
+
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
         max_grad = 0.0   # khởi tạo trước vòng lặp — tránh UnboundLocalError
@@ -933,8 +941,12 @@ def main():
     parser.add_argument("--unfreeze_schedule",      type=str,   default="",
                         help="Comma-separated epochs to progressively unfreeze backbone")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
+    parser.add_argument("--head_lr_factor",         type=float, default=1.0,
+                        help="LR factor cho head. Giảm xuống 0.1-0.5 khi head đã pretrained")
     parser.add_argument("--alpha_lr_factor",        type=float, default=0.01,
                         help="LR factor for FoggyAwareNorm.alpha and DWSA.gamma")
+    parser.add_argument("--warmup_epochs",          type=int,   default=0,
+                        help="Số epoch warmup LR từ lr/10 lên lr đầy đủ")
     parser.add_argument("--use_class_weights",      action="store_true")
 
     # Dataset
