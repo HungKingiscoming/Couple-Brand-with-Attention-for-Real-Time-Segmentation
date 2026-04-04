@@ -517,6 +517,13 @@ class Trainer:
         self.save_dir.mkdir(parents=True, exist_ok=True)
         self.writer   = SummaryWriter(log_dir=self.save_dir / "tensorboard")
 
+        # Head warmup state
+        self.head_warmup_epochs = getattr(args, 'head_warmup_epochs', 2)
+        self._head_warmup_active = False
+
+        self.save_config()
+        self._print_config(loss_cfg)
+
         self.save_config()
         self._print_config(loss_cfg)
 
