@@ -1371,7 +1371,7 @@ def main():
         if epoch in unfreeze_epochs and k >= 4:
             print("\nStem unfrozen — resetting FoggyAwareNorm BN stats...")
             reset_foggy_norm_bn_stats(model)
-            re_estimate_bn_stats(model, train_loader, device, args, num_batches=10
+            re_estimate_bn_stats(model, train_loader, device, args, num_batches=10)
         # Rebuild optimizer + scheduler khi đúng epoch unfreeze
         if epoch in unfreeze_epochs:
             trainer.set_loss_phase('full')
