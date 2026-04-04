@@ -223,56 +223,285 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     print(f"Expected missing: {len(expected_missing)} keys (new modules + DAPPM BN order) → OK\n")
     return rate
 
-
+def reset_foggy_norm_bn_stats(model):
+    """Reset BN running stats trong TẤT CẢ FoggyAwareNorm modules.
+ 
+    Gọi hàm này NGAY TRƯỚC khi unfreeze stem (khi unfreeze_schedule đến
+    epoch unfreeze stem_conv1/stem_conv2).
+ 
+    Sau khi reset:
+      - BN.running_mean = 0
+      - BN.running_var  = 1
+      - BN.num_batches_tracked = 0
+    Model sẽ tự re-estimate running stats trong các batch đầu tiên sau đó.
+ 
+    Args:
+        model: Segmentor instance.
+ 
+    Returns:
+        int: Số BN layers đã được reset.
+    """
+    reset_count = 0
+    for name, module in model.backbone.named_modules():
+        # FoggyAwareNorm chứa self.bn (BatchNorm2d) và self.in_ (InstanceNorm2d)
+        # Chỉ reset BN, InstanceNorm không có running stats
+        if hasattr(module, 'bn') and isinstance(module.bn, nn.BatchNorm2d):
+            module.bn.reset_running_stats()
+            # Đảm bảo BN về train mode để cập nhật running stats
+            module.bn.train()
+            reset_count += 1
+            print(f"  Reset FAN.bn running stats: backbone.{name}.bn  "
+                  f"(channels={module.bn.num_features})")
+ 
+    print(f"  Total FoggyAwareNorm BN layers reset: {reset_count}\n")
+    return reset_count
+ 
+ 
+def re_estimate_bn_stats(model, data_loader, device, args, num_batches=100):
+    """Chạy forward pass (không backward) để BN re-estimate running stats.
+ 
+    Chỉ cần ~50-100 batch để running stats hội tụ ổn định.
+    Không tốn nhiều thời gian (~2-3 phút với batch_size=20).
+ 
+    Gọi hàm này SAU reset_foggy_norm_bn_stats() và TRƯỚC epoch training tiếp theo.
+ 
+    Args:
+        model: Segmentor instance.
+        data_loader: Train DataLoader.
+        device: cuda/cpu.
+        args: Namespace, cần args.use_amp.
+        num_batches: Số batch để re-estimate. Default: 100.
+    """
+    print(f"Re-estimating FAN BN running stats ({num_batches} batches)...")
+ 
+    # Đặt toàn bộ model về eval, nhưng BN trong FoggyAwareNorm về train
+    model.eval()
+    fan_bn_modules = []
+    for module in model.backbone.modules():
+        if hasattr(module, 'bn') and isinstance(module.bn, nn.BatchNorm2d):
+            module.bn.train()
+            fan_bn_modules.append(module.bn)
+ 
+    if not fan_bn_modules:
+        print("  Không tìm thấy FoggyAwareNorm BN — bỏ qua re-estimation.")
+        return
+ 
+    print(f"  {len(fan_bn_modules)} FAN BN layers đang re-estimating...")
+ 
+    with torch.no_grad():
+        pbar = tqdm(data_loader, desc="  BN re-estimate", leave=False,
+                    total=min(num_batches, len(data_loader)))
+        for i, (imgs, _) in enumerate(pbar):
+            if i >= num_batches:
+                break
+            imgs = imgs.to(device, non_blocking=True)
+            with autocast(device_type='cuda', enabled=args.use_amp):
+                _ = model(imgs)   # inference mode: chỉ forward, không loss
+ 
+    # Trả model về train mode bình thường
+    model.train()
+    print("  BN re-estimation complete.\n")
+ 
+    # Log running stats sau re-estimation
+    for i, bn in enumerate(fan_bn_modules):
+        print(f"  FAN BN[{i}] — mean: [{bn.running_mean.min().item():.3f}, "
+              f"{bn.running_mean.max().item():.3f}]  "
+              f"var: [{bn.running_var.min().item():.3f}, "
+              f"{bn.running_var.max().item():.3f}]")
 # ============================================
 # OPTIMIZER
 # ============================================
 
 def build_optimizer(model, args):
-    """Phân tách params thành 3 nhóm với LR khác nhau:
-      - alpha (FoggyAwareNorm gate + DWSA gamma): LR rất nhỏ
-      - backbone: LR * backbone_lr_factor
-      - head: LR đầy đủ
+    """Phân tách params thành 4 nhóm LR:
+ 
+    Nhóm          | LR                              | Lý do
+    --------------|----------------------------------|-----------------------------
+    head          | args.lr                         | Train từ đầu, cần LR cao
+    backbone      | args.lr * backbone_lr_factor    | Pretrained, cần LR thấp
+    gamma (DWSA)  | args.lr * gamma_lr_factor       | Init=0, cần LR trung bình
+    alpha (FAN)   | args.lr * alpha_lr_factor       | Init=0.5, cần LR rất nhỏ
+ 
+    Vấn đề gốc: gamma và alpha bị gộp chung → gamma không học được
+    vì bị kìm bởi LR quá nhỏ (alpha_lr_factor=0.01).
+ 
+    gamma_lr_factor nên = 0.05~0.1 (10× lớn hơn alpha_lr_factor).
     """
-    alpha_params = []
-    gamma_params = []   
-    backbone_params = []
-    head_params = []
-
+    alpha_params    = []   # FoggyAwareNorm.alpha — gate từ 0.5, học chậm
+    gamma_params    = []   # DWSA.gamma           — init từ 0, cần học nhanh hơn
+    backbone_params = []   # Các param backbone còn lại
+    head_params     = []   # Decode head
+ 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
+        # Phân biệt rõ gamma (DWSA residual scale) vs alpha (FAN gate)
         if 'gamma' in name:
-            gamma_params.append(param)   # DWSA residual scale
+            gamma_params.append(param)
         elif 'alpha' in name:
-            alpha_params.append(param)   # FoggyAwareNorm gate
+            alpha_params.append(param)
         elif 'backbone' in name:
             backbone_params.append(param)
         else:
             head_params.append(param)
-
+ 
     groups = []
     if head_params:
-        groups.append({'params': head_params,    'lr': args.lr,                           'name': 'head'})
+        groups.append({
+            'params': head_params,
+            'lr': args.lr,
+            'name': 'head',
+        })
     if backbone_params:
-        groups.append({'params': backbone_params,'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+        groups.append({
+            'params': backbone_params,
+            'lr': args.lr * args.backbone_lr_factor,
+            'name': 'backbone',
+        })
     if gamma_params:
-        # gamma cần LR lớn hơn alpha vì init từ 0
-        groups.append({'params': gamma_params,   'lr': args.lr * args.gamma_lr_factor,    'name': 'gamma'})
+        # gamma_lr_factor = 0.05~0.1 → với lr=1e-4: gamma_lr = 5e-6~1e-5
+        # Đủ để gamma thoát khỏi vùng ≈0 mà không gây spike
+        groups.append({
+            'params': gamma_params,
+            'lr': args.lr * args.gamma_lr_factor,
+            'name': 'gamma',
+        })
     if alpha_params:
-        groups.append({'params': alpha_params,   'lr': args.lr * args.alpha_lr_factor,    'name': 'alpha'})
-
+        groups.append({
+            'params': alpha_params,
+            'lr': args.lr * args.alpha_lr_factor,
+            'name': 'alpha',
+        })
+ 
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
         g.setdefault('initial_lr', g['lr'])
-
-    print(f"Optimizer: AdamW (Discriminative LR)")
+ 
+    print("Optimizer: AdamW (4-group Discriminative LR)")
     for g in optimizer.param_groups:
-        print(f"  group '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
-
+        n_params = sum(p.numel() for p in g['params'])
+        print(f"  group '{g['name']}': lr={g['lr']:.2e}, "
+              f"tensors={len(g['params'])}, params={n_params:,}")
+ 
     return optimizer
 
-
+def warmup_dwsa(model, train_loader, device, args, num_epochs=3):
+    """Train chỉ DWSA gamma trong vài epoch trước khi freeze backbone.
+ 
+    Mục đích: đưa gamma từ 0 lên giá trị khởi điểm có ý nghĩa (~0.1~0.3)
+    trước khi các param khác bị freeze/unfreeze. Nếu bỏ qua bước này,
+    DWSA mất ~10 epoch đầu chỉ để "khởi động" trong khi gradients spike.
+ 
+    Cơ chế:
+    - Freeze toàn bộ model
+    - Chỉ unfreeze dwsa_stage4/5/6 (chỉ gamma, query, key, value, dw_gen)
+    - Dùng LR cao hơn bình thường (1e-3) với Adam (không AdamW)
+    - Loss: chỉ CE đơn giản trên c6_logit, không OHEM/Dice để gradient sạch
+ 
+    Args:
+        model: Segmentor instance.
+        train_loader: DataLoader cho train set.
+        device: cuda/cpu.
+        args: Namespace chứa num_classes, ignore_index, use_amp.
+        num_epochs: Số epoch warmup. Khuyến nghị 2-3.
+    """
+    print(f"\n{'='*70}")
+    print(f"DWSA WARMUP — {num_epochs} epochs (gamma: 0 → meaningful values)")
+    print(f"{'='*70}")
+ 
+    # 1. Freeze toàn bộ model
+    for p in model.parameters():
+        p.requires_grad = False
+ 
+    # 2. Chỉ mở DWSA
+    dwsa_names = ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']
+    total_warmup_params = 0
+    for name in dwsa_names:
+        module = getattr(model.backbone, name, None)
+        if module is not None:
+            for p in module.parameters():
+                p.requires_grad = True
+                total_warmup_params += p.numel()
+            print(f"  Warmup trainable: backbone.{name} "
+                  f"({sum(p.numel() for p in module.parameters()):,} params)")
+ 
+    print(f"  Total warmup params: {total_warmup_params:,}\n")
+ 
+    # 3. Optimizer riêng cho warmup — Adam với LR cao
+    warmup_opt = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=1e-3,       # LR cao: gamma cần đi từ 0 lên nhanh
+        betas=(0.9, 0.999),
+    )
+    warmup_scaler = GradScaler(enabled=args.use_amp)
+    ce_loss_fn    = nn.CrossEntropyLoss(ignore_index=args.ignore_index)
+ 
+    # 4. Training loop
+    model.train()
+    # Đảm bảo frozen layers ở eval mode (BN running stats không bị thay đổi)
+    for m in model.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+ 
+    for epoch in range(num_epochs):
+        total_loss = 0.0
+        gamma_vals = {}
+ 
+        pbar = tqdm(train_loader,
+                    desc=f"DWSA Warmup {epoch+1}/{num_epochs}",
+                    leave=False)
+ 
+        for imgs, masks in pbar:
+            imgs  = imgs.to(device, non_blocking=True)
+            masks = masks.to(device, non_blocking=True).long()
+            if masks.dim() == 4:
+                masks = masks.squeeze(1)
+ 
+            warmup_opt.zero_grad(set_to_none=True)
+ 
+            with autocast(device_type='cuda', enabled=args.use_amp):
+                # Dùng forward_train để có c6_logit
+                outputs     = model.forward_train(imgs)
+                _, c6_logit = outputs["main"]
+ 
+                # Upsample về full resolution
+                c6_full = F.interpolate(
+                    c6_logit, size=masks.shape[-2:],
+                    mode='bilinear', align_corners=False,
+                )
+                loss = ce_loss_fn(c6_full, masks)
+ 
+            warmup_scaler.scale(loss).backward()
+            # Clip nhẹ để gamma không overshoot
+            warmup_scaler.unscale_(warmup_opt)
+            torch.nn.utils.clip_grad_norm_(
+                filter(lambda p: p.requires_grad, model.parameters()),
+                max_norm=2.0,
+            )
+            warmup_scaler.step(warmup_opt)
+            warmup_scaler.update()
+ 
+            total_loss += loss.item()
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+ 
+        # Log gamma values sau mỗi epoch warmup
+        for name in dwsa_names:
+            module = getattr(model.backbone, name, None)
+            if module is not None and hasattr(module, 'gamma'):
+                gamma_vals[name] = module.gamma.item()
+ 
+        avg_loss = total_loss / len(train_loader)
+        print(f"  Warmup epoch {epoch+1}/{num_epochs} — Loss: {avg_loss:.4f}")
+        for k, v in gamma_vals.items():
+            print(f"    {k}.gamma = {v:.4f}  (target: 0.05~0.3)")
+ 
+    print("\nDWSA warmup complete. Gamma values initialized from 0.\n")
+ 
+    # 5. Restore requires_grad = False cho tất cả (freeze_backbone() sẽ tự xử lý sau)
+    for p in model.parameters():
+        p.requires_grad = False
+ 
+    return gamma_vals
 def build_scheduler(optimizer, args, train_loader, start_epoch=0):
     n_groups = len(optimizer.param_groups)
 
@@ -950,7 +1179,12 @@ def main():
     parser.add_argument("--alpha_lr_factor",        type=float, default=0.01,
                         help="LR factor for FoggyAwareNorm.alpha and DWSA.gamma")
     parser.add_argument("--use_class_weights",      action="store_true")
-
+    parser.add_argument("--gamma_lr_factor",   type=float, default=0.05,
+                       help="LR factor cho DWSA.gamma (nên 0.05~0.1, "
+                            "lớn hơn alpha_lr_factor để gamma học từ 0)")
+    parser.add_argument("--warmup_dwsa_epochs", type=int, default=3,
+                       help="Số epoch warmup chỉ train DWSA gamma trước "
+                            "khi freeze backbone. Set 0 để tắt.")
     # Dataset
     parser.add_argument("--train_txt",   required=True)
     parser.add_argument("--val_txt",     required=True)
@@ -1051,7 +1285,10 @@ def main():
 
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights)
-
+    if getattr(args, 'warmup_dwsa_epochs', 0) > 0:
+        warmup_gamma_vals = warmup_dwsa(
+           model, train_loader, device, args,
+           num_epochs=args.warmup_dwsa_epochs,)
     if args.freeze_backbone:
         freeze_backbone(model)
 
@@ -1131,7 +1368,10 @@ def main():
             targets += UNFREEZE_STAGES[i]
         if targets:
             unfreeze_backbone_progressive(model, targets)
-
+        if epoch in unfreeze_epochs and k >= 4:
+            print("\nStem unfrozen — resetting FoggyAwareNorm BN stats...")
+            reset_foggy_norm_bn_stats(model)
+            re_estimate_bn_stats(model, train_loader, device, args, num_batches=10
         # Rebuild optimizer + scheduler khi đúng epoch unfreeze
         if epoch in unfreeze_epochs:
             trainer.set_loss_phase('full')
