@@ -1182,7 +1182,7 @@ def main():
     parser.add_argument("--gamma_lr_factor",   type=float, default=0.05,
                        help="LR factor cho DWSA.gamma (nên 0.05~0.1, "
                             "lớn hơn alpha_lr_factor để gamma học từ 0)")
-    parser.add_argument("--warmup_dwsa_epochs", type=int, default=3,
+    parser.add_argument("--warmup_dwsa_epochs", type=int, default=0,
                        help="Số epoch warmup chỉ train DWSA gamma trước "
                             "khi freeze backbone. Set 0 để tắt.")
     # Dataset
