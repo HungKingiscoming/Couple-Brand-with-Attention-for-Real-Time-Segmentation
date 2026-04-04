@@ -8,7 +8,255 @@ from typing import Callable, Optional, Tuple, List, Dict
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
+from albumentations.core.transforms_interface import ImageOnlyTransform
 
+class PhysicalFog(ImageOnlyTransform):
+    """Simulate fog theo Atmospheric Scattering Model (ASM).
+ 
+    Công thức: I(x) = J(x) * t(x) + A * (1 - t(x))
+    Trong đó:
+        I(x) = foggy image (output)
+        J(x) = clear image (input)
+        A     = atmospheric light (~0.85–1.0 cho foggy driving)
+        t(x) = transmission map = exp(-beta * d(x))
+        d(x) = depth tại pixel x
+        beta  = scattering coefficient (fog density)
+ 
+    Depth được approximate bằng vertical gradient (phần dưới = gần = ít mờ,
+    phần trên = xa = mờ hơn) — phù hợp với camera perspective trên xe.
+ 
+    Khác với A.RandomFog (dùng blur đơn giản), PhysicalFog:
+    - Tạo depth-dependent attenuation (xa mờ hơn gần)
+    - Atmospheric light A ngả vàng/xám nhẹ (realistic hơn pure white)
+    - Có thể combine với horizontal bands để simulate fog layers
+ 
+    Args:
+        beta_range (tuple): Range của scattering coefficient.
+            (0.05, 0.15) = light fog, (0.15, 0.4) = dense fog.
+        atm_light_range (tuple): Atmospheric light intensity (per-channel).
+        depth_bias (float): Bias vertical gradient (0=uniform, 1=top-heavy).
+        always_apply (bool): Always apply. Default: False.
+        p (float): Probability. Default: 0.5.
+    """
+ 
+    def __init__(self,
+                 beta_range=(0.08, 0.25),
+                 atm_light_range=(0.80, 0.95),
+                 depth_bias=0.7,
+                 always_apply=False,
+                 p=0.5):
+        super().__init__(always_apply, p)
+        self.beta_range       = beta_range
+        self.atm_light_range  = atm_light_range
+        self.depth_bias       = depth_bias
+ 
+    def apply(self, img, beta=0.15, atm_light=0.9, **params):
+        """
+        Args:
+            img: numpy array (H, W, C), dtype uint8 hoặc float32.
+        """
+        img_f = img.astype(np.float32) / 255.0 if img.dtype == np.uint8 else img.copy()
+        H, W  = img_f.shape[:2]
+ 
+        # Depth map: vertical gradient (top=far=1, bottom=near=0)
+        # Thêm noise nhỏ để không quá đều
+        depth = np.linspace(1.0, 0.0, H)[:, np.newaxis]          # (H, 1)
+        depth = depth * self.depth_bias + np.random.uniform(0, 1 - self.depth_bias, (H, 1))
+        depth = np.clip(depth, 0.0, 1.0)
+        depth = np.tile(depth, (1, W))                             # (H, W)
+ 
+        # Transmission map
+        transmission = np.exp(-beta * depth * 3.0)                 # (H, W)
+        transmission = transmission[:, :, np.newaxis]              # (H, W, 1)
+ 
+        # Atmospheric light — hơi vàng ấm (RGB: ~0.9, 0.88, 0.85) để realistic
+        atm_r = atm_light * np.random.uniform(0.98, 1.02)
+        atm_g = atm_light * np.random.uniform(0.96, 1.00)
+        atm_b = atm_light * np.random.uniform(0.90, 0.96)
+        A_light = np.array([atm_r, atm_g, atm_b], dtype=np.float32).reshape(1, 1, 3)
+        A_light = np.clip(A_light, 0.0, 1.0)
+ 
+        # ASM: I = J*t + A*(1-t)
+        foggy = img_f * transmission + A_light * (1.0 - transmission)
+        foggy = np.clip(foggy, 0.0, 1.0)
+ 
+        if img.dtype == np.uint8:
+            return (foggy * 255).astype(np.uint8)
+        return foggy.astype(np.float32)
+ 
+    def get_params(self):
+        return {
+            'beta':      np.random.uniform(*self.beta_range),
+            'atm_light': np.random.uniform(*self.atm_light_range),
+        }
+ 
+    def get_transform_init_args_names(self):
+        return ('beta_range', 'atm_light_range', 'depth_bias')
+ 
+ 
+class HazeStripe(ImageOnlyTransform):
+    """Thêm horizontal haze bands — simulate fog layers ở các độ cao khác nhau.
+ 
+    Foggy driving images thường có fog không đều theo chiều dọc:
+    - Có thể có lớp mù dày ở horizon
+    - Vùng gần camera thường clear hơn
+    Đây là edge case mà model hay fail.
+ 
+    Args:
+        num_stripes (tuple): Range số lượng stripe. Default: (1, 3).
+        stripe_width_ratio (tuple): Chiều cao stripe / H. Default: (0.05, 0.15).
+        intensity_range (tuple): Fog intensity cho mỗi stripe. Default: (0.1, 0.4).
+        always_apply (bool): Default: False.
+        p (float): Default: 0.3.
+    """
+ 
+    def __init__(self,
+                 num_stripes=(1, 3),
+                 stripe_width_ratio=(0.05, 0.15),
+                 intensity_range=(0.1, 0.4),
+                 always_apply=False,
+                 p=0.3):
+        super().__init__(always_apply, p)
+        self.num_stripes        = num_stripes
+        self.stripe_width_ratio = stripe_width_ratio
+        self.intensity_range    = intensity_range
+ 
+    def apply(self, img, stripes=None, **params):
+        if stripes is None:
+            return img
+        img_f = img.astype(np.float32) / 255.0 if img.dtype == np.uint8 else img.copy()
+        H, W  = img_f.shape[:2]
+ 
+        for (y0, y1, intensity) in stripes:
+            # Fog color: xám sáng pha nhẹ xanh (atmospheric)
+            fog_color  = np.array([0.92, 0.93, 0.95], dtype=np.float32)
+            # Gaussian fade ở biên stripe để không bị cứng
+            fade       = np.ones(y1 - y0, dtype=np.float32)
+            fade_len   = max(1, (y1 - y0) // 4)
+            fade_curve = np.linspace(0, 1, fade_len)
+            fade[:fade_len]  = fade_curve
+            fade[-fade_len:] = fade_curve[::-1]
+            fade = fade[:, np.newaxis, np.newaxis] * intensity
+ 
+            img_f[y0:y1] = img_f[y0:y1] * (1 - fade) + fog_color * fade
+ 
+        img_f = np.clip(img_f, 0.0, 1.0)
+        if img.dtype == np.uint8:
+            return (img_f * 255).astype(np.uint8)
+        return img_f
+ 
+    def get_params_dependent_on_targets(self, params):
+        img   = params['image']
+        H, W  = img.shape[:2]
+        n     = np.random.randint(*self.num_stripes) if self.num_stripes[0] < self.num_stripes[1] \
+                else self.num_stripes[0]
+        stripes = []
+        for _ in range(n):
+            w   = int(np.random.uniform(*self.stripe_width_ratio) * H)
+            y0  = np.random.randint(0, max(1, H - w))
+            y1  = min(H, y0 + w)
+            intensity = np.random.uniform(*self.intensity_range)
+            stripes.append((y0, y1, intensity))
+        return {'stripes': stripes}
+ 
+    @property
+    def targets_as_params(self):
+        return ['image']
+ 
+    def get_transform_init_args_names(self):
+        return ('num_stripes', 'stripe_width_ratio', 'intensity_range')
+
+def get_foggy_specific_augmentations():
+    """Trả về list augmentation thay thế foggy_specific hiện tại.
+ 
+    So với bản cũ:
+    - PhysicalFog thay A.RandomFog: ASM đúng, depth-dependent, p=0.4 (tăng 4×)
+    - HazeStripe: thêm mới, simulate fog layers
+    - CoarseDropout fill_value thay bằng màu fog-like (200, 200, 205)
+    - RandomBrightnessContrast tăng limit từ 0.08 lên 0.15
+    - Thêm A.CLAHE nhẹ: simulate contrast enhancement (camera auto-exposure)
+    - Thêm A.ISONoise nhẹ: simulate noise trong foggy/low-contrast scene
+    """
+    return [
+        # ------------------------------------------------------------------ #
+        # 1. Physical fog simulation — QUAN TRỌNG NHẤT                        #
+        # ------------------------------------------------------------------ #
+        # PhysicalFog: depth-dependent, ASM đúng, p=0.4
+        # Tăng mạnh khả năng model thấy foggy samples trong mỗi epoch
+        PhysicalFog(
+            beta_range=(0.06, 0.22),      # light → moderate fog
+            atm_light_range=(0.78, 0.95), # atmospheric light variation
+            depth_bias=0.65,              # top-heavy (xa mờ hơn)
+            p=0.40,                       # ← tăng từ 0.1 lên 0.4
+        ),
+ 
+        # HazeStripe: fog không đồng đều theo chiều dọc, p=0.25
+        HazeStripe(
+            num_stripes=(1, 3),
+            stripe_width_ratio=(0.04, 0.12),
+            intensity_range=(0.08, 0.30),
+            p=0.25,
+        ),
+ 
+        # Giữ A.RandomFog nhẹ như một dạng augmentation bổ sung (không thay thế)
+        A.RandomFog(
+            fog_coef_lower=0.05,
+            fog_coef_upper=0.18,
+            alpha_coef=0.06,
+            p=0.15,                       # ← giữ nguyên, cộng thêm vào Physical
+        ),
+ 
+        # ------------------------------------------------------------------ #
+        # 2. Robustness — CoarseDropout với fill màu fog-like                  #
+        # ------------------------------------------------------------------ #
+        # fill_value=(200, 200, 205) thay vì 0 (đen)
+        # Foggy images không có vùng đen tự nhiên — đen là OOD với foggy val set
+        A.CoarseDropout(
+            max_holes=6,
+            max_height=32,
+            max_width=32,
+            fill_value=(200, 200, 205),   # ← xám sáng thay đen
+            mask_fill_value=255,
+            p=0.30,
+        ),
+ 
+        # ------------------------------------------------------------------ #
+        # 3. Illumination — tăng range để cover val distribution rộng hơn    #
+        # ------------------------------------------------------------------ #
+        A.OneOf([
+            A.RandomBrightnessContrast(
+                brightness_limit=0.15,    # ← tăng từ 0.08 lên 0.15
+                contrast_limit=0.15,      # ← tăng từ 0.08 lên 0.15
+                p=1.0,
+            ),
+            A.RandomGamma(gamma_limit=(88, 112), p=1.0),  # ← mở rộng từ (95,105)
+        ], p=0.35),                       # ← tăng từ 0.3 lên 0.35
+ 
+        # CLAHE nhẹ: simulate camera auto-exposure trong foggy condition
+        A.CLAHE(
+            clip_limit=2.0,
+            tile_grid_size=(8, 8),
+            p=0.15,                       # ← thêm mới
+        ),
+ 
+        # ------------------------------------------------------------------ #
+        # 4. Blur — giữ nguyên, hơi tăng probability                          #
+        # ------------------------------------------------------------------ #
+        A.OneOf([
+            A.GaussianBlur(blur_limit=3, p=1.0),
+            A.MotionBlur(blur_limit=3, p=1.0),
+        ], p=0.20),                       # ← tăng từ 0.15 lên 0.20
+ 
+        # ------------------------------------------------------------------ #
+        # 5. Sensor noise — thêm mới                                           #
+        # ------------------------------------------------------------------ #
+        # ISONoise: simulate noise trong điều kiện ánh sáng thấp (foggy = low contrast)
+        A.ISONoise(
+            color_shift=(0.01, 0.03),
+            intensity=(0.05, 0.15),
+            p=0.15,                       # ← thêm mới
+        ),
+    ]
 class CityscapesDataset(Dataset):
     """
     Universal Dataset for Cityscapes (Normal & Foggy versions)
@@ -217,42 +465,7 @@ def get_train_transforms(
 
     # ===== DATASET-SPECIFIC =====
     if dataset_type == 'foggy':
-        foggy_specific = [
-
-            # 🔥 Robustness (rất quan trọng)
-            A.CoarseDropout(
-                max_holes=6,
-                max_height=32,
-                max_width=32,
-                fill_value=0,
-                mask_fill_value=255,
-                p=0.3
-            ),
-
-            # Blur nhẹ (giảm lại)
-            A.OneOf([
-                A.GaussianBlur(blur_limit=3, p=1.0),
-                A.MotionBlur(blur_limit=3, p=1.0),
-            ], p=0.15),
-
-            # Light intensity change
-            A.OneOf([
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.08,
-                    contrast_limit=0.08,
-                    p=1.0
-                ),
-                A.RandomGamma(gamma_limit=(95, 105), p=1.0),
-            ], p=0.3),
-
-            # ⚠️ Fog rất nhẹ (hoặc có thể tắt)
-            A.RandomFog(
-                fog_coef_lower=0.05,
-                fog_coef_upper=0.15,
-                alpha_coef=0.05,
-                p=0.1
-            ),
-        ]
+        foggy_specific = get_foggy_specific_augmentations()
 
     else:
         # NORMAL dataset → augment mạnh hơn
