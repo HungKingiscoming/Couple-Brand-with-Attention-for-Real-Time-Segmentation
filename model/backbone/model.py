@@ -18,9 +18,28 @@ from components.components import (
 )
 
 
+# =============================================================================
+# Foggy-aware Normalization
+# =============================================================================
 
 class FoggyAwareNorm(nn.Module):
+    """Foggy-aware Normalization.
 
+    Kết hợp Instance Normalization (robust với distribution shift của foggy
+    images) và Batch Normalization thông qua một learnable gate `alpha`.
+
+    Khi alpha → 1: thiên về IN (tốt cho foggy / unseen domain).
+    Khi alpha → 0: thiên về BN (tốt cho clear images / in-domain).
+
+    Model tự học mức cân bằng tối ưu trong quá trình training mà không
+    cần hard-code loại normalization.
+
+    Args:
+        num_channels (int): Number of feature channels.
+        requires_grad (bool): Whether params require gradient. Default: True.
+        eps (float): Numerical stability. Default: 1e-5.
+        momentum (float): BN running stats momentum. Default: 0.1.
+    """
 
     def __init__(self,
                  num_channels: int,
@@ -34,7 +53,7 @@ class FoggyAwareNorm(nn.Module):
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
                                       affine=True, track_running_stats=False)
 
-        # Learnable gate per-channel, khá»Ÿi táº¡o 0.5 â†’ trung láº­p
+        # Learnable gate per-channel, khởi tạo 0.5 → trung lập
         self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
 
         if not requires_grad:
@@ -46,9 +65,26 @@ class FoggyAwareNorm(nn.Module):
         return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
 
 
-
+# =============================================================================
+# DWSA — Dynamic Weight Self-Attention
+# =============================================================================
 
 class DWSA(nn.Module):
+    """Dynamic Weight Self-Attention.
+
+    Kết hợp spatial attention (dot-product trên pooled Q/K để tránh OOM)
+    và dynamic channel weighting (học từ global context).
+
+    Với foggy images, module tự suppress các vùng bị haze nặng (low signal)
+    và enhance các vùng còn giữ được cấu trúc (high signal).
+
+    Args:
+        in_channels (int): Number of input channels.
+        reduction (int): Channel reduction ratio cho Q/K projection.
+            Default: 8.
+        norm_cfg (dict): Config dict for normalization layer.
+    """
+
     def __init__(self,
                  in_channels: int,
                  reduction: int = 8,
@@ -57,12 +93,12 @@ class DWSA(nn.Module):
 
         mid_channels = max(in_channels // reduction, 16)
 
-        # Q / K / V projections â€” 1Ã—1 conv, giá»¯ lightweight
+        # Q / K / V projections — 1×1 conv, giữ lightweight
         self.query   = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
         self.key     = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
         self.value   = nn.Conv2d(in_channels, in_channels,  kernel_size=1, bias=False)
 
-        # Dynamic channel weight: global avg pool â†’ MLP â†’ sigmoid
+        # Dynamic channel weight: global avg pool → MLP → sigmoid
         self.dw_gen = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
@@ -72,12 +108,14 @@ class DWSA(nn.Module):
             nn.Sigmoid(),
         )
 
-        # Output projection + normalization
+        # Output projection + BN (giữ nhất quán với phần còn lại của backbone)
         self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
         _, self.norm  = build_norm_layer(norm_cfg, in_channels)
 
-        # Learnable residual scale â€” khá»Ÿi táº¡o = 0 Ä‘á»ƒ training á»•n Ä‘á»‹nh ban Ä‘áº§u
-        self.gamma = nn.Parameter(torch.zeros(1))
+        # gamma: thay vì scalar tự do, dùng sigmoid để giới hạn output trong (0,1)
+        # tránh bùng gradient so với scalar không bị ràng buộc
+        # Khởi tạo raw=-4 → sigmoid(-4)≈0.018 ≈ gần 0, ổn định đầu training
+        self.gamma_raw = nn.Parameter(torch.full((1,), -4.0))
 
         self._init_weights()
 
@@ -92,7 +130,7 @@ class DWSA(nn.Module):
         k = self.key(x)     # B, C//r, H, W
         v = self.value(x)   # B, C,    H, W
 
-        # Pool spatial dims Ä‘á»ƒ trÃ¡nh OOM á»Ÿ resolution cao
+        # Pool spatial dims để tránh OOM ở resolution cao
         ph, pw = H // 4 + 1, W // 4 + 1
         q_pool = F.adaptive_avg_pool2d(q, (ph, pw)).flatten(2)   # B, C//r, ph*pw
         k_pool = F.adaptive_avg_pool2d(k, (ph, pw)).flatten(2)   # B, C//r, ph*pw
@@ -104,7 +142,7 @@ class DWSA(nn.Module):
             dim=-1
         )
 
-        # Attended value â†’ upsample vá» kÃ­ch thÆ°á»›c gá»‘c
+        # Attended value → upsample về kích thước gốc
         attended = torch.bmm(v_pool, attn.transpose(1, 2))       # B, C, hw
         attended = attended.view(B, C, ph, pw)
         attended = F.interpolate(attended, size=(H, W),
@@ -116,7 +154,10 @@ class DWSA(nn.Module):
         out = self.out_proj(attended * dw)
         out = self.norm(out)
 
-        return x + self.gamma * out
+        # sigmoid(gamma_raw): bounded (0,1), gradient tự nhiên bị kiềm bởi sigmoid
+        # không cần clamp thủ công, tương thích deploy mode
+        gamma = torch.sigmoid(self.gamma_raw)
+        return x + gamma * out
 
 
 # =============================================================================
@@ -124,6 +165,32 @@ class DWSA(nn.Module):
 # =============================================================================
 
 class GCNet(BaseModule):
+    """GCNet backbone with DWSA (stage 4/5/6) and Foggy-aware Normalization.
+
+    Thay đổi so với bản gốc:
+      1. Stem stage 1 (hai conv đầu tiên) dùng FoggyAwareNorm thay BN.
+         Đây là điểm feature gần raw pixel nhất — distribution shift của
+         foggy ảnh hưởng mạnh nhất tại đây.
+      2. DWSA đặt sau bilateral fusion ở stage 4 và 5 (áp lên detail branch),
+         và sau khi fuse semantic + detail ở stage 6 (áp lên output cuối).
+
+    Decoder (GCNetHead) giữ nguyên hoàn toàn.
+
+    Args:
+        in_channels (int): Input image channels. Default: 3.
+        channels (int): Base channels. Default: 32.
+        ppm_channels (int): PPM channels. Default: 128.
+        num_blocks_per_stage (List): Blocks per stage.
+            '[4, 4, [5,4], [5,4], [2,2]]' → GCNet-S/M.
+            '[5, 5, [5,5], [5,5], [3,3]]' → GCNet-L.
+        align_corners (bool): F.interpolate align_corners. Default: False.
+        norm_cfg (dict): Norm config. Default: BN.
+        act_cfg (dict): Activation config. Default: ReLU.
+        dwsa_reduction (int): DWSA channel reduction ratio. Default: 8.
+        init_cfg (dict, optional): Init config. Default: None.
+        deploy (bool): Deploy mode. Default: False.
+    """
+
     def __init__(self,
                  in_channels: int = 3,
                  channels: int = 32,
@@ -146,7 +213,9 @@ class GCNet(BaseModule):
         self.act_cfg              = act_cfg
         self.deploy               = deploy
 
-
+        # ------------------------------------------------------------------ #
+        # Stage 1 — FoggyAwareNorm ở 2 conv đầu                              #
+        # ------------------------------------------------------------------ #
         self.stem_conv1 = nn.Sequential(
             nn.Conv2d(in_channels, channels,
                       kernel_size=3, stride=2, padding=1, bias=False),
@@ -160,12 +229,14 @@ class GCNet(BaseModule):
             build_activation_layer(act_cfg),
         )
 
+        # Stage 2 — GCBlocks tại resolution 1/4, channels không đổi
         self.stem_stage2 = nn.Sequential(
             *[GCBlock(channels, channels, stride=1,
                       norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
               for _ in range(num_blocks_per_stage[0])]
         )
 
+        # Stage 3 — downsample lên channels*2, resolution 1/8
         self.stem_stage3 = nn.Sequential(
             GCBlock(channels, channels * 2, stride=2,
                     norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
@@ -176,10 +247,13 @@ class GCNet(BaseModule):
 
         self.relu = build_activation_layer(act_cfg)
 
-
+        # ------------------------------------------------------------------ #
+        # Semantic branch (stage 4 → 6)                                       #
+        # Resolution: 1/16 → 1/32 → 1/64, channels: ×4 → ×8 → ×16          #
+        # ------------------------------------------------------------------ #
         self.semantic_branch_layers = nn.ModuleList()
 
-        # Stage 4 semantic: channels*2 â†’ channels*4
+        # Stage 4 semantic: channels*2 → channels*4
         self.semantic_branch_layers.append(nn.Sequential(
             GCBlock(channels * 2, channels * 4, stride=2,
                     norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
@@ -190,7 +264,7 @@ class GCNet(BaseModule):
                     norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
         ))
 
-        # Stage 5 semantic: channels*4 â†’ channels*8
+        # Stage 5 semantic: channels*4 → channels*8
         self.semantic_branch_layers.append(nn.Sequential(
             GCBlock(channels * 4, channels * 8, stride=2,
                     norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
@@ -201,7 +275,7 @@ class GCNet(BaseModule):
                     norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
         ))
 
-        # Stage 6 semantic: channels*8 â†’ channels*16
+        # Stage 6 semantic: channels*8 → channels*16
         self.semantic_branch_layers.append(nn.Sequential(
             GCBlock(channels * 8, channels * 16, stride=2,
                     norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
@@ -212,7 +286,9 @@ class GCNet(BaseModule):
                     norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
         ))
 
-
+        # ------------------------------------------------------------------ #
+        # Bilateral fusion — trao đổi thông tin giữa hai nhánh               #
+        # ------------------------------------------------------------------ #
         # Stage 4 fusion
         self.compression_1 = ConvModule(
             channels * 4, channels * 2, kernel_size=1,
@@ -234,10 +310,13 @@ class GCNet(BaseModule):
                        norm_cfg=norm_cfg, act_cfg=None),
         )
 
-
+        # ------------------------------------------------------------------ #
+        # Detail branch (stage 4 → 6)                                         #
+        # Giữ resolution 1/8 xuyên suốt, channels: ×2 → ×2 → ×4             #
+        # ------------------------------------------------------------------ #
         self.detail_branch_layers = nn.ModuleList()
 
-        # Stage 4 detail: channels*2 â†’ channels*2
+        # Stage 4 detail: channels*2 → channels*2
         self.detail_branch_layers.append(nn.Sequential(
             *[GCBlock(channels * 2, channels * 2, stride=1,
                       norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
@@ -246,7 +325,7 @@ class GCNet(BaseModule):
                     norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
         ))
 
-        # Stage 5 detail: channels*2 â†’ channels*2
+        # Stage 5 detail: channels*2 → channels*2
         self.detail_branch_layers.append(nn.Sequential(
             *[GCBlock(channels * 2, channels * 2, stride=1,
                       norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
@@ -255,7 +334,7 @@ class GCNet(BaseModule):
                     norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
         ))
 
-        # Stage 6 detail: channels*2 â†’ channels*4
+        # Stage 6 detail: channels*2 → channels*4
         self.detail_branch_layers.append(nn.Sequential(
             GCBlock(channels * 2, channels * 4, stride=1,
                     norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
@@ -266,14 +345,23 @@ class GCNet(BaseModule):
                     norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
         ))
 
-
+        # ------------------------------------------------------------------ #
+        # DAPPM — dùng default conv_cfg order=(norm,act,conv) giống ckpt gốc #
+        # ConvModule đã được fix: norm build với in_channels khi đứng trước  #
+        # conv → không còn shape mismatch, weight load được đầy đủ.          #
+        # ------------------------------------------------------------------ #
         self.spp = DAPPM(
             channels * 16, ppm_channels, channels * 4,
             num_scales=5,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg)
 
-
+        # ------------------------------------------------------------------ #
+        # DWSA modules                                                         #
+        #   stage4: áp sau fusion lên detail branch  → in = channels*2       #
+        #   stage5: áp sau fusion lên detail branch  → in = channels*2       #
+        #   stage6: áp lên output fused (x_d + x_s)  → in = channels*4      #
+        # ------------------------------------------------------------------ #
         self.dwsa_stage4 = DWSA(channels * 2,
                                 reduction=dwsa_reduction, norm_cfg=norm_cfg)
         self.dwsa_stage5 = DWSA(channels * 2,
@@ -291,7 +379,7 @@ class GCNet(BaseModule):
         """Forward function."""
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
 
-
+        # ---- Stage 1–3 --------------------------------------------------- #
         x = self.stem_conv1(x)      # 1/2
         x = self.stem_conv2(x)      # 1/4,  channels
         x = self.stem_stage2(x)     # 1/4,  channels
@@ -307,7 +395,7 @@ class GCNet(BaseModule):
                             mode='bilinear',
                             align_corners=self.align_corners)
 
-        # DWSA sau fusion stage 4: refine detail feature sau láº§n trao Ä‘á»•i Ä‘áº§u
+        # DWSA sau fusion stage 4: refine detail feature sau lần trao đổi đầu
         x_d = self.dwsa_stage4(x_d)
 
         if self.training:
@@ -323,8 +411,8 @@ class GCNet(BaseModule):
                             mode='bilinear',
                             align_corners=self.align_corners)
 
-        # DWSA sau fusion stage 5: x_d lÃºc nÃ y Ä‘Ã£ tÃ­ch há»£p context tá»«
-        # cáº£ hai nhÃ¡nh, DWSA cÃ³ thá»ƒ weighting phong phÃº hÆ¡n
+        # DWSA sau fusion stage 5: x_d lúc này đã tích hợp context từ
+        # cả hai nhánh, DWSA có thể weighting phong phú hơn
         x_d = self.dwsa_stage5(x_d)
 
         # ---- Stage 6 ---------------------------------------------------- #
@@ -334,7 +422,7 @@ class GCNet(BaseModule):
         x_s = resize(x_s, size=out_size,
                      mode='bilinear', align_corners=self.align_corners)
 
-        # Fuse rá»“i má»›i DWSA â€” full context, weighting chÃ­nh xÃ¡c nháº¥t
+        # Fuse rồi mới DWSA — full context, weighting chính xác nhất
         fused = self.dwsa_stage6(x_d + x_s)                   # 1/8,  channels*4
 
         return (c4_feat, fused) if self.training else fused
@@ -344,7 +432,7 @@ class GCNet(BaseModule):
     # ---------------------------------------------------------------------- #
 
     def switch_to_deploy(self):
-        """Merge multi-branch GCBlocks thÃ nh single conv Ä‘á»ƒ tÄƒng tá»‘c inference."""
+        """Merge multi-branch GCBlocks thành single conv để tăng tốc inference."""
         for m in self.modules():
             if isinstance(m, GCBlock):
                 m.switch_to_deploy()
@@ -361,7 +449,9 @@ class GCNet(BaseModule):
                 nn.init.constant_(m.bias, 0)
 
 
-
+# =============================================================================
+# Block1x1 — 1×1 → 1×1 path với BN fusion
+# =============================================================================
 
 class Block1x1(BaseModule):
     """The 1x1_1x1 path of the GCBlock.
@@ -441,7 +531,9 @@ class Block1x1(BaseModule):
         self.deploy = True
 
 
-
+# =============================================================================
+# Block3x3 — 3×3 → 1×1 path với BN fusion
+# =============================================================================
 
 class Block3x3(BaseModule):
     """The 3x3_1x1 path of the GCBlock.
@@ -520,9 +612,30 @@ class Block3x3(BaseModule):
         self.deploy = True
 
 
-
+# =============================================================================
+# GCBlock — multi-path block với structural reparameterization
+# =============================================================================
 
 class GCBlock(nn.Module):
+    """GCBlock — core building block của GCNet.
+
+    Training: 4 path song song:
+        path_3x3_1 + path_3x3_2 + path_1x1 + path_residual (BN only)
+
+    Deploy: hợp nhất thành 1 conv 3×3 duy nhất (switch_to_deploy).
+
+    Args:
+        in_channels (int): Input channels.
+        out_channels (int): Output channels.
+        kernel_size: Kernel size. Must be 3. Default: 3.
+        stride: Stride. Default: 1.
+        padding: Padding. Must be 1. Default: 1.
+        padding_mode (str): Padding mode. Default: 'zeros'.
+        norm_cfg (dict): Norm config.
+        act_cfg (dict): Activation config.
+        act (bool): Whether to apply activation at output. Default: True.
+        deploy (bool): Deploy mode. Default: False.
+    """
 
     def __init__(self,
                  in_channels: int,
@@ -547,7 +660,7 @@ class GCBlock(nn.Module):
         assert kernel_size == 3, "GCBlock only supports kernel_size=3"
         assert padding    == 1, "GCBlock only supports padding=1"
 
-        padding_11 = padding - kernel_size // 2   # = 0 cho 1Ã—1 path
+        padding_11 = padding - kernel_size // 2   # = 0 cho 1×1 path
 
         self.relu = build_activation_layer(act_cfg) if act else nn.Identity()
 
@@ -557,7 +670,7 @@ class GCBlock(nn.Module):
                 stride=stride, padding=padding, bias=True,
                 padding_mode=padding_mode)
         else:
-            # Residual path: chá»‰ tá»“n táº¡i khi shape khÃ´ng Ä‘á»•i
+            # Residual path: chỉ tồn tại khi shape không đổi
             if (out_channels == in_channels) and (stride == 1):
                 self.path_residual = build_norm_layer(norm_cfg, in_channels)[1]
             else:
@@ -587,6 +700,7 @@ class GCBlock(nn.Module):
         )
 
     def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        """Tính kernel và bias tương đương của 4 paths."""
         self.path_3x3_1.switch_to_deploy()
         k3_1, b3_1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
 
@@ -607,7 +721,7 @@ class GCBlock(nn.Module):
         return F.pad(kernel1x1, [1, 1, 1, 1])
 
     def _fuse_bn_tensor(self, conv: nn.Module) -> Tuple:
-        """Fuse conv + BN thÃ nh equivalent kernel/bias."""
+        """Fuse conv + BN thành equivalent kernel/bias."""
         if conv is None:
             return 0, 0
 
@@ -619,7 +733,7 @@ class GCBlock(nn.Module):
             beta         = conv.bn.bias
             eps          = conv.bn.eps
         else:
-            # path_residual: pure BN, kernel lÃ  identity
+            # path_residual: pure BN, kernel là identity
             assert isinstance(conv, (nn.BatchNorm2d, nn.SyncBatchNorm))
             if not hasattr(self, 'id_tensor'):
                 kv = np.zeros(
@@ -639,6 +753,7 @@ class GCBlock(nn.Module):
         return kernel * t, beta - running_mean * gamma / std
 
     def switch_to_deploy(self):
+        """Hợp nhất tất cả paths thành 1 conv 3×3."""
         if hasattr(self, 'reparam_3x3'):
             return
         kernel, bias = self.get_equivalent_kernel_bias()
