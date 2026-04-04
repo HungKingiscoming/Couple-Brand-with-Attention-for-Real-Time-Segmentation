@@ -84,7 +84,15 @@ def _remap_stem_key(key: str, N2: int = 4):
     else:
         return f'stem_stage3.{idx - (2 + N2)}.{rest}'
 
-
+def reset_foggy_norm_running_stats(model):
+    """Reset BN running stats trong FoggyAwareNorm để tránh stale stats."""
+    for name in ['stem_conv1', 'stem_conv2']:
+        module = getattr(model.backbone, name, None)
+        if module is not None and len(module) > 1:
+            fan = module[1]
+            if hasattr(fan, 'bn'):
+                fan.bn.reset_running_stats()
+                print(f"  Reset BN running stats: backbone.{name}[1].bn")
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     """Load pretrained weights vào model.backbone (GCNet v3).
 
@@ -226,15 +234,18 @@ def build_optimizer(model, args):
       - backbone: LR * backbone_lr_factor
       - head: LR đầy đủ
     """
-    alpha_params    = []
+    alpha_params = []
+    gamma_params = []   
     backbone_params = []
-    head_params     = []
+    head_params = []
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'alpha' in name or 'gamma' in name:
-            alpha_params.append(param)
+        if 'gamma' in name:
+            gamma_params.append(param)   # DWSA residual scale
+        elif 'alpha' in name:
+            alpha_params.append(param)   # FoggyAwareNorm gate
         elif 'backbone' in name:
             backbone_params.append(param)
         else:
@@ -242,11 +253,14 @@ def build_optimizer(model, args):
 
     groups = []
     if head_params:
-        groups.append({'params': head_params,    'lr': args.lr,                              'name': 'head'})
+        groups.append({'params': head_params,    'lr': args.lr,                           'name': 'head'})
     if backbone_params:
-        groups.append({'params': backbone_params,'lr': args.lr * args.backbone_lr_factor,    'name': 'backbone'})
+        groups.append({'params': backbone_params,'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+    if gamma_params:
+        # gamma cần LR lớn hơn alpha vì init từ 0
+        groups.append({'params': gamma_params,   'lr': args.lr * args.gamma_lr_factor,    'name': 'gamma'})
     if alpha_params:
-        groups.append({'params': alpha_params,   'lr': args.lr * args.alpha_lr_factor,       'name': 'alpha'})
+        groups.append({'params': alpha_params,   'lr': args.lr * args.alpha_lr_factor,    'name': 'alpha'})
 
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
