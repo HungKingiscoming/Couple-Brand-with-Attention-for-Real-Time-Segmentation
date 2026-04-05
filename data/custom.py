@@ -194,9 +194,12 @@ def get_train_transforms(
     dataset_type: str = 'normal'
 ) -> A.Compose:
 
-    # ===== GEOMETRIC (CORE) =====
+    # ===== GEOMETRIC (CORE) — giữ nguyên cho cả hai dataset =====
     base_list = [
-        A.RandomScale(scale_limit=0.4, p=1.0),
+        # Fix 1: scale nhỏ hơn, không p=1.0
+        # MultiScale strategy: 50% giữ scale gốc, 50% random scale
+        A.RandomScale(scale_limit=0.5, p=0.5),
+        # scale_limit=0.5 → [0.5, 1.5], p=0.5 → một nửa sample dùng scale gốc
 
         A.PadIfNeeded(
             min_height=img_size[0],
@@ -208,56 +211,80 @@ def get_train_transforms(
         ),
 
         A.RandomCrop(height=img_size[0], width=img_size[1], p=1.0),
-
         A.HorizontalFlip(p=0.5),
-
-        # ❌ REMOVE ROTATE (rất quan trọng cho Cityscapes)
-        # A.ShiftScaleRotate(...)
     ]
 
-    # ===== DATASET-SPECIFIC =====
     if dataset_type == 'foggy':
         foggy_specific = [
 
-            # 🔥 Robustness (rất quan trọng)
+            # Fix 2: Fog augmentation thực sự có ý nghĩa
+            # Foggy Cityscapes dùng beta=0.005/0.01/0.02 — nên simulate range này
+            A.OneOf([
+                A.RandomFog(
+                    fog_coef_lower=0.1,
+                    fog_coef_upper=0.35,   # tăng từ 0.15 lên 0.35
+                    alpha_coef=0.08,
+                    p=1.0
+                ),
+                A.RandomFog(
+                    fog_coef_lower=0.3,
+                    fog_coef_upper=0.6,    # simulate fog nặng hơn
+                    alpha_coef=0.1,
+                    p=1.0
+                ),
+            ], p=0.5),   # tăng từ 0.1 lên 0.5
+
+            # Fix 3: Gaussian noise — foggy sensor thường noisy
+            A.OneOf([
+                A.GaussNoise(var_limit=(10.0, 50.0), p=1.0),
+                A.ISONoise(color_shift=(0.01, 0.05), intensity=(0.1, 0.5), p=1.0),
+            ], p=0.3),
+
+            # Fix 4: Blur — fog gây blur tự nhiên, nhưng không quá mạnh
+            A.OneOf([
+                A.GaussianBlur(blur_limit=(3, 5), p=1.0),
+                A.MotionBlur(blur_limit=(3, 5), p=1.0),
+            ], p=0.25),   # tăng nhẹ từ 0.15
+
+            # Fix 5: Brightness/contrast — fog làm giảm contrast rõ rệt
+            A.OneOf([
+                A.RandomBrightnessContrast(
+                    brightness_limit=(-0.2, 0.05),  # foggy thường tối hơn → bias âm
+                    contrast_limit=(-0.3, 0.1),     # fog giảm contrast → bias âm
+                    p=1.0
+                ),
+                A.RandomGamma(gamma_limit=(80, 110), p=1.0),
+                # CLAHE giúp model học feature trong vùng low-contrast
+                A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+            ], p=0.5),   # tăng từ 0.3
+
+            # Fix 6: CoarseDropout lớn hơn
             A.CoarseDropout(
-                max_holes=6,
-                max_height=32,
-                max_width=32,
+                max_holes=8,          # tăng từ 6
+                max_height=64,        # tăng từ 32 — simulate vùng fog dày
+                max_width=64,
+                min_holes=2,
+                min_height=16,
+                min_width=16,
                 fill_value=0,
                 mask_fill_value=255,
                 p=0.3
             ),
 
-            # Blur nhẹ (giảm lại)
-            A.OneOf([
-                A.GaussianBlur(blur_limit=3, p=1.0),
-                A.MotionBlur(blur_limit=3, p=1.0),
-            ], p=0.15),
-
-            # Light intensity change
-            A.OneOf([
-                A.RandomBrightnessContrast(
-                    brightness_limit=0.08,
-                    contrast_limit=0.08,
-                    p=1.0
-                ),
-                A.RandomGamma(gamma_limit=(95, 105), p=1.0),
-            ], p=0.3),
-
-            # ⚠️ Fog rất nhẹ (hoặc có thể tắt)
-            A.RandomFog(
-                fog_coef_lower=0.05,
-                fog_coef_upper=0.15,
-                alpha_coef=0.05,
-                p=0.1
+            # Fix 7: Simulate depth-dependent fog — vùng xa bị fog nhiều hơn
+            # RandomShadow gần giống effect này
+            A.RandomShadow(
+                shadow_roi=(0, 0.5, 1, 1),   # chỉ ở nửa dưới (foreground)
+                num_shadows_lower=1,
+                num_shadows_upper=2,
+                shadow_dimension=4,
+                p=0.2
             ),
         ]
 
     else:
-        # NORMAL dataset → augment mạnh hơn
+        # NORMAL dataset — giữ gần như cũ, chỉ fix RandomScale
         foggy_specific = [
-
             A.CoarseDropout(
                 max_holes=8,
                 max_height=32,
@@ -266,12 +293,10 @@ def get_train_transforms(
                 mask_fill_value=255,
                 p=0.3
             ),
-
             A.OneOf([
                 A.GaussianBlur(blur_limit=3, p=1.0),
                 A.MedianBlur(blur_limit=3, p=1.0),
             ], p=0.1),
-
             A.OneOf([
                 A.ColorJitter(
                     brightness=0.1,
