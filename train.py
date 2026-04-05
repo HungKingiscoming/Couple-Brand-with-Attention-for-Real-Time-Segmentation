@@ -221,105 +221,40 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
 # ============================================
 
 def build_optimizer(model, args):
-    """Phân tách params thành 4 nhóm với LR khác nhau:
-      - head:         LR đầy đủ
-      - dwsa_gamma:   LR trung bình — gamma cần học attention nhanh hơn alpha
-      - fan_alpha:    LR rất nhỏ   — alpha ảnh hưởng normalization, cần ổn định
-      - backbone:     LR * backbone_lr_factor (chỉ khi không freeze)
+    """Phân tách params thành 3 nhóm với LR khác nhau:
+      - alpha (FoggyAwareNorm gate + DWSA gamma): LR rất nhỏ
+      - backbone: LR * backbone_lr_factor
+      - head: LR đầy đủ
     """
+    alpha_params    = []
+    backbone_params = []
     head_params     = []
-    dwsa_params     = []   # DWSA.gamma — attention gate
-    fan_params      = []   # FoggyAwareNorm.alpha — normalization gate
-    backbone_params = []   # phần còn lại của backbone
-
-    # Tên các module DWSA và FoggyAwareNorm trong backbone
-    DWSA_MODULES = {'dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6'}
-    FAN_MODULES  = {'stem_conv1', 'stem_conv2'}          # chứa FoggyAwareNorm ở index [1]
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-
-        # Xác định param thuộc module nào
-        # name format: "backbone.dwsa_stage6.gamma" hoặc "decode_head.conv_seg.weight"
-        parts = name.split('.')   # ['backbone', 'dwsa_stage6', 'gamma']
-
-        is_backbone = (len(parts) > 0 and parts[0] == 'backbone')
-
-        if is_backbone and len(parts) > 1:
-            module_name = parts[1]   # 'dwsa_stage6' / 'stem_conv1' / ...
-
-            if module_name in DWSA_MODULES:
-                # backbone.dwsa_stage*.* → group riêng
-                dwsa_params.append(param)
-
-            elif module_name in FAN_MODULES:
-                # backbone.stem_conv1.1.alpha (FoggyAwareNorm là index [1])
-                # Chỉ tách FoggyAwareNorm params, conv weight vẫn là backbone
-                if 'alpha' in name or (len(parts) > 2 and parts[2] == '1'):
-                    fan_params.append(param)
-                else:
-                    backbone_params.append(param)
-
-            else:
-                backbone_params.append(param)
-
+        if 'alpha' in name or 'gamma' in name:
+            alpha_params.append(param)
+        elif 'backbone' in name:
+            backbone_params.append(param)
         else:
-            # decode_head.* và bất kỳ param nào không thuộc backbone
             head_params.append(param)
 
-    # ---- Tính lr cho từng group ---- #
-    # DWSA cần lr đủ lớn để gamma thoát khỏi 0, nhưng không quá cao
-    # → dùng backbone_lr_factor * 3 (compromise giữa head và backbone)
-    dwsa_lr = args.lr * args.backbone_lr_factor * 3.0
-
-    # FoggyAwareNorm alpha cần rất ổn định
-    # → dùng alpha_lr_factor như cũ
-    fan_lr  = args.lr * args.alpha_lr_factor
-
     groups = []
-
     if head_params:
-        groups.append({
-            'params'    : head_params,
-            'lr'        : args.lr,
-            'name'      : 'head',
-        })
-
-    if dwsa_params:
-        groups.append({
-            'params'    : dwsa_params,
-            'lr'        : dwsa_lr,
-            'name'      : 'dwsa_gamma',
-        })
-
-    if fan_params:
-        groups.append({
-            'params'    : fan_params,
-            'lr'        : fan_lr,
-            'name'      : 'fan_alpha',
-        })
-
-    # Backbone chỉ add vào optimizer khi không freeze
-    # (nếu freeze, requires_grad=False → đã bị lọc ra ở vòng lặp trên)
+        groups.append({'params': head_params,    'lr': args.lr,                              'name': 'head'})
     if backbone_params:
-        groups.append({
-            'params'    : backbone_params,
-            'lr'        : args.lr * args.backbone_lr_factor,
-            'name'      : 'backbone',
-        })
+        groups.append({'params': backbone_params,'lr': args.lr * args.backbone_lr_factor,    'name': 'backbone'})
+    if alpha_params:
+        groups.append({'params': alpha_params,   'lr': args.lr * args.alpha_lr_factor,       'name': 'alpha'})
 
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
         g.setdefault('initial_lr', g['lr'])
 
-    # ---- In ra để verify ---- #
-    print(f"\nOptimizer: AdamW (Discriminative LR)")
-    print(f"{'─'*55}")
+    print(f"Optimizer: AdamW (Discriminative LR)")
     for g in optimizer.param_groups:
-        n_params = sum(p.numel() for p in g['params'])
-        print(f"  group '{g['name']:<12}': lr={g['lr']:.2e} | {len(g['params'])} tensors | {n_params:,} params")
-    print(f"{'─'*55}\n")
+        print(f"  group '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
 
     return optimizer
 
