@@ -323,7 +323,7 @@ class DiceLoss(nn.Module):
         targets_one_hot  = F.one_hot(targets_clamped, C).permute(0, 3, 1, 2).float()
         targets_one_hot  = targets_one_hot * valid_mask.unsqueeze(1).float()
 
-        probs       = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1).float()
+        probs       = F.softmax(logits.float(), dim=1) * valid_mask.unsqueeze(1).float()
         probs_flat  = probs.reshape(B, C, -1)
         target_flat = targets_one_hot.reshape(B, C, -1)
 
@@ -352,7 +352,7 @@ class OHEMLoss(nn.Module):
 
     def forward(self, logits, labels):
         weight      = self.class_weights.to(logits.device) if self.class_weights is not None else None
-        loss_pixel  = F.cross_entropy(logits, labels, weight=weight,
+        loss_pixel  = F.cross_entropy(logits.float(), labels, weight=weight,
                                       ignore_index=self.ignore_index, reduction='none').view(-1)
         valid_mask  = (labels.view(-1) != self.ignore_index)
         valid_losses = loss_pixel[valid_mask]
@@ -724,12 +724,15 @@ class Trainer:
                 ohem_loss = self.ohem(c6_full, masks)
 
                 if self.dice_weight > 0:
-                    # Dice tính ở resolution thấp (c6_logit), downsample mask
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=c6_logit.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
+                    # FIX: thoát autocast → masks.float() luôn là float32
+                    # Trong autocast, .float() bị cast sang float16 →
+                    # F.interpolate nearest tạo garbage values → .long() sai
+                    with torch.amp.autocast('cuda', enabled=False):
+                        masks_small = F.interpolate(
+                            masks.unsqueeze(1).float(),
+                            size=c6_logit.shape[-2:],
+                            mode='nearest'
+                        ).squeeze(1).long()
                     dice_loss = self.dice(c6_logit, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
