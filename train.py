@@ -889,12 +889,12 @@ def main():
     parser.add_argument("--unfreeze_schedule",      type=str,   default="",
                         help="Comma-separated epochs to progressively unfreeze backbone")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
-    # FIX: thêm dwsa_lr_factor riêng — mặc định 0.1 → lr_dwsa = lr * 0.1
-    # Tách khỏi alpha_lr_factor vì gamma=0 cần LR đủ lớn (~1e-4 với lr=1e-3)
-    parser.add_argument("--dwsa_lr_factor",         type=float, default=0.1,
-                        help="LR factor riêng cho DWSA (gamma). Nên >= 0.05 để gamma thoát 0.")
-    parser.add_argument("--alpha_lr_factor",        type=float, default=0.05,
-                        help="LR factor cho FoggyAwareNorm.alpha (soft gate, cần LR nhỏ hơn DWSA)")
+    # FIX: thêm dwsa_lr_factor riêng — mặc định 0.5 → lr_dwsa = lr * 0.5
+    # Tách khỏi alpha_lr_factor vì gamma=0 (hoặc 0.1) cần LR đủ lớn để học
+    parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5,
+                        help="LR factor riêng cho DWSA (gamma). Nên >= 0.3 để gamma thoát 0.")
+    parser.add_argument("--alpha_lr_factor",        type=float, default=0.1,
+                        help="LR factor cho FoggyAwareNorm.alpha (soft gate)")
     parser.add_argument("--use_class_weights",      action="store_true")
 
     # Dataset
@@ -1047,18 +1047,23 @@ def main():
         except Exception:
             raise ValueError("unfreeze_schedule phải là chuỗi số nguyên cách nhau bởi dấu phẩy")
 
-    # Module names của GCNet v3 để unfreeze dần (từ sâu ra ngoài)
+    # Module names của GCNet v3 để unfreeze dần.
+    # FIX: đảo thứ tự — stem trước, high-level sau.
+    # Lý do: fog = domain shift mạnh ở pixel level → stem là bottleneck chính.
+    # DWSA nằm ở stage 4/5/6 chỉ hiệu quả khi nhận được low-level feature đã
+    # adapted với foggy domain. Unfreeze stem trước → feature distribution đúng
+    # → DWSA mới học được attention có ý nghĩa.
     UNFREEZE_STAGES = [
-        # k=1: unfreeze stage 6
-        ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa_stage6', 'spp'],
-        # k=2: unfreeze stage 5
-        ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa_stage5',
-         'compression_2', 'down_2'],
-        # k=3: unfreeze stage 4
+        # k=1: unfreeze stem — fix domain shift ngay từ low-level
+        ['stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3'],
+        # k=2: unfreeze stage 4 + DWSA stage 4 — lúc này stem đã adapted
         ['semantic_branch_layers.0', 'detail_branch_layers.0', 'dwsa_stage4',
          'compression_1', 'down_1'],
-        # k=4: unfreeze stem
-        ['stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3'],
+        # k=3: unfreeze stage 5 + DWSA stage 5
+        ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa_stage5',
+         'compression_2', 'down_2'],
+        # k=4: unfreeze stage 6 + DWSA stage 6 + DAPPM
+        ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa_stage6', 'spp'],
     ]
 
     print(f"\n{'='*70}")
