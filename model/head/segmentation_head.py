@@ -69,187 +69,125 @@ class CrossEntropyLoss(nn.Module):
 # =============================================================================
 
 class GCNetHead(BaseModule):
-    """Decode head for GCNet.
-
-    Nhận output từ GCNet backbone:
-      - Training  : (c4_feat, c6_feat) — c4 cho auxiliary loss, c6 cho main loss
-      - Inference : c6_feat only
-
-    Loss:
-      loss_c4 = CE(upsample(c4_logit), gt)   weight = loss_weight_aux
-      loss_c6 = CE(upsample(c6_logit), gt)   weight = 1.0
-      acc_seg  = pixel accuracy trên c6_logit
-
-    Args:
-        in_channels (int): Channels của c6_feat (backbone output chính).
-            Với GCNet-S/M channels=32: in_channels = channels*4 = 128.
-        channels (int): Hidden channels bên trong head.
-        num_classes (int): Số lớp phân đoạn (bao gồm background).
-        norm_cfg (dict): Norm config. Default: BN.
-        act_cfg (dict): Activation config. Default: ReLU.
-        align_corners (bool): F.interpolate align_corners. Default: False.
-        ignore_index (int): Label ignored trong loss và accuracy. Default: 255.
-        loss_weight_aux (float): Weight của auxiliary loss (c4). Default: 0.4.
-        dropout_ratio (float): Dropout trước cls_seg. Default: 0.1.
-        init_cfg (dict, optional): Init config. Default: None.
-    """
 
     def __init__(self,
-                 in_channels: int,
-                 channels: int,
-                 num_classes: int,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                 align_corners: bool = False,
-                 ignore_index: int = 255,
-                 loss_weight_aux: float = 0.4,
-                 dropout_ratio: float = 0.1,
-                 init_cfg: OptConfigType = None):
+                 in_channels,
+                 channels,
+                 num_classes,
+                 norm_cfg=dict(type='BN', requires_grad=True),
+                 act_cfg=dict(type='ReLU', inplace=True),
+                 align_corners=False,
+                 ignore_index=255,
+                 loss_weight_aux=0.4,
+                 dropout_ratio=0.1,
+                 init_cfg=None):
+
         super().__init__(init_cfg)
 
-        self.in_channels    = in_channels
-        self.channels       = channels
-        self.num_classes    = num_classes
-        self.norm_cfg       = norm_cfg
-        self.act_cfg        = act_cfg
-        self.align_corners  = align_corners
-        self.ignore_index   = ignore_index
-        self.loss_weight_aux = loss_weight_aux
+        self.align_corners = align_corners
+        self.ignore_index = ignore_index
 
-        # ---- Main head (c6) ---------------------------------------------- #
-        # c6_feat: in_channels = channels*4 (backbone output)
-        self.head = self._make_base_head(in_channels, channels)
+        # =========================
+        # 🔥 MAIN DECODER (REFINE ONLY)
+        # =========================
 
-        # ---- Auxiliary head (c4) ----------------------------------------- #
-        # c4_feat: in_channels // 2 vì detail branch ở stage 4 = channels*2
-        self.aux_head_c4    = self._make_base_head(in_channels // 2, channels)
-        self.aux_cls_seg_c4 = nn.Conv2d(channels, num_classes, kernel_size=1)
-
-        # ---- Final classifiers ------------------------------------------- #
-        self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
-        self.cls_seg  = nn.Conv2d(channels, num_classes, kernel_size=1)
-
-        # ---- Loss functions ---------------------------------------------- #
-        self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
-                                         loss_weight=loss_weight_aux)
-        self.loss_c6 = CrossEntropyLoss(ignore_index=ignore_index,
-                                         loss_weight=1.0)
-
-        self.init_weights()
-
-    # ---------------------------------------------------------------------- #
-    # Weight init                                                              #
-    # ---------------------------------------------------------------------- #
-
-    def init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-
-    # ---------------------------------------------------------------------- #
-    # Forward                                                                  #
-    # ---------------------------------------------------------------------- #
-
-    def forward(self,
-                inputs: Union[Tensor, Tuple[Tensor, Tensor]]
-                ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Forward pass.
-
-        Training  : inputs = (c4_feat, c6_feat) → returns (c4_logit, c6_logit)
-        Inference : inputs = c6_feat            → returns c6_logit
-        """
-        if self.training:
-            c4_feat, c6_feat = inputs
-
-            c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
-            c6_logit = self.cls_seg(self.dropout(self.head(c6_feat)))
-
-            return c4_logit, c6_logit
-
-        else:
-            c6_logit = self.cls_seg(self.dropout(self.head(inputs)))
-            return c6_logit
-
-    # ---------------------------------------------------------------------- #
-    # Loss                                                                     #
-    # ---------------------------------------------------------------------- #
-
-    def loss(self,
-             seg_logits: Tuple[Tensor, Tensor],
-             seg_label: Tensor) -> Dict[str, Tensor]:
-        """Tính loss từ logits và ground-truth label.
-
-        Args:
-            seg_logits: (c4_logit, c6_logit) — output của forward() khi training.
-                c4_logit: (B, num_classes, H4, W4)
-                c6_logit: (B, num_classes, H6, W6)
-            seg_label: Ground-truth shape (B, H, W), dtype=torch.long.
-                Pixels cần ignore mang giá trị ignore_index.
-
-        Returns:
-            dict với keys: 'loss_c4', 'loss_c6', 'acc_seg'.
-        """
-        c4_logit, c6_logit = seg_logits
-        target_size = seg_label.shape[1:]   # (H, W)
-
-        # Upsample logits về kích thước gt
-        c4_logit = resize(c4_logit, size=target_size,
-                          mode='bilinear', align_corners=self.align_corners)
-        c6_logit = resize(c6_logit, size=target_size,
-                          mode='bilinear', align_corners=self.align_corners)
-
-        losses = {
-            'loss_c4': self.loss_c4(c4_logit, seg_label),
-            'loss_c6': self.loss_c6(c6_logit, seg_label),
-            'acc_seg': accuracy(c6_logit, seg_label,
-                                ignore_index=self.ignore_index),
-        }
-        return losses
-
-    # ---------------------------------------------------------------------- #
-    # Helper                                                                   #
-    # ---------------------------------------------------------------------- #
-
-    def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
-        """BN → ReLU → Conv3×3(BN, ReLU)."""
-        return nn.Sequential(
-            build_norm_layer(self.norm_cfg, in_channels)[1],
-            build_activation_layer(self.act_cfg),
-            ConvModule(
-                in_channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg,
-                order=('conv', 'norm', 'act')),
+        self.conv1 = ConvModule(
+            in_channels, channels, 3, padding=1,
+            norm_cfg=norm_cfg, act_cfg=act_cfg
         )
 
-    # ---------------------------------------------------------------------- #
-    # Inference helper                                                         #
-    # ---------------------------------------------------------------------- #
+        self.conv2 = ConvModule(
+            channels, channels, 3, padding=1,
+            norm_cfg=norm_cfg, act_cfg=act_cfg
+        )
 
-    def predict(self,
-                inputs: Union[Tensor, Tuple[Tensor, Tensor]],
-                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
-        """Inference: forward + upsample về img_size nếu cần.
+        # 🔥 lightweight attention
+        self.attn = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, channels // 4, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(channels // 4, channels, 1),
+            nn.Sigmoid()
+        )
 
-        Args:
-            inputs: c6_feat hoặc (c4_feat, c6_feat).
-            img_size: (H, W) của ảnh gốc. Nếu None, không upsample.
+        # residual refinement
+        self.res = ConvModule(
+            channels, channels, 3, padding=1,
+            norm_cfg=norm_cfg, act_cfg=None
+        )
 
-        Returns:
-            Tensor: Segmentation map (B, num_classes, H, W).
-        """
-        self.eval()
-        with torch.no_grad():
-            logit = self.forward(inputs)
-            if img_size is not None:
-                logit = resize(logit, size=img_size,
-                               mode='bilinear', align_corners=self.align_corners)
-        return logit
+        self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
+        self.cls_seg = nn.Conv2d(channels, num_classes, 1)
+
+        # =========================
+        # AUX HEAD (giữ nguyên)
+        # =========================
+
+        self.aux_head = nn.Sequential(
+            ConvModule(in_channels // 2, channels, 3, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg)
+        )
+
+        self.aux_cls = nn.Conv2d(channels, num_classes, 1)
+
+        # =========================
+        # LOSS
+        # =========================
+
+        self.loss_c4 = CrossEntropyLoss(ignore_index, loss_weight_aux)
+        self.loss_c6 = CrossEntropyLoss(ignore_index, 1.0)
+
+    # =====================================================
+
+    def forward(self, inputs):
+
+        if self.training:
+            c4, fused = inputs   # fused đã là 1/8
+
+            x = self.conv1(fused)
+            x = self.conv2(x)
+
+            # attention
+            w = self.attn(x)
+            x = x * w
+
+            # residual
+            x = self.res(x) + x
+
+            out = self.cls_seg(self.dropout(x))
+
+            aux = self.aux_cls(self.aux_head(c4))
+
+            return aux, out
+
+        else:
+            fused = inputs
+
+            x = self.conv1(fused)
+            x = self.conv2(x)
+
+            w = self.attn(x)
+            x = x * w
+
+            x = self.res(x) + x
+
+            return self.cls_seg(self.dropout(x))
+
+    # =====================================================
+
+    def loss(self, seg_logits, seg_label):
+
+        aux, main = seg_logits
+        target_size = seg_label.shape[1:]
+
+        aux = resize(aux, size=target_size,
+                     mode='bilinear', align_corners=self.align_corners)
+
+        main = resize(main, size=target_size,
+                      mode='bilinear', align_corners=self.align_corners)
+
+        return {
+            'loss_c4': self.loss_c4(aux, seg_label),
+            'loss_c6': self.loss_c6(main, seg_label),
+            'acc_seg': accuracy(main, seg_label, self.ignore_index)
+        }
