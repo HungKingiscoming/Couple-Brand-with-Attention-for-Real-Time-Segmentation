@@ -630,8 +630,8 @@ class Trainer:
         if phase == self.loss_phase:
             return
         if phase == 'ce_only':
-            self.dice_weight = 0.1
-            self.ce_weight = 0.9            
+            self.dice_weight = 0.0
+            self.ce_weight = 1.0            
         elif phase == 'full':
             self.dice_weight = self.base_loss_cfg['dice_weight']
         self.loss_phase = phase
@@ -678,19 +678,14 @@ class Trainer:
 
                 target_size = masks.shape[-2:]
                 c4_full = F.interpolate(c4_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
+                        mode='bilinear', align_corners=False)
                 c6_full = F.interpolate(c6_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
+                        mode='bilinear', align_corners=False)
 
                 ohem_loss = self.ohem(c6_full, masks)
 
                 if self.dice_weight > 0:
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=c6_logit.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-                    dice_loss = self.dice(c6_logit, masks_small)
+                    dice_loss = self.dice(c4_full, masks)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
 
