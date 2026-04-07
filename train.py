@@ -553,8 +553,8 @@ class ModelConfig:
                 "act_cfg"         : dict(type='ReLU', inplace=True),
             },
             "loss": {
-                "ce_weight"    : 1.0,
-                "dice_weight"  : 0.5,
+                "ce_weight"    : 0.7,
+                "dice_weight"  : 0.3,
                 "dice_smooth"  : 1e-5,
             },
         }
@@ -630,7 +630,8 @@ class Trainer:
         if phase == self.loss_phase:
             return
         if phase == 'ce_only':
-            self.dice_weight = 0.0
+            self.dice_weight = 0.1
+            self.ce_weight = 0.9            
         elif phase == 'full':
             self.dice_weight = self.base_loss_cfg['dice_weight']
         self.loss_phase = phase
