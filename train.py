@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 # IMPORTS — model mới, không còn mmcv/mmseg
 # ============================================
 
-from model.backbone.model import GCNet          # backbone mới
+from model.backbone.model import GCNetSegmentor          # backbone mới
 from model.head.segmentation_head import GCNetHead      # head mới (tích hợp aux)
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
@@ -215,7 +215,13 @@ def build_optimizer(model, args):
     if alpha_params:
         groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,       'name': 'alpha'})
 
-    optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+    params = model.get_param_groups(
+        head_lr=args.lr, 
+        backbone_lr=args.lr * 0.1, 
+        fan_lr=args.lr * 0.1, 
+        msc_lr=args.lr * 0.2
+    )
+    optimizer = optim.AdamW(params, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
         g.setdefault('initial_lr', g['lr'])
 
@@ -682,10 +688,10 @@ class Trainer:
                 masks = masks.squeeze(1)
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                outputs = self.model.forward_train(imgs)
+                aux_logit, main_logit = self.model(imgs)
 
-                c4_logit = outputs["aux"]
-                c6_logit = outputs["main"]
+                c4_logit = aux_logit
+                c6_logit = main_logit
 
                 target_size = masks.shape[-2:]
                 c4_full = F.interpolate(c4_logit, size=target_size,
@@ -696,11 +702,7 @@ class Trainer:
                 ohem_loss = self.ohem(c6_full, masks)
 
                 if self.dice_weight > 0:
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=c6_logit.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
+
                     dice_loss = self.dice(c6_full, masks)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
@@ -762,7 +764,8 @@ class Trainer:
         torch.cuda.empty_cache()
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
-
+        current_alpha = self.model.backbone.stem_conv1[1].alpha.item()
+        self.writer.add_scalar('train/fan_alpha', current_alpha, epoch)
         return {
             'loss': total_loss / n,
             'ohem': total_ohem / n,
