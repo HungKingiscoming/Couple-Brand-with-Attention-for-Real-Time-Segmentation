@@ -326,7 +326,7 @@ def freeze_backbone(model):
     print("Backbone partially frozen (FAN + MSC trainable)\n")
 
 
-ef unfreeze_backbone_progressive(model, stage_names):
+def unfreeze_backbone_progressive(model, stage_names):
     """Unfreeze specific modules by name (supports dotted names)."""
     if isinstance(stage_names, str):
         stage_names = [stage_names]
