@@ -378,7 +378,6 @@ class ModelConfig:
                 align_corners=False,
                 norm_cfg=dict(type='BN', requires_grad=True),
                 act_cfg=dict(type='ReLU', inplace=True),
-                dwsa_reduction=8,
                 deploy=False,
             ),
             "head": dict(
