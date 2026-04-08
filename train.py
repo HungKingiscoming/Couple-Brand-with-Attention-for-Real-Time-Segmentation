@@ -48,7 +48,7 @@ class GCNetModel(nn.Module):
                  backbone_cfg: dict,
                  head_cfg: dict):
         super().__init__()
-        self.backbone = GCNet(**backbone_cfg)
+        self.backbone = GCNetBackbone(**backbone_cfg)
         self.head     = GCNetHeadLite(**head_cfg)
 
     def forward(self, x: torch.Tensor):
