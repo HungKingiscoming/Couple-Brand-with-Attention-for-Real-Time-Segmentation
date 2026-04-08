@@ -688,16 +688,20 @@ class Trainer:
                 masks = masks.squeeze(1)
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                aux_logit, main_logit = self.model(imgs)
+                outputs = self.model.forward_train(imgs)
+                aux_logit = outputs["aux"]
+                main_logit = outputs["main"]
 
                 c4_logit = aux_logit
                 c6_logit = main_logit
 
                 target_size = masks.shape[-2:]
-                c4_full = F.interpolate(c4_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
-                c6_full = F.interpolate(c6_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
+                if c4_logit is not None:
+                    c4_full = F.interpolate(c4_logit, size=target_size, mode='bilinear', align_corners=False)
+                if c6_logit.shape[-2:] != target_size:
+                    c6_full = F.interpolate(c6_logit, size=target_size, mode='bilinear', align_corners=False)
+                else:
+                    c6_full = c6_logit
 
                 ohem_loss = self.ohem(c6_full, masks)
 
@@ -707,7 +711,7 @@ class Trainer:
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
 
-                loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
+                loss = ohem_loss + self.dice_weight * dice_loss
 
                 if self.args.aux_weight > 0:
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
@@ -779,59 +783,87 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
-        total_loss   = 0.0
-        num_classes  = self.args.num_classes
-        conf_matrix  = np.zeros((num_classes, num_classes), dtype=np.int64)
-        pbar         = tqdm(loader, desc="Validation")
-
+    
+        total_loss  = 0.0
+        num_classes = self.args.num_classes
+        conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+    
+        pbar = tqdm(loader, desc=f"Validation Epoch {epoch}")
+    
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
+    
+            # fix shape mask
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
+    
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)
-
-                if isinstance(logits, tuple):
-                    logits = logits[1]
-
-                logits_full = F.interpolate(
-                    logits, size=masks.shape[-2:],
-                    mode='bilinear', align_corners=False
-                )
+    
+                # ✅ FIX 1: thống nhất với train
+                outputs = self.model.forward_train(imgs)
+                logits  = outputs["main"]   # (B, C, H, W)
+    
+                # ✅ FIX 2: chỉ resize khi cần
+                if logits.shape[-2:] != masks.shape[-2:]:
+                    logits_full = F.interpolate(
+                        logits,
+                        size=masks.shape[-2:],
+                        mode='bilinear',
+                        align_corners=False
+                    )
+                else:
+                    logits_full = logits
+    
+                # ✅ CE / OHEM (tùy bạn đang dùng gì)
                 ce_loss = self.ce(logits_full, masks)
-
+    
+                # ✅ FIX 3: Dice chuẩn (softmax)
                 if self.dice_weight > 0:
+                    probs = torch.softmax(logits, dim=1)
+    
                     masks_small = F.interpolate(
                         masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:], mode='nearest'
+                        size=logits.shape[-2:],
+                        mode='nearest'
                     ).squeeze(1).long()
-                    dice_loss = self.dice(logits, masks_small)
+    
+                    dice_loss = self.dice(probs, masks_small)
                 else:
-                    dice_loss = torch.tensor(0.0, device=self.device)
-
+                    dice_loss = 0.0
+    
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-
+    
             total_loss += loss.item()
-
-            pred   = logits_full.argmax(1).cpu().numpy()
-            target = masks.cpu().numpy()
-            valid  = (target >= 0) & (target < num_classes)
-            label  = num_classes * target[valid].astype(int) + pred[valid]
-            count  = np.bincount(label, minlength=num_classes ** 2)
-            conf_matrix += count.reshape(num_classes, num_classes)
-
+    
+            # ================== METRICS ==================
+            pred   = logits_full.argmax(1)
+            target = masks
+    
+            pred   = pred.view(-1)
+            target = target.view(-1)
+    
+            valid = (target >= 0) & (target < num_classes)
+    
+            hist = torch.bincount(
+                num_classes * target[valid] + pred[valid],
+                minlength=num_classes ** 2
+            ).reshape(num_classes, num_classes)
+    
+            conf_matrix += hist.cpu().numpy()
+    
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            if batch_idx % 20 == 0:
-                clear_gpu_memory()
-
+    
+            # ❌ REMOVE: clear_gpu_memory (làm chậm validate)
+    
+        # ================== FINAL METRICS ==================
         intersection = np.diag(conf_matrix)
         union        = conf_matrix.sum(1) + conf_matrix.sum(0) - intersection
-        iou          = intersection / (union + 1e-10)
-        miou         = np.nanmean(iou)
-        acc          = intersection.sum() / (conf_matrix.sum() + 1e-10)
-
+    
+        iou  = intersection / (union + 1e-10)
+        miou = np.nanmean(iou)
+        acc  = intersection.sum() / (conf_matrix.sum() + 1e-10)
+    
         return {
             'loss'         : total_loss / len(loader),
             'miou'         : miou,
@@ -1030,7 +1062,8 @@ def main():
         sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
             out = model.forward_train(sample)
-            c4_logit, c6_logit = out["main"]
+            c4_logit = out["aux"]
+            c6_logit = out["main"]
             print(f"Forward pass OK:")
             print(f"  c4_logit: {c4_logit.shape}")
             print(f"  c6_logit: {c6_logit.shape}\n")
