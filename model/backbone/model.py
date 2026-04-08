@@ -648,16 +648,16 @@ class ResidualBlock(nn.Module):
 class EnhancedDecoder(nn.Module):
     """4-skip decoder: c5(/8) + c4(/8) + c2(/4) + c1(/2).
 
-    Pipeline:
+    Pipeline (simplified):
       c5 ──GatedFusion(c4_proj)──> /8
            ResidualBlock → Conv → D
            ↓ up×2
       GatedFusion(c2_proj) ──> /4, D
            ResidualBlock → Conv → D//2
            ↓ up×2
-      GatedFusion(c1_proj) ──> /2, D//2
+      simple add(c1_proj) ──> /2, D//2   # bỏ GatedFusion tại /2
            ↓ up×2
-      DWConv×2 → final_proj ──> full, D//2
+      Conv1x1 → dropout ──> full, D//2   # bỏ DWConv×2 tại full res
     """
 
     def __init__(self,
@@ -665,7 +665,7 @@ class EnhancedDecoder(nn.Module):
                  c4_channels: int,
                  c2_channels: int,
                  c1_channels: int,
-                 decoder_channels: int = 128,
+                 decoder_channels: int = 96,
                  norm_cfg=dict(type='BN', requires_grad=True),
                  act_cfg=dict(type='ReLU', inplace=True),
                  dropout_ratio: float = 0.1):
@@ -682,7 +682,7 @@ class EnhancedDecoder(nn.Module):
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
 
-        # /8 → /4: fuse c2
+        # /8 → /4: fuse c2 (giữ GatedFusion vì /4 vẫn reasonable)
         self.up1     = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.c2_proj = ConvModule(c2_channels, D, 1, norm_cfg=norm_cfg, act_cfg=None)
         self.fuse_c2 = GatedFusion(D, norm_cfg, act_cfg)
@@ -692,18 +692,16 @@ class EnhancedDecoder(nn.Module):
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
 
-        # /4 → /2: fuse c1
+        # /4 → /2: c1 dùng simple add thay GatedFusion
+        # GatedFusion tại /2 phải xử lý tensor 256×512 — quá tốn
         self.up2     = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.c1_proj = ConvModule(c1_channels, D // 2, 1, norm_cfg=norm_cfg, act_cfg=None)
-        self.fuse_c1 = GatedFusion(D // 2, norm_cfg, act_cfg)
+        self.c1_proj = ConvModule(c1_channels, D // 2, 1,
+                                  norm_cfg=norm_cfg, act_cfg=act_cfg)  # có act để align range
 
-        # /2 → full
+        # /2 → full: bỏ DWConv×2, chỉ giữ 1 conv nhẹ
+        # DWConv tại 512×1024 tốn activation dù params ít
         self.up3        = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.refine2    = nn.Sequential(
-            DWConvModule(D // 2, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            DWConvModule(D // 2, norm_cfg=norm_cfg, act_cfg=act_cfg),
-        )
-        self.final_proj = ConvModule(D // 2, D // 2, 1,
+        self.final_proj = ConvModule(D // 2, D // 2, 3, padding=1,
                                      norm_cfg=norm_cfg, act_cfg=act_cfg)
         self.dropout    = (nn.Dropout2d(dropout_ratio)
                            if dropout_ratio > 0 else nn.Identity())
@@ -724,17 +722,16 @@ class EnhancedDecoder(nn.Module):
         x = self.fuse_c2(c2p, x)
         x = self.refine1(x)
 
-        # /4 → /2: fuse c1
+        # /4 → /2: simple add thay vì GatedFusion
         x   = self.up2(x)
         c1p = self.c1_proj(c1)
         if c1p.shape[-2:] != x.shape[-2:]:
             c1p = F.interpolate(c1p, x.shape[-2:],
                                 mode='bilinear', align_corners=False)
-        x = self.fuse_c1(c1p, x)
+        x = x + c1p  # add thay vì gate — /2 resolution quá lớn cho gate
 
-        # /2 → full
+        # /2 → full: 1 conv3x3 thay DWConv×2
         x = self.up3(x)
-        x = self.refine2(x)
         x = self.final_proj(x)
         x = self.dropout(x)
         return x
