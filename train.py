@@ -396,29 +396,23 @@ class ModelConfig:
     def get_config():
         C = 32
         return {
-            "backbone": {
-                "in_channels"          : 3,
-                "channels"             : C,
-                "ppm_channels"         : 128,
-                "num_blocks_per_stage" : [4, 4, [5, 4], [5, 4], [2, 2]],
-                "align_corners"        : False,
-                "norm_cfg"             : dict(type='BN', requires_grad=True),
-                "act_cfg"              : dict(type='ReLU', inplace=True),
-                "deploy"               : False,
-            },
-            "head": {
-                "in_channels"     : C * 4,
-                "channels"        : 128,
-                "align_corners"   : False,
-                "dropout_ratio"   : 0.1,
-                "loss_weight_aux" : 0.4,
-                "norm_cfg"        : dict(type='BN', requires_grad=True),
-                "act_cfg"         : dict(type='ReLU', inplace=True),
-            },
+            "channels": C,
+            "ppm_channels": 128,
+            "num_blocks_per_stage": [4, 4, [5, 4], [5, 4], [2, 2]],
+            "decoder_channels": 128,
+            "dropout_ratio": 0.1,
+            "align_corners": False,
+            "norm_cfg": dict(type='BN', requires_grad=True),
+            "act_cfg": dict(type='ReLU', inplace=True),
+            "fan_eps": 1e-5,
+            "fan_momentum": 0.1,
+            "ms_scales": (1, 2),
+            "ms_branch_ratio": 8,
+            "ms_alpha": 0.1,
             "loss": {
-                "ce_weight"    : 1.0,
-                "dice_weight"  : 0.5,
-                "dice_smooth"  : 1e-5,
+                "ce_weight": 1.0,
+                "dice_weight": 0.5,
+                "dice_smooth": 1e-5,
             },
         }
 
