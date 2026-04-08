@@ -501,16 +501,6 @@ def unfreeze_backbone_progressive(model, stage_names):
     return total_unfrozen
 
 
-def log_dwsa_gamma(model, writer, epoch):
-    """Log giá trị gamma của DWSA lên TensorBoard để monitor quá trình học.
-
-    gamma khởi tạo = 0. Nếu sau 5-10 epoch gamma vẫn ≈ 0 → DWSA chưa học được.
-    """
-    for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
-        module = getattr(model.backbone, name, None)
-        if module is not None and hasattr(module, 'gamma'):
-            g_val = module.gamma.item()
-            writer.add_scalar(f'dwsa/{name}_gamma', g_val, epoch)
 
 
 def print_backbone_structure(model):
@@ -546,7 +536,6 @@ class ModelConfig:
                 "align_corners"        : False,
                 "norm_cfg"             : dict(type='BN', requires_grad=True),
                 "act_cfg"              : dict(type='ReLU', inplace=True),
-                "dwsa_reduction"       : 8,
                 "deploy"               : False,
             },
             "head": {
@@ -688,9 +677,7 @@ class Trainer:
                 masks = masks.squeeze(1)
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                outputs = self.model.forward_train(imgs)
-                aux_logit = outputs["aux"]
-                main_logit = outputs["main"]
+                aux_logit, main_logit = self.model(imgs)
 
                 c4_logit = aux_logit
                 c6_logit = main_logit
@@ -937,8 +924,6 @@ def main():
     parser.add_argument("--unfreeze_schedule",      type=str,   default="",
                         help="Comma-separated epochs to progressively unfreeze backbone")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
-    # FIX: thêm dwsa_lr_factor riêng — mặc định 0.5 → lr_dwsa = lr * 0.5
-    # Tách khỏi alpha_lr_factor vì gamma=0 (hoặc 0.1) cần LR đủ lớn để học
     parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5,
                         help="LR factor riêng cho DWSA (gamma). Nên >= 0.3 để gamma thoát 0.")
     parser.add_argument("--alpha_lr_factor",        type=float, default=0.1,
@@ -1060,8 +1045,8 @@ def main():
         sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
             out = model.forward_train(sample)
-            c4_logit = out["aux"]
-            c6_logit = out["main"]
+            c4_logit = aux_logit
+            c6_logit = main_logit
             print(f"Forward pass OK:")
             print(f"  c4_logit: {c4_logit.shape}")
             print(f"  c6_logit: {c6_logit.shape}\n")
@@ -1155,7 +1140,7 @@ def main():
         val_metrics   = trainer.validate(val_loader, epoch)
 
         # FIX: log gamma của DWSA mỗi epoch — dùng để monitor xem DWSA có học không
-        log_dwsa_gamma(model, trainer.writer, epoch)
+       
 
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{args.epochs}")
