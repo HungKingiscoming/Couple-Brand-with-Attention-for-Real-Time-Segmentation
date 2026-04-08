@@ -417,35 +417,7 @@ class ModelConfig:
         }
 
 
-# ============================================
-# SEGMENTOR
-# ============================================
 
-class Segmentor(nn.Module):
-    def __init__(self, backbone: nn.Module, head: nn.Module):
-        super().__init__()
-        self.backbone    = backbone
-        self.decode_head = head
-
-    def forward(self, x):
-        feat = self.backbone(x)
-        return self.decode_head(feat)
-
-    def forward_train(self, x):
-        feats = self.backbone(x)
-        outputs = self.decode_head(feats)
-    
-        # outputs = (aux, main)
-        if isinstance(outputs, tuple):
-            aux_logit, main_logit = outputs
-        else:
-            aux_logit = None
-            main_logit = outputs
-    
-        return {
-            "aux": aux_logit,
-            "main": main_logit
-        }
 
 
 # ============================================
@@ -864,12 +836,11 @@ def main():
     with torch.no_grad():
         sample = torch.randn(2, 3, args.img_h, args.img_w).to(device)
         try:
-            out = model.forward_train(sample)
-            c4_logit = aux_logit
-            c6_logit = main_logit
+            # GCNetSegmentor returns (aux, main) in training mode
+            aux_logit, main_logit = model(sample)
             print(f"Forward pass OK:")
-            print(f"  c4_logit: {c4_logit.shape}")
-            print(f"  c6_logit: {c6_logit.shape}\n")
+            print(f"  aux_logit:  {aux_logit.shape if aux_logit is not None else 'None'}")
+            print(f"  main_logit: {main_logit.shape}\n")
         except Exception as e:
             print(f"Forward pass FAILED: {e}")
             return
