@@ -525,36 +525,36 @@ class Trainer:
     # ---------------------------------------------------------------------- #
 
     def train_epoch(self, loader, epoch):
-    self.model.train()
-    total_loss = total_ohem = total_dice = 0.0
-    max_grad_epoch = 0.0
-    pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
-
-    for batch_idx, (imgs, masks) in enumerate(pbar):
-        imgs = imgs.to(self.device, non_blocking=True)
-        masks = masks.to(self.device, non_blocking=True).long()
-        if masks.dim() == 4:
-            masks = masks.squeeze(1)
-
-        with autocast(device_type='cuda', enabled=self.args.use_amp):
-            # 👇 FIX: call model directly, returns (aux_logit, main_logit)
-            aux_logit, main_logit = self.model(imgs)
-
-            target_size = masks.shape[-2:]
-            if aux_logit is not None:
-                aux_full = F.interpolate(aux_logit, size=target_size, mode='bilinear', align_corners=False)
-            main_full = F.interpolate(main_logit, size=target_size, mode='bilinear', align_corners=False)
-
-            ohem_loss = self.ohem(main_full, masks)
-            dice_loss = self.dice(main_full, masks) if self.dice_weight > 0 else torch.tensor(0.0, device=self.device)
-            loss = ohem_loss + self.dice_weight * dice_loss
-
-            if self.args.aux_weight > 0 and aux_logit is not None:
-                aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
-                aux_loss = self.ohem(aux_full, masks)
-                loss = loss + aux_weight * aux_loss
-
-            loss = loss / self.args.accumulation_steps
+        self.model.train()
+        total_loss = total_ohem = total_dice = 0.0
+        max_grad_epoch = 0.0
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
+    
+        for batch_idx, (imgs, masks) in enumerate(pbar):
+            imgs = imgs.to(self.device, non_blocking=True)
+            masks = masks.to(self.device, non_blocking=True).long()
+            if masks.dim() == 4:
+                masks = masks.squeeze(1)
+    
+            with autocast(device_type='cuda', enabled=self.args.use_amp):
+                # 👇 FIX: call model directly, returns (aux_logit, main_logit)
+                aux_logit, main_logit = self.model(imgs)
+    
+                target_size = masks.shape[-2:]
+                if aux_logit is not None:
+                    aux_full = F.interpolate(aux_logit, size=target_size, mode='bilinear', align_corners=False)
+                main_full = F.interpolate(main_logit, size=target_size, mode='bilinear', align_corners=False)
+    
+                ohem_loss = self.ohem(main_full, masks)
+                dice_loss = self.dice(main_full, masks) if self.dice_weight > 0 else torch.tensor(0.0, device=self.device)
+                loss = ohem_loss + self.dice_weight * dice_loss
+    
+                if self.args.aux_weight > 0 and aux_logit is not None:
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    aux_loss = self.ohem(aux_full, masks)
+                    loss = loss + aux_weight * aux_loss
+    
+                loss = loss / self.args.accumulation_steps
 
 
             if torch.isnan(loss) or torch.isinf(loss):
