@@ -575,9 +575,20 @@ class Segmentor(nn.Module):
         return self.decode_head(feat)
 
     def forward_train(self, x):
-        feats  = self.backbone(x)
-        logits = self.decode_head(feats)
-        return {"main": logits}
+        feats = self.backbone(x)
+        outputs = self.decode_head(feats)
+    
+        # outputs = (aux, main)
+        if isinstance(outputs, tuple):
+            aux_logit, main_logit = outputs
+        else:
+            aux_logit = None
+            main_logit = outputs
+    
+        return {
+            "aux": aux_logit,
+            "main": main_logit
+        }
 
 
 # ============================================
@@ -673,7 +684,8 @@ class Trainer:
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
 
-                c4_logit, c6_logit = outputs["main"]
+                c4_logit = outputs["aux"]
+                c6_logit = outputs["main"]
 
                 target_size = masks.shape[-2:]
                 c4_full = F.interpolate(c4_logit, size=target_size,
@@ -689,7 +701,7 @@ class Trainer:
                         size=c6_logit.shape[-2:],
                         mode='nearest'
                     ).squeeze(1).long()
-                    dice_loss = self.dice(c6_logit, masks_small)
+                    dice_loss = self.dice(c6_full, masks)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
 
@@ -777,6 +789,9 @@ class Trainer:
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 logits = self.model(imgs)
+
+                if isinstance(logits, tuple):
+                    logits = logits[1]
 
                 logits_full = F.interpolate(
                     logits, size=masks.shape[-2:],
