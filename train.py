@@ -786,91 +786,89 @@ class Trainer:
     
         total_loss  = 0.0
         num_classes = self.args.num_classes
-        conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+        ignore_idx  = getattr(self.args, "ignore_index", 255)
     
+        conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
         pbar = tqdm(loader, desc=f"Validation Epoch {epoch}")
     
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
     
-            # fix shape mask
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
     
             with autocast(device_type='cuda', enabled=self.args.use_amp):
     
-                # ✅ FIX 1: thống nhất với train
-                outputs = self.model.forward_train(imgs)
-                logits  = outputs["main"]   # (B, C, H, W)
+                logits = self.model(imgs)
     
-                # ✅ FIX 2: chỉ resize khi cần
-                if logits.shape[-2:] != masks.shape[-2:]:
-                    logits_full = F.interpolate(
-                        logits,
-                        size=masks.shape[-2:],
-                        mode='bilinear',
-                        align_corners=False
-                    )
-                else:
-                    logits_full = logits
+                # 👉 fix output tuple
+                if isinstance(logits, tuple):
+                    logits = logits[0]
     
-                # ✅ CE / OHEM (tùy bạn đang dùng gì)
-                ce_loss = self.ce(logits_full, masks)
+                # 👉 resize logits về GT
+                logits = F.interpolate(
+                    logits,
+                    size=masks.shape[-2:],
+                    mode='bilinear',
+                    align_corners=False
+                )
     
-                # ✅ FIX 3: Dice chuẩn (softmax)
+                # =========================
+                # 🔥 OHEM LOSS
+                # =========================
+                loss_ce = self.ohem(logits, masks)
+    
+                # =========================
+                # 🔥 DICE LOSS (chuẩn)
+                # =========================
                 if self.dice_weight > 0:
                     probs = torch.softmax(logits, dim=1)
-    
-                    masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:],
-                        mode='nearest'
-                    ).squeeze(1).long()
-    
-                    dice_loss = self.dice(probs, masks_small)
+                    loss_dice = self.dice(probs, masks)
                 else:
-                    dice_loss = 0.0
+                    loss_dice = torch.tensor(0.0, device=self.device)
     
-                loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
+                loss = self.ce_weight * loss_ce + self.dice_weight * loss_dice
     
             total_loss += loss.item()
     
-            # ================== METRICS ==================
-            pred   = logits_full.argmax(1)
-            target = masks
+            # =========================
+            # 🔥 METRIC (mIoU)
+            # =========================
+            pred   = logits.argmax(1).cpu().numpy()
+            target = masks.cpu().numpy()
     
-            pred   = pred.view(-1)
-            target = target.view(-1)
+            valid = (target != ignore_idx) & (target < num_classes)
     
-            valid = (target >= 0) & (target < num_classes)
+            label = num_classes * target[valid].astype(int) + pred[valid]
+            count = np.bincount(label, minlength=num_classes ** 2)
     
-            hist = torch.bincount(
-                num_classes * target[valid] + pred[valid],
-                minlength=num_classes ** 2
-            ).reshape(num_classes, num_classes)
+            conf_matrix += count.reshape(num_classes, num_classes)
     
-            conf_matrix += hist.cpu().numpy()
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}'
+            })
     
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            if batch_idx % 20 == 0:
+                clear_gpu_memory()
     
-            # ❌ REMOVE: clear_gpu_memory (làm chậm validate)
-    
-        # ================== FINAL METRICS ==================
+        # =========================
+        # 🔥 FINAL METRICS
+        # =========================
         intersection = np.diag(conf_matrix)
-        union        = conf_matrix.sum(1) + conf_matrix.sum(0) - intersection
+        union = conf_matrix.sum(1) + conf_matrix.sum(0) - intersection
     
         iou  = intersection / (union + 1e-10)
         miou = np.nanmean(iou)
-        acc  = intersection.sum() / (conf_matrix.sum() + 1e-10)
+    
+        acc = intersection.sum() / (conf_matrix.sum() + 1e-10)
     
         return {
-            'loss'         : total_loss / len(loader),
-            'miou'         : miou,
-            'accuracy'     : acc,
+            'loss': total_loss / len(loader),
+            'miou': miou,
+            'accuracy': acc,
             'per_class_iou': iou,
         }
-
     # ---------------------------------------------------------------------- #
     # Checkpoint                                                               #
     # ---------------------------------------------------------------------- #
