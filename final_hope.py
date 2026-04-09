@@ -26,7 +26,7 @@ warnings.filterwarnings('ignore')
 from model.backbone.model import GCNetWithEnhance
 from model.head.segmentation_head import GCNetHead, GCNetAuxHead
 from data.custom import create_dataloaders
-from model.model_utils import replace_bn_with_gn
+
 
 # ============================================
 # SEGMENTOR
