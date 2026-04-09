@@ -1,16 +1,24 @@
 """
-GCNet Final — FoggyAwareNorm + MultiScaleContext, không DWSA
-=============================================================
-Backbone:
-  - Stem 2 conv đầu dùng FoggyAwareNorm (IN + BN learnable gate)
-  - GCNetCore bilateral branch giữ nguyên
-  - MultiScaleContextModule trên x_spp (/8, C*4)
-  - Bỏ hoàn toàn DWSA
+GCNet Final — tích hợp backbone mới + head mới
+===============================================
 
-Head:
-  - EnhancedDecoder: c5(/8) + c4(/8) + c2(/4) + c1(/2)
-  - GatedFusion tại mỗi skip connection
-  - Aux head trên c4
+Backbone (GCNetBackbone):
+  - stem_conv1/2: FoggyAwareNorm (IN + BN learnable gate per-channel)
+  - stage2~6: bilateral branch GCBlock giữ nguyên
+  - MultiScaleContextModule trên x_spp (/8, C*4)
+  - Không DWSA
+  - Training  → (c4_feat, c6_feat, c1, c2)
+  - Inference → (c6_feat, c1, c2)
+
+Head (GCNetHead / GCNetHeadLite):
+  - GCNetHead    : dùng đủ c1,c2,c4,c6 skip — cần backbone mới
+  - GCNetHeadLite: chỉ dùng c4,c6 — tương thích backward với backbone cũ
+
+Segmentor (GCNetSegmentor):
+  - Kết nối backbone mới + GCNetHead
+  - Training  → (aux_logit/2, main_logit/2)
+  - Inference → main_logit/2  (resize trong loss/predict)
+  - switch_to_deploy(): fuse GCBlock → single Conv3x3
 
 Deploy:
   - switch_to_deploy() gộp GCBlock → single Conv3x3
@@ -33,7 +41,31 @@ from components.components import (
     build_norm_layer,
     resize,
     OptConfigType,
+    SampleList,
 )
+
+
+# =============================================================================
+# Accuracy helper
+# =============================================================================
+
+def accuracy(pred: Tensor, target: Tensor, ignore_index: int = 255) -> Tensor:
+    pred_label = pred.argmax(dim=1)
+    mask    = target != ignore_index
+    correct = (pred_label[mask] == target[mask]).sum().float()
+    total   = mask.sum().float().clamp(min=1)
+    return correct / total * 100.0
+
+
+class CrossEntropyLoss(nn.Module):
+    def __init__(self, ignore_index: int = 255, loss_weight: float = 1.0):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.loss_weight  = loss_weight
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        return self.loss_weight * F.cross_entropy(
+            pred, target, ignore_index=self.ignore_index)
 
 
 # =============================================================================
@@ -41,14 +73,12 @@ from components.components import (
 # =============================================================================
 
 class FoggyAwareNorm(nn.Module):
-    """Learnable blend của InstanceNorm và BatchNorm.
+    """Learnable blend: alpha*IN(x) + (1-alpha)*BN(x).
 
     alpha → 1 : thiên về IN  (robust với foggy / domain shift)
-    alpha → 0 : thiên về BN  (tốt cho clear images / in-domain)
-
-    Khởi tạo alpha=0.5 — trung tính, không bias ban đầu.
-    Đặt tại 2 conv đầu của stem (stage1) nơi ảnh foggy chưa được
-    normalize lần nào.
+    alpha → 0 : thiên về BN  (tốt cho clear / in-domain)
+    Khởi tạo alpha=0.5, per-channel.
+    Đặt tại 2 conv đầu stem — nơi ảnh foggy chưa được normalize lần nào.
     """
 
     def __init__(self, num_channels: int, eps: float = 1e-5,
@@ -58,7 +88,6 @@ class FoggyAwareNorm(nn.Module):
                                   affine=True, track_running_stats=True)
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
                                      affine=True, track_running_stats=False)
-        # Per-channel learnable gate
         self.alpha = nn.Parameter(
             torch.ones(1, num_channels, 1, 1) * 0.5,
             requires_grad=requires_grad)
@@ -69,7 +98,7 @@ class FoggyAwareNorm(nn.Module):
 
 
 # =============================================================================
-# GCBlock primitives  (giữ nguyên từ bản gốc)
+# GCBlock primitives
 # =============================================================================
 
 class Block1x1(BaseModule):
@@ -106,9 +135,8 @@ class Block1x1(BaseModule):
         g, beta, eps = conv.bn.weight, conv.bn.bias, conv.bn.eps
         std = (rv + eps).sqrt()
         t = (g / std).reshape(-1, 1, 1, 1)
-        fused_b = (beta + (b - rm) * g / std
-                   if self.bias else beta - rm * g / std)
-        return k * t, fused_b
+        return k * t, (beta + (b - rm) * g / std
+                       if self.bias else beta - rm * g / std)
 
     def switch_to_deploy(self):
         k1, b1 = self._fuse_bn(self.conv1)
@@ -117,8 +145,7 @@ class Block1x1(BaseModule):
                               stride=self.stride, padding=self.padding, bias=True)
         self.conv.weight.data = torch.einsum(
             'oi,icjk->ocjk', k2.squeeze(3).squeeze(2), k1)
-        self.conv.bias.data = (b2
-                               + (b1.view(1, -1, 1, 1) * k2).sum(3).sum(2).sum(1))
+        self.conv.bias.data = b2 + (b1.view(1, -1, 1, 1) * k2).sum(3).sum(2).sum(1)
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
@@ -158,9 +185,8 @@ class Block3x3(BaseModule):
         g, beta, eps = conv.bn.weight, conv.bn.bias, conv.bn.eps
         std = (rv + eps).sqrt()
         t = (g / std).reshape(-1, 1, 1, 1)
-        fused_b = (beta + (b - rm) * g / std
-                   if self.bias else beta - rm * g / std)
-        return k * t, fused_b
+        return k * t, (beta + (b - rm) * g / std
+                       if self.bias else beta - rm * g / std)
 
     def switch_to_deploy(self):
         k1, b1 = self._fuse_bn(self.conv1)
@@ -169,15 +195,14 @@ class Block3x3(BaseModule):
                               stride=self.stride, padding=self.padding, bias=True)
         self.conv.weight.data = torch.einsum(
             'oi,icjk->ocjk', k2.squeeze(3).squeeze(2), k1)
-        self.conv.bias.data = (b2
-                               + (b1.view(1, -1, 1, 1) * k2).sum(3).sum(2).sum(1))
+        self.conv.bias.data = b2 + (b1.view(1, -1, 1, 1) * k2).sum(3).sum(2).sum(1)
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
 
 
 class GCBlock(nn.Module):
-    """Re-parameterizable block: 2×3x3 + 1x1 + BN-identity → single 3x3 at deploy."""
+    """Re-parameterizable: 2×3x3 + 1x1 + BN-identity → single Conv3x3 at deploy."""
 
     def __init__(self, in_channels, out_channels, kernel_size=3, stride=1,
                  padding=1, padding_mode='zeros',
@@ -281,9 +306,8 @@ class GCBlock(nn.Module):
 class MultiScaleContextModule(nn.Module):
     """Multi-scale context trên x_spp (/8, C*4).
 
-    scales=(1,2): branch 1x1 conv + branch avgpool(2)→upsample.
-    Nhẹ hơn attention, không redundant với DAPPM (DAPPM trên /64,
-    MSC trên fused feature /8).
+    scales=(1,2): 1x1 conv + avgpool(2)→upsample.
+    Nhẹ hơn attention, không redundant với DAPPM.
     Residual: x + clamp(alpha, 0, 0.5) * fused.
     """
 
@@ -355,16 +379,10 @@ class MultiScaleContextModule(nn.Module):
 class GCNetBackbone(BaseModule):
     """Bilateral branch backbone với FoggyAwareNorm tại stem.
 
-    Thay đổi so với GCNet gốc:
-      1. stem_conv1 và stem_conv2 dùng FoggyAwareNorm thay BN thuần.
-      2. MultiScaleContextModule trên x_spp trước final_proj.
-      3. Không có DWSA ở bất kỳ stage nào.
+    Training  → (c4_feat, c6_feat, c1, c2)
+    Inference → (c6_feat, c1, c2)
 
-    Outputs dict:
-      c1 : /2,  C        — skip cho decoder
-      c2 : /4,  C        — skip cho decoder
-      c4 : /8,  C*2      — detail branch sau stage4 fusion (aux loss)
-      c5 : /8,  C*4      — fused + MSC enhanced (input cho head)
+    Tương thích với GCNetHead (dùng đủ 4 skip) và GCNetHeadLite (chỉ c4+c6).
     """
 
     def __init__(self,
@@ -394,9 +412,7 @@ class GCNetBackbone(BaseModule):
         C  = channels
         nb = num_blocks_per_stage
 
-        # ------------------------------------------------------------------ #
-        # Stem — stage1: FoggyAwareNorm ở 2 conv đầu                         #
-        # ------------------------------------------------------------------ #
+        # ---- Stem: FoggyAwareNorm ở 2 conv đầu ----
         self.stem_conv1 = nn.Sequential(
             nn.Conv2d(in_channels, C, 3, stride=2, padding=1, bias=False),
             FoggyAwareNorm(C, eps=fan_eps, momentum=fan_momentum),
@@ -408,27 +424,22 @@ class GCNetBackbone(BaseModule):
             build_activation_layer(act_cfg),
         )
 
-        # Stage 2
         self.stem_stage2 = nn.Sequential(
             *[GCBlock(C, C, stride=1, norm_cfg=norm_cfg,
                       act_cfg=act_cfg, deploy=deploy)
               for _ in range(nb[0])]
         )
-
-        # Stage 3
         self.stem_stage3 = nn.Sequential(
-            GCBlock(C, C * 2, stride=2, norm_cfg=norm_cfg,
+            GCBlock(C, C*2, stride=2, norm_cfg=norm_cfg,
                     act_cfg=act_cfg, deploy=deploy),
-            *[GCBlock(C * 2, C * 2, stride=1, norm_cfg=norm_cfg,
+            *[GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
                       act_cfg=act_cfg, deploy=deploy)
               for _ in range(nb[1] - 1)],
         )
 
         self.relu = build_activation_layer(act_cfg)
 
-        # ------------------------------------------------------------------ #
-        # Semantic branch (stage 4 → 6)                                       #
-        # ------------------------------------------------------------------ #
+        # ---- Semantic branch ----
         self.semantic_branch = nn.ModuleList([
             nn.Sequential(
                 GCBlock(C*2, C*4, stride=2, norm_cfg=norm_cfg,
@@ -459,9 +470,7 @@ class GCNetBackbone(BaseModule):
             ),
         ])
 
-        # ------------------------------------------------------------------ #
-        # Detail branch (stage 4 → 6)                                         #
-        # ------------------------------------------------------------------ #
+        # ---- Detail branch ----
         self.detail_branch = nn.ModuleList([
             nn.Sequential(
                 *[GCBlock(C*2, C*2, stride=1, norm_cfg=norm_cfg,
@@ -488,98 +497,92 @@ class GCNetBackbone(BaseModule):
             ),
         ])
 
-        # ------------------------------------------------------------------ #
-        # Bilateral fusion                                                      #
-        # ------------------------------------------------------------------ #
-        self.compression_1 = ConvModule(
-            C*4, C*2, 1, norm_cfg=norm_cfg, act_cfg=None)
-        self.down_1 = ConvModule(
-            C*2, C*4, 3, stride=2, padding=1, norm_cfg=norm_cfg, act_cfg=None)
-
-        self.compression_2 = ConvModule(
-            C*8, C*2, 1, norm_cfg=norm_cfg, act_cfg=None)
-        self.down_2 = nn.Sequential(
+        # ---- Bilateral fusion ----
+        self.compression_1 = ConvModule(C*4, C*2, 1, norm_cfg=norm_cfg, act_cfg=None)
+        self.down_1        = ConvModule(C*2, C*4, 3, stride=2, padding=1,
+                                        norm_cfg=norm_cfg, act_cfg=None)
+        self.compression_2 = ConvModule(C*8, C*2, 1, norm_cfg=norm_cfg, act_cfg=None)
+        self.down_2        = nn.Sequential(
             ConvModule(C*2, C*4, 3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
             ConvModule(C*4, C*8, 3, stride=2, padding=1,
                        norm_cfg=norm_cfg, act_cfg=None),
         )
 
-        # ------------------------------------------------------------------ #
-        # DAPPM + MSC + final_proj                                             #
-        # ------------------------------------------------------------------ #
+        # ---- DAPPM + MSC + final_proj ----
         self.spp = DAPPM(C*16, ppm_channels, C*4, num_scales=5,
                          norm_cfg=norm_cfg, act_cfg=act_cfg)
-
         self.ms_context = MultiScaleContextModule(
-            in_channels=C * 4,
-            out_channels=C * 4,
-            scales=ms_scales,
-            branch_ratio=ms_branch_ratio,
-            alpha=ms_alpha,
-        )
-
-        self.final_proj = ConvModule(
-            C * 4, C * 4, 1, norm_cfg=norm_cfg, act_cfg=act_cfg)
+            C*4, C*4, scales=ms_scales,
+            branch_ratio=ms_branch_ratio, alpha=ms_alpha)
+        self.final_proj = ConvModule(C*4, C*4, 1, norm_cfg=norm_cfg, act_cfg=act_cfg)
 
         self._kaiming_init()
 
     def _kaiming_init(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: Tensor) -> Dict[str, Tensor]:
+    def forward(self, x: Tensor):
+        """
+        Training  → (c4_feat, c6_feat, c1, c2)
+        Inference → (c6_feat, c1, c2)
+
+        c4_feat : /8,  C*2  — detail branch sau stage4, dùng cho aux loss
+        c6_feat : /8,  C*4  — fused + MSC enhanced, main input cho head
+        c1      : /2,  C    — skip decoder
+        c2      : /4,  C    — skip decoder
+        """
         out_size = (math.ceil(x.shape[-2] / 8),
                     math.ceil(x.shape[-1] / 8))
 
-        # ---- Stage 1 — FoggyAwareNorm ----
-        c1   = self.stem_conv1(x)       # /2,  C
-        c2   = self.stem_conv2(c1)      # /4,  C
+        # Stage 1 — FoggyAwareNorm
+        c1   = self.stem_conv1(x)      # /2,  C
+        c2   = self.stem_conv2(c1)     # /4,  C
 
-        # ---- Stage 2 & 3 ----
-        feat = self.stem_stage2(c2)     # /4,  C
-        feat = self.stem_stage3(feat)   # /8,  C*2
+        # Stage 2 & 3
+        feat = self.stem_stage2(c2)    # /4,  C
+        feat = self.stem_stage3(feat)  # /8,  C*2
 
-        # ---- Stage 4 — bilateral ----
-        x_s  = self.semantic_branch[0](feat)         # /16, C*4
-        x_d  = self.detail_branch[0](feat)           # /8,  C*2
+        # Stage 4 — bilateral
+        x_s  = self.semantic_branch[0](feat)
+        x_d  = self.detail_branch[0](feat)
         comp = self.compression_1(self.relu(x_s))
         x_s  = x_s + self.down_1(self.relu(x_d))
         x_d  = x_d + resize(comp, size=out_size, mode='bilinear',
                              align_corners=self.align_corners)
-        c4   = x_d                                   # /8,  C*2  → aux loss
+        c4_feat = x_d                  # /8,  C*2  → aux loss
 
-        # ---- Stage 5 — bilateral ----
-        x_s  = self.semantic_branch[1](self.relu(x_s))  # /32, C*8
-        x_d  = self.detail_branch[1](self.relu(x_d))    # /8,  C*2
+        # Stage 5 — bilateral
+        x_s  = self.semantic_branch[1](self.relu(x_s))
+        x_d  = self.detail_branch[1](self.relu(x_d))
         comp = self.compression_2(self.relu(x_s))
         x_s  = x_s + self.down_2(self.relu(x_d))
         x_d  = x_d + resize(comp, size=out_size, mode='bilinear',
                              align_corners=self.align_corners)
 
-        # ---- Stage 6 ----
-        x_d6 = self.detail_branch[2](self.relu(x_d))    # /8,  C*4
-        x_s6 = self.semantic_branch[2](self.relu(x_s))  # /64, C*16
+        # Stage 6
+        x_d6 = self.detail_branch[2](self.relu(x_d))   # /8,  C*4
+        x_s6 = self.semantic_branch[2](self.relu(x_s)) # /64, C*16
 
         spp  = self.spp(x_s6)
         spp  = resize(spp, size=out_size, mode='bilinear',
                       align_corners=self.align_corners)
-
-        # ---- MSC + fuse + proj ----
         spp  = self.ms_context(spp)
-        c5   = self.final_proj(x_d6 + spp)              # /8,  C*4
+        c6_feat = self.final_proj(x_d6 + spp)          # /8,  C*4
 
-        return dict(c1=c1, c2=c2, c4=c4, c5=c5)
+        if self.training:
+            return c4_feat, c6_feat, c1, c2
+        else:
+            return c6_feat, c1, c2
 
     def switch_to_deploy(self):
-        """Fuse tất cả GCBlock → single Conv3x3."""
         for m in self.modules():
             if isinstance(m, GCBlock):
                 m.switch_to_deploy()
@@ -587,7 +590,7 @@ class GCNetBackbone(BaseModule):
 
 
 # =============================================================================
-# Decoder components
+# Head primitives (dùng chung cho GCNetHead và GCNetHeadLite)
 # =============================================================================
 
 class GatedFusion(nn.Module):
@@ -609,23 +612,6 @@ class GatedFusion(nn.Module):
         return g * skip + (1.0 - g) * dec
 
 
-class DWConvModule(nn.Module):
-    """Depthwise-separable conv."""
-
-    def __init__(self, channels, kernel_size=3,
-                 norm_cfg=dict(type='BN', requires_grad=True),
-                 act_cfg=dict(type='ReLU', inplace=True)):
-        super().__init__()
-        self.dw = ConvModule(channels, channels, kernel_size,
-                             padding=kernel_size // 2, groups=channels,
-                             norm_cfg=norm_cfg, act_cfg=None)
-        self.pw = ConvModule(channels, channels, 1,
-                             norm_cfg=norm_cfg, act_cfg=act_cfg)
-
-    def forward(self, x: Tensor) -> Tensor:
-        return self.pw(self.dw(x))
-
-
 class ResidualBlock(nn.Module):
     def __init__(self, channels,
                  norm_cfg=dict(type='BN', requires_grad=True),
@@ -635,54 +621,55 @@ class ResidualBlock(nn.Module):
                                 norm_cfg=norm_cfg, act_cfg=act_cfg)
         self.conv2 = ConvModule(channels, channels, 3, padding=1,
                                 norm_cfg=norm_cfg, act_cfg=None)
-        self.act = build_activation_layer(act_cfg)
+        self.act   = build_activation_layer(act_cfg)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.act(self.conv2(self.conv1(x)) + x)
 
 
 # =============================================================================
-# EnhancedDecoder
+# EnhancedDecoder — dừng tại /2
 # =============================================================================
 
 class EnhancedDecoder(nn.Module):
-    """4-skip decoder: c5(/8) + c4(/8) + c2(/4) + c1(/2).
+    """3-skip decoder: c6(/8) + c4_skip(/8) + c2(/4) + c1(/2).
 
-    Pipeline (simplified):
-      c5 ──GatedFusion(c4_proj)──> /8
+    Dừng tại /2 — KHÔNG upsample lên full res.
+    Loss trong GCNetHead resize logit /2 → full res khi tính CE.
+    → Không có activation nào tại full resolution.
+
+    Pipeline:
+      c6 ──GatedFusion(c4_proj)──> /8
            ResidualBlock → Conv → D
            ↓ up×2
       GatedFusion(c2_proj) ──> /4, D
            ResidualBlock → Conv → D//2
            ↓ up×2
-      simple add(c1_proj) ──> /2, D//2   # bỏ GatedFusion tại /2
-           ↓ up×2
-      Conv1x1 → dropout ──> full, D//2   # bỏ DWConv×2 tại full res
+      simple add(c1_proj) ──> /2, D//2   ← OUTPUT
     """
 
     def __init__(self,
-                 c5_channels: int,
+                 c6_channels: int,
                  c4_channels: int,
                  c2_channels: int,
                  c1_channels: int,
                  decoder_channels: int = 96,
                  norm_cfg=dict(type='BN', requires_grad=True),
-                 act_cfg=dict(type='ReLU', inplace=True),
-                 dropout_ratio: float = 0.1):
+                 act_cfg=dict(type='ReLU', inplace=True)):
         super().__init__()
         D = decoder_channels
 
-        # /8: fuse c4 vào c5
-        self.c4_proj = ConvModule(c4_channels, c5_channels, 1,
+        # /8: fuse c4 vào c6
+        self.c4_proj = ConvModule(c4_channels, c6_channels, 1,
                                   norm_cfg=norm_cfg, act_cfg=None)
-        self.fuse_c4 = GatedFusion(c5_channels, norm_cfg, act_cfg)
+        self.fuse_c4 = GatedFusion(c6_channels, norm_cfg, act_cfg)
         self.refine0 = nn.Sequential(
-            ResidualBlock(c5_channels, norm_cfg, act_cfg),
-            ConvModule(c5_channels, D, 3, padding=1,
+            ResidualBlock(c6_channels, norm_cfg, act_cfg),
+            ConvModule(c6_channels, D, 3, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
 
-        # /8 → /4: fuse c2 (giữ GatedFusion vì /4 vẫn reasonable)
+        # /8 → /4: fuse c2 (GatedFusion — /4 còn nhỏ, chi phí ok)
         self.up1     = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.c2_proj = ConvModule(c2_channels, D, 1, norm_cfg=norm_cfg, act_cfg=None)
         self.fuse_c2 = GatedFusion(D, norm_cfg, act_cfg)
@@ -692,25 +679,17 @@ class EnhancedDecoder(nn.Module):
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
         )
 
-        # /4 → /2: c1 dùng simple add thay GatedFusion
-        # GatedFusion tại /2 phải xử lý tensor 256×512 — quá tốn
+        # /4 → /2: simple add c1 (/2 quá lớn cho GatedFusion)
         self.up2     = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.c1_proj = ConvModule(c1_channels, D // 2, 1,
-                                  norm_cfg=norm_cfg, act_cfg=act_cfg)  # có act để align range
+                                  norm_cfg=norm_cfg, act_cfg=act_cfg)
 
-        # /2 → full: bỏ DWConv×2, chỉ giữ 1 conv nhẹ
-        # DWConv tại 512×1024 tốn activation dù params ít
-        self.up3        = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.final_proj = ConvModule(D // 2, D // 2, 3, padding=1,
-                                     norm_cfg=norm_cfg, act_cfg=act_cfg)
-        self.dropout    = (nn.Dropout2d(dropout_ratio)
-                           if dropout_ratio > 0 else nn.Identity())
         self.out_channels = D // 2
 
-    def forward(self, c5: Tensor, c4: Tensor,
+    def forward(self, c6: Tensor, c4_skip: Tensor,
                 c2: Tensor, c1: Tensor) -> Tensor:
-        # /8: fuse c4 → c5
-        x = self.fuse_c4(self.c4_proj(c4), c5)
+        # /8: fuse c4 → c6
+        x = self.fuse_c4(self.c4_proj(c4_skip), c6)
         x = self.refine0(x)
 
         # /8 → /4: fuse c2
@@ -722,106 +701,289 @@ class EnhancedDecoder(nn.Module):
         x = self.fuse_c2(c2p, x)
         x = self.refine1(x)
 
-        # /4 → /2: simple add thay vì GatedFusion
+        # /4 → /2: simple add c1
         x   = self.up2(x)
         c1p = self.c1_proj(c1)
         if c1p.shape[-2:] != x.shape[-2:]:
             c1p = F.interpolate(c1p, x.shape[-2:],
                                 mode='bilinear', align_corners=False)
-        x = x + c1p  # add thay vì gate — /2 resolution quá lớn cho gate
-
-        # /2 → full: 1 conv3x3 thay DWConv×2
-        x = self.up3(x)
-        x = self.final_proj(x)
-        x = self.dropout(x)
-        return x
+        return x + c1p   # /2, D//2
 
 
 # =============================================================================
-# GCNetHead
+# GCNetHead — full skip (c1, c2, c4, c6), dùng với GCNetBackbone mới
 # =============================================================================
 
-class GCNetHead(nn.Module):
-    """Main head: EnhancedDecoder + conv_seg + aux head.
+class GCNetHead(BaseModule):
+    """Decode head với EnhancedDecoder.
 
-    Training  → (aux_logit, main_logit)
-    Eval      → main_logit
+    Nhận output từ GCNetBackbone:
+      Training  : (c4_feat, c6_feat, c1, c2)
+      Inference : (c6_feat, c1, c2)
+
+    Training  → (aux_logit/2, main_logit/2)
+    Inference → main_logit/2
+    Loss tự resize /2 → full res trong loss().
     """
 
     def __init__(self,
-                 channels: int = 32,
-                 num_classes: int = 19,
-                 decoder_channels: int = 128,
-                 dropout_ratio: float = 0.1,
+                 in_channels: int,          # c6 channels = C*4
+                 channels: int,             # backbone base C
+                 num_classes: int,
+                 decoder_channels: int = 96,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                 align_corners: bool = False):
-        super().__init__()
-        self.align_corners = align_corners
+                 align_corners: bool = False,
+                 ignore_index: int = 255,
+                 loss_weight_aux: float = 0.4,
+                 dropout_ratio: float = 0.1,
+                 init_cfg: OptConfigType = None):
+        super().__init__(init_cfg)
+
+        self.align_corners   = align_corners
+        self.ignore_index    = ignore_index
+        self.loss_weight_aux = loss_weight_aux
         C = channels
 
         self.decoder = EnhancedDecoder(
-            c5_channels=C * 4,
-            c4_channels=C * 2,
+            c6_channels=in_channels,        # C*4
+            c4_channels=in_channels // 2,   # C*2
             c2_channels=C,
             c1_channels=C,
             decoder_channels=decoder_channels,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
-            dropout_ratio=dropout_ratio,
         )
 
-        out_ch = self.decoder.out_channels
-        self.conv_seg = nn.Sequential(
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(out_ch, num_classes, 1),
-        )
+        out_ch = self.decoder.out_channels  # D//2
 
-        # Aux head trên c4 (/8, C*2)
+        self.dropout  = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
+        self.cls_seg  = nn.Conv2d(out_ch, num_classes, kernel_size=1)
+
+        # Aux head trên c4_feat (/8, C*2)
         self.aux_head = nn.Sequential(
-            ConvModule(C * 2, C * 2, 3, padding=1,
+            build_norm_layer(norm_cfg, in_channels // 2)[1],
+            build_activation_layer(act_cfg),
+            ConvModule(in_channels // 2, in_channels // 2, 3, padding=1,
                        norm_cfg=norm_cfg, act_cfg=act_cfg),
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(C * 2, num_classes, 1),
         )
+        self.aux_cls_seg = nn.Conv2d(in_channels // 2, num_classes, kernel_size=1)
 
-    def forward(self, inputs: Dict[str, Tensor]):
-        c1 = inputs['c1']
-        c2 = inputs['c2']
-        c4 = inputs['c4']
-        c5 = inputs['c5']
+        self.loss_main = CrossEntropyLoss(ignore_index=ignore_index, loss_weight=1.0)
+        self.loss_aux  = CrossEntropyLoss(ignore_index=ignore_index,
+                                          loss_weight=loss_weight_aux)
 
-        feat       = self.decoder(c5, c4, c2, c1)
-        main_logit = self.conv_seg(feat)
+        self.init_weights()
 
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, inputs) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Training  : inputs = (c4_feat, c6_feat, c1, c2)
+                    returns (aux_logit/2, main_logit/2)
+        Inference : inputs = (c6_feat, c1, c2)
+                    returns main_logit/2
+        """
         if self.training:
-            aux_logit = self.aux_head(c4)
+            c4_feat, c6_feat, c1, c2 = inputs
+            feat       = self.decoder(c6_feat, c4_feat, c2, c1)
+            main_logit = self.cls_seg(self.dropout(feat))
+            aux_logit  = self.aux_cls_seg(self.aux_head(c4_feat))
             return aux_logit, main_logit
-        return main_logit
+        else:
+            c6_feat, c1, c2 = inputs
+            feat = self.decoder(c6_feat, None, c2, c1)
+            return self.cls_seg(self.dropout(feat))
+
+    def loss(self, seg_logits: Tuple[Tensor, Tensor],
+             seg_label: Tensor) -> Dict[str, Tensor]:
+        """Resize /2 → full res NGOÀI backward graph decoder."""
+        aux_logit, main_logit = seg_logits
+        target_size = seg_label.shape[1:]
+
+        main_logit = resize(main_logit, size=target_size,
+                            mode='bilinear', align_corners=self.align_corners)
+        aux_logit  = resize(aux_logit,  size=target_size,
+                            mode='bilinear', align_corners=self.align_corners)
+
+        return {
+            'loss_main': self.loss_main(main_logit, seg_label),
+            'loss_aux':  self.loss_aux(aux_logit,  seg_label),
+            'acc_seg':   accuracy(main_logit, seg_label,
+                                  ignore_index=self.ignore_index),
+        }
+
+    def predict(self, inputs,
+                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
+        self.eval()
+        with torch.no_grad():
+            logit = self.forward(inputs)
+            if img_size is not None:
+                logit = resize(logit, size=img_size,
+                               mode='bilinear', align_corners=self.align_corners)
+        return logit
 
 
 # =============================================================================
-# GCNetSegmentor — entry point
+# GCNetHeadLite — fallback, tương thích backbone CŨ (c4, c6) only
+# =============================================================================
+
+class GCNetHeadLite(BaseModule):
+    """Head nhẹ, tương thích 100% backbone cũ trả về (c4_feat, c6_feat).
+
+    Không cần c1/c2 skip — pipeline:
+      c6(/8) ──GatedFusion(c4_proj)──> /8
+               ResidualBlock → Conv → D
+               ↓ up×2
+               ResidualBlock → Conv → D//2   (/4)
+               ↓ up×2
+               Conv → D//2                   (/2) ← DỪNG
+
+    Training  → (aux_logit/2, main_logit/2)
+    Inference → main_logit/2
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 channels: int,
+                 num_classes: int,
+                 decoder_channels: int = 96,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 align_corners: bool = False,
+                 ignore_index: int = 255,
+                 loss_weight_aux: float = 0.4,
+                 dropout_ratio: float = 0.1,
+                 init_cfg: OptConfigType = None):
+        super().__init__(init_cfg)
+
+        self.align_corners   = align_corners
+        self.ignore_index    = ignore_index
+        self.loss_weight_aux = loss_weight_aux
+        D   = decoder_channels
+        C4  = in_channels        # C*4
+        C4h = in_channels // 2   # C*2
+
+        self.c4_proj = ConvModule(C4h, C4, 1, norm_cfg=norm_cfg, act_cfg=None)
+        self.fuse_c4 = GatedFusion(C4, norm_cfg, act_cfg)
+        self.refine0 = nn.Sequential(
+            ResidualBlock(C4, norm_cfg, act_cfg),
+            ConvModule(C4, D, 3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg),
+        )
+        self.up1     = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.refine1 = nn.Sequential(
+            ResidualBlock(D, norm_cfg, act_cfg),
+            ConvModule(D, D // 2, 3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg),
+        )
+        self.up2     = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.refine2 = ConvModule(D // 2, D // 2, 3, padding=1,
+                                  norm_cfg=norm_cfg, act_cfg=act_cfg)
+
+        self.dropout     = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
+        self.cls_seg     = nn.Conv2d(D // 2, num_classes, kernel_size=1)
+
+        self.aux_head = nn.Sequential(
+            build_norm_layer(norm_cfg, C4h)[1],
+            build_activation_layer(act_cfg),
+            ConvModule(C4h, C4h, 3, padding=1, norm_cfg=norm_cfg, act_cfg=act_cfg),
+        )
+        self.aux_cls_seg = nn.Conv2d(C4h, num_classes, kernel_size=1)
+
+        self.loss_main = CrossEntropyLoss(ignore_index=ignore_index, loss_weight=1.0)
+        self.loss_aux  = CrossEntropyLoss(ignore_index=ignore_index,
+                                          loss_weight=loss_weight_aux)
+
+        self.init_weights()
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def _decode(self, c6: Tensor, c4: Tensor) -> Tensor:
+        x = self.fuse_c4(self.c4_proj(c4), c6)
+        x = self.refine1(self.up1(self.refine0(x)))
+        x = self.refine2(self.up2(x))
+        return x
+
+    def forward(self, inputs) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """
+        Training  : inputs = (c4_feat, c6_feat) → (aux_logit/2, main_logit/2)
+        Inference : inputs = c6_feat            → main_logit/2
+        """
+        if self.training:
+            c4_feat, c6_feat = inputs
+            feat       = self._decode(c6_feat, c4_feat)
+            main_logit = self.cls_seg(self.dropout(feat))
+            aux_logit  = self.aux_cls_seg(self.aux_head(c4_feat))
+            return aux_logit, main_logit
+        else:
+            c6_feat = inputs
+            B, C, H, W = c6_feat.shape
+            c4_dummy = torch.zeros(B, C // 2, H, W,
+                                   dtype=c6_feat.dtype, device=c6_feat.device)
+            return self.cls_seg(self.dropout(self._decode(c6_feat, c4_dummy)))
+
+    def loss(self, seg_logits: Tuple[Tensor, Tensor],
+             seg_label: Tensor) -> Dict[str, Tensor]:
+        aux_logit, main_logit = seg_logits
+        target_size = seg_label.shape[1:]
+        main_logit = resize(main_logit, size=target_size,
+                            mode='bilinear', align_corners=self.align_corners)
+        aux_logit  = resize(aux_logit,  size=target_size,
+                            mode='bilinear', align_corners=self.align_corners)
+        return {
+            'loss_main': self.loss_main(main_logit, seg_label),
+            'loss_aux':  self.loss_aux(aux_logit,  seg_label),
+            'acc_seg':   accuracy(main_logit, seg_label,
+                                  ignore_index=self.ignore_index),
+        }
+
+    def predict(self, inputs,
+                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
+        self.eval()
+        with torch.no_grad():
+            logit = self.forward(inputs)
+            if img_size is not None:
+                logit = resize(logit, size=img_size,
+                               mode='bilinear', align_corners=self.align_corners)
+        return logit
+
+
+# =============================================================================
+# GCNetSegmentor — full model entry point
 # =============================================================================
 
 class GCNetSegmentor(nn.Module):
     """Full model = GCNetBackbone (FAN + MSC) + GCNetHead (EnhancedDecoder).
 
+    Training  → (aux_logit/2, main_logit/2)
+    Inference → main_logit/2
+    Deploy    → switch_to_deploy() fuse GCBlock → single Conv3x3
+
     Cách dùng:
         model = GCNetSegmentor(channels=32, num_classes=19)
-
-        # Training
         model.train()
         aux_logit, main_logit = model(x)
 
-        # Eval
         model.eval()
         logit = model(x)
 
-        # Deploy — fuse GCBlocks → single Conv3x3, nhanh hơn ~20-30%
-        model.switch_to_deploy()
-        model.eval()
-        logit = model(x)
+        model.switch_to_deploy(); model.eval()
+        logit = model(x)   # nhanh hơn ~20-30%
     """
 
     def __init__(self,
@@ -830,11 +992,13 @@ class GCNetSegmentor(nn.Module):
                  ppm_channels: int = 128,
                  num_blocks_per_stage: List = None,
                  num_classes: int = 19,
-                 decoder_channels: int = 128,
+                 decoder_channels: int = 96,
                  dropout_ratio: float = 0.1,
                  align_corners: bool = False,
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 ignore_index: int = 255,
+                 loss_weight_aux: float = 0.4,
                  # FoggyAwareNorm
                  fan_eps: float = 1e-5,
                  fan_momentum: float = 0.1,
@@ -862,20 +1026,22 @@ class GCNetSegmentor(nn.Module):
         )
 
         self.head = GCNetHead(
+            in_channels=channels * 4,   # c6 = C*4
             channels=channels,
             num_classes=num_classes,
             decoder_channels=decoder_channels,
-            dropout_ratio=dropout_ratio,
             norm_cfg=norm_cfg,
             act_cfg=act_cfg,
             align_corners=align_corners,
+            ignore_index=ignore_index,
+            loss_weight_aux=loss_weight_aux,
+            dropout_ratio=dropout_ratio,
         )
 
     def forward(self, x: Tensor):
         return self.head(self.backbone(x))
 
     def switch_to_deploy(self):
-        """Fuse tất cả GCBlock → single Conv3x3 để inference nhanh hơn."""
         self.backbone.switch_to_deploy()
 
     def get_param_groups(self,
@@ -883,21 +1049,16 @@ class GCNetSegmentor(nn.Module):
                          backbone_lr: float = 3e-5,
                          fan_lr: float = 3e-5,
                          msc_lr: float = 5e-5) -> List[Dict]:
-        """Param groups cho AdamW discriminative LR.
+        """Discriminative LR groups cho AdamW."""
+        fan_params = (list(self.backbone.stem_conv1.parameters())
+                      + list(self.backbone.stem_conv2.parameters()))
+        fan_ids    = {id(p) for p in fan_params}
 
-        fan_lr = 3e-5  : FAN alpha học chậm cùng backbone để ổn định.
-        msc_lr = 5e-5  : MSC alpha không cần lr cao, tránh oscillation.
-        """
-        fan_params  = (list(self.backbone.stem_conv1.parameters())
-                       + list(self.backbone.stem_conv2.parameters()))
-        fan_ids     = {id(p) for p in fan_params}
-
-        msc_params  = (list(self.backbone.ms_context.parameters())
-                       + list(self.backbone.final_proj.parameters()))
-        msc_ids     = {id(p) for p in msc_params}
+        msc_params = (list(self.backbone.ms_context.parameters())
+                      + list(self.backbone.final_proj.parameters()))
+        msc_ids    = {id(p) for p in msc_params}
 
         head_params = list(self.head.parameters())
-        head_ids    = {id(p) for p in head_params}
 
         bb_params = [p for p in self.backbone.parameters()
                      if id(p) not in fan_ids and id(p) not in msc_ids]
