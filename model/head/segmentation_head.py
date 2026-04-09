@@ -1,450 +1,255 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
 from torch import Tensor
-from typing import List, Tuple, Optional, Dict
+from typing import Dict, List, Optional, Tuple, Union
 
 from components.components import (
-    ConvModule,
     BaseModule,
+    ConvModule,
     build_norm_layer,
     build_activation_layer,
     resize,
-    DAPPM,
-    OptConfigType
+    OptConfigType,
+    SampleList,
 )
 
 
+# =============================================================================
+# Accuracy helper
+# =============================================================================
 
-class GatedFusion(nn.Module):
+def accuracy(pred: Tensor,
+             target: Tensor,
+             ignore_index: int = 255) -> Tensor:
+    """Tính pixel accuracy, bỏ qua các pixel có nhãn = ignore_index.
+
+    Args:
+        pred (Tensor): Logits shape (B, C, H, W).
+        target (Tensor): Ground truth shape (B, H, W).
+        ignore_index (int): Label value to ignore. Default: 255.
+
+    Returns:
+        Tensor: Scalar accuracy in [0, 100].
     """
-    âœ… UPGRADED: Gated Fusion with improved feature selection
-    - Learns to weight skip connections vs decoder features
-    - Prevents information loss through selective gating
+    pred_label = pred.argmax(dim=1)             # (B, H, W)
+    mask       = target != ignore_index
+    correct    = (pred_label[mask] == target[mask]).sum().float()
+    total      = mask.sum().float().clamp(min=1)
+    return correct / total * 100.0
+
+
+# =============================================================================
+# Cross-entropy loss wrapper
+# =============================================================================
+
+class CrossEntropyLoss(nn.Module):
+    """Wrapper nhỏ quanh F.cross_entropy để tương thích với loss_decode API.
+
+    Args:
+        ignore_index (int): Label value to ignore. Default: 255.
+        loss_weight (float): Scalar weight applied to this loss. Default: 1.0.
     """
-    def __init__(
-        self,
-        channels: int,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
-    ):
+
+    def __init__(self,
+                 ignore_index: int = 255,
+                 loss_weight: float = 1.0):
         super().__init__()
-        
-        # Gate mechanism: [skip, decoder] -> gate weights
-        self.gate_conv = nn.Sequential(
-            ConvModule(
-                in_channels=channels * 2,
-                out_channels=channels,
-                kernel_size=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            ),
-            ConvModule(
-                in_channels=channels,
-                out_channels=channels,
-                kernel_size=1,
-                norm_cfg=None,  # No norm on gate output
-                act_cfg=dict(type='Sigmoid')
-            )
-        )
-    
-    def forward(self, skip_feat: Tensor, dec_feat: Tensor) -> Tensor:
-        """
-        Args:
-            skip_feat: Features from encoder skip connection
-            dec_feat: Features from decoder upsampling
-        Returns:
-            Fused features with learned gating
-        """
-        concat = torch.cat([skip_feat, dec_feat], dim=1)
-        gate = self.gate_conv(concat)
-        
-        # Adaptive fusion: gate * skip + (1-gate) * dec
-        out = gate * skip_feat + (1 - gate) * dec_feat
-        return out
+        self.ignore_index = ignore_index
+        self.loss_weight  = loss_weight
+
+    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
+        return self.loss_weight * F.cross_entropy(
+            pred, target, ignore_index=self.ignore_index)
 
 
-class DWConvModule(nn.Module):
+# =============================================================================
+# GCNetHead
+# =============================================================================
+
+class GCNetHead(BaseModule):
+    """Decode head for GCNet.
+
+    Nhận output từ GCNet backbone:
+      - Training  : (c4_feat, c6_feat) — c4 cho auxiliary loss, c6 cho main loss
+      - Inference : c6_feat only
+
+    Loss:
+      loss_c4 = CE(upsample(c4_logit), gt)   weight = loss_weight_aux
+      loss_c6 = CE(upsample(c6_logit), gt)   weight = 1.0
+      acc_seg  = pixel accuracy trên c6_logit
+
+    Args:
+        in_channels (int): Channels của c6_feat (backbone output chính).
+            Với GCNet-S/M channels=32: in_channels = channels*4 = 128.
+        channels (int): Hidden channels bên trong head.
+        num_classes (int): Số lớp phân đoạn (bao gồm background).
+        norm_cfg (dict): Norm config. Default: BN.
+        act_cfg (dict): Activation config. Default: ReLU.
+        align_corners (bool): F.interpolate align_corners. Default: False.
+        ignore_index (int): Label ignored trong loss và accuracy. Default: 255.
+        loss_weight_aux (float): Weight của auxiliary loss (c4). Default: 0.4.
+        dropout_ratio (float): Dropout trước cls_seg. Default: 0.1.
+        init_cfg (dict, optional): Init config. Default: None.
     """
-    âœ… NEW: Depthwise Separable Convolution for efficient upsampling
-    - Reduces computation while maintaining receptive field
-    """
-    def __init__(
-        self,
-        channels: int,
-        kernel_size: int = 3,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
-    ):
-        super().__init__()
-        
-        padding = kernel_size // 2
-        
-        # Depthwise convolution
-        self.dw_conv = ConvModule(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=kernel_size,
-            padding=padding,
-            groups=channels,  # Depthwise
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        )
-        
-        # Pointwise convolution
-        self.pw_conv = ConvModule(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-    
-    def forward(self, x: Tensor) -> Tensor:
-        x = self.dw_conv(x)
-        x = self.pw_conv(x)
-        return x
 
+    def __init__(self,
+                 in_channels: int,
+                 channels: int,
+                 num_classes: int,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 align_corners: bool = False,
+                 ignore_index: int = 255,
+                 loss_weight_aux: float = 0.4,
+                 dropout_ratio: float = 0.1,
+                 init_cfg: OptConfigType = None):
+        super().__init__(init_cfg)
 
-class ResidualBlock(nn.Module):
-    """
-    âœ… NEW: Residual block for decoder stability
-    - Skip connection prevents gradient vanishing
-    - Improves feature propagation
-    """
-    def __init__(
-        self,
-        channels: int,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False)
-    ):
-        super().__init__()
-        
-        self.conv1 = ConvModule(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=3,
-            padding=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-        
-        self.conv2 = ConvModule(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=3,
-            padding=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        )
-        
-        self.act = build_activation_layer(act_cfg)
-    
-    def forward(self, x: Tensor) -> Tensor:
-        identity = x
-        out = self.conv1(x)
-        out = self.conv2(out)
-        out = out + identity
-        out = self.act(out)
-        return out
+        self.in_channels    = in_channels
+        self.channels       = channels
+        self.num_classes    = num_classes
+        self.norm_cfg       = norm_cfg
+        self.act_cfg        = act_cfg
+        self.align_corners  = align_corners
+        self.ignore_index   = ignore_index
+        self.loss_weight_aux = loss_weight_aux
 
+        # ---- Main head (c6) ---------------------------------------------- #
+        # c6_feat: in_channels = channels*4 (backbone output)
+        self.head = self._make_base_head(in_channels, channels)
 
-# ============================================
-# ENHANCED DECODER WITH FLEXIBLE CHANNELS
-# ============================================
+        # ---- Auxiliary head (c4) ----------------------------------------- #
+        # c4_feat: in_channels // 2 vì detail branch ở stage 4 = channels*2
+        self.aux_head_c4    = self._make_base_head(in_channels // 2, channels)
+        self.aux_cls_seg_c4 = nn.Conv2d(channels, num_classes, kernel_size=1)
 
-class EnhancedDecoder(nn.Module):
-    """
-    âœ… FIXED: Decoder with flexible channel handling
-    - No longer assumes specific c1, c2 channels
-    - Auto-projects backbone outputs to decoder needs
-    - Zero performance impact
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 128,        # c5 channels
-        c2_channels: int = 64,        # âœ… NEW: c2 from backbone
-        c1_channels: int = 32,        # âœ… NEW: c1 from backbone
-        decoder_channels: int = 128,
-        norm_cfg: dict = dict(type='BN', requires_grad=True),
-        act_cfg: dict = dict(type='ReLU', inplace=False),
-        dropout_ratio: float = 0.1,
-        use_gated_fusion: bool = True
-    ):
-        super().__init__()
-        
-        self.use_gated_fusion = use_gated_fusion
-        self.decoder_channels = decoder_channels
-        
-        # ======================================
-        # STAGE 1: c5 (H/16) â†’ H/8
-        # ======================================
-        self.up1 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
-        self.refine1 = nn.Sequential(
-            ResidualBlock(in_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(
-                in_channels=in_channels,
-                out_channels=decoder_channels,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
-        )
-        
-        # âœ… NEW: Project c2 to decoder_channels (flexible)
-        self.c2_proj = ConvModule(
-            in_channels=c2_channels,
-            out_channels=decoder_channels,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        ) if c2_channels != decoder_channels else nn.Identity()
-        
-        # Skip fusion: project c2 before fusion
-        if use_gated_fusion:
-            self.fusion1_gate = GatedFusion(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg)
-        else:
-            self.fusion1 = ConvModule(
-                in_channels=decoder_channels + decoder_channels,
-                out_channels=decoder_channels,
-                kernel_size=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
-        
-        # ======================================
-        # STAGE 2: H/8 â†’ H/4
-        # ======================================
-        self.up2 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
-        self.refine2 = nn.Sequential(
-            ResidualBlock(decoder_channels, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            ConvModule(
-                in_channels=decoder_channels,
-                out_channels=decoder_channels // 2,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
-        )
-        
-        # âœ… NEW: Project c1 to decoder_channels//2 (flexible)
-        self.c1_proj = ConvModule(
-            in_channels=c1_channels,
-            out_channels=decoder_channels // 2,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=None
-        ) if c1_channels != (decoder_channels // 2) else nn.Identity()
-        
-        # Skip fusion: project c1 before fusion
-        if use_gated_fusion:
-            self.fusion2_gate = GatedFusion(decoder_channels // 2, norm_cfg=norm_cfg, act_cfg=act_cfg)
-        else:
-            self.fusion2 = ConvModule(
-                in_channels=(decoder_channels // 2) + (decoder_channels // 2),
-                out_channels=decoder_channels // 2,
-                kernel_size=1,
-                norm_cfg=norm_cfg,
-                act_cfg=act_cfg
-            )
-        
-        # ======================================
-        # STAGE 3: H/4 â†’ H/2
-        # ======================================
-        self.up3 = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        
-        self.refine3 = nn.Sequential(
-            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg),
-            DWConvModule(decoder_channels // 2, kernel_size=3, norm_cfg=norm_cfg, act_cfg=act_cfg)
-        )
-        
-        # ======================================
-        # FINAL: Output projection
-        # ======================================
-        self.final_proj = ConvModule(
-            in_channels=decoder_channels // 2,
-            out_channels=decoder_channels // 2,
-            kernel_size=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
-        )
-        
+        # ---- Final classifiers ------------------------------------------- #
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
-    
-    def forward(self, c5: Tensor, c2: Tensor, c1: Tensor) -> Tensor:
+        self.cls_seg  = nn.Conv2d(channels, num_classes, kernel_size=1)
+
+        # ---- Loss functions ---------------------------------------------- #
+        self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
+                                         loss_weight=loss_weight_aux)
+        self.loss_c6 = CrossEntropyLoss(ignore_index=ignore_index,
+                                         loss_weight=1.0)
+
+        self.init_weights()
+
+    # ---------------------------------------------------------------------- #
+    # Weight init                                                              #
+    # ---------------------------------------------------------------------- #
+
+    def init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    # ---------------------------------------------------------------------- #
+    # Forward                                                                  #
+    # ---------------------------------------------------------------------- #
+
+    def forward(self,
+                inputs: Union[Tensor, Tuple[Tensor, Tensor]]
+                ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """Forward pass.
+
+        Training  : inputs = (c4_feat, c6_feat) → returns (c4_logit, c6_logit)
+        Inference : inputs = c6_feat            → returns c6_logit
         """
+        if self.training:
+            c4_feat, c6_feat = inputs
+
+            c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
+            c6_logit = self.cls_seg(self.dropout(self.head(c6_feat)))
+
+            return c4_logit, c6_logit
+
+        else:
+            c6_logit = self.cls_seg(self.dropout(self.head(inputs)))
+            return c6_logit
+
+    # ---------------------------------------------------------------------- #
+    # Loss                                                                     #
+    # ---------------------------------------------------------------------- #
+
+    def loss(self,
+             seg_logits: Tuple[Tensor, Tensor],
+             seg_label: Tensor) -> Dict[str, Tensor]:
+        """Tính loss từ logits và ground-truth label.
+
         Args:
-            c5: (B, in_channels, H/16, W/16)
-            c2: (B, c2_channels, H/4, W/4) - flexible channels
-            c1: (B, c1_channels, H/2, W/2) - flexible channels
+            seg_logits: (c4_logit, c6_logit) — output của forward() khi training.
+                c4_logit: (B, num_classes, H4, W4)
+                c6_logit: (B, num_classes, H6, W6)
+            seg_label: Ground-truth shape (B, H, W), dtype=torch.long.
+                Pixels cần ignore mang giá trị ignore_index.
+
         Returns:
-            (B, 64, H/2, W/2)
+            dict với keys: 'loss_c4', 'loss_c6', 'acc_seg'.
         """
-        
-        # Stage 1: H/16 â†’ H/8
-        x = self.up1(c5)
-        x = self.refine1(x)
-        
-        # âœ… Project c2 before fusion
-        c2_proj = self.c2_proj(c2)
-        
-        if self.use_gated_fusion:
-            x = self.fusion1_gate(c2_proj, x)
-        else:
-            x = torch.cat([x, c2_proj], dim=1)
-            x = self.fusion1(x)
-        
-        # Stage 2: H/8 â†’ H/4
-        x = self.up2(x)
-        x = self.refine2(x)
-        
-        # âœ… Project c1 before fusion
-        c1_proj = self.c1_proj(c1)
-        
-        if self.use_gated_fusion:
-            x = self.fusion2_gate(c1_proj, x)
-        else:
-            x = torch.cat([x, c1_proj], dim=1)
-            x = self.fusion2(x)
-        
-        # Stage 3: H/4 â†’ H/2
-        x = self.up3(x)
-        x = self.refine3(x)
-        
-        # Final projection
-        x = self.final_proj(x)
-        x = self.dropout(x)
-        
-        return x
+        c4_logit, c6_logit = seg_logits
+        target_size = seg_label.shape[1:]   # (H, W)
 
+        # Upsample logits về kích thước gt
+        c4_logit = resize(c4_logit, size=target_size,
+                          mode='bilinear', align_corners=self.align_corners)
+        c6_logit = resize(c6_logit, size=target_size,
+                          mode='bilinear', align_corners=self.align_corners)
 
-# ============================================
-# AUXILIARY HEAD
-# ============================================
+        losses = {
+            'loss_c4': self.loss_c4(c4_logit, seg_label),
+            'loss_c6': self.loss_c6(c6_logit, seg_label),
+            'acc_seg': accuracy(c6_logit, seg_label,
+                                ignore_index=self.ignore_index),
+        }
+        return losses
 
-class GCNetAuxHead(nn.Module):
-    """
-    âœ… UPDATED: Auxiliary head for early supervision
-    - Applied to c4 features for multi-scale training
-    - Improves gradient flow in early stages
-    """
-    def __init__(
-        self,
-        in_channels: int = 192,  # c4 = channels * 4 = 48 * 4
-        channels: int = 96,
-        num_classes: int = 19,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
-        dropout_ratio: float = 0.1,
-        align_corners: bool = False
-    ):
-        super().__init__()
-        
-        self.align_corners = align_corners
-        
-        # Feature extraction
-        self.conv1 = ConvModule(
-            in_channels=in_channels,
-            out_channels=channels,
-            kernel_size=3,
-            padding=1,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg
+    # ---------------------------------------------------------------------- #
+    # Helper                                                                   #
+    # ---------------------------------------------------------------------- #
+
+    def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
+        """BN → ReLU → Conv3×3(BN, ReLU)."""
+        return nn.Sequential(
+            build_norm_layer(self.norm_cfg, in_channels)[1],
+            build_activation_layer(self.act_cfg),
+            ConvModule(
+                in_channels,
+                channels,
+                kernel_size=3,
+                padding=1,
+                norm_cfg=self.norm_cfg,
+                act_cfg=self.act_cfg,
+                order=('conv', 'norm', 'act')),
         )
-        
-        # Segmentation head
-        self.conv_seg = nn.Sequential(
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(channels, num_classes, kernel_size=1)
-        )
-    
-    def forward(self, x: Tensor) -> Tensor:
-        """Handle both dict and tensor input"""
-        if isinstance(x, dict):
-            x = x['c4']
-        
-        x = self.conv1(x)
-        return self.conv_seg(x)
 
+    # ---------------------------------------------------------------------- #
+    # Inference helper                                                         #
+    # ---------------------------------------------------------------------- #
 
-# ============================================
-# MAIN SEGMENTATION HEAD
-# ============================================
+    def predict(self,
+                inputs: Union[Tensor, Tuple[Tensor, Tensor]],
+                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
+        """Inference: forward + upsample về img_size nếu cần.
 
-class GCNetHead(nn.Module):
-    """
-    âœ… FINAL VERSION: Main segmentation head with flexible channels
-    
-    Pipeline:
-    c5 (96ch) â†’ Decoder â†’ (64ch, H/2) â†’ Segmentation
-    
-    Components:
-    - Enhanced decoder with gated fusion
-    - Residual blocks for stability
-    - Dropout for regularization
-    - Flexible channel handling for any backbone
-    """
-    
-    def __init__(
-        self,
-        in_channels: int = 128,  # c5
-        num_classes: int = 19,
-        decoder_channels: int = 128,
-        dropout_ratio: float = 0.1,
-        norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-        act_cfg: OptConfigType = dict(type='ReLU', inplace=False),
-        align_corners: bool = False,
-        use_gated_fusion: bool = True,
-        # âœ… NEW: Accept flexible c1, c2 channels from backbone
-        c1_channels: int = 32,
-        c2_channels: int = 64
-    ):
-        super().__init__()
-        
-        self.align_corners = align_corners
-        
-        # âœ… Pass detected channels to decoder
-        self.decoder = EnhancedDecoder(
-            in_channels=in_channels,
-            c2_channels=c2_channels,      # From backbone
-            c1_channels=c1_channels,      # From backbone
-            decoder_channels=decoder_channels,
-            norm_cfg=norm_cfg,
-            act_cfg=act_cfg,
-            dropout_ratio=dropout_ratio,
-            use_gated_fusion=use_gated_fusion
-        )
-        
-        # Segmentation head
-        output_channels = decoder_channels // 2
-        self.conv_seg = nn.Sequential(
-            nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity(),
-            nn.Conv2d(output_channels, num_classes, kernel_size=1)
-        )
-    
-    def forward(self, inputs: Dict[str, Tensor]) -> Tensor:
-        """
         Args:
-            inputs: Dictionary containing c1, c2, c5 tensors
+            inputs: c6_feat hoặc (c4_feat, c6_feat).
+            img_size: (H, W) của ảnh gốc. Nếu None, không upsample.
+
         Returns:
-            Segmentation logits
+            Tensor: Segmentation map (B, num_classes, H, W).
         """
-        # âœ… CRITICAL: Extract tensors from dict FIRST
-        if isinstance(inputs, dict):
-            c1 = inputs['c1']
-            c2 = inputs['c2']
-            c5 = inputs['c5']
-        else:
-            # Fallback for tuple input
-            c1, c2, c5 = inputs[0], inputs[1], inputs[2]
-        
-        # Now pass individual tensors (NOT dict!)
-        x = self.decoder(c5, c2, c1)
-        x = self.conv_seg(x)
-        
-        return x
+        self.eval()
+        with torch.no_grad():
+            logit = self.forward(inputs)
+            if img_size is not None:
+                logit = resize(logit, size=img_size,
+                               mode='bilinear', align_corners=self.align_corners)
+        return logit
