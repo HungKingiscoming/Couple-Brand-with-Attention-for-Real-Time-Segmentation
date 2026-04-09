@@ -8,7 +8,7 @@ from PIL import Image
 from typing import Callable, Optional, Tuple, List, Dict
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-import albumentations.augmentations.functional as AF
+from albumentations import functional as AF
 import cv2
 
 
