@@ -494,7 +494,7 @@ def build_model(num_classes=19, device='cuda', deploy=False):
             'channels': 32,
             'ppm_channels': 128,
             'num_blocks_per_stage': [4, 4, [5, 4], [5, 4], [2, 2]],
-            'dwsa_stages': ['stage5', 'stage6'],
+            'dwsa_stages': ['stage4','stage5', 'stage6'],
             'dwsa_num_heads': 4,
             'dwsa_reduction': 4,
             'dwsa_qk_sharing': True,
@@ -557,7 +557,6 @@ def build_model(num_classes=19, device='cuda', deploy=False):
     )
     
     model = Segmentor(backbone=backbone, head=head, aux_head=aux_head)
-    model = replace_bn_with_gn(model)
     model = model.to(device)
     
     return model
@@ -599,6 +598,7 @@ def load_model_from_checkpoint(checkpoint_path, num_classes, device, deploy=Fals
         model = build_model(num_classes=num_classes, device=device, deploy=False)
     
     # Load state dict
+    state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     try:
         model.load_state_dict(state_dict, strict=True)
         print(f"✅ Loaded successfully")
