@@ -1,6 +1,7 @@
 # ============================================
-# train_v2.py — GCNet (model__13__) + GCNetHeadLite
+# train_v3.py — GCNetBackbone (FAN+MSC) + GCNetHeadLite
 # Decoder dừng tại /2, không có activation tại full res
+# Pretrained loader tương thích checkpoint GCNet gốc
 # ============================================
 
 import os
@@ -16,44 +17,46 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 import json
-import time
 import gc
 import warnings
-from torch.optim.lr_scheduler import LambdaLR
 warnings.filterwarnings('ignore')
 
 # ============================================
 # IMPORTS
 # ============================================
 
-from model.backbone.model import GCNetBackbone                      # backbone giữ nguyên
-from model.head.segmentation_head import GCNetHeadLite   # head mới
+from model.backbone.model import GCNet        
+from model.head.segmentation_head import GCNetHead     
 from data.custom import create_dataloaders
 from model.model_utils import init_weights, check_model_health
 
 
 # ============================================
-# WRAPPER — gộp backbone + head thành 1 model
+# WRAPPER
 # ============================================
 
 class GCNetModel(nn.Module):
-    """Wrapper gộp GCNet backbone + GCNetHeadLite.
+    """Wrapper: GCNetBackbone (FAN + MSC) + GCNetHeadLite.
 
-    Training  : forward(x) → (aux_logit/2, main_logit/2)
-    Inference : forward(x) → main_logit/2
-    Cả 2 đều tại /2 — train loop tự resize lên full res trước loss.
+    Train : forward(x) → (aux_logit/2, main_logit/2)
+    Eval  : forward(x) → main_logit/2
     """
 
-    def __init__(self,
-                 backbone_cfg: dict,
-                 head_cfg: dict):
+    def __init__(self, backbone_cfg: dict, head_cfg: dict):
         super().__init__()
         self.backbone = GCNetBackbone(**backbone_cfg)
         self.head     = GCNetHeadLite(**head_cfg)
 
     def forward(self, x: torch.Tensor):
-        feats = self.backbone(x)     # (c4_feat, c6_feat) hoặc c6_feat
-        return self.head(feats)
+        feats = self.backbone(x)   # train→(c4,c6,c1,c2) | eval→(c6,c1,c2)
+        # GCNetHeadLite chỉ cần (c4, c6) khi train, c6 khi eval
+        # Tách đúng theo mode
+        if self.training:
+            c4_feat, c6_feat, c1, c2 = feats
+            return self.head((c4_feat, c6_feat))
+        else:
+            c6_feat, c1, c2 = feats
+            return self.head(c6_feat)
 
     def switch_to_deploy(self):
         self.backbone.switch_to_deploy()
@@ -62,80 +65,209 @@ class GCNetModel(nn.Module):
                          head_lr: float = 5e-4,
                          backbone_lr: float = 5e-5,
                          fan_lr: float = 5e-5,
-                         dwsa_lr: float = 1e-4) -> list:
-        """Discriminative LR groups."""
-        # FAN params (stem_conv1, stem_conv2)
+                         msc_lr: float = 1e-4) -> list:
         fan_params = (list(self.backbone.stem_conv1.parameters())
                       + list(self.backbone.stem_conv2.parameters()))
         fan_ids = {id(p) for p in fan_params}
 
-        # DWSA params
-        dwsa_params = []
-        for attr in ('dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6'):
-            if hasattr(self.backbone, attr):
-                dwsa_params += list(getattr(self.backbone, attr).parameters())
-        dwsa_ids = {id(p) for p in dwsa_params}
+        msc_params = (list(self.backbone.ms_context.parameters())
+                      + list(self.backbone.final_proj.parameters()))
+        msc_ids = {id(p) for p in msc_params}
 
-        # Head params
         head_params = list(self.head.parameters())
-        head_ids = {id(p) for p in head_params}
+        head_ids    = {id(p) for p in head_params}
 
-        # Remaining backbone params
         bb_params = [p for p in self.backbone.parameters()
-                     if id(p) not in fan_ids and id(p) not in dwsa_ids]
+                     if id(p) not in fan_ids and id(p) not in msc_ids]
 
         return [
-            {'params': head_params,  'lr': head_lr,    'name': 'head'},
-            {'params': bb_params,    'lr': backbone_lr, 'name': 'backbone'},
-            {'params': fan_params,   'lr': fan_lr,      'name': 'fan'},
-            {'params': dwsa_params,  'lr': dwsa_lr,     'name': 'dwsa'},
+            {'params': head_params, 'lr': head_lr,     'name': 'head'},
+            {'params': bb_params,   'lr': backbone_lr, 'name': 'backbone'},
+            {'params': fan_params,  'lr': fan_lr,      'name': 'fan'},
+            {'params': msc_params,  'lr': msc_lr,      'name': 'msc'},
         ]
 
 
 # ============================================
-# PRETRAINED WEIGHT LOADER
+# PRETRAINED WEIGHT LOADER — tương thích checkpoint GCNet gốc
 # ============================================
 
-def load_pretrained_gcnet(model: GCNetModel, ckpt_path: str):
+# Mapping: key_prefix_trong_ckpt → key_prefix_trong_backbone_mới
+#
+# Checkpoint gốc dùng:
+#   backbone.stem.0/1           → ConvModule (có .conv + .bn)
+#   backbone.stem.2..9          → GCBlock stage2 (4 blocks) + stage3 (1+3 blocks)
+#   backbone.semantic_branch_layers.N  → semantic_branch[N]
+#   backbone.detail_branch_layers.N    → detail_branch[N]
+#   backbone.compression_1/2, down_1/2, spp → giữ nguyên tên
+#
+# Backbone mới dùng:
+#   stem_conv1 (Conv2d + FAN + ReLU) — KHÔNG có .conv/.bn (naked Conv2d)
+#   stem_conv2 (Conv2d + FAN + ReLU) — KHÔNG có .conv/.bn
+#   stem_stage2 (GCBlock x4)
+#   stem_stage3 (GCBlock x4: 1 stride=2 + 3 stride=1)
+#   semantic_branch[N]
+#   detail_branch[N]
+
+def _remap_ckpt_key(key: str) -> str | None:
+    """Chuyển key của checkpoint gốc sang key của backbone mới.
+
+    Trả về None nếu key không thể map (ví dụ: decode_head, stem conv/bn).
+    """
+    # Bỏ decode_head hoàn toàn
+    if key.startswith('decode_head.'):
+        return None
+
+    # Bỏ prefix 'backbone.' để xử lý phần còn lại
+    if not key.startswith('backbone.'):
+        return None
+    rest = key[len('backbone.'):]  # phần sau 'backbone.'
+
+    # --- stem.0 / stem.1 : ConvModule → KHÔNG map được vào FAN ---
+    # stem.0.conv.weight → stem_conv1[0].weight  (Conv2d naked, key = '0.weight')
+    # stem.0.bn.*        → SKIP (FAN thay BN, không tương thích shape-wise)
+    # stem.1.*           → tương tự cho stem_conv2
+    if rest.startswith('stem.0.'):
+        sub = rest[len('stem.0.'):]       # e.g. 'conv.weight', 'bn.weight'
+        if sub == 'conv.weight':
+            return 'stem_conv1.0.weight'  # Conv2d(in,C,3,stride=2,...).weight
+        # bn.* → không map vào FAN (khác cấu trúc)
+        return None
+
+    if rest.startswith('stem.1.'):
+        sub = rest[len('stem.1.'):]
+        if sub == 'conv.weight':
+            return 'stem_conv2.0.weight'
+        return None
+
+    # --- stem.2 ~ stem.5 : GCBlock stage2 (index 0..3 trong stem_stage2) ---
+    # stem.2 → stem_stage2.0, stem.3 → stem_stage2.1, ...
+    for stem_idx in range(2, 6):
+        prefix = f'stem.{stem_idx}.'
+        if rest.startswith(prefix):
+            stage2_idx = stem_idx - 2   # 0..3
+            return f'stem_stage2.{stage2_idx}.' + rest[len(prefix):]
+
+    # --- stem.6 : GCBlock stage3[0] (stride=2, C→C*2) ---
+    if rest.startswith('stem.6.'):
+        return 'stem_stage3.0.' + rest[len('stem.6.'):]
+
+    # --- stem.7 ~ stem.9 : GCBlock stage3[1..3] (stride=1) ---
+    for stem_idx in range(7, 10):
+        prefix = f'stem.{stem_idx}.'
+        if rest.startswith(prefix):
+            stage3_idx = stem_idx - 6   # 1..3
+            return f'stem_stage3.{stage3_idx}.' + rest[len(prefix):]
+
+    # --- semantic_branch_layers → semantic_branch ---
+    if rest.startswith('semantic_branch_layers.'):
+        return 'semantic_branch.' + rest[len('semantic_branch_layers.'):]
+
+    # --- detail_branch_layers → detail_branch ---
+    if rest.startswith('detail_branch_layers.'):
+        return 'detail_branch.' + rest[len('detail_branch_layers.'):]
+
+    # --- compression_1/2, down_1/2, spp : giữ nguyên ---
+    for name in ('compression_1.', 'compression_2.',
+                 'down_1.', 'down_2.', 'spp.'):
+        if rest.startswith(name):
+            return rest   # key trong backbone mới không có prefix 'backbone.'
+
+    return None
+
+
+def load_pretrained_gcnet(model: GCNetModel, ckpt_path: str) -> float:
+    """Load pretrained weights từ checkpoint GCNet gốc vào GCNetModel mới.
+
+    Mapping được thực hiện qua _remap_ckpt_key():
+      - stem conv weights (không có BN/FAN) được load vào Conv2d đầu tiên của stem_conv1/2
+      - GCBlock stage2/3 được map sang stem_stage2/3
+      - semantic/detail branch được map sang tên mới
+      - ms_context, final_proj, FAN alpha, head: khởi tạo random (không có trong ckpt cũ)
+      - decode_head: bỏ hoàn toàn
+
+    Returns:
+        float: tỉ lệ phần trăm keys được load thành công
+    """
     print(f"\n{'='*70}")
-    print("TRANSFER LEARNING SETUP")
-    print(f"{'='*70}\n")
-    print(f"Loading pretrained weights from: {ckpt_path}")
+    print("TRANSFER LEARNING — GCNet gốc → GCNetBackbone (FAN + MSC)")
+    print(f"{'='*70}")
+    print(f"Checkpoint: {ckpt_path}\n")
 
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = ckpt.get('state_dict', ckpt)
+    state = ckpt.get('state_dict', ckpt.get('model', ckpt))
 
-    model_state = model.backbone.state_dict()
-    compatible  = {}
-    skipped     = []
+    backbone_state = model.backbone.state_dict()
+
+    compatible: dict = {}
+    skipped_decode  = 0
+    skipped_no_map  = 0
+    skipped_shape   = []
+    loaded_keys     = []
 
     for ckpt_key, ckpt_val in state.items():
-        key = ckpt_key
-        for pref in ('backbone.', 'model.', 'module.'):
-            if key.startswith(pref):
-                key = key[len(pref):]
-                break
-        if key in model_state and model_state[key].shape == ckpt_val.shape:
-            compatible[key] = ckpt_val
-        else:
-            skipped.append(ckpt_key)
+        # Thử remap
+        new_key = _remap_ckpt_key(ckpt_key)
 
-    loaded = len(compatible)
-    total  = len(model_state)
-    rate   = 100 * loaded / total if total > 0 else 0.0
+        if new_key is None:
+            if ckpt_key.startswith('decode_head.'):
+                skipped_decode += 1
+            else:
+                skipped_no_map += 1
+            continue
+
+        if new_key not in backbone_state:
+            skipped_no_map += 1
+            continue
+
+        if backbone_state[new_key].shape != ckpt_val.shape:
+            skipped_shape.append(
+                f"  {ckpt_key} → {new_key}: "
+                f"ckpt {tuple(ckpt_val.shape)} vs model {tuple(backbone_state[new_key].shape)}"
+            )
+            continue
+
+        compatible[new_key] = ckpt_val
+        loaded_keys.append(new_key)
+
+    total   = len(backbone_state)
+    loaded  = len(compatible)
+    rate    = 100.0 * loaded / total if total > 0 else 0.0
+
+    print(f"Checkpoint keys total : {len(state)}")
+    print(f"  decode_head skipped : {skipped_decode}")
+    print(f"  no mapping / not in model: {skipped_no_map}")
+    print(f"  shape mismatch      : {len(skipped_shape)}")
+    print(f"  loaded successfully : {loaded}")
+    print(f"\nBackbone keys total   : {total}")
+    print(f"  Loaded              : {loaded} ({rate:.1f}%)")
+    print(f"  Random init         : {total - loaded} (FAN alpha, MSC, final_proj, ...)")
+
+    if skipped_shape:
+        print(f"\nShape mismatches:")
+        for s in skipped_shape[:10]:
+            print(s)
+
+    missing, unexpected = model.backbone.load_state_dict(compatible, strict=False)
+
+    # Phân loại missing keys
+    fan_missing  = [k for k in missing if 'stem_conv' in k]
+    msc_missing  = [k for k in missing if 'ms_context' in k or 'final_proj' in k]
+    gcb_missing  = [k for k in missing if k not in fan_missing and k not in msc_missing]
+
+    print(f"\nMissing keys breakdown:")
+    print(f"  FAN (alpha, IN, BN new params) : {len(fan_missing)}")
+    print(f"  MSC + final_proj (new modules) : {len(msc_missing)}")
+    print(f"  GCBlock / branch (unmatched)   : {len(gcb_missing)}")
+    if gcb_missing:
+        print(f"  First 5 unmatched GCBlock keys:")
+        for k in gcb_missing[:5]:
+            print(f"    {k}")
 
     print(f"\n{'='*70}")
-    print("WEIGHT LOADING SUMMARY")
-    print(f"{'='*70}")
-    print(f"Loaded:  {loaded:>5} / {total} ({rate:.1f}%)")
-    print(f"Skipped: {len(skipped)} keys (unmatched or shape mismatch)")
+    print(f"Load rate: {rate:.1f}%  |  New modules will train from scratch")
     print(f"{'='*70}\n")
 
-    missing, _ = model.backbone.load_state_dict(compatible, strict=False)
-    if missing:
-        print(f"Missing keys in loaded state: {len(missing)}")
-        for k in missing[:5]:
-            print(f"  - {k}")
     return rate
 
 
@@ -144,11 +276,12 @@ def load_pretrained_gcnet(model: GCNetModel, ckpt_path: str):
 # ============================================
 
 def freeze_backbone(model: GCNetModel):
-    """Freeze toàn bộ backbone, giữ FAN + DWSA trainable."""
-    print("Freezing backbone (keeping FoggyAwareNorm + DWSA trainable)...")
+    """Freeze backbone, giữ FAN + MSC trainable."""
+    print("Freezing backbone (keeping FAN + MSC trainable)...")
     for p in model.backbone.parameters():
         p.requires_grad = False
 
+    # FAN: stem_conv1, stem_conv2
     fan_params = 0
     for mod in (model.backbone.stem_conv1, model.backbone.stem_conv2):
         for p in mod.parameters():
@@ -157,16 +290,15 @@ def freeze_backbone(model: GCNetModel):
         for m in mod.modules():
             if isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d)):
                 m.train()
-    print(f"  FoggyAwareNorm trainable: {fan_params:,} params")
+    print(f"  FAN trainable: {fan_params:,} params")
 
-    dwsa_params = 0
-    for attr in ('dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6'):
-        if hasattr(model.backbone, attr):
-            for p in getattr(model.backbone, attr).parameters():
-                p.requires_grad = True
-                dwsa_params += p.numel()
-    print(f"  DWSA trainable: {dwsa_params:,} params")
-    print("Backbone partially frozen\n")
+    # MSC + final_proj
+    msc_params = 0
+    for mod in (model.backbone.ms_context, model.backbone.final_proj):
+        for p in mod.parameters():
+            p.requires_grad = True
+            msc_params += p.numel()
+    print(f"  MSC + final_proj trainable: {msc_params:,} params\n")
 
 
 def unfreeze_backbone_progressive(model: GCNetModel, stage_names):
@@ -175,17 +307,13 @@ def unfreeze_backbone_progressive(model: GCNetModel, stage_names):
     total = 0
     for name in stage_names:
         module = None
-        if hasattr(model.backbone, name):
-            module = getattr(model.backbone, name)
-        elif '.' in name:
-            obj = model.backbone
-            for part in name.split('.'):
-                obj = getattr(obj, part, None)
-                if obj is None:
-                    break
-            module = obj
+        for part in name.split('.'):
+            obj = model.backbone if module is None else module
+            module = getattr(obj, part, None)
+            if module is None:
+                break
         if module is None:
-            print(f"  [skip] module '{name}' not found")
+            print(f"  [skip] '{name}' not found in backbone")
             continue
         count = sum(1 for p in module.parameters() if not p.requires_grad)
         for p in module.parameters():
@@ -209,7 +337,7 @@ def build_optimizer(model: GCNetModel, args) -> optim.AdamW:
         head_lr=args.lr,
         backbone_lr=args.lr * args.backbone_lr_factor,
         fan_lr=args.lr * args.alpha_lr_factor,
-        dwsa_lr=args.lr * args.dwsa_lr_factor,
+        msc_lr=args.lr * args.msc_lr_factor,
     )
     optimizer = optim.AdamW(param_groups, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
@@ -234,8 +362,9 @@ def build_scheduler(optimizer, args, train_loader, start_epoch=0):
         print(f"OneCycleLR (total_steps={total_steps})")
     elif args.scheduler == 'poly':
         scheduler = optim.lr_scheduler.LambdaLR(
-            optimizer, lr_lambda=lambda e: (1 - e / args.epochs) ** 0.9)
-        print("Polynomial LR decay")
+            optimizer,
+            lr_lambda=lambda e: (1 - e / args.epochs) ** 0.9)
+        print("Polynomial LR")
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
             optimizer, T_max=args.epochs, eta_min=1e-6)
@@ -259,15 +388,12 @@ class DiceLoss(nn.Module):
         t_clamp = targets.clamp(0, C - 1)
         t_oh = F.one_hot(t_clamp, C).permute(0, 3, 1, 2).float()
         t_oh = t_oh * valid.unsqueeze(1).float()
-
         probs = F.softmax(logits, dim=1) * valid.unsqueeze(1).float()
         pf = probs.reshape(B, C, -1)
         tf = t_oh.reshape(B, C, -1)
-
         inter = (pf * tf).sum(2)
         card  = pf.sum(2) + tf.sum(2)
         dice  = 1.0 - (2.0 * inter + self.smooth) / (card + self.smooth)
-
         present = tf.sum(2) > 0
         dice = dice * present.float()
         n = present.float().sum(1).clamp(min=1)
@@ -285,18 +411,18 @@ class OHEMLoss(nn.Module):
 
     def forward(self, logits, labels):
         w = self.class_weights.to(logits.device) if self.class_weights is not None else None
-        pixel_loss = F.cross_entropy(logits, labels, weight=w,
-                                     ignore_index=self.ignore_index,
-                                     reduction='none').view(-1)
-        valid = labels.view(-1) != self.ignore_index
-        losses = pixel_loss[valid]
+        pixel_loss = F.cross_entropy(
+            logits, labels, weight=w,
+            ignore_index=self.ignore_index, reduction='none').view(-1)
+        valid   = labels.view(-1) != self.ignore_index
+        losses  = pixel_loss[valid]
         n = losses.numel()
         if n == 0:
             return logits.sum() * 0
         n_keep = max(int(self.keep_ratio * n), min(self.min_kept, n))
         n_keep = min(n_keep, n)
         if n_keep < n:
-            thr = torch.sort(losses, descending=True)[0][n_keep - 1].detach()
+            thr    = torch.sort(losses, descending=True)[0][n_keep - 1].detach()
             losses = losses[losses >= thr]
         return losses.mean()
 
@@ -325,10 +451,9 @@ def check_gradients(model, threshold=10.0):
             total_sq += g ** 2
             if g > max_grad:
                 max_grad = g; max_name = name
-    total_norm = total_sq ** 0.5
     if max_grad > threshold:
         print(f"Large gradient: {max_name[:60]}... = {max_grad:.2f}")
-    return max_grad, total_norm
+    return max_grad, total_sq ** 0.5
 
 
 def count_trainable_params(model: GCNetModel):
@@ -338,7 +463,6 @@ def count_trainable_params(model: GCNetModel):
     bb_train  = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
     hd_total  = sum(p.numel() for p in model.head.parameters())
     hd_train  = sum(p.numel() for p in model.head.parameters() if p.requires_grad)
-
     print(f"\n{'='*70}")
     print("PARAMETER STATISTICS")
     print(f"{'='*70}")
@@ -348,16 +472,6 @@ def count_trainable_params(model: GCNetModel):
     print(f"{'-'*70}")
     print(f"Backbone:   {bb_train:>15,} / {bb_total:,} | {100*bb_train/max(bb_total,1):.1f}%")
     print(f"Head:       {hd_train:>15,} / {hd_total:,} | {100*hd_train/max(hd_total,1):.1f}%")
-    print(f"{'='*70}\n")
-
-
-def print_backbone_structure(model: GCNetModel):
-    print(f"\n{'='*70}")
-    print(" BACKBONE STRUCTURE (GCNet — FAN + DWSA)")
-    print(f"{'='*70}")
-    for name, module in model.backbone.named_children():
-        n = sum(p.numel() for p in module.parameters())
-        print(f"  {name}: {type(module).__name__}  ({n:,} params)")
     print(f"{'='*70}\n")
 
 
@@ -378,13 +492,18 @@ class ModelConfig:
                 align_corners=False,
                 norm_cfg=dict(type='BN', requires_grad=True),
                 act_cfg=dict(type='ReLU', inplace=True),
+                fan_eps=1e-5,
+                fan_momentum=0.1,
+                ms_scales=(1, 2),
+                ms_branch_ratio=8,
+                ms_alpha=0.1,
                 deploy=False,
             ),
             "head": dict(
-                in_channels=C * 4,       # c6_feat channels = channels*4 = 128
+                in_channels=C * 4,       # c6_feat = channels*4
                 channels=C,
-                num_classes=19,          # ghi đè từ args
-                decoder_channels=96,     # D — dừng tại /2
+                num_classes=19,
+                decoder_channels=96,
                 norm_cfg=dict(type='BN', requires_grad=True),
                 act_cfg=dict(type='ReLU', inplace=True),
                 align_corners=False,
@@ -417,10 +536,10 @@ class Trainer:
         self.global_step = 0
 
         loss_cfg = args.loss_config
-        self.ce_weight   = loss_cfg['ce_weight']
-        self.dice_weight = loss_cfg['dice_weight']
+        self.ce_weight        = loss_cfg['ce_weight']
+        self.dice_weight      = loss_cfg['dice_weight']
         self.base_dice_weight = loss_cfg['dice_weight']
-        self.loss_phase  = 'full'
+        self.loss_phase       = 'full'
 
         self.ohem = OHEMLoss(
             ignore_index=args.ignore_index,
@@ -462,11 +581,11 @@ class Trainer:
         print(f"Mixed precision:        {self.args.use_amp}")
         print(f"Gradient clipping:      {self.args.grad_clip}")
         print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
-        print(f"Decoder stops at /2, resize in loss (no full-res activation)")
+        print(f"Decoder stops at /2, resize in loss loop")
         print(f"{'='*70}\n")
 
     # ---------------------------------------------------------------------- #
-    # Training epoch                                                           #
+    # Train epoch                                                              #
     # ---------------------------------------------------------------------- #
 
     def train_epoch(self, loader, epoch: int) -> dict:
@@ -482,28 +601,23 @@ class Trainer:
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
 
-            target_size = masks.shape[-2:]   # full res (H, W)
+            target_size = masks.shape[-2:]
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                # backbone(train) → (c4_feat, c6_feat)
-                # head(train)     → (aux_logit/2, main_logit/2)
-                outputs = self.model(imgs)
-                aux_logit, main_logit = outputs   # cả 2 tại /2
+                aux_logit, main_logit = self.model(imgs)   # both at /2
 
-                # Resize /2 → full res ở ĐÂY, ngoài backward graph decoder
+                # Resize /2 → full res NGOÀI backward graph decoder
                 main_full = F.interpolate(main_logit, size=target_size,
                                           mode='bilinear', align_corners=False)
                 aux_full  = F.interpolate(aux_logit,  size=target_size,
                                           mode='bilinear', align_corners=False)
 
-                # Main loss
                 ohem_loss = self.ohem(main_full, masks)
                 dice_loss = (self.dice(main_full, masks)
                              if self.dice_weight > 0
                              else torch.tensor(0.0, device=self.device))
                 loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
 
-                # Aux loss — decay theo epoch
                 if self.args.aux_weight > 0:
                     aux_w    = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     aux_loss = self.ohem(aux_full, masks)
@@ -523,7 +637,8 @@ class Trainer:
                 max_grad, _ = check_gradients(self.model)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
                 if self.args.grad_clip > 0:
-                    nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
+                    nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
@@ -547,10 +662,12 @@ class Trainer:
                 clear_gpu_memory()
 
             if batch_idx % self.args.log_interval == 0:
-                self.writer.add_scalar('train/loss', loss.item() * self.args.accumulation_steps, self.global_step)
+                self.writer.add_scalar('train/loss',
+                    loss.item() * self.args.accumulation_steps, self.global_step)
                 self.writer.add_scalar('train/ohem', ohem_loss.item(), self.global_step)
                 self.writer.add_scalar('train/dice', dice_loss.item(), self.global_step)
-                self.writer.add_scalar('train/lr',   self.optimizer.param_groups[0]['lr'], self.global_step)
+                self.writer.add_scalar('train/lr',
+                    self.optimizer.param_groups[0]['lr'], self.global_step)
 
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
@@ -558,17 +675,26 @@ class Trainer:
         # Log FAN alpha
         try:
             fan_alpha = self.model.backbone.stem_conv1[1].alpha.mean().item()
-            self.writer.add_scalar('train/fan_alpha', fan_alpha, epoch)
+            self.writer.add_scalar('monitor/fan_alpha', fan_alpha, epoch)
+            print(f"  FAN alpha (stem_conv1): {fan_alpha:.4f}")
+        except Exception:
+            pass
+
+        # Log MSC alpha
+        try:
+            msc_alpha = self.model.backbone.ms_context.alpha.item()
+            self.writer.add_scalar('monitor/msc_alpha', msc_alpha, epoch)
+            print(f"  MSC alpha:              {msc_alpha:.4f}")
         except Exception:
             pass
 
         n = len(loader)
-        print(f"\nEpoch {epoch+1} — max_grad: {max_grad_epoch:.2f}")
+        print(f"Epoch {epoch+1} — max_grad: {max_grad_epoch:.2f}")
         clear_gpu_memory()
         return dict(loss=total_loss/n, ohem=total_ohem/n, dice=total_dice/n)
 
     # ---------------------------------------------------------------------- #
-    # Validation                                                               #
+    # Validate                                                                 #
     # ---------------------------------------------------------------------- #
 
     @torch.no_grad()
@@ -579,7 +705,7 @@ class Trainer:
         ignore_idx  = self.args.ignore_index
         conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
 
-        pbar = tqdm(loader, desc=f"Val Epoch {epoch+1}")
+        pbar = tqdm(loader, desc=f"Val {epoch+1}")
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
@@ -587,12 +713,9 @@ class Trainer:
                 masks = masks.squeeze(1)
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                # eval mode: backbone → c6_feat, head → main_logit/2
                 logits = self.model(imgs)
                 if isinstance(logits, tuple):
-                    logits = logits[-1]   # safety
-
-                # Resize /2 → full res cho eval
+                    logits = logits[-1]
                 logits = F.interpolate(logits, size=masks.shape[-2:],
                                        mode='bilinear', align_corners=False)
                 loss = self.ohem(logits, masks)
@@ -613,8 +736,8 @@ class Trainer:
         inter = np.diag(conf_matrix)
         union = conf_matrix.sum(1) + conf_matrix.sum(0) - inter
         iou   = inter / (union + 1e-10)
-        miou  = np.nanmean(iou)
-        acc   = inter.sum() / (conf_matrix.sum() + 1e-10)
+        miou  = float(np.nanmean(iou))
+        acc   = float(inter.sum() / (conf_matrix.sum() + 1e-10))
 
         return dict(loss=total_loss/len(loader), miou=miou,
                     accuracy=acc, per_class_iou=iou)
@@ -649,12 +772,12 @@ class Trainer:
             try:
                 self.optimizer.load_state_dict(ckpt['optimizer'])
             except ValueError as e:
-                print(f"Optimizer state not loaded: {e}")
+                print(f"Optimizer not loaded: {e}")
         if load_optimizer and 'scaler' in ckpt and ckpt['scaler']:
             try:
                 self.scaler.load_state_dict(ckpt['scaler'])
             except Exception as e:
-                print(f"Scaler state not loaded: {e}")
+                print(f"Scaler not loaded: {e}")
         if reset_epoch:
             self.start_epoch = 0
             self.global_step = 0
@@ -667,9 +790,9 @@ class Trainer:
                 try:
                     self.scheduler.load_state_dict(ckpt['scheduler'])
                 except Exception as e:
-                    print(f"Scheduler state not loaded: {e}")
+                    print(f"Scheduler not loaded: {e}")
         mode = "transfer" if reset_epoch else "resume"
-        print(f"Checkpoint loaded ({mode}), epoch {self.start_epoch}")
+        print(f"Checkpoint loaded ({mode}), starting epoch {self.start_epoch}")
 
 
 # ============================================
@@ -677,34 +800,36 @@ class Trainer:
 # ============================================
 
 def main():
-    parser = argparse.ArgumentParser(description="GCNet Training — FAN + DWSA + GCNetHeadLite")
+    parser = argparse.ArgumentParser(
+        description="GCNet Training — FAN + MSC + GCNetHeadLite")
 
     # Pretrained / Transfer
-    parser.add_argument("--pretrained_weights", type=str, default=None)
-    parser.add_argument("--freeze_backbone", action="store_true", default=False)
-    parser.add_argument("--unfreeze_schedule", type=str, default="",
-                        help="Comma-separated epochs to progressively unfreeze backbone, e.g. '5,10,15'")
-    parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
-    parser.add_argument("--dwsa_lr_factor", type=float, default=0.2)
-    parser.add_argument("--alpha_lr_factor", type=float, default=0.1)
-    parser.add_argument("--use_class_weights", action="store_true")
+    parser.add_argument("--pretrained_weights",  type=str, default=None)
+    parser.add_argument("--freeze_backbone",     action="store_true", default=False)
+    parser.add_argument("--unfreeze_schedule",   type=str, default="",
+                        help="Comma-separated epochs, e.g. '5,10,15,20'")
+    parser.add_argument("--backbone_lr_factor",  type=float, default=0.1)
+    parser.add_argument("--msc_lr_factor",       type=float, default=0.2)
+    parser.add_argument("--alpha_lr_factor",     type=float, default=0.1)
+    parser.add_argument("--use_class_weights",   action="store_true")
 
     # Dataset
     parser.add_argument("--train_txt",    required=True)
     parser.add_argument("--val_txt",      required=True)
-    parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
+    parser.add_argument("--dataset_type", default="foggy",
+                        choices=["normal", "foggy"])
     parser.add_argument("--num_classes",  type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
 
     # Training
-    parser.add_argument("--epochs",             type=int,   default=100)
-    parser.add_argument("--batch_size",          type=int,   default=8)
-    parser.add_argument("--accumulation_steps",  type=int,   default=5)
-    parser.add_argument("--lr",                  type=float, default=5e-4)
-    parser.add_argument("--weight_decay",        type=float, default=1e-4)
-    parser.add_argument("--grad_clip",           type=float, default=5.0)
-    parser.add_argument("--aux_weight",          type=float, default=0.4)
-    parser.add_argument("--scheduler",           default="onecycle",
+    parser.add_argument("--epochs",            type=int,   default=100)
+    parser.add_argument("--batch_size",        type=int,   default=8)
+    parser.add_argument("--accumulation_steps",type=int,   default=5)
+    parser.add_argument("--lr",                type=float, default=5e-4)
+    parser.add_argument("--weight_decay",      type=float, default=1e-4)
+    parser.add_argument("--grad_clip",         type=float, default=5.0)
+    parser.add_argument("--aux_weight",        type=float, default=0.4)
+    parser.add_argument("--scheduler",         default="onecycle",
                         choices=["onecycle", "poly", "cosine"])
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
 
@@ -732,10 +857,11 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'='*70}")
-    print("GCNet Training  |  FAN + DWSA + GCNetHeadLite (decoder /2)")
+    print("GCNet Training v3  |  FAN + MSC + GCNetHeadLite (decoder /2)")
     print(f"{'='*70}")
     print(f"Device: {device}  |  Image: {args.img_h}x{args.img_w}")
-    print(f"Batch: {args.batch_size} × accum {args.accumulation_steps} = effective {args.batch_size*args.accumulation_steps}")
+    print(f"Batch: {args.batch_size} × accum {args.accumulation_steps} "
+          f"= effective {args.batch_size*args.accumulation_steps}")
     print(f"{'='*70}\n")
 
     # Config
@@ -760,7 +886,7 @@ def main():
 
     # Model
     print(f"{'='*70}")
-    print("BUILDING MODEL — GCNet + GCNetHeadLite")
+    print("BUILDING MODEL — GCNetBackbone (FAN+MSC) + GCNetHeadLite")
     print(f"{'='*70}\n")
 
     model = GCNetModel(
@@ -771,7 +897,7 @@ def main():
     model.apply(init_weights)
     check_model_health(model)
 
-    # Transfer learning
+    # Transfer learning từ checkpoint GCNet gốc
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights)
 
@@ -779,7 +905,6 @@ def main():
         freeze_backbone(model)
 
     count_trainable_params(model)
-    print_backbone_structure(model)
 
     # Sanity check forward pass
     with torch.no_grad():
@@ -787,9 +912,10 @@ def main():
         model.train()
         try:
             aux_logit, main_logit = model(sample)
+            h2, w2 = args.img_h // 2, args.img_w // 2
             print(f"Forward pass (train) OK:")
-            print(f"  aux_logit:  {aux_logit.shape}   (expected /2 = {args.img_h//2}x{args.img_w//2})")
-            print(f"  main_logit: {main_logit.shape}  (expected /2 = {args.img_h//2}x{args.img_w//2})\n")
+            print(f"  aux_logit:  {tuple(aux_logit.shape)}  (expected {h2}x{w2})")
+            print(f"  main_logit: {tuple(main_logit.shape)} (expected {h2}x{w2})\n")
         except Exception as e:
             print(f"Forward pass FAILED: {e}")
             raise
@@ -798,8 +924,7 @@ def main():
             logit = model(sample)
             if isinstance(logit, tuple):
                 logit = logit[-1]
-            print(f"Forward pass (eval) OK:")
-            print(f"  logit: {logit.shape}\n")
+            print(f"Forward pass (eval) OK: {tuple(logit.shape)}\n")
         except Exception as e:
             print(f"Eval forward FAILED: {e}")
             raise
@@ -829,17 +954,21 @@ def main():
     unfreeze_epochs = []
     if args.unfreeze_schedule:
         try:
-            unfreeze_epochs = sorted(int(e) for e in args.unfreeze_schedule.split(','))
+            unfreeze_epochs = sorted(
+                int(e) for e in args.unfreeze_schedule.split(','))
         except Exception:
-            raise ValueError("unfreeze_schedule phải là chuỗi số nguyên, vd: '5,10,15'")
+            raise ValueError("unfreeze_schedule: chuỗi số nguyên, vd '5,10,15'")
 
+    # Tên modules trong GCNetBackbone mới
     UNFREEZE_STAGES = [
-        ['stem_conv1', 'stem_conv2'],
-        ['stem_stage2', 'stem_stage3'],
-        ['semantic_branch_layers', 'detail_branch_layers',
-         'compression_1', 'down_1'],
-        ['compression_2', 'down_2'],
-        ['spp', 'dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6'],
+        ['stem_conv1', 'stem_conv2'],           # stage 1 (FAN)
+        ['stem_stage2', 'stem_stage3'],          # stage 2-3
+        ['semantic_branch.0', 'detail_branch.0',
+         'compression_1', 'down_1'],             # stage 4
+        ['semantic_branch.1', 'detail_branch.1',
+         'compression_2', 'down_2'],             # stage 5
+        ['semantic_branch.2', 'detail_branch.2',
+         'spp', 'ms_context', 'final_proj'],     # stage 6 + MSC
     ]
 
     print(f"\n{'='*70}")
@@ -848,7 +977,7 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
-        # Progressive unfreezing
+        # Progressive unfreezing — tích lũy tất cả stages đến epoch hiện tại
         past    = [e for e in unfreeze_epochs if e <= epoch]
         targets = []
         for i in range(min(len(past), len(UNFREEZE_STAGES))):
@@ -856,20 +985,21 @@ def main():
         if targets:
             unfreeze_backbone_progressive(model, targets)
 
-        # Rebuild optimizer/scheduler khi unfreeze
+        # Rebuild optimizer khi unfreeze
         if epoch in unfreeze_epochs:
             optimizer = build_optimizer(model, args)
-            scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
+            scheduler = build_scheduler(
+                optimizer, args, train_loader, start_epoch=epoch)
             trainer.optimizer = optimizer
             trainer.scheduler = scheduler
 
-        # Loss phase: ce_only ngay sau unfreeze, rồi full
+        # Loss phase: ce_only ngay sau unfreeze, full sau vài epoch
         if unfreeze_epochs:
-            last_unfreeze = max((e for e in unfreeze_epochs if e <= epoch), default=None)
-            if last_unfreeze is not None:
-                if epoch == last_unfreeze:
+            last_uf = max((e for e in unfreeze_epochs if e <= epoch), default=None)
+            if last_uf is not None:
+                if epoch == last_uf:
                     trainer.set_loss_phase('ce_only')
-                elif epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
+                elif epoch >= last_uf + args.ce_only_epochs_after_unfreeze:
                     trainer.set_loss_phase('full')
 
         train_metrics = trainer.train_epoch(train_loader, epoch)
@@ -878,22 +1008,12 @@ def main():
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
-        print(f"Train — Loss: {train_metrics['loss']:.4f} | OHEM: {train_metrics['ohem']:.4f} | Dice: {train_metrics['dice']:.4f}")
-        print(f"Val   — Loss: {val_metrics['loss']:.4f}  | mIoU: {val_metrics['miou']:.4f}  | Acc:  {val_metrics['accuracy']:.4f}")
-
-        # Log FAN / DWSA state
-        try:
-            fan_alpha = model.backbone.stem_conv1[1].alpha.mean().item()
-            print(f"  FAN alpha (stem_conv1): {fan_alpha:.4f}")
-            trainer.writer.add_scalar('monitor/fan_alpha', fan_alpha, epoch)
-        except Exception:
-            pass
-        try:
-            dwsa_gamma = model.backbone.dwsa_stage6.gamma.item()
-            print(f"  DWSA gamma (stage6):    {dwsa_gamma:.4f}")
-            trainer.writer.add_scalar('monitor/dwsa_gamma', dwsa_gamma, epoch)
-        except Exception:
-            pass
+        print(f"Train — Loss: {train_metrics['loss']:.4f} | "
+              f"OHEM: {train_metrics['ohem']:.4f} | "
+              f"Dice: {train_metrics['dice']:.4f}")
+        print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
+              f"mIoU: {val_metrics['miou']:.4f}  | "
+              f"Acc:  {val_metrics['accuracy']:.4f}")
         print(f"{'='*70}\n")
 
         trainer.writer.add_scalar('val/loss',     val_metrics['loss'],     epoch)
