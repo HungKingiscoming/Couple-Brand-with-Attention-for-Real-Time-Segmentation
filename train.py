@@ -581,7 +581,7 @@ class Trainer:
         self.model.train()
         total_loss = total_ohem = total_dice = 0.0
         max_grad_ep = 0.0
-
+        max_grad = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs  = imgs.to(self.device, non_blocking=True)
