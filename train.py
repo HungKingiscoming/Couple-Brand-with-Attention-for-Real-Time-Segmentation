@@ -25,7 +25,7 @@ warnings.filterwarnings('ignore')
 # IMPORTS
 # ============================================
 
-from model.backbone.model import GCNet        
+from model.backbone.model import GCNetBackbone        
 from model.head.segmentation_head import GCNetHeadLite    
 from data.custom import create_dataloaders
 from model.model_utils import init_weights, check_model_health
