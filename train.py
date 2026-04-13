@@ -58,8 +58,10 @@ def _remap_stem_key(key: str, N2: int = 4):
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     """Load pretrained weights vào model.backbone VÀ model.decode_head.
 
-    Backbone: dùng _remap_stem_key đã hoạt động ổn định (95.2% load rate).
-    Head    : remap conv_seg → cls_seg rồi load theo key trực tiếp.
+    Fix so với bản gốc:
+      1. Load cả head (remap conv_seg → cls_seg)
+      2. Reset DWSA gamma về 0 — tránh random init inject noise vào features
+      3. Reset fog_bridge alpha về -4.0 — near-identity, tránh distribution mismatch
     """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -68,12 +70,12 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     # ================================================================ #
     # BACKBONE                                                           #
     # ================================================================ #
-    model_bb_state = model.backbone.state_dict()
-    compatible_bb  = {}
-    skipped        = []
+    model_state = model.backbone.state_dict()
+    compatible  = {}
+    skipped     = []
 
     model_key_map = {}
-    for mk in model_bb_state.keys():
+    for mk in model_state.keys():
         norm = mk
         for pref in ['backbone.', 'model.', 'module.']:
             if norm.startswith(pref):
@@ -100,26 +102,26 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         matched = False
         if norm_ckpt in model_key_map:
             mk = model_key_map[norm_ckpt]
-            if model_bb_state[mk].shape == ckpt_val.shape:
-                compatible_bb[mk] = ckpt_val
+            if model_state[mk].shape == ckpt_val.shape:
+                compatible[mk] = ckpt_val
                 matched = True
 
         if not matched and not strict_match:
             for norm_model, mk in model_key_map.items():
                 if (norm_model.endswith(norm_ckpt) or norm_ckpt.endswith(norm_model)):
-                    if model_bb_state[mk].shape == ckpt_val.shape:
-                        compatible_bb[mk] = ckpt_val
+                    if model_state[mk].shape == ckpt_val.shape:
+                        compatible[mk] = ckpt_val
                         matched = True
                         break
 
         if not matched:
             skipped.append(ckpt_key)
 
-    loaded_bb = len(compatible_bb)
-    total_bb  = len(model_bb_state)
+    loaded_bb = len(compatible)
+    total_bb  = len(model_state)
     rate_bb   = 100 * loaded_bb / total_bb if total_bb > 0 else 0.0
 
-    missing_bb, _ = model.backbone.load_state_dict(compatible_bb, strict=False)
+    missing_bb, _ = model.backbone.load_state_dict(compatible, strict=False)
 
     expected_skip_markers    = ('dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.')
     truly_expected           = [k for k in skipped   if any(s in k for s in expected_skip_markers)]
@@ -129,7 +131,7 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     unexpected_missing_bb    = [k for k in missing_bb if k not in expected_missing_bb]
 
     # ================================================================ #
-    # HEAD — remap conv_seg → cls_seg, load key trực tiếp               #
+    # HEAD — remap conv_seg → cls_seg                                    #
     # ================================================================ #
     model_hd_state = model.decode_head.state_dict()
     compatible_hd  = {}
@@ -137,10 +139,8 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     for ckpt_key, ckpt_val in state.items():
         if not ckpt_key.startswith('decode_head.'):
             continue
-        # Strip prefix + remap classifier name
         stripped_hd = ckpt_key[len('decode_head.'):]
         stripped_hd = stripped_hd.replace('conv_seg', 'cls_seg')
-
         if stripped_hd not in model_hd_state:
             continue
         if model_hd_state[stripped_hd].shape != ckpt_val.shape:
@@ -178,55 +178,50 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
 
     if loaded_hd == 0:
         print(f"\n⚠️  HEAD: 0 keys loaded!")
-        print(f"   Kiểm tra key prefix trong checkpoint:")
+        print(f"   Sample checkpoint keys:")
         for k in list(state.keys())[:5]:
             print(f"   {k}")
     elif rate_hd < 60:
-        print(f"\n⚠️  HEAD: {rate_hd:.1f}% loaded — shape mismatch ở một số layer.")
-        shape_issues = []
-        for ckpt_key, ckpt_val in state.items():
-            if not ckpt_key.startswith('decode_head.'):
-                continue
-            stripped_hd = ckpt_key[len('decode_head.'):].replace('conv_seg', 'cls_seg')
-            if stripped_hd in model_hd_state:
-                if model_hd_state[stripped_hd].shape != ckpt_val.shape:
-                    shape_issues.append(
-                        f"  {stripped_hd}: ckpt={tuple(ckpt_val.shape)} "
-                        f"model={tuple(model_hd_state[stripped_hd].shape)}")
-        for s in shape_issues[:5]:
-            print(s)
-        if shape_issues:
-            print(f"  → Đổi head.channels trong ModelConfig cho khớp checkpoint.")
+        print(f"\n⚠️  HEAD: {rate_hd:.1f}% loaded — shape mismatch.")
+        print(f"   → Kiểm tra head.channels trong ModelConfig.")
     else:
         print(f"\n✓  HEAD loaded {rate_hd:.1f}% — pretrained head weights active.")
-
     print(sep + "\n")
 
     # ================================================================ #
-    # fog_bridge near-identity init                                      #
+    # FIX 1: Reset DWSA gamma về 0                                       #
     # ================================================================ #
-    # fog_bridge là layer MỚI (random init) nằm ngay trước split branches.
-    # Nếu alpha khởi tạo = 0.5 (random), output distribution của fog_bridge
-    # khác hoàn toàn so với backbone gốc → head pretrained "không nhận ra"
-    # features → mIoU epoch 1 ≈ 0 dù head load 100%.
-    #
-    # Fix: set alpha rất âm → sigmoid(-4) ≈ 0.018 → fog_bridge gần như
-    # pure BN → output ≈ identity so với không có fog_bridge → head
-    # pretrained hoạt động ngay từ epoch 1.
-    # alpha sẽ tự học tăng dần trong quá trình train foggy.
+    # DWSA có random init weights → inject noise mạnh vào features
+    # → head pretrained không nhận ra features → mIoU epoch 1 ≈ 0
+    # gamma=0 → x + 0*out = x → DWSA transparent hoàn toàn
+    # gamma sẽ tự học tăng dần khi DWSA weights hội tụ
+    dwsa_reset = []
+    for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
+        module = getattr(model.backbone, name, None)
+        if module is not None and hasattr(module, 'gamma'):
+            with torch.no_grad():
+                module.gamma.fill_(0.0)
+            dwsa_reset.append(name)
+    if dwsa_reset:
+        print(f"✓ DWSA gamma reset về 0.0: {', '.join(dwsa_reset)}")
+        print(f"  → DWSA transparent, sẽ học dần từ epoch đầu\n")
+
+    # ================================================================ #
+    # FIX 2: Reset fog_bridge về near-identity                          #
+    # ================================================================ #
+    # fog_bridge random init → output distribution khác backbone gốc
+    # → head pretrained không nhận ra features
+    # alpha=-4 → sigmoid(-4)≈0.018 → gần như pure BN → near-identity
     fog_bridge = getattr(model.backbone, 'fog_bridge', None)
     if fog_bridge is not None:
         with torch.no_grad():
-            fog_bridge.alpha.fill_(-4.0)   # sigmoid(-4) ≈ 0.018 ≈ pure BN
-            # BN trong fog_bridge: copy running stats từ stem_stage3
-            # để BN path của fog_bridge không gây distribution shift
+            fog_bridge.alpha.fill_(-4.0)
             fog_bridge.bn.weight.fill_(1.0)
             fog_bridge.bn.bias.fill_(0.0)
             fog_bridge.bn.running_mean.fill_(0.0)
             fog_bridge.bn.running_var.fill_(1.0)
-        print("✓ fog_bridge alpha = -4.0 (near-identity, sẽ học dần)")
-        print(f"  sigmoid(-4.0) = {torch.sigmoid(torch.tensor(-4.0)).item():.4f} "
-              f"→ gần như pure BN\n")
+        print(f"✓ fog_bridge alpha = -4.0 (sigmoid≈0.018, near-identity BN)")
+        print(f"  → fog_bridge transparent, sẽ học dần\n")
 
     return rate_bb
 
