@@ -21,40 +21,31 @@ import warnings
 from torch.optim.lr_scheduler import LambdaLR
 warnings.filterwarnings('ignore')
 
-# ============================================
-# IMPORTS — model mới, không còn mmcv/mmseg
-# ============================================
-
-from model.backbone.model import GCNet          # backbone mới
-from model.head.segmentation_head import GCNetHead      # head mới (tích hợp aux)
+from model.backbone.model import GCNet
+from model.head.segmentation_head import GCNetHead
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
 
 # ============================================
 # PRETRAINED WEIGHT LOADER
+# [FIX 1] Load cả backbone lẫn head từ checkpoint
 # ============================================
 
 def _remap_stem_key(key: str, N2: int = 4):
-    """Remap checkpoint key sang GCNet v3."""
     import re as _re
-
     for pref in ['backbone.', 'model.', 'module.']:
         if key.startswith(pref):
             key = key[len(pref):]
-
     m = _re.match(r'stem\.(\d+)\.(.+)$', key)
     if not m:
         return key
-
     idx  = int(m.group(1))
     rest = m.group(2)
-
     def _map_convmodule(rest_str, target_prefix):
         if rest_str.startswith('conv.'):
             return f'{target_prefix}.{rest_str[len("conv."):].lstrip(".")}'
         return None
-
     if idx == 0:
         return _map_convmodule(rest, 'stem_conv1.0')
     elif idx == 1:
@@ -66,17 +57,23 @@ def _remap_stem_key(key: str, N2: int = 4):
 
 
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
-    """Load pretrained weights vào model.backbone (GCNet v3)."""
+    """Load pretrained weights vào model.backbone VÀ model.decode_head.
+
+    [FIX 1] Bản gốc chỉ load backbone → head random init → mất ~10-15 mIoU.
+    Bản fix load cả head từ checkpoint nếu key match.
+    Head mới có thêm FAN/DWSA → một số key sẽ missing (expected).
+    """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    model_state = model.backbone.state_dict()
-    compatible  = {}
-    skipped     = []
+    # ---- Load backbone --------------------------------------------------- #
+    model_bb_state  = model.backbone.state_dict()
+    compatible_bb   = {}
+    skipped         = []
 
     model_key_map = {}
-    for mk in model_state.keys():
+    for mk in model_bb_state.keys():
         norm = mk
         for pref in ['backbone.', 'model.', 'module.']:
             if norm.startswith(pref):
@@ -96,7 +93,6 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
             continue
 
         norm_ckpt = _remap_stem_key(ckpt_key)
-
         if norm_ckpt is None:
             bn_dropped.append(ckpt_key)
             continue
@@ -104,70 +100,107 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         matched = False
         if norm_ckpt in model_key_map:
             mk = model_key_map[norm_ckpt]
-            if model_state[mk].shape == ckpt_val.shape:
-                compatible[mk] = ckpt_val
+            if model_bb_state[mk].shape == ckpt_val.shape:
+                compatible_bb[mk] = ckpt_val
                 matched = True
 
         if not matched and not strict_match:
             for norm_model, mk in model_key_map.items():
                 if (norm_model.endswith(norm_ckpt) or norm_ckpt.endswith(norm_model)):
-                    if model_state[mk].shape == ckpt_val.shape:
-                        compatible[mk] = ckpt_val
+                    if model_bb_state[mk].shape == ckpt_val.shape:
+                        compatible_bb[mk] = ckpt_val
                         matched = True
                         break
 
         if not matched:
             skipped.append(ckpt_key)
 
-    loaded = len(compatible)
-    total  = len(model_state)
-    rate   = 100 * loaded / total if total > 0 else 0.0
+    loaded_bb = len(compatible_bb)
+    total_bb  = len(model_bb_state)
+    rate_bb   = 100 * loaded_bb / total_bb if total_bb > 0 else 0.0
+
+    # ---- [FIX 1] Load decode_head ---------------------------------------- #
+    # Checkpoint có thể có head dưới key 'decode_head.*' hoặc 'head.*'
+    model_hd_state  = model.decode_head.state_dict()
+    compatible_hd   = {}
+    head_prefixes   = ('decode_head.', 'head.', 'aux_head.')
+
+    for ckpt_key, ckpt_val in state.items():
+        # Tìm key thuộc head trong checkpoint
+        stripped_hd = None
+        for pref in head_prefixes:
+            if ckpt_key.startswith(pref):
+                stripped_hd = ckpt_key[len(pref):]
+                break
+        # Cũng thử với backbone. prefix trước head prefix (mmcv style)
+        if stripped_hd is None:
+            for bb_pref in ('backbone.', 'model.', 'module.'):
+                if ckpt_key.startswith(bb_pref):
+                    rest = ckpt_key[len(bb_pref):]
+                    for pref in head_prefixes:
+                        if rest.startswith(pref):
+                            stripped_hd = rest[len(pref):]
+                            break
+                    if stripped_hd is not None:
+                        break
+
+        if stripped_hd is None:
+            continue
+
+        if stripped_hd in model_hd_state:
+            if model_hd_state[stripped_hd].shape == ckpt_val.shape:
+                compatible_hd[stripped_hd] = ckpt_val
+
+    loaded_hd = len(compatible_hd)
+    total_hd  = len(model_hd_state)
+    rate_hd   = 100 * loaded_hd / total_hd if total_hd > 0 else 0.0
+
+    # ---- Apply weights ---------------------------------------------------- #
+    missing_bb, _ = model.backbone.load_state_dict(compatible_bb, strict=False)
+    missing_hd, _ = model.decode_head.load_state_dict(compatible_hd, strict=False)
 
     expected_skip_markers = (
-        'dwsa_stage', 'foggy', 'alpha', 'in_.',
-        '.spp.',
-        'backbone.spp.',
+        'dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.',
     )
-    truly_expected = [k for k in skipped if any(s in k for s in expected_skip_markers)]
+    truly_expected  = [k for k in skipped if any(s in k for s in expected_skip_markers)]
     truly_unmatched = [k for k in skipped if k not in truly_expected]
+
+    expected_missing_markers = ('dwsa', 'alpha', 'in_.', 'foggy', '.1.bn.', 'spp.', 'fog_bridge')
+    expected_missing_bb   = [k for k in missing_bb if any(s in k for s in expected_missing_markers)]
+    unexpected_missing_bb = [k for k in missing_bb if k not in expected_missing_bb]
 
     sep = '=' * 70
     print(f"\n{sep}")
     print("WEIGHT LOADING SUMMARY")
     print(sep)
-    print(f"Loaded:                  {loaded:>5} / {total} ({rate:.1f}%)")
-    print(f"BN dropped (expected):   {len(bn_dropped):>5}  (stem BN → FoggyAwareNorm ✓)")
-    print(f"Skipped total:           {len(skipped):>5}")
-    print(f"  Expected (shape/new):  {len(truly_expected):>5}  (DWSA / FoggyNorm / DAPPM BN order ✓)")
+    print(f"Backbone — Loaded: {loaded_bb:>5} / {total_bb} ({rate_bb:.1f}%)")
+    print(f"Head     — Loaded: {loaded_hd:>5} / {total_hd} ({rate_hd:.1f}%)")
+    print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm ✓)")
     if truly_unmatched:
-        print(f"  Unmatched:             {len(truly_unmatched):>5}  ← cần kiểm tra")
+        print(f"\nUnexpected missing ({len(truly_unmatched)}) — cần kiểm tra:")
         for k in truly_unmatched[:5]:
-            print(f"      {k}")
+            print(f"  - {k}")
+    if unexpected_missing_bb:
+        print(f"\nBackbone unexpected missing ({len(unexpected_missing_bb)}):")
+        for k in unexpected_missing_bb[:5]:
+            print(f"  - {k}")
+    print(f"\nExpected missing backbone: {len(expected_missing_bb)} keys "
+          f"(fog_bridge / DWSA / FAN / DAPPM BN order) → OK")
+    # [FIX 1] Cảnh báo nếu head không load được gì
+    if loaded_hd == 0:
+        print(f"\n⚠️  HEAD: 0 keys loaded — checkpoint có thể không có head weights.")
+        print(f"   Head sẽ dùng random init. Kiểm tra key prefix trong checkpoint:")
+        sample_keys = [k for k in state.keys() if any(p in k for p in head_prefixes)][:5]
+        for k in sample_keys:
+            print(f"   {k}")
+    elif rate_hd < 50:
+        print(f"\n⚠️  HEAD: chỉ load được {rate_hd:.1f}% — "
+              f"một số layer head mới (aux_cls_seg_c4) là expected missing.")
+    else:
+        print(f"\n✓  HEAD loaded {rate_hd:.1f}% — head pretrained weights active.")
     print(sep + "\n")
 
-    if truly_unmatched:
-        print(f"WARNING: {len(truly_unmatched)} key không match — kiểm tra checkpoint format\n")
-
-    missing, _ = model.backbone.load_state_dict(compatible, strict=False)
-
-    expected_missing_markers = (
-        'dwsa',
-        'alpha',
-        'in_.',
-        'foggy',
-        '.1.bn.',
-        'spp.',
-    )
-    expected_missing   = [k for k in missing if any(s in k for s in expected_missing_markers)]
-    unexpected_missing = [k for k in missing if k not in expected_missing]
-
-    if unexpected_missing:
-        print(f"Unexpected missing ({len(unexpected_missing)}) — cần kiểm tra:")
-        for k in unexpected_missing[:10]:
-            print(f"  - {k}")
-        print()
-    print(f"Expected missing: {len(expected_missing)} keys (new modules + DAPPM BN order) → OK\n")
-    return rate
+    return rate_bb
 
 
 # ============================================
@@ -175,17 +208,7 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
 # ============================================
 
 def build_optimizer(model, args):
-    """Phân tách params thành 4 nhóm với LR khác nhau:
-      - dwsa: LR riêng (dwsa_lr_factor) — cần đủ lớn để gamma thoát khỏi 0
-      - alpha (FoggyAwareNorm gate): LR riêng (alpha_lr_factor)
-      - backbone: LR * backbone_lr_factor
-      - head: LR đầy đủ
-
-    FIX: tách DWSA ra nhóm riêng thay vì gộp chung với alpha.
-    gamma=0 khi init cần LR đủ lớn (~1e-4) để học được trong vài epoch đầu.
-    Với alpha_lr_factor=0.01 → lr=3e-6 quá nhỏ, gamma không nhúc nhích.
-    """
-    dwsa_params     = []   # FIX: nhóm riêng cho DWSA
+    dwsa_params     = []
     alpha_params    = []
     backbone_params = []
     head_params     = []
@@ -193,11 +216,9 @@ def build_optimizer(model, args):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # FIX: tách DWSA ra trước — ưu tiên cao hơn alpha/gamma chung
         if 'dwsa' in name:
             dwsa_params.append(param)
         elif 'alpha' in name:
-            # FoggyAwareNorm.alpha — giữ LR nhỏ vì đây là soft gate
             alpha_params.append(param)
         elif 'backbone' in name:
             backbone_params.append(param)
@@ -206,14 +227,13 @@ def build_optimizer(model, args):
 
     groups = []
     if head_params:
-        groups.append({'params': head_params,     'lr': args.lr,                              'name': 'head'})
+        groups.append({'params': head_params,     'lr': args.lr,                           'name': 'head'})
     if backbone_params:
-        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor,    'name': 'backbone'})
+        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
     if dwsa_params:
-        # FIX: dùng dwsa_lr_factor riêng — default 0.1 → lr=3e-5, đủ để gamma học
-        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,        'name': 'dwsa'})
+        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,     'name': 'dwsa'})
     if alpha_params:
-        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,       'name': 'alpha'})
+        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,    'name': 'alpha'})
 
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
@@ -222,49 +242,30 @@ def build_optimizer(model, args):
     print(f"Optimizer: AdamW (Discriminative LR)")
     for g in optimizer.param_groups:
         print(f"  group '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
-
     return optimizer
 
 
 def build_scheduler(optimizer, args, train_loader, start_epoch=0):
     n_groups = len(optimizer.param_groups)
-
     if args.scheduler == 'onecycle':
         remaining_epochs = args.epochs - start_epoch
         total_steps      = len(train_loader) * remaining_epochs
-
-        if n_groups == 1:
-            max_lrs = args.lr
-        else:
-            max_lrs = [g['initial_lr'] for g in optimizer.param_groups]
-
+        max_lrs = args.lr if n_groups == 1 else [g['initial_lr'] for g in optimizer.param_groups]
         scheduler = optim.lr_scheduler.OneCycleLR(
-            optimizer,
-            max_lr=max_lrs,
-            total_steps=total_steps,
-            pct_start=0.05,
-            anneal_strategy='cos',
-            cycle_momentum=True,
-            base_momentum=0.85,
-            max_momentum=0.95,
-            div_factor=25,
-            final_div_factor=100000,
+            optimizer, max_lr=max_lrs, total_steps=total_steps,
+            pct_start=0.05, anneal_strategy='cos',
+            cycle_momentum=True, base_momentum=0.85, max_momentum=0.95,
+            div_factor=25, final_div_factor=100000,
         )
         print(f"OneCycleLR (total_steps={total_steps})")
-
     elif args.scheduler == 'poly':
         scheduler = optim.lr_scheduler.LambdaLR(
-            optimizer,
-            lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9
-        )
+            optimizer, lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9)
         print("Polynomial LR decay")
-
     else:
         scheduler = optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=1e-6
-        )
+            optimizer, T_max=args.epochs, eta_min=1e-6)
         print("CosineAnnealingLR")
-
     return scheduler
 
 
@@ -285,24 +286,19 @@ class DiceLoss(nn.Module):
 
     def forward(self, logits, targets):
         B, C, H, W = logits.shape
-        valid_mask       = (targets != self.ignore_index)
-        targets_clamped  = targets.clamp(0, C - 1)
-        targets_one_hot  = F.one_hot(targets_clamped, C).permute(0, 3, 1, 2).float()
-        targets_one_hot  = targets_one_hot * valid_mask.unsqueeze(1).float()
-
+        valid_mask      = (targets != self.ignore_index)
+        targets_clamped = targets.clamp(0, C - 1)
+        targets_one_hot = F.one_hot(targets_clamped, C).permute(0, 3, 1, 2).float()
+        targets_one_hot = targets_one_hot * valid_mask.unsqueeze(1).float()
         probs       = F.softmax(logits, dim=1) * valid_mask.unsqueeze(1).float()
         probs_flat  = probs.reshape(B, C, -1)
         target_flat = targets_one_hot.reshape(B, C, -1)
-
         intersection = (probs_flat * target_flat).sum(2)
         cardinality  = probs_flat.sum(2) + target_flat.sum(2)
         dice_score   = (2.0 * intersection + self.smooth) / (cardinality + self.smooth)
-
-        dice_loss = -torch.log(dice_score.clamp(min=self.smooth)) if self.log_loss else 1.0 - dice_score
-
+        dice_loss    = -torch.log(dice_score.clamp(min=self.smooth)) if self.log_loss else 1.0 - dice_score
         if self.class_weights is not None:
             dice_loss = dice_loss * self.class_weights.unsqueeze(0)
-
         class_present = target_flat.sum(2) > 0
         dice_loss     = dice_loss * class_present.float()
         n_present     = class_present.float().sum(1).clamp(min=1)
@@ -329,7 +325,7 @@ class OHEMLoss(nn.Module):
         n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
         n_keep = min(n_keep, n_valid)
         if n_keep < n_valid:
-            threshold   = torch.sort(valid_losses, descending=True)[0][n_keep - 1].detach()
+            threshold    = torch.sort(valid_losses, descending=True)[0][n_keep - 1].detach()
             valid_losses = valid_losses[valid_losses >= threshold]
         return valid_losses.mean()
 
@@ -373,7 +369,6 @@ def count_trainable_params(model):
     bb_train  = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
     hd_total  = sum(p.numel() for p in model.decode_head.parameters())
     hd_train  = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
-
     print(f"\n{'='*70}")
     print("PARAMETER STATISTICS")
     print(f"{'='*70}")
@@ -388,22 +383,10 @@ def count_trainable_params(model):
 
 
 def freeze_backbone(model):
-    """Freeze toàn bộ backbone trừ DWSA và FoggyAwareNorm.
-
-    FIX so với bản gốc:
-      1. Sau khi lock BN toàn backbone, set lại BN trong DWSA về train mode.
-         Bản gốc lock BN theo thứ tự toàn bộ modules() → BN trong DWSA bị
-         lock luôn dù DWSA được mark trainable sau đó.
-         BN frozen → gradient qua DWSA ≈ 0 → gamma không học được.
-      2. In rõ số BN được unfreeze lại trong DWSA để dễ debug.
-    """
+    """Freeze toàn bộ backbone trừ DWSA và FoggyAwareNorm."""
     print("Freezing backbone (keeping DWSA + FoggyAwareNorm trainable)...")
-
-    # Bước 1: Freeze toàn bộ
     for p in model.backbone.parameters():
         p.requires_grad = False
-
-    # Bước 2: Lock TẤT CẢ BN về eval (kể cả BN trong DWSA — sẽ fix ở bước 4)
     bn_count = 0
     for m in model.backbone.modules():
         if isinstance(m, nn.BatchNorm2d):
@@ -413,18 +396,13 @@ def freeze_backbone(model):
             bn_count += 1
     print(f"  {bn_count} BN layers locked")
 
-    # Bước 3: Unfreeze DWSA params + BN bên trong DWSA
-    # FIX: phải gọi m.train() cho BN trong DWSA sau khi đã lock toàn bộ ở trên
-    dwsa_params = 0
-    dwsa_bn_count = 0
+    dwsa_params = 0; dwsa_bn_count = 0
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
         if module is not None:
-            # Unfreeze tất cả params trong DWSA
             for p in module.parameters():
                 p.requires_grad = True
                 dwsa_params += p.numel()
-            # FIX: set BN trong DWSA về train mode — BN frozen → gradient ≈ 0
             for m in module.modules():
                 if isinstance(m, nn.BatchNorm2d):
                     m.train()
@@ -433,7 +411,17 @@ def freeze_backbone(model):
                     dwsa_bn_count += 1
     print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn_count} BN unfrozen")
 
-    # Bước 4: Unfreeze FoggyAwareNorm — alpha + BN + IN params
+    # [FIX 1b] Unfreeze fog_bridge — đây là layer quan trọng nhất
+    fog_bridge = getattr(model.backbone, 'fog_bridge', None)
+    if fog_bridge is not None:
+        for p in fog_bridge.parameters():
+            p.requires_grad = True
+        fog_bridge.bn.train()
+        print(f"  fog_bridge kept trainable: "
+              f"{sum(p.numel() for p in fog_bridge.parameters()):,} params")
+    else:
+        print("  ⚠️  fog_bridge not found — using old backbone?")
+
     fan_params = 0
     for name in ['stem_conv1', 'stem_conv2']:
         module = getattr(model.backbone, name, None)
@@ -442,7 +430,6 @@ def freeze_backbone(model):
                 for p in module[1].parameters():
                     p.requires_grad = True
                     fan_params += p.numel()
-                # FoggyAwareNorm.bn cũng cần train mode
                 fan_bn = module[1].bn
                 fan_bn.train()
                 if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
@@ -452,17 +439,13 @@ def freeze_backbone(model):
 
 
 def unfreeze_backbone_progressive(model, stage_names):
-    """Unfreeze từng stage theo tên — hỗ trợ cả dotted names."""
     if isinstance(stage_names, str):
         stage_names = [stage_names]
-
     total_unfrozen = 0
     for stage_name in stage_names:
         module = None
-
         if hasattr(model.backbone, stage_name):
             module = getattr(model.backbone, stage_name)
-
         elif '.' in stage_name:
             parts    = stage_name.split('.', 1)
             base_mod = getattr(model.backbone, parts[0], None)
@@ -471,11 +454,9 @@ def unfreeze_backbone_progressive(model, stage_names):
                     module = base_mod[int(parts[1])]
                 except (IndexError, TypeError):
                     pass
-
         if module is None:
             print(f"  [skip] module '{stage_name}' not found in backbone")
             continue
-
         count = 0; bn_count = 0
         for p in module.parameters():
             if not p.requires_grad:
@@ -490,16 +471,11 @@ def unfreeze_backbone_progressive(model, stage_names):
         total_unfrozen += count
         if count > 0:
             print(f"  Unfrozen: backbone.{stage_name} ({count:,} params, {bn_count} BN)")
-
     print(f"  Total unfrozen this call: {total_unfrozen:,} params\n")
     return total_unfrozen
 
 
 def log_dwsa_gamma(model, writer, epoch):
-    """Log giá trị gamma của DWSA lên TensorBoard để monitor quá trình học.
-
-    gamma khởi tạo = 0. Nếu sau 5-10 epoch gamma vẫn ≈ 0 → DWSA chưa học được.
-    """
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
         if module is not None and hasattr(module, 'gamma'):
@@ -609,14 +585,8 @@ class Trainer:
             min_kept=100000,
             class_weights=class_weights,
         )
-        self.dice = DiceLoss(
-            smooth=loss_cfg['dice_smooth'],
-            ignore_index=args.ignore_index,
-        )
-        self.ce = nn.CrossEntropyLoss(
-            weight=cw_device,
-            ignore_index=args.ignore_index,
-        )
+        self.dice = DiceLoss(smooth=loss_cfg['dice_smooth'], ignore_index=args.ignore_index)
+        self.ce   = nn.CrossEntropyLoss(weight=cw_device, ignore_index=args.ignore_index)
 
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
@@ -629,11 +599,8 @@ class Trainer:
     def set_loss_phase(self, phase: str):
         if phase == self.loss_phase:
             return
-        if phase == 'ce_only':
-            self.dice_weight = 0.0
-        elif phase == 'full':
-            self.dice_weight = self.base_loss_cfg['dice_weight']
-        self.loss_phase = phase
+        self.dice_weight = 0.0 if phase == 'ce_only' else self.base_loss_cfg['dice_weight']
+        self.loss_phase  = phase
         print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight})")
 
     def _print_config(self, loss_cfg):
@@ -652,12 +619,28 @@ class Trainer:
         with open(self.save_dir / "config.json", "w") as f:
             json.dump(vars(self.args), f, indent=2, default=str)
 
-    # ---------------------------------------------------------------------- #
-    # Training                                                                 #
-    # ---------------------------------------------------------------------- #
-
     def train_epoch(self, loader, epoch):
         self.model.train()
+        # [FIX 2] Giữ BN của frozen layers ở eval mode
+        # Tránh BN running stats bị cập nhật bởi foggy/clear batch
+        for m in self.model.backbone.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+        # Unfreeze lại BN trong các layer đang train
+        for layer_name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
+            layer = getattr(self.model.backbone, layer_name, None)
+            if layer is not None:
+                for m in layer.modules():
+                    if isinstance(m, nn.BatchNorm2d) and m.weight.requires_grad:
+                        m.train()
+        fog_bridge = getattr(self.model.backbone, 'fog_bridge', None)
+        if fog_bridge is not None and fog_bridge.bn.weight.requires_grad:
+            fog_bridge.bn.train()
+        for name in ['stem_conv1', 'stem_conv2']:
+            layer = getattr(self.model.backbone, name, None)
+            if layer is not None and len(layer) > 1 and hasattr(layer[1], 'bn'):
+                if layer[1].bn.weight.requires_grad:
+                    layer[1].bn.train()
 
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
@@ -672,34 +655,23 @@ class Trainer:
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs = self.model.forward_train(imgs)
-
                 c4_logit, c6_logit = outputs["main"]
-
                 target_size = masks.shape[-2:]
-                c4_full = F.interpolate(c4_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
-                c6_full = F.interpolate(c6_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
-
+                c4_full = F.interpolate(c4_logit, size=target_size, mode='bilinear', align_corners=False)
+                c6_full = F.interpolate(c6_logit, size=target_size, mode='bilinear', align_corners=False)
                 ohem_loss = self.ohem(c6_full, masks)
-
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=c6_logit.shape[-2:],
-                        mode='nearest'
+                        masks.unsqueeze(1).float(), size=c6_logit.shape[-2:], mode='nearest'
                     ).squeeze(1).long()
                     dice_loss = self.dice(c6_logit, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
-
                 loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
-
                 if self.args.aux_weight > 0:
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     aux_loss   = self.ohem(c4_full, masks)
                     loss       = loss + aux_weight * aux_loss
-
                 loss = loss / self.args.accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -719,7 +691,6 @@ class Trainer:
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
-
                 if self.scheduler and self.args.scheduler == 'onecycle':
                     self.scheduler.step()
 
@@ -737,7 +708,6 @@ class Trainer:
 
             if batch_idx % 50 == 0:
                 clear_gpu_memory()
-
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/loss',     loss.item() * self.args.accumulation_steps, self.global_step)
                 self.writer.add_scalar('train/ohem',     ohem_loss.item(), self.global_step)
@@ -750,60 +720,46 @@ class Trainer:
         torch.cuda.empty_cache()
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
-
-        return {
-            'loss': total_loss / n,
-            'ohem': total_ohem / n,
-            'dice': total_dice / n,
-        }
-
-    # ---------------------------------------------------------------------- #
-    # Validation                                                               #
-    # ---------------------------------------------------------------------- #
+        return {'loss': total_loss / n, 'ohem': total_ohem / n, 'dice': total_dice / n}
 
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
-        total_loss   = 0.0
-        num_classes  = self.args.num_classes
-        conf_matrix  = np.zeros((num_classes, num_classes), dtype=np.int64)
-        pbar         = tqdm(loader, desc="Validation")
+        # [FIX 2] BN eval mode khi validate
+        for m in self.model.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.eval()
+
+        total_loss  = 0.0
+        num_classes = self.args.num_classes
+        conf_matrix = np.zeros((num_classes, num_classes), dtype=np.int64)
+        pbar        = tqdm(loader, desc="Validation")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
             imgs  = imgs.to(self.device, non_blocking=True)
             masks = masks.to(self.device, non_blocking=True).long()
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
-
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 logits = self.model(imgs)
-
-                logits_full = F.interpolate(
-                    logits, size=masks.shape[-2:],
-                    mode='bilinear', align_corners=False
-                )
+                logits_full = F.interpolate(logits, size=masks.shape[-2:],
+                                            mode='bilinear', align_corners=False)
                 ce_loss = self.ce(logits_full, masks)
-
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
-                        masks.unsqueeze(1).float(),
-                        size=logits.shape[-2:], mode='nearest'
+                        masks.unsqueeze(1).float(), size=logits.shape[-2:], mode='nearest'
                     ).squeeze(1).long()
                     dice_loss = self.dice(logits, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
-
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
-
             total_loss += loss.item()
-
             pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             valid  = (target >= 0) & (target < num_classes)
             label  = num_classes * target[valid].astype(int) + pred[valid]
             count  = np.bincount(label, minlength=num_classes ** 2)
             conf_matrix += count.reshape(num_classes, num_classes)
-
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
             if batch_idx % 20 == 0:
                 clear_gpu_memory()
@@ -813,17 +769,8 @@ class Trainer:
         iou          = intersection / (union + 1e-10)
         miou         = np.nanmean(iou)
         acc          = intersection.sum() / (conf_matrix.sum() + 1e-10)
-
-        return {
-            'loss'         : total_loss / len(loader),
-            'miou'         : miou,
-            'accuracy'     : acc,
-            'per_class_iou': iou,
-        }
-
-    # ---------------------------------------------------------------------- #
-    # Checkpoint                                                               #
-    # ---------------------------------------------------------------------- #
+        return {'loss': total_loss / len(loader), 'miou': miou,
+                'accuracy': acc, 'per_class_iou': iou}
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
         ckpt = {
@@ -846,19 +793,16 @@ class Trainer:
     def load_checkpoint(self, path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model'])
-
         if load_optimizer and ckpt.get('optimizer'):
             try:
                 self.optimizer.load_state_dict(ckpt['optimizer'])
             except ValueError as e:
                 print(f"Optimizer state not loaded: {e}")
-
         if load_optimizer and 'scaler' in ckpt and ckpt['scaler']:
             try:
                 self.scaler.load_state_dict(ckpt['scaler'])
             except Exception as e:
                 print(f"Scaler state not loaded: {e}")
-
         if reset_epoch:
             self.start_epoch = 0
             self.global_step = 0
@@ -883,60 +827,49 @@ class Trainer:
 def main():
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
 
-    # Transfer learning
     parser.add_argument("--pretrained_weights",    type=str,   default=None)
     parser.add_argument("--freeze_backbone",        action="store_true", default=False)
     parser.add_argument("--unfreeze_schedule",      type=str,   default="",
-                        help="Comma-separated epochs to progressively unfreeze backbone")
+                        help="Comma-separated epochs for progressive unfreeze. "
+                             "E.g. '10,20,30,40' unfreezes stem→stage4→stage5→stage6")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
-    # FIX: thêm dwsa_lr_factor riêng — mặc định 0.5 → lr_dwsa = lr * 0.5
-    # Tách khỏi alpha_lr_factor vì gamma=0 (hoặc 0.1) cần LR đủ lớn để học
-    parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5,
-                        help="LR factor riêng cho DWSA (gamma). Nên >= 0.3 để gamma thoát 0.")
-    parser.add_argument("--alpha_lr_factor",        type=float, default=0.1,
-                        help="LR factor cho FoggyAwareNorm.alpha (soft gate)")
+    parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5)
+    parser.add_argument("--alpha_lr_factor",        type=float, default=0.1)
     parser.add_argument("--use_class_weights",      action="store_true")
 
-    # Dataset
-    parser.add_argument("--train_txt",   required=True)
-    parser.add_argument("--val_txt",     required=True)
+    parser.add_argument("--train_txt",    required=True)
+    parser.add_argument("--val_txt",      required=True)
     parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
-    parser.add_argument("--num_classes", type=int, default=19)
+    parser.add_argument("--num_classes",  type=int, default=19)
     parser.add_argument("--ignore_index", type=int, default=255)
 
-    # Training
-    parser.add_argument("--epochs",            type=int,   default=100)
-    parser.add_argument("--batch_size",        type=int,   default=4)
-    parser.add_argument("--accumulation_steps",type=int,   default=2)
-    parser.add_argument("--lr",                type=float, default=5e-4)
-    parser.add_argument("--weight_decay",      type=float, default=1e-4)
-    parser.add_argument("--grad_clip",         type=float, default=5.0)
-    parser.add_argument("--aux_weight",        type=float, default=0.4)
-    parser.add_argument("--scheduler",         default="onecycle",
+    parser.add_argument("--epochs",             type=int,   default=100)
+    parser.add_argument("--batch_size",         type=int,   default=4)
+    parser.add_argument("--accumulation_steps", type=int,   default=2)
+    parser.add_argument("--lr",                 type=float, default=5e-4)
+    parser.add_argument("--weight_decay",       type=float, default=1e-4)
+    parser.add_argument("--grad_clip",          type=float, default=5.0)
+    parser.add_argument("--aux_weight",         type=float, default=0.4)
+    parser.add_argument("--scheduler",          default="onecycle",
                         choices=["onecycle", "poly", "cosine"])
-    parser.add_argument("--freeze_epochs",     type=int,   default=0)
+    parser.add_argument("--freeze_epochs",      type=int,   default=0)
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
 
-    # Image
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
 
-    # System
-    parser.add_argument("--use_amp",       action="store_true", default=True)
-    parser.add_argument("--num_workers",   type=int, default=4)
-    parser.add_argument("--save_dir",      default="./checkpoints")
-    parser.add_argument("--resume",        type=str, default=None)
-    parser.add_argument("--resume_mode",   type=str, default="transfer",
+    parser.add_argument("--use_amp",        action="store_true", default=True)
+    parser.add_argument("--num_workers",    type=int, default=4)
+    parser.add_argument("--save_dir",       default="./checkpoints")
+    parser.add_argument("--resume",         type=str, default=None)
+    parser.add_argument("--resume_mode",    type=str, default="transfer",
                         choices=["transfer", "continue"])
-    parser.add_argument("--seed",          type=int, default=42)
-    parser.add_argument("--log_interval",  type=int, default=50)
-    parser.add_argument("--save_interval", type=int, default=10)
+    parser.add_argument("--seed",           type=int, default=42)
+    parser.add_argument("--log_interval",   type=int, default=50)
+    parser.add_argument("--save_interval",  type=int, default=10)
     parser.add_argument("--reset_best_metric", action="store_true")
 
     args = parser.parse_args()
-
-    if args.freeze_epochs >= args.epochs:
-        raise ValueError("freeze_epochs must be < total epochs")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -944,17 +877,24 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'='*70}")
-    print(f"GCNet v3 Training  |  FoggyAwareNorm + DWSA stage 4/5/6")
+    print(f"GCNet v3 Training  |  FoggyAwareNorm + DWSA + fog_bridge")
     print(f"{'='*70}")
-    print(f"Device:     {device}")
-    print(f"Image size: {args.img_h}x{args.img_w}")
-    print(f"Epochs:     {args.epochs}  |  Scheduler: {args.scheduler}")
-    print(f"Grad clip:  {args.grad_clip}  |  AMP: {args.use_amp}")
-    print(f"LR DWSA:    {args.lr * args.dwsa_lr_factor:.2e}  (factor={args.dwsa_lr_factor})")
-    print(f"LR alpha:   {args.lr * args.alpha_lr_factor:.2e}  (factor={args.alpha_lr_factor})")
+    print(f"Device: {device}  |  Image: {args.img_h}x{args.img_w}")
+    print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
+
+    # [FIX 3] In rõ unfreeze schedule để tránh bỏ sót
+    if args.unfreeze_schedule:
+        print(f"Unfreeze schedule: epochs {args.unfreeze_schedule}")
+        print(f"  Stage mapping:")
+        print(f"  k=1 → stem_conv1/2, stem_stage2/3")
+        print(f"  k=2 → semantic/detail branch [0], dwsa_stage4, compression_1, down_1")
+        print(f"  k=3 → semantic/detail branch [1], dwsa_stage5, compression_2, down_2")
+        print(f"  k=4 → semantic/detail branch [2], dwsa_stage6, spp")
+    else:
+        print(f"Unfreeze schedule: none (static freeze)")
     print(f"{'='*70}\n")
 
-    cfg          = ModelConfig.get_config()
+    cfg = ModelConfig.get_config()
     args.loss_config = cfg["loss"]
 
     print("Creating dataloaders...")
@@ -970,10 +910,6 @@ def main():
     )
     print("Dataloaders ready\n")
 
-    print(f"{'='*70}")
-    print("BUILDING MODEL")
-    print(f"{'='*70}\n")
-
     backbone = GCNet(**cfg["backbone"])
     head     = GCNetHead(
         **cfg["head"],
@@ -981,16 +917,10 @@ def main():
         ignore_index=args.ignore_index,
     )
     model = Segmentor(backbone=backbone, head=head).to(device)
-
-    print("Applying init_weights...")
     model.apply(init_weights)
     check_model_health(model)
-    print()
 
-    print(f"{'='*70}")
-    print("TRANSFER LEARNING SETUP")
-    print(f"{'='*70}\n")
-
+    # [FIX 1] Load cả backbone + head từ checkpoint
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights)
 
@@ -1000,12 +930,13 @@ def main():
     count_trainable_params(model)
     print_backbone_structure(model)
 
-    # Sanity: in gamma values lúc init để confirm = 0
+    # [FIX 2] Comment đúng: gamma=0.5 là intentional, không phải bug
     print("DWSA gamma values at init:")
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         m = getattr(model.backbone, name, None)
         if m is not None and hasattr(m, 'gamma'):
-            print(f"  {name}.gamma = {m.gamma.item():.6f}  (should be 0.0)")
+            print(f"  {name}.gamma = {m.gamma.item():.6f}  "
+                  f"(init=0.5, sẽ học trong quá trình train)")
     print()
 
     with torch.no_grad():
@@ -1013,9 +944,7 @@ def main():
         try:
             out = model.forward_train(sample)
             c4_logit, c6_logit = out["main"]
-            print(f"Forward pass OK:")
-            print(f"  c4_logit: {c4_logit.shape}")
-            print(f"  c6_logit: {c6_logit.shape}\n")
+            print(f"Forward pass OK: c4={c4_logit.shape}, c6={c6_logit.shape}\n")
         except Exception as e:
             print(f"Forward pass FAILED: {e}")
             return
@@ -1024,11 +953,8 @@ def main():
     scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=0)
 
     trainer = Trainer(
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        device=device,
-        args=args,
+        model=model, optimizer=optimizer, scheduler=scheduler,
+        device=device, args=args,
         class_weights=class_weights if args.use_class_weights else None,
     )
 
@@ -1040,29 +966,20 @@ def main():
             reset_best_metric=args.reset_best_metric,
         )
 
+    # [FIX 3] Parse unfreeze_schedule đúng cách
     unfreeze_epochs = []
     if args.unfreeze_schedule:
         try:
             unfreeze_epochs = sorted(int(e) for e in args.unfreeze_schedule.split(','))
         except Exception:
-            raise ValueError("unfreeze_schedule phải là chuỗi số nguyên cách nhau bởi dấu phẩy")
+            raise ValueError("unfreeze_schedule phải là chuỗi số nguyên, ví dụ: '10,20,30,40'")
 
-    # Module names của GCNet v3 để unfreeze dần.
-    # FIX: đảo thứ tự — stem trước, high-level sau.
-    # Lý do: fog = domain shift mạnh ở pixel level → stem là bottleneck chính.
-    # DWSA nằm ở stage 4/5/6 chỉ hiệu quả khi nhận được low-level feature đã
-    # adapted với foggy domain. Unfreeze stem trước → feature distribution đúng
-    # → DWSA mới học được attention có ý nghĩa.
     UNFREEZE_STAGES = [
-        # k=1: unfreeze stem — fix domain shift ngay từ low-level
         ['stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3'],
-        # k=2: unfreeze stage 4 + DWSA stage 4 — lúc này stem đã adapted
         ['semantic_branch_layers.0', 'detail_branch_layers.0', 'dwsa_stage4',
          'compression_1', 'down_1'],
-        # k=3: unfreeze stage 5 + DWSA stage 5
         ['semantic_branch_layers.1', 'detail_branch_layers.1', 'dwsa_stage5',
          'compression_2', 'down_2'],
-        # k=4: unfreeze stage 6 + DWSA stage 6 + DAPPM
         ['semantic_branch_layers.2', 'detail_branch_layers.2', 'dwsa_stage6', 'spp'],
     ]
 
@@ -1072,18 +989,15 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
-        # Cumulative unfreeze
-        past = [e for e in unfreeze_epochs if e <= epoch]
-        k    = len(past)
+        past    = [e for e in unfreeze_epochs if e <= epoch]
+        k       = len(past)
         targets = []
         for i in range(min(k, len(UNFREEZE_STAGES))):
             targets += UNFREEZE_STAGES[i]
         if targets:
             unfreeze_backbone_progressive(model, targets)
 
-        # Rebuild optimizer + scheduler khi đúng epoch unfreeze
         if epoch in unfreeze_epochs:
-            trainer.set_loss_phase('full')
             optimizer = build_optimizer(model, args)
             scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
             trainer.optimizer = optimizer
@@ -1093,7 +1007,6 @@ def main():
                 print(f"  {g.get('name','?')}: {g['lr']:.2e}")
             print()
 
-        # Switch back to full loss sau ce_only phase
         if unfreeze_epochs:
             last_unfreeze = max((e for e in unfreeze_epochs if e <= epoch), default=None)
             if last_unfreeze is not None:
@@ -1105,15 +1018,15 @@ def main():
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics   = trainer.validate(val_loader, epoch)
 
-        # FIX: log gamma của DWSA mỗi epoch — dùng để monitor xem DWSA có học không
         log_dwsa_gamma(model, trainer.writer, epoch)
 
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
-        print(f"Train — Loss: {train_metrics['loss']:.4f} | OHEM: {train_metrics['ohem']:.4f} | Dice: {train_metrics['dice']:.4f}")
-        print(f"Val   — Loss: {val_metrics['loss']:.4f}  | mIoU: {val_metrics['miou']:.4f}  | Acc: {val_metrics['accuracy']:.4f}")
-        # FIX: in gamma values ra console để theo dõi tiến trình học của DWSA
+        print(f"Train — Loss: {train_metrics['loss']:.4f} | "
+              f"OHEM: {train_metrics['ohem']:.4f} | Dice: {train_metrics['dice']:.4f}")
+        print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
+              f"mIoU: {val_metrics['miou']:.4f}  | Acc: {val_metrics['accuracy']:.4f}")
         for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
             m = getattr(model.backbone, name, None)
             if m is not None and hasattr(m, 'gamma'):
@@ -1130,7 +1043,6 @@ def main():
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
 
     trainer.writer.close()
-
     print(f"\n{'='*70}")
     print("TRAINING COMPLETED!")
     print(f"Best mIoU: {trainer.best_miou:.4f}")
