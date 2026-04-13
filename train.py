@@ -56,13 +56,6 @@ def _remap_stem_key(key: str, N2: int = 4):
 
 
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
-    """Load pretrained weights vào model.backbone VÀ model.decode_head.
-
-    Fix so với bản gốc:
-      1. Load cả head (remap conv_seg → cls_seg)
-      2. Reset DWSA gamma về 0 — tránh random init inject noise vào features
-      3. Reset fog_bridge alpha về -4.0 — near-identity, tránh distribution mismatch
-    """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
@@ -183,6 +176,16 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
             print(f"   {k}")
     elif rate_hd < 60:
         print(f"\n⚠️  HEAD: {rate_hd:.1f}% loaded — shape mismatch.")
+        # In chi tiết shape mismatch để debug
+        for ckpt_key, ckpt_val in state.items():
+            if not ckpt_key.startswith('decode_head.'):
+                continue
+            stripped_hd = ckpt_key[len('decode_head.'):].replace('conv_seg', 'cls_seg')
+            if stripped_hd in model_hd_state:
+                if model_hd_state[stripped_hd].shape != ckpt_val.shape:
+                    print(f"   mismatch: {stripped_hd} "
+                          f"ckpt={tuple(ckpt_val.shape)} "
+                          f"model={tuple(model_hd_state[stripped_hd].shape)}")
         print(f"   → Kiểm tra head.channels trong ModelConfig.")
     else:
         print(f"\n✓  HEAD loaded {rate_hd:.1f}% — pretrained head weights active.")
@@ -191,10 +194,6 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     # ================================================================ #
     # FIX 1: Reset DWSA gamma về 0                                       #
     # ================================================================ #
-    # DWSA có random init weights → inject noise mạnh vào features
-    # → head pretrained không nhận ra features → mIoU epoch 1 ≈ 0
-    # gamma=0 → x + 0*out = x → DWSA transparent hoàn toàn
-    # gamma sẽ tự học tăng dần khi DWSA weights hội tụ
     dwsa_reset = []
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
@@ -209,9 +208,6 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     # ================================================================ #
     # FIX 2: Reset fog_bridge về near-identity                          #
     # ================================================================ #
-    # fog_bridge random init → output distribution khác backbone gốc
-    # → head pretrained không nhận ra features
-    # alpha=-4 → sigmoid(-4)≈0.018 → gần như pure BN → near-identity
     fog_bridge = getattr(model.backbone, 'fog_bridge', None)
     if fog_bridge is not None:
         with torch.no_grad():
@@ -224,6 +220,130 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         print(f"  → fog_bridge transparent, sẽ học dần\n")
 
     return rate_bb
+
+
+# ============================================
+# DEBUG
+# ============================================
+
+def debug_after_load(model, ckpt_path, device, img_h=512, img_w=1024, num_classes=19):
+    """Chạy ngay sau load_pretrained_gcnet để xác nhận weights đúng."""
+    ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state = ckpt.get('state_dict', ckpt)
+
+    sep = '=' * 65
+    print(f"\n{sep}")
+    print("DEBUG: WEIGHT VERIFICATION")
+    print(sep)
+
+    # ---- 1. cls_seg weight match ---------------------------------------- #
+    ckpt_cls_key = 'decode_head.conv_seg.weight'
+    if ckpt_cls_key in state:
+        ckpt_val  = state[ckpt_cls_key].flatten()[:5]
+        model_val = model.decode_head.cls_seg.weight.data.flatten()[:5].cpu()
+        match     = torch.allclose(ckpt_val, model_val, atol=1e-5)
+        print(f"\n[1] cls_seg.weight (first 5):")
+        print(f"    ckpt : {[f'{v:.4f}' for v in ckpt_val.tolist()]}")
+        print(f"    model: {[f'{v:.4f}' for v in model_val.tolist()]}")
+        print(f"    → {'✓ KHỚP — head load thành công' if match else '✗ KHÔNG KHỚP — head load thất bại!'}")
+    else:
+        print(f"\n[1] ✗ Key '{ckpt_cls_key}' không có trong checkpoint")
+
+    # ---- 2. stem_conv1 weight match ------------------------------------- #
+    ckpt_stem_key = 'backbone.stem.0.conv.weight'
+    if ckpt_stem_key in state:
+        ckpt_stem  = state[ckpt_stem_key].flatten()[:5]
+        model_stem = model.backbone.stem_conv1[0].weight.data.flatten()[:5].cpu()
+        match_stem = torch.allclose(ckpt_stem, model_stem, atol=1e-5)
+        print(f"\n[2] stem_conv1.weight (first 5):")
+        print(f"    ckpt : {[f'{v:.4f}' for v in ckpt_stem.tolist()]}")
+        print(f"    model: {[f'{v:.4f}' for v in model_stem.tolist()]}")
+        print(f"    → {'✓ KHỚP — backbone load thành công' if match_stem else '✗ KHÔNG KHỚP — backbone load thất bại!'}")
+
+    # ---- 3. DWSA gamma -------------------------------------------------- #
+    print(f"\n[3] DWSA gamma (phải = 0.000 sau reset):")
+    for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
+        m = getattr(model.backbone, name, None)
+        if m is not None and hasattr(m, 'gamma'):
+            g = m.gamma.item()
+            ok = abs(g) < 0.001
+            print(f"    {name}.gamma = {g:.6f}  {'✓' if ok else '✗ CHƯA RESET!'}")
+
+    # ---- 4. fog_bridge alpha -------------------------------------------- #
+    fb = getattr(model.backbone, 'fog_bridge', None)
+    if fb is not None:
+        a_mean = fb.alpha.data.mean().item()
+        a_sig  = torch.sigmoid(fb.alpha.data).mean().item()
+        ok     = a_mean < -3.0
+        print(f"\n[4] fog_bridge alpha mean = {a_mean:.4f}  "
+              f"sigmoid = {a_sig:.4f}  {'✓' if ok else '✗ CHƯA RESET!'}")
+    else:
+        print(f"\n[4] ✗ fog_bridge không tìm thấy!")
+
+    # ---- 5. Forward pass logit range ------------------------------------ #
+    print(f"\n[5] Forward pass (model.eval()):")
+    model.eval()
+    with torch.no_grad():
+        dummy = torch.randn(1, 3, img_h, img_w).to(device)
+        try:
+            out      = model(dummy)
+            out_up   = F.interpolate(out, size=(img_h, img_w),
+                                     mode='bilinear', align_corners=False)
+            pred     = out_up.argmax(1)
+            n_cls    = pred.unique().numel()
+            l_std    = out.std().item()
+            l_max    = out.abs().max().item()
+            l_mean   = out.mean().item()
+            print(f"    logit mean={l_mean:.3f}  std={l_std:.3f}  max_abs={l_max:.3f}")
+            print(f"    unique classes predicted: {n_cls} / {num_classes}")
+            if l_std < 0.1:
+                print(f"    ✗ std quá thấp → model predict gần uniform → head chưa hoạt động")
+            elif l_std > 20:
+                print(f"    ✗ std quá cao → exploding")
+            else:
+                print(f"    ✓ logit range bình thường")
+            if n_cls < 3:
+                print(f"    ✗ chỉ predict {n_cls} class → model chưa nhận ra features")
+            else:
+                print(f"    ✓ predict {n_cls} classes")
+        except Exception as e:
+            print(f"    ✗ FAILED: {e}")
+    model.train()
+
+    # ---- 6. BN mode ----------------------------------------------------- #
+    print(f"\n[6] BN train/eval trong backbone:")
+    bn_train, bn_eval, bn_train_names = 0, 0, []
+    for name, m in model.backbone.named_modules():
+        if isinstance(m, nn.BatchNorm2d):
+            if m.training:
+                bn_train += 1
+                if len(bn_train_names) < 8:
+                    bn_train_names.append(name)
+            else:
+                bn_eval += 1
+    print(f"    eval={bn_eval}  train={bn_train}")
+    if bn_train > 0:
+        print(f"    BN đang train:")
+        for n in bn_train_names:
+            print(f"      {n}")
+        if bn_train > 10:
+            print(f"    ✗ Quá nhiều BN ở train mode trong frozen backbone!")
+        else:
+            print(f"    ✓ Chỉ DWSA/fog_bridge/FAN ở train mode — đúng")
+
+    # ---- 7. head channels ----------------------------------------------- #
+    print(f"\n[7] Head channel sizes:")
+    print(f"    head.head[2].conv.weight shape: "
+          f"{model.decode_head.head[2].conv.weight.shape}")
+    print(f"    cls_seg.weight shape          : "
+          f"{model.decode_head.cls_seg.weight.shape}")
+    ckpt_head_conv = state.get('decode_head.head.2.conv.weight')
+    if ckpt_head_conv is not None:
+        match = model.decode_head.head[2].conv.weight.shape == ckpt_head_conv.shape
+        print(f"    ckpt head[2].conv shape       : {tuple(ckpt_head_conv.shape)}")
+        print(f"    → {'✓ KHỚP' if match else '✗ KHÔNG KHỚP — head.channels sai!'}")
+
+    print(f"\n{sep}\n")
 
 
 # ============================================
@@ -405,10 +525,7 @@ def count_trainable_params(model):
 
 
 def freeze_backbone(model):
-    """Freeze toàn bộ backbone trừ DWSA, fog_bridge và FoggyAwareNorm."""
     print("Freezing backbone (keeping DWSA + fog_bridge + FoggyAwareNorm trainable)...")
-
-    # Bước 1: Freeze + lock BN toàn backbone
     for p in model.backbone.parameters():
         p.requires_grad = False
     bn_count = 0
@@ -420,7 +537,6 @@ def freeze_backbone(model):
             bn_count += 1
     print(f"  {bn_count} BN layers locked")
 
-    # Bước 2: Unfreeze DWSA (+ BN trong DWSA)
     dwsa_params = 0; dwsa_bn = 0
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
@@ -437,7 +553,6 @@ def freeze_backbone(model):
                 dwsa_bn += 1
     print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn} BN unfrozen")
 
-    # Bước 3: Unfreeze fog_bridge
     fog_bridge = getattr(model.backbone, 'fog_bridge', None)
     if fog_bridge is not None:
         for p in fog_bridge.parameters():
@@ -448,9 +563,8 @@ def freeze_backbone(model):
         print(f"  fog_bridge kept trainable: "
               f"{sum(p.numel() for p in fog_bridge.parameters()):,} params")
     else:
-        print("  ⚠️  fog_bridge not found — using old backbone?")
+        print("  ⚠️  fog_bridge not found!")
 
-    # Bước 4: Unfreeze FoggyAwareNorm (alpha + BN + IN) trong stem_conv1/2
     fan_params = 0
     for name in ['stem_conv1', 'stem_conv2']:
         module = getattr(model.backbone, name, None)
@@ -649,24 +763,19 @@ class Trainer:
             json.dump(vars(self.args), f, indent=2, default=str)
 
     def _set_bn_train_for_trainable_layers(self):
-        """Set BN về eval cho frozen layers, train cho các layer đang trainable."""
-        # Trước tiên lock toàn bộ BN backbone về eval
         for m in self.model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
-        # Mở lại BN trong DWSA nếu đang trainable
         for layer_name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
             layer = getattr(self.model.backbone, layer_name, None)
             if layer is not None:
                 for m in layer.modules():
                     if isinstance(m, nn.BatchNorm2d) and m.weight.requires_grad:
                         m.train()
-        # Mở lại BN trong fog_bridge nếu trainable
         fog_bridge = getattr(self.model.backbone, 'fog_bridge', None)
         if fog_bridge is not None and hasattr(fog_bridge, 'bn'):
             if fog_bridge.bn.weight is not None and fog_bridge.bn.weight.requires_grad:
                 fog_bridge.bn.train()
-        # Mở lại BN trong FoggyAwareNorm (stem_conv1/2)
         for name in ['stem_conv1', 'stem_conv2']:
             layer = getattr(self.model.backbone, name, None)
             if layer is not None and len(layer) > 1 and hasattr(layer[1], 'bn'):
@@ -695,9 +804,7 @@ class Trainer:
                 target_size = masks.shape[-2:]
                 c4_full = F.interpolate(c4_logit, size=target_size, mode='bilinear', align_corners=False)
                 c6_full = F.interpolate(c6_logit, size=target_size, mode='bilinear', align_corners=False)
-
                 ohem_loss = self.ohem(c6_full, masks)
-
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
                         masks.unsqueeze(1).float(), size=c6_logit.shape[-2:], mode='nearest'
@@ -705,13 +812,10 @@ class Trainer:
                     dice_loss = self.dice(c6_logit, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
-
                 loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
-
                 if self.args.aux_weight > 0:
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
                     loss       = loss + aux_weight * self.ohem(c4_full, masks)
-
                 loss = loss / self.args.accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -793,7 +897,6 @@ class Trainer:
                     dice_loss = torch.tensor(0.0, device=self.device)
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             total_loss += loss.item()
-
             pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             valid  = (target >= 0) & (target < num_classes)
@@ -870,8 +973,7 @@ def main():
     parser.add_argument("--pretrained_weights",    type=str,   default=None)
     parser.add_argument("--freeze_backbone",        action="store_true", default=False)
     parser.add_argument("--unfreeze_schedule",      type=str,   default="",
-                        help="Comma-separated epochs for progressive unfreeze. "
-                             "E.g. '15,30,45,60'")
+                        help="Comma-separated epochs for progressive unfreeze.")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
     parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5)
     parser.add_argument("--alpha_lr_factor",        type=float, default=0.1)
@@ -923,13 +1025,6 @@ def main():
     print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
     if args.unfreeze_schedule:
         print(f"Unfreeze schedule: {args.unfreeze_schedule}")
-        print(f"  k=1 (epoch {args.unfreeze_schedule.split(',')[0] if args.unfreeze_schedule else '?'})"
-              f" → stem_conv1/2, stem_stage2/3")
-        print(f"  k=2 → semantic/detail[0], dwsa_stage4, compression_1, down_1")
-        print(f"  k=3 → semantic/detail[1], dwsa_stage5, compression_2, down_2")
-        print(f"  k=4 → semantic/detail[2], dwsa_stage6, spp")
-    else:
-        print(f"Unfreeze schedule: none")
     print(f"{'='*70}\n")
 
     cfg = ModelConfig.get_config()
@@ -958,9 +1053,16 @@ def main():
     model.apply(init_weights)
     check_model_health(model)
 
-    # Load pretrained backbone + head
+    # ------------------------------------------------------------------ #
+    # Load pretrained + DEBUG                                              #
+    # ------------------------------------------------------------------ #
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights)
+        # DEBUG: chạy sau load để xác nhận weights đúng
+        # Xóa hoặc comment dòng này sau khi xác nhận OK
+        debug_after_load(model, args.pretrained_weights, device,
+                         img_h=args.img_h, img_w=args.img_w,
+                         num_classes=args.num_classes)
 
     if args.freeze_backbone:
         freeze_backbone(model)
@@ -972,7 +1074,7 @@ def main():
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         m = getattr(model.backbone, name, None)
         if m is not None and hasattr(m, 'gamma'):
-            print(f"  {name}.gamma = {m.gamma.item():.6f}  (init=0.5)")
+            print(f"  {name}.gamma = {m.gamma.item():.6f}")
     print()
 
     with torch.no_grad():
@@ -1024,7 +1126,6 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
-        # Progressive unfreeze (cumulative)
         past    = [e for e in unfreeze_epochs if e <= epoch]
         k       = len(past)
         targets = []
@@ -1033,7 +1134,6 @@ def main():
         if targets:
             unfreeze_backbone_progressive(model, targets)
 
-        # Rebuild optimizer+scheduler tại epoch unfreeze
         if epoch in unfreeze_epochs:
             optimizer = build_optimizer(model, args)
             scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
@@ -1044,7 +1144,6 @@ def main():
                 print(f"  {g.get('name','?')}: {g['lr']:.2e}")
             print()
 
-        # Loss phase: ce_only ngay sau unfreeze, full sau đó
         if unfreeze_epochs:
             last_unfreeze = max((e for e in unfreeze_epochs if e <= epoch), default=None)
             if last_unfreeze is not None:
