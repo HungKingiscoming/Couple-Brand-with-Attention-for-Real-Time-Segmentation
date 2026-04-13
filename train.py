@@ -32,55 +32,90 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # [FIX 1] Load cả backbone lẫn head từ checkpoint
 # ============================================
 def load_full_checkpoint(model, ckpt_path):
-    """Load cả backbone + head với remap conv_seg → cls_seg."""
+    """Load cả backbone + head với remap stem key và bỏ qua shape mismatch."""
+    import re
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    # Remap key: conv_seg → cls_seg
+    def remap_key(key):
+        # conv_seg → cls_seg
+        key = key.replace('conv_seg', 'cls_seg')
+
+        # backbone.stem.N.* → backbone.stem_conv1/2/stage2/stage3
+        m = re.match(r'(backbone\.)stem\.(\d+)\.(.+)$', key)
+        if m:
+            prefix = m.group(1)   # 'backbone.'
+            idx    = int(m.group(2))
+            rest   = m.group(3)
+
+            # stem.0 → stem_conv1.0 (Conv2d, bỏ BN vì đã thay bằng FAN)
+            if idx == 0:
+                if rest.startswith('conv.'):
+                    return f'{prefix}stem_conv1.0.{rest[5:]}'
+                return None   # BN của stem.0 → drop (FoggyAwareNorm thay thế)
+
+            # stem.1 → stem_conv2.0
+            elif idx == 1:
+                if rest.startswith('conv.'):
+                    return f'{prefix}stem_conv2.0.{rest[5:]}'
+                return None   # BN của stem.1 → drop
+
+            # stem.2..5 → stem_stage2.0..3
+            elif 2 <= idx <= 5:
+                return f'{prefix}stem_stage2.{idx - 2}.{rest}'
+
+            # stem.6..9 → stem_stage3.0..3
+            else:
+                return f'{prefix}stem_stage3.{idx - 6}.{rest}'
+
+        return key
+
+    # Remap tất cả keys
     remapped = {}
     for k, v in state.items():
-        new_k = k.replace('conv_seg', 'cls_seg')
-        remapped[new_k] = v
+        new_k = remap_key(k)
+        if new_k is not None:
+            remapped[new_k] = v
 
-    missing, unexpected = model.load_state_dict(remapped, strict=False)
+    # Load chỉ key có shape match
+    model_state    = model.state_dict()
+    filtered       = {}
+    shape_mismatch = []
 
-    # Phân loại missing keys
+    for k, v in remapped.items():
+        if k not in model_state:
+            continue
+        if model_state[k].shape != v.shape:
+            shape_mismatch.append(
+                f"{k}: ckpt={tuple(v.shape)} model={tuple(model_state[k].shape)}")
+            continue
+        filtered[k] = v
+
+    missing, _ = model.load_state_dict(filtered, strict=False)
+
     expected_missing = [k for k in missing if any(s in k for s in
-        ['dwsa', 'alpha', 'in_.', 'fog_bridge', 'FoggyAware',
-         'stem_conv1.1', 'stem_conv2.1'])]
+        ['dwsa', 'alpha', 'in_.', 'fog_bridge', 'stem_conv1.1', 'stem_conv2.1'])]
     unexpected_missing = [k for k in missing if k not in expected_missing]
 
-    print(f"Loaded: {len(remapped) - len(missing)} / {len(model.state_dict())} keys")
-    print(f"Expected missing (new layers): {len(expected_missing)}")
+    print(f"\n{'='*60}")
+    print("WEIGHT LOADING SUMMARY")
+    print(f"{'='*60}")
+    print(f"Loaded:            {len(filtered):>5} / {len(model_state)}")
+    print(f"Expected missing:  {len(expected_missing):>5}  (DWSA, fog_bridge, FAN)")
+    print(f"Shape mismatch:    {len(shape_mismatch):>5}  (head channels 64 vs 128)")
+    if shape_mismatch:
+        print(f"\nShape mismatch (skipped):")
+        for s in shape_mismatch[:5]:
+            print(f"  {s}")
     if unexpected_missing:
-        print(f"⚠️  Unexpected missing ({len(unexpected_missing)}):")
-        for k in unexpected_missing[:10]:
+        print(f"\n⚠️  Unexpected missing ({len(unexpected_missing)}):")
+        for k in unexpected_missing[:5]:
             print(f"  - {k}")
     else:
-        print("✓ Tất cả pretrained weights loaded thành công")
-    return model
-def _remap_stem_key(key: str, N2: int = 4):
-    import re as _re
-    for pref in ['backbone.', 'model.', 'module.']:
-        if key.startswith(pref):
-            key = key[len(pref):]
-    m = _re.match(r'stem\.(\d+)\.(.+)$', key)
-    if not m:
-        return key
-    idx  = int(m.group(1))
-    rest = m.group(2)
-    def _map_convmodule(rest_str, target_prefix):
-        if rest_str.startswith('conv.'):
-            return f'{target_prefix}.{rest_str[len("conv."):].lstrip(".")}'
-        return None
-    if idx == 0:
-        return _map_convmodule(rest, 'stem_conv1.0')
-    elif idx == 1:
-        return _map_convmodule(rest, 'stem_conv2.0')
-    elif 2 <= idx <= 1 + N2:
-        return f'stem_stage2.{idx - 2}.{rest}'
-    else:
-        return f'stem_stage3.{idx - (2 + N2)}.{rest}'
+        print(f"\n✓ Backbone fully loaded. Head shape mismatch là expected")
+        print(f"  vì checkpoint channels=64, model channels=128.")
+        print(f"  → Đổi head.channels=64 trong ModelConfig để load head luôn.")
+    print(f"{'='*60}\n")
 
 
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
