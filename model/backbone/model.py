@@ -5,337 +5,414 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from torch import Tensor
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union, List
 
 from components.components import (
     BaseModule,
     ConvModule,
+    DAPPM,
     build_norm_layer,
     build_activation_layer,
     resize,
     OptConfigType,
-    SampleList,
 )
 
 
 # =============================================================================
-# Accuracy helper
+# Foggy-aware Normalization
 # =============================================================================
 
-def accuracy(pred: Tensor,
-             target: Tensor,
-             ignore_index: int = 255) -> Tensor:
-    """Tính pixel accuracy, bỏ qua các pixel có nhãn = ignore_index.
+class FoggyAwareNorm(nn.Module):
+    """Foggy-aware Normalization.
 
-    Args:
-        pred (Tensor): Logits shape (B, C, H, W).
-        target (Tensor): Ground truth shape (B, H, W).
-        ignore_index (int): Label value to ignore. Default: 255.
+    Kết hợp Instance Normalization (robust với distribution shift của foggy
+    images) và Batch Normalization thông qua một learnable gate `alpha`.
 
-    Returns:
-        Tensor: Scalar accuracy in [0, 100].
-    """
-    pred_label = pred.argmax(dim=1)             # (B, H, W)
-    mask       = target != ignore_index
-    correct    = (pred_label[mask] == target[mask]).sum().float()
-    total      = mask.sum().float().clamp(min=1)
-    return correct / total * 100.0
+    Khi alpha → 1: thiên về IN (tốt cho foggy / unseen domain).
+    Khi alpha → 0: thiên về BN (tốt cho clear images / in-domain).
 
-
-# =============================================================================
-# Cross-entropy loss wrapper
-# =============================================================================
-
-class CrossEntropyLoss(nn.Module):
-    """Wrapper nhỏ quanh F.cross_entropy để tương thích với loss_decode API.
-
-    Args:
-        ignore_index (int): Label value to ignore. Default: 255.
-        loss_weight (float): Scalar weight applied to this loss. Default: 1.0.
+    [CITYSCAPES FOGGY] alpha khởi tạo 0.5 — cân bằng IN/BN ngay từ đầu.
+    Khi fine-tune từ Cityscapes clear, alpha sẽ tự học dịch về 1 (IN)
+    để thích nghi với distribution shift của fog.
     """
 
     def __init__(self,
-                 ignore_index: int = 255,
-                 loss_weight: float = 1.0):
+                 num_channels: int,
+                 requires_grad: bool = True,
+                 eps: float = 1e-5,
+                 momentum: float = 0.1):
         super().__init__()
-        self.ignore_index = ignore_index
-        self.loss_weight  = loss_weight
 
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        return self.loss_weight * F.cross_entropy(
-            pred, target, ignore_index=self.ignore_index)
+        self.bn  = nn.BatchNorm2d(num_channels, eps=eps, momentum=momentum,
+                                   affine=True, track_running_stats=True)
+        self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
+                                      affine=True, track_running_stats=False)
+        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2b]
+        # alpha init 0.5 → balanced. Khi fine-tune foggy, alpha drift về 1 (IN).
+        # Nếu train trực tiếp trên foggy không qua pretrain clear, có thể init 0.7.
+        self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
 
+        if not requires_grad:
+            for p in self.parameters():
+                p.requires_grad_(False)
 
-# =============================================================================
-# OHEM Cross-entropy loss
-# =============================================================================
-
-class OHEMCrossEntropyLoss(nn.Module):
-    """Online Hard Example Mining Cross-Entropy Loss.
-
-    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 3]
-    Thay CrossEntropyLoss thuần bằng OHEM cho loss_c6 (main loss).
-
-    Lý do: Cityscapes Foggy có class imbalance nặng hơn Cityscapes thường —
-    fog che khuất nhiều pixel của các class nhỏ (người đi bộ, xe đạp, biển báo),
-    khiến model dễ dominated bởi background và road (class lớn, loss thấp).
-    OHEM giải quyết bằng cách chỉ backprop qua các pixel "khó" (loss cao),
-    buộc model focus vào các vùng bị fog che phủ.
-
-    Cơ chế:
-      1. Tính per-pixel CE loss với reduction='none'.
-      2. Loại bỏ pixel ignore_index.
-      3. Sort loss giảm dần.
-      4. Giữ lại top-K pixel: K = max(n_pixel_with_loss > thresh, min_kept).
-      5. Backprop qua mean loss của K pixel đó.
-
-    Args:
-        ignore_index (int): Label value to ignore. Default: 255.
-        loss_weight (float): Scalar weight applied to this loss. Default: 1.0.
-        thresh (float): Loss threshold để xác định "hard example".
-            Pixel có loss > thresh đều được giữ. Default: 0.7.
-            Tăng thresh → strict hơn (chỉ lấy pixel rất khó).
-            Giảm thresh → lấy nhiều pixel hơn (gần với CE thường).
-        min_kept (int): Số pixel tối thiểu được giữ dù loss < thresh.
-            Đảm bảo gradient không quá thưa khi fog nhẹ. Default: 100_000.
-            Với Cityscapes (1024×2048 → ~2M pixel/image), 100k ≈ 5% pixel/image.
-
-    Lưu ý training:
-        - Với batch_size nhỏ (< 4), có thể tăng min_kept lên 200_000.
-        - Nếu model diverge sớm, thử tăng thresh lên 0.9 (chỉ lấy pixel
-          rất khó, giảm gradient noise).
-        - OHEM không áp dụng cho loss_c4 (auxiliary) — CE thường là đủ.
-    """
-
-    def __init__(self,
-                 ignore_index: int = 255,
-                 loss_weight: float = 1.0,
-                 thresh: float = 0.7,
-                 min_kept: int = 100_000):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.loss_weight  = loss_weight
-        self.thresh       = thresh
-        self.min_kept     = min_kept
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        """
-        Args:
-            pred   (Tensor): Logits shape (B, C, H, W).
-            target (Tensor): Ground truth shape (B, H, W), dtype=torch.long.
-
-        Returns:
-            Tensor: Scalar OHEM loss.
-        """
-        # Per-pixel CE, không reduce
-        losses = F.cross_entropy(
-            pred, target,
-            ignore_index=self.ignore_index,
-            reduction='none'
-        ).view(-1)                                   # (B*H*W,)
-
-        # Loại pixel ignore
-        valid_mask = target.view(-1) != self.ignore_index
-        losses     = losses[valid_mask]              # (N_valid,)
-
-        if losses.numel() == 0:
-            return pred.sum() * 0.0                 # safe zero-grad
-
-        # Sort giảm dần, giữ top-K
-        losses_sorted, _ = losses.sort(descending=True)
-
-        # K = max(số pixel có loss > thresh, min_kept)
-        n_above_thresh = (losses_sorted > self.thresh).sum().item()
-        n_keep         = int(max(n_above_thresh, self.min_kept))
-        n_keep         = min(n_keep, losses_sorted.numel())   # clamp to available
-
-        return self.loss_weight * losses_sorted[:n_keep].mean()
+    def forward(self, x: Tensor) -> Tensor:
+        alpha = torch.sigmoid(self.alpha)
+        return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
 
 
 # =============================================================================
-# Fog Consistency Loss
+# DWSA — Dynamic Weight Self-Attention
 # =============================================================================
 
-class FogConsistencyLoss(nn.Module):
-    """Fog Consistency Loss — KL divergence giữa predictions của cùng scene
-    ở hai mức fog khác nhau.
+class DWSA(nn.Module):
+    """Dynamic Weight Self-Attention.
 
-    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 4]
-    Cityscapes Foggy cung cấp 3 mức fog (beta = 0.005, 0.01, 0.02) cho cùng
-    scene. Loss này khuyến khích model cho prediction nhất quán giữa các mức
-    fog: p(y | foggy_light) ≈ p(y | foggy_heavy).
+    Áp lên semantic branch (global context) thay vì detail branch (local).
+    Lý do: semantic branch downsampled 1/16~1/32 → spatial attention trên
+    global feature có ý nghĩa hơn. Với foggy images, fog là global degradation
+    → suppress trên semantic branch hiệu quả hơn.
 
-    Ý tưởng: Nhãn ground-truth là như nhau cho cả 3 mức → model không nên
-    thay đổi prediction đột ngột khi fog thay đổi mức độ.
-
-    Cơ chế:
-      KL(softmax(logit_a/T) || softmax(logit_b/T)) * T²
-      Temperature T làm mềm distribution, tập trung vào "dark knowledge".
-
-    Args:
-        temperature (float): Softmax temperature. Default: 4.0.
-            T cao → soft distribution, focus vào class-level similarity.
-            T thấp → hard distribution, gần với CE thường.
-        loss_weight (float): Scalar weight. Default: 0.1.
-            Giữ nhỏ để không át loss_c6 chính. Tăng lên 0.2 nếu
-            train multi-beta với batch cân bằng giữa các mức fog.
-
-    Cách dùng trong training loop:
-        # Giả sử mỗi batch có ảnh foggy ở 2 mức beta khác nhau:
-        logit_light = head(backbone(img_light))   # beta=0.005
-        logit_heavy = head(backbone(img_heavy))   # beta=0.02
-        loss_fog = fog_consistency(logit_light, logit_heavy)
-
-    Lưu ý:
-        - Chỉ có ý nghĩa khi train với NHIỀU MỨC fog trong cùng batch.
-          Nếu chỉ dùng một mức beta, bỏ loss này — không có tác dụng.
-        - logit_a và logit_b phải cùng shape (B, C, H, W).
-        - Nên detach() một trong hai nếu muốn one-way KL (thường detach logit_b
-          để logit_a học về phía logit_b — heavy fog học từ light fog).
-    """
-
-    def __init__(self,
-                 temperature: float = 4.0,
-                 loss_weight: float = 0.1):
-        super().__init__()
-        self.T           = temperature
-        self.loss_weight = loss_weight
-
-    def forward(self, logit_a: Tensor, logit_b: Tensor) -> Tensor:
-        """
-        Args:
-            logit_a (Tensor): Logits shape (B, C, H, W) — ảnh foggy mức A.
-            logit_b (Tensor): Logits shape (B, C, H, W) — ảnh foggy mức B.
-                Nên .detach() logit_b nếu muốn one-way KL
-                (logit_a học về phía logit_b).
-
-        Returns:
-            Tensor: Scalar consistency loss.
-        """
-        assert logit_a.shape == logit_b.shape, (
-            f"FogConsistencyLoss: shape mismatch "
-            f"{logit_a.shape} vs {logit_b.shape}"
-        )
-
-        log_p = F.log_softmax(logit_a / self.T, dim=1)   # log Q
-        q     = F.softmax(logit_b / self.T, dim=1)        # P (target)
-
-        # KL(P || Q) * T² — scale back bởi T² để gradient magnitude
-        # không phụ thuộc vào lựa chọn temperature
-        kl = F.kl_div(log_p, q, reduction='batchmean') * (self.T ** 2)
-
-        return self.loss_weight * kl
-
-
-# =============================================================================
-# GCNetHead
-# =============================================================================
-
-class GCNetHead(BaseModule):
-    """Decode head for GCNet.
-
-    Nhận output từ GCNet backbone:
-      - Training  : (c4_feat, c6_feat) — c4 cho auxiliary loss, c6 cho main loss
-      - Inference : c6_feat only
-
-    Loss:
-      loss_c4 = CE(upsample(c4_logit), gt)           weight = loss_weight_aux
-      loss_c6 = OHEM_CE(upsample(c6_logit), gt)      weight = 1.0   [ĐIỀU CHỈNH 3]
-      loss_fog = FogConsistency(logit_a, logit_b)     weight = 0.1   [ĐIỀU CHỈNH 4]
-      acc_seg  = pixel accuracy trên c6_logit
-
-    Args:
-        in_channels (int): Channels của c6_feat (backbone output chính).
-            Với GCNet-S/M channels=32: in_channels = channels*4 = 128.
-        channels (int): Hidden channels bên trong head.
-        num_classes (int): Số lớp phân đoạn (bao gồm background).
-        norm_cfg (dict): Norm config. Default: BN.
-        act_cfg (dict): Activation config. Default: ReLU.
-        align_corners (bool): F.interpolate align_corners. Default: False.
-        ignore_index (int): Label ignored trong loss và accuracy. Default: 255.
-        loss_weight_aux (float): Weight của auxiliary loss (c4). Default: 0.4.
-        dropout_ratio (float): Dropout trước cls_seg. Default: 0.1.
-        ohem_thresh (float): OHEM threshold cho loss_c6. Default: 0.7.
-        ohem_min_kept (int): OHEM min pixel kept cho loss_c6. Default: 100_000.
-        fog_consistency_weight (float): Weight của FogConsistencyLoss.
-            Set 0.0 để disable nếu không train multi-beta. Default: 0.1.
-        fog_temperature (float): Temperature cho FogConsistencyLoss. Default: 4.0.
-        init_cfg (dict, optional): Init config. Default: None.
+    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1]
+    - gamma: 0.1 → 0.5 — DWSA có ảnh hưởng mạnh hơn ngay từ đầu training.
+      Fog là global degradation; attention cần suppress fog-region mạnh hơn.
+    - pooling: H//4+1 → max(H//8, 4) — pooling thô hơn để bắt fog-pattern
+      toàn cục, tránh bị nhiễu bởi local texture.
     """
 
     def __init__(self,
                  in_channels: int,
-                 channels: int,
-                 num_classes: int,
-                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
-                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
-                 align_corners: bool = False,
-                 ignore_index: int = 255,
-                 loss_weight_aux: float = 0.4,
-                 dropout_ratio: float = 0.1,
-                 # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 3] OHEM params
-                 ohem_thresh: float = 0.7,
-                 ohem_min_kept: int = 100_000,
-                 # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 4] Fog consistency params
-                 fog_consistency_weight: float = 0.1,
-                 fog_temperature: float = 4.0,
-                 init_cfg: OptConfigType = None):
-        super().__init__(init_cfg)
+                 reduction: int = 8,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True)):
+        super().__init__()
 
-        self.in_channels         = in_channels
-        self.channels            = channels
-        self.num_classes         = num_classes
-        self.norm_cfg            = norm_cfg
-        self.act_cfg             = act_cfg
-        self.align_corners       = align_corners
-        self.ignore_index        = ignore_index
-        self.loss_weight_aux     = loss_weight_aux
+        mid_channels = max(in_channels // reduction, 16)
 
-        # ---- Main head (c6) ---------------------------------------------- #
-        self.head = self._make_base_head(in_channels, channels)
+        self.query   = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
+        self.key     = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
+        self.value   = nn.Conv2d(in_channels, in_channels,  kernel_size=1, bias=False)
 
-        # ---- Auxiliary head (c4) ----------------------------------------- #
-        self.aux_head_c4    = self._make_base_head(in_channels // 2, channels)
-        self.aux_cls_seg_c4 = nn.Conv2d(channels, num_classes, kernel_size=1)
-
-        # ---- Final classifiers ------------------------------------------- #
-        self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
-        self.cls_seg  = nn.Conv2d(channels, num_classes, kernel_size=1)
-
-        # ---- Loss functions ---------------------------------------------- #
-        # Auxiliary loss (c4): CE thường — đủ cho supervision ở feature level
-        self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
-                                         loss_weight=loss_weight_aux)
-
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 3]
-        # Main loss (c6): OHEM-CE thay CE thường.
-        # Fog che khuất class nhỏ → OHEM focus backprop vào pixel khó.
-        self.loss_c6 = OHEMCrossEntropyLoss(
-            ignore_index=ignore_index,
-            loss_weight=1.0,
-            thresh=ohem_thresh,
-            min_kept=ohem_min_kept,
+        self.dw_gen = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(in_channels, mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(mid_channels, in_channels),
+            nn.Sigmoid(),
         )
 
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 4]
-        # Fog consistency loss: chỉ active khi train multi-beta.
-        # Set fog_consistency_weight=0.0 để disable hoàn toàn.
-        self.fog_consistency_weight = fog_consistency_weight
-        if fog_consistency_weight > 0.0:
-            self.loss_fog = FogConsistencyLoss(
-                temperature=fog_temperature,
-                loss_weight=fog_consistency_weight,
-            )
-        else:
-            self.loss_fog = None
+        self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
+        _, self.norm  = build_norm_layer(norm_cfg, in_channels)
 
-        self.init_weights()
+        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1a]
+        # gamma: 0.1 → 0.5
+        # Fog = global degradation → DWSA cần có ảnh hưởng mạnh hơn ngay từ
+        # epoch đầu để học suppress fog-region trên semantic branch.
+        # Nếu thấy training không ổn định, có thể hạ về 0.3.
+        self.gamma = nn.Parameter(torch.ones(1) * 0.5)
 
-    # ---------------------------------------------------------------------- #
-    # Weight init                                                              #
-    # ---------------------------------------------------------------------- #
+        self._init_weights()
 
-    def init_weights(self):
+    def _init_weights(self):
+        for m in [self.query, self.key, self.value, self.out_proj]:
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+
+    def forward(self, x: Tensor) -> Tensor:
+        B, C, H, W = x.shape
+
+        q = self.query(x)
+        k = self.key(x)
+        v = self.value(x)
+
+        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1b]
+        # Pooling thô hơn: H//8 thay vì H//4
+        # Fog là degradation toàn cục → pooling thô bắt fog-pattern tốt hơn,
+        # không bị nhiễu bởi local texture (vỉa hè, tường, biển báo).
+        # clamp min=4 để tránh tensor quá nhỏ ở resolution thấp.
+        ph = max(H // 8, 4)
+        pw = max(W // 8, 4)
+
+        q_pool = F.adaptive_avg_pool2d(q, (ph, pw)).flatten(2)
+        k_pool = F.adaptive_avg_pool2d(k, (ph, pw)).flatten(2)
+        v_pool = F.adaptive_avg_pool2d(v, (ph, pw)).flatten(2)
+
+        scale = q_pool.shape[1] ** -0.5
+        attn  = torch.softmax(
+            torch.bmm(q_pool.transpose(1, 2), k_pool) * scale,
+            dim=-1
+        )
+
+        attended = torch.bmm(v_pool, attn.transpose(1, 2))
+        attended = attended.view(B, C, ph, pw)
+        attended = F.interpolate(attended, size=(H, W),
+                                 mode='bilinear', align_corners=False)
+
+        dw  = self.dw_gen(x).view(B, C, 1, 1)
+        out = self.out_proj(attended * dw)
+        out = self.norm(out)
+
+        return x + self.gamma * out
+
+
+# =============================================================================
+# GCNet backbone
+# =============================================================================
+
+class GCNet(BaseModule):
+    """GCNet backbone với DWSA trên semantic branch và FoggyAwareNorm.
+
+    Thay đổi so với bản gốc:
+      1. Stem dùng FoggyAwareNorm thay BN ở 2 conv đầu.
+      2. DWSA áp lên SEMANTIC branch (không phải detail branch):
+         - stage4: x_s sau bilateral fusion (channels*4, 1/16)
+         - stage5: x_s sau bilateral fusion (channels*8, 1/32)
+         - stage6: x_spp (DAPPM output) trước khi fuse với x_d (channels*4)
+      3. gamma khởi tạo 0.5 — DWSA có ảnh hưởng mạnh hơn ngay từ epoch đầu.
+
+    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2]
+    Thêm fog_bridge (FoggyAwareNorm) sau stem_stage3, trước khi split thành
+    semantic và detail branch. Đây là điểm mà feature fog bắt đầu "thấm sâu"
+    — một FoggyAwareNorm tại đây giúp cả hai branch bắt đầu từ fog-robust
+    representation, thay vì chỉ normalize ở 2 conv đầu.
+    """
+
+    def __init__(self,
+                 in_channels: int = 3,
+                 channels: int = 32,
+                 ppm_channels: int = 128,
+                 num_blocks_per_stage: List = [4, 4, [5, 4], [5, 4], [2, 2]],
+                 align_corners: bool = False,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 dwsa_reduction: int = 8,
+                 init_cfg: OptConfigType = None,
+                 deploy: bool = False):
+        super().__init__(init_cfg)
+
+        self.in_channels          = in_channels
+        self.channels             = channels
+        self.ppm_channels         = ppm_channels
+        self.num_blocks_per_stage = num_blocks_per_stage
+        self.align_corners        = align_corners
+        self.norm_cfg             = norm_cfg
+        self.act_cfg              = act_cfg
+        self.deploy               = deploy
+
+        # ------------------------------------------------------------------ #
+        # Stage 1 — FoggyAwareNorm ở 2 conv đầu                              #
+        # ------------------------------------------------------------------ #
+        self.stem_conv1 = nn.Sequential(
+            nn.Conv2d(in_channels, channels,
+                      kernel_size=3, stride=2, padding=1, bias=False),
+            FoggyAwareNorm(channels),
+            build_activation_layer(act_cfg),
+        )
+        self.stem_conv2 = nn.Sequential(
+            nn.Conv2d(channels, channels,
+                      kernel_size=3, stride=2, padding=1, bias=False),
+            FoggyAwareNorm(channels),
+            build_activation_layer(act_cfg),
+        )
+
+        self.stem_stage2 = nn.Sequential(
+            *[GCBlock(channels, channels, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[0])]
+        )
+
+        self.stem_stage3 = nn.Sequential(
+            GCBlock(channels, channels * 2, stride=2,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+            *[GCBlock(channels * 2, channels * 2, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[1] - 1)]
+        )
+
+        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2]
+        # FoggyAwareNorm bridge sau stem_stage3, trước khi split branches.
+        # stem_stage3 output: channels*2, resolution 1/8.
+        # Tại đây fog đã "thấm" qua 3 stage — normalize fog-distribution
+        # trước khi chia semantic/detail giúp cả hai branch bắt đầu ổn định.
+        self.fog_bridge = FoggyAwareNorm(channels * 2)
+
+        self.relu = build_activation_layer(act_cfg)
+
+        # ------------------------------------------------------------------ #
+        # Semantic branch (stage 4 → 6)                                       #
+        # ------------------------------------------------------------------ #
+        self.semantic_branch_layers = nn.ModuleList()
+
+        self.semantic_branch_layers.append(nn.Sequential(
+            GCBlock(channels * 2, channels * 4, stride=2,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+            *[GCBlock(channels * 4, channels * 4, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[2][0] - 2)],
+            GCBlock(channels * 4, channels * 4, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+        ))
+
+        self.semantic_branch_layers.append(nn.Sequential(
+            GCBlock(channels * 4, channels * 8, stride=2,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+            *[GCBlock(channels * 8, channels * 8, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[3][0] - 2)],
+            GCBlock(channels * 8, channels * 8, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+        ))
+
+        self.semantic_branch_layers.append(nn.Sequential(
+            GCBlock(channels * 8, channels * 16, stride=2,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+            *[GCBlock(channels * 16, channels * 16, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[4][0] - 2)],
+            GCBlock(channels * 16, channels * 16, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+        ))
+
+        # ------------------------------------------------------------------ #
+        # Bilateral fusion                                                      #
+        # ------------------------------------------------------------------ #
+        self.compression_1 = ConvModule(
+            channels * 4, channels * 2, kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=None)
+        self.down_1 = ConvModule(
+            channels * 2, channels * 4, kernel_size=3, stride=2, padding=1,
+            norm_cfg=norm_cfg, act_cfg=None)
+
+        self.compression_2 = ConvModule(
+            channels * 8, channels * 2, kernel_size=1,
+            norm_cfg=norm_cfg, act_cfg=None)
+        self.down_2 = nn.Sequential(
+            ConvModule(channels * 2, channels * 4,
+                       kernel_size=3, stride=2, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=act_cfg),
+            ConvModule(channels * 4, channels * 8,
+                       kernel_size=3, stride=2, padding=1,
+                       norm_cfg=norm_cfg, act_cfg=None),
+        )
+
+        # ------------------------------------------------------------------ #
+        # Detail branch (stage 4 → 6)                                         #
+        # ------------------------------------------------------------------ #
+        self.detail_branch_layers = nn.ModuleList()
+
+        self.detail_branch_layers.append(nn.Sequential(
+            *[GCBlock(channels * 2, channels * 2, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[2][1] - 1)],
+            GCBlock(channels * 2, channels * 2, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+        ))
+
+        self.detail_branch_layers.append(nn.Sequential(
+            *[GCBlock(channels * 2, channels * 2, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[3][1] - 1)],
+            GCBlock(channels * 2, channels * 2, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+        ))
+
+        self.detail_branch_layers.append(nn.Sequential(
+            GCBlock(channels * 2, channels * 4, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy),
+            *[GCBlock(channels * 4, channels * 4, stride=1,
+                      norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
+              for _ in range(num_blocks_per_stage[4][1] - 2)],
+            GCBlock(channels * 4, channels * 4, stride=1,
+                    norm_cfg=norm_cfg, act_cfg=act_cfg, act=False, deploy=deploy),
+        ))
+
+        self.spp = DAPPM(
+            channels * 16, ppm_channels, channels * 4,
+            num_scales=5,
+            norm_cfg=norm_cfg,
+            act_cfg=act_cfg)
+
+        # ------------------------------------------------------------------ #
+        # DWSA — áp lên SEMANTIC branch                                       #
+        #                                                                      #
+        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1]                                  #
+        # gamma=0.5, pooling=H//8 (thô hơn để bắt fog-pattern toàn cục).    #
+        # Chi tiết xem class DWSA.                                            #
+        # ------------------------------------------------------------------ #
+        self.dwsa_stage4 = DWSA(channels * 4,
+                                reduction=dwsa_reduction, norm_cfg=norm_cfg)
+        self.dwsa_stage5 = DWSA(channels * 8,
+                                reduction=dwsa_reduction, norm_cfg=norm_cfg)
+        self.dwsa_stage6 = DWSA(channels * 4,
+                                reduction=dwsa_reduction, norm_cfg=norm_cfg)
+
+        self.kaiming_init()
+
+    def forward(self, x: Tensor) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
+
+        # ---- Stage 1–3 --------------------------------------------------- #
+        x = self.stem_conv1(x)
+        x = self.stem_conv2(x)
+        x = self.stem_stage2(x)
+        x = self.stem_stage3(x)           # 1/8, channels*2
+
+        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2]
+        # fog_bridge: FoggyAwareNorm trước khi split thành 2 branch.
+        # Normalize fog-distribution tại điểm split để cả semantic và detail
+        # branch bắt đầu từ fog-robust representation.
+        x = self.fog_bridge(x)            # 1/8, channels*2 (fog-normalized)
+
+        # ---- Stage 4 ---------------------------------------------------- #
+        x_s = self.semantic_branch_layers[0](x)      # 1/16, channels*4
+        x_d = self.detail_branch_layers[0](x)        # 1/8,  channels*2
+
+        comp_c = self.compression_1(self.relu(x_s))
+        x_s = x_s + self.down_1(self.relu(x_d))
+        x_d = x_d + resize(comp_c, size=out_size,
+                            mode='bilinear',
+                            align_corners=self.align_corners)
+
+        # DWSA trên semantic branch sau fusion stage 4
+        x_s = self.dwsa_stage4(x_s)
+
+        if self.training:
+            c4_feat = x_d.clone()
+
+        # ---- Stage 5 ---------------------------------------------------- #
+        x_s = self.semantic_branch_layers[1](self.relu(x_s))  # 1/32, channels*8
+        x_d = self.detail_branch_layers[1](self.relu(x_d))    # 1/8,  channels*2
+
+        comp_c = self.compression_2(self.relu(x_s))
+        x_s = x_s + self.down_2(self.relu(x_d))
+        x_d = x_d + resize(comp_c, size=out_size,
+                            mode='bilinear',
+                            align_corners=self.align_corners)
+
+        # DWSA trên semantic branch sau fusion stage 5
+        x_s = self.dwsa_stage5(x_s)
+
+        # ---- Stage 6 ---------------------------------------------------- #
+        x_d = self.detail_branch_layers[2](self.relu(x_d))    # 1/8,  channels*4
+        x_s = self.semantic_branch_layers[2](self.relu(x_s))  # 1/64, channels*16
+        x_spp = self.spp(x_s)                                  # DAPPM output, channels*4
+        x_spp = resize(x_spp, size=out_size,
+                       mode='bilinear', align_corners=self.align_corners)
+
+        # DWSA trên x_spp (DAPPM output) trước khi fuse với detail branch
+        x_spp = self.dwsa_stage6(x_spp)
+
+        # Fuse detail + semantic (đã qua DWSA)
+        fused = x_d + x_spp
+
+        return (c4_feat, fused) if self.training else fused
+
+    def switch_to_deploy(self):
+        for m in self.modules():
+            if isinstance(m, GCBlock):
+                m.switch_to_deploy()
+        self.deploy = True
+
+    def kaiming_init(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -345,152 +422,274 @@ class GCNetHead(BaseModule):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    # ---------------------------------------------------------------------- #
-    # Forward                                                                  #
-    # ---------------------------------------------------------------------- #
 
-    def forward(self,
-                inputs: Union[Tensor, Tuple[Tensor, Tensor]]
-                ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Forward pass.
+# =============================================================================
+# Block1x1
+# =============================================================================
 
-        Training  : inputs = (c4_feat, c6_feat) → returns (c4_logit, c6_logit)
-        Inference : inputs = c6_feat            → returns c6_logit
-        """
-        if self.training:
-            c4_feat, c6_feat = inputs
+class Block1x1(BaseModule):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 stride: Union[int, Tuple[int, int]] = 1,
+                 padding: Union[int, Tuple[int, int]] = 0,
+                 bias: bool = True,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 deploy: bool = False):
+        super().__init__()
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.stride       = stride
+        self.padding      = padding
+        self.bias         = bias
+        self.deploy       = deploy
 
-            c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
-            c6_logit = self.cls_seg(self.dropout(self.head(c6_feat)))
-
-            return c4_logit, c6_logit
-
+        if deploy:
+            self.conv = nn.Conv2d(in_channels, out_channels,
+                                  kernel_size=1, stride=stride,
+                                  padding=padding, bias=True)
         else:
-            c6_logit = self.cls_seg(self.dropout(self.head(inputs)))
-            return c6_logit
+            self.conv1 = ConvModule(in_channels, out_channels,
+                                    kernel_size=1, stride=stride,
+                                    padding=padding, bias=bias,
+                                    norm_cfg=norm_cfg, act_cfg=None)
+            self.conv2 = ConvModule(out_channels, out_channels,
+                                    kernel_size=1, stride=1,
+                                    padding=padding, bias=bias,
+                                    norm_cfg=norm_cfg, act_cfg=None)
 
-    # ---------------------------------------------------------------------- #
-    # Loss                                                                     #
-    # ---------------------------------------------------------------------- #
+    def forward(self, x: Tensor) -> Tensor:
+        if self.deploy:
+            return self.conv(x)
+        return self.conv2(self.conv1(x))
 
-    def loss(self,
-             seg_logits: Tuple[Tensor, Tensor],
-             seg_label: Tensor) -> Dict[str, Tensor]:
-        """Tính loss từ logits và ground-truth label.
+    def _fuse_bn_tensor(self, conv: ConvModule):
+        kernel       = conv.conv.weight
+        bias         = conv.conv.bias
+        running_mean = conv.bn.running_mean
+        running_var  = conv.bn.running_var
+        gamma        = conv.bn.weight
+        beta         = conv.bn.bias
+        eps          = conv.bn.eps
+        std          = (running_var + eps).sqrt()
+        t            = (gamma / std).reshape(-1, 1, 1, 1)
+        fused_bias   = (beta + (bias - running_mean) * gamma / std
+                        if self.bias else beta - running_mean * gamma / std)
+        return kernel * t, fused_bias
 
-        Args:
-            seg_logits: (c4_logit, c6_logit) — output của forward() khi training.
-                c4_logit: (B, num_classes, H4, W4)
-                c6_logit: (B, num_classes, H6, W6)
-            seg_label: Ground-truth shape (B, H, W), dtype=torch.long.
-                Pixels cần ignore mang giá trị ignore_index.
+    def switch_to_deploy(self):
+        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
+        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
+        self.conv = nn.Conv2d(self.in_channels, self.out_channels,
+                              kernel_size=1, stride=self.stride,
+                              padding=self.padding, bias=True)
+        self.conv.weight.data = torch.einsum(
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
+        self.conv.bias.data   = (bias2
+                                 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1))
+        self.__delattr__('conv1')
+        self.__delattr__('conv2')
+        self.deploy = True
 
-        Returns:
-            dict với keys: 'loss_c4', 'loss_c6', 'acc_seg'.
-            Nếu loss_fog được enable, dict thêm key 'loss_fog_consistency'.
 
-        Lưu ý [ĐIỀU CHỈNH 4]:
-            FogConsistencyLoss KHÔNG được tính ở đây — nó cần logits của
-            HAI ảnh khác mức beta, trong khi loss() chỉ nhận một batch.
-            Gọi compute_fog_consistency() riêng từ training loop khi có
-            cặp (logit_light, logit_heavy).
-        """
-        c4_logit, c6_logit = seg_logits
-        target_size = seg_label.shape[1:]   # (H, W)
+# =============================================================================
+# Block3x3
+# =============================================================================
 
-        # Upsample logits về kích thước gt
-        c4_logit = resize(c4_logit, size=target_size,
-                          mode='bilinear', align_corners=self.align_corners)
-        c6_logit = resize(c6_logit, size=target_size,
-                          mode='bilinear', align_corners=self.align_corners)
+class Block3x3(BaseModule):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 stride: Union[int, Tuple[int, int]] = 1,
+                 padding: Union[int, Tuple[int, int]] = 0,
+                 bias: bool = True,
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 deploy: bool = False):
+        super().__init__()
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.stride       = stride
+        self.padding      = padding
+        self.bias         = bias
+        self.deploy       = deploy
 
-        losses = {
-            'loss_c4': self.loss_c4(c4_logit, seg_label),
-            # [ĐIỀU CHỈNH 3] OHEM-CE thay CE thường cho main loss
-            'loss_c6': self.loss_c6(c6_logit, seg_label),
-            'acc_seg': accuracy(c6_logit, seg_label,
-                                ignore_index=self.ignore_index),
-        }
-        return losses
+        if deploy:
+            self.conv = nn.Conv2d(in_channels, out_channels,
+                                  kernel_size=3, stride=stride,
+                                  padding=padding, bias=True)
+        else:
+            self.conv1 = ConvModule(in_channels, out_channels,
+                                    kernel_size=3, stride=stride,
+                                    padding=padding, bias=bias,
+                                    norm_cfg=norm_cfg, act_cfg=None)
+            self.conv2 = ConvModule(out_channels, out_channels,
+                                    kernel_size=1, stride=1, padding=0,
+                                    bias=bias, norm_cfg=norm_cfg, act_cfg=None)
 
-    def compute_fog_consistency(self,
-                                 logit_a: Tensor,
-                                 logit_b: Tensor) -> Optional[Tensor]:
-        """[CITYSCAPES FOGGY - ĐIỀU CHỈNH 4]
-        Tính FogConsistencyLoss giữa logits của cùng scene ở 2 mức fog.
+    def forward(self, x: Tensor) -> Tensor:
+        if self.deploy:
+            return self.conv(x)
+        return self.conv2(self.conv1(x))
 
-        Gọi từ training loop khi có cặp ảnh multi-beta trong cùng batch.
-        Trả về None nếu loss_fog bị disable (fog_consistency_weight=0.0).
+    def _fuse_bn_tensor(self, conv: ConvModule):
+        kernel       = conv.conv.weight
+        bias         = conv.conv.bias
+        running_mean = conv.bn.running_mean
+        running_var  = conv.bn.running_var
+        gamma        = conv.bn.weight
+        beta         = conv.bn.bias
+        eps          = conv.bn.eps
+        std          = (running_var + eps).sqrt()
+        t            = (gamma / std).reshape(-1, 1, 1, 1)
+        fused_bias   = (beta + (bias - running_mean) * gamma / std
+                        if self.bias else beta - running_mean * gamma / std)
+        return kernel * t, fused_bias
 
-        Args:
-            logit_a (Tensor): Logits của ảnh foggy nhẹ, shape (B, C, H, W).
-            logit_b (Tensor): Logits của ảnh foggy nặng, shape (B, C, H, W).
-                .detach() logit_b để one-way KL (heavy fog học từ light fog):
-                    logit_b = logit_b.detach()
+    def switch_to_deploy(self):
+        kernel1, bias1 = self._fuse_bn_tensor(self.conv1)
+        kernel2, bias2 = self._fuse_bn_tensor(self.conv2)
+        self.conv = nn.Conv2d(self.in_channels, self.out_channels,
+                              kernel_size=3, stride=self.stride,
+                              padding=self.padding, bias=True)
+        self.conv.weight.data = torch.einsum(
+            'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
+        self.conv.bias.data   = (bias2
+                                 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1))
+        self.__delattr__('conv1')
+        self.__delattr__('conv2')
+        self.deploy = True
 
-        Returns:
-            Tensor hoặc None: Scalar fog consistency loss.
 
-        Ví dụ sử dụng trong training loop:
-            feat_light = backbone(img_light)    # beta=0.005
-            feat_heavy = backbone(img_heavy)    # beta=0.02
+# =============================================================================
+# GCBlock
+# =============================================================================
 
-            logit_light = head(feat_light)
-            logit_heavy = head(feat_heavy)
+class GCBlock(nn.Module):
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 kernel_size: Union[int, Tuple[int, int]] = 3,
+                 stride: Union[int, Tuple[int, int]] = 1,
+                 padding: Union[int, Tuple[int, int]] = 1,
+                 padding_mode: Optional[str] = 'zeros',
+                 norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
+                 act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
+                 act: bool = True,
+                 deploy: bool = False):
+        super().__init__()
 
-            losses = head.loss((c4, logit_light), label)
+        self.in_channels  = in_channels
+        self.out_channels = out_channels
+        self.kernel_size  = kernel_size
+        self.stride       = stride
+        self.padding      = padding
+        self.deploy       = deploy
 
-            fog_loss = head.compute_fog_consistency(
-                logit_light,
-                logit_heavy.detach()   # one-way: light học từ heavy distribution
-            )
-            if fog_loss is not None:
-                losses['loss_fog_consistency'] = fog_loss
-                total_loss = sum(losses.values())
-        """
-        if self.loss_fog is None:
-            return None
-        return self.loss_fog(logit_a, logit_b)
+        assert kernel_size == 3
+        assert padding    == 1
 
-    # ---------------------------------------------------------------------- #
-    # Helper                                                                   #
-    # ---------------------------------------------------------------------- #
+        padding_11 = padding - kernel_size // 2
 
-    def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
-        """BN → ReLU → Conv3×3(BN, ReLU)."""
-        return nn.Sequential(
-            build_norm_layer(self.norm_cfg, in_channels)[1],
-            build_activation_layer(self.act_cfg),
-            ConvModule(
-                in_channels,
-                channels,
-                kernel_size=3,
-                padding=1,
-                norm_cfg=self.norm_cfg,
-                act_cfg=self.act_cfg,
-                order=('conv', 'norm', 'act')),
+        self.relu = build_activation_layer(act_cfg) if act else nn.Identity()
+
+        if deploy:
+            self.reparam_3x3 = nn.Conv2d(
+                in_channels, out_channels, kernel_size=kernel_size,
+                stride=stride, padding=padding, bias=True,
+                padding_mode=padding_mode)
+        else:
+            if (out_channels == in_channels) and (stride == 1):
+                self.path_residual = build_norm_layer(norm_cfg, in_channels)[1]
+            else:
+                self.path_residual = None
+
+            self.path_3x3_1 = Block3x3(
+                in_channels, out_channels, stride=stride,
+                padding=padding, bias=False, norm_cfg=norm_cfg)
+            self.path_3x3_2 = Block3x3(
+                in_channels, out_channels, stride=stride,
+                padding=padding, bias=False, norm_cfg=norm_cfg)
+            self.path_1x1 = Block1x1(
+                in_channels, out_channels, stride=stride,
+                padding=padding_11, bias=False, norm_cfg=norm_cfg)
+
+    def forward(self, inputs: Tensor) -> Tensor:
+        if hasattr(self, 'reparam_3x3'):
+            return self.relu(self.reparam_3x3(inputs))
+
+        id_out = 0 if self.path_residual is None else self.path_residual(inputs)
+
+        return self.relu(
+            self.path_3x3_1(inputs)
+            + self.path_3x3_2(inputs)
+            + self.path_1x1(inputs)
+            + id_out
         )
 
-    # ---------------------------------------------------------------------- #
-    # Inference helper                                                         #
-    # ---------------------------------------------------------------------- #
+    def get_equivalent_kernel_bias(self) -> Tuple[Tensor, Tensor]:
+        self.path_3x3_1.switch_to_deploy()
+        k3_1, b3_1 = self.path_3x3_1.conv.weight.data, self.path_3x3_1.conv.bias.data
+        self.path_3x3_2.switch_to_deploy()
+        k3_2, b3_2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
+        self.path_1x1.switch_to_deploy()
+        k1x1, b1x1 = self.path_1x1.conv.weight.data, self.path_1x1.conv.bias.data
+        kid, bid = self._fuse_bn_tensor(self.path_residual)
 
-    def predict(self,
-                inputs: Union[Tensor, Tuple[Tensor, Tensor]],
-                img_size: Optional[Tuple[int, int]] = None) -> Tensor:
-        """Inference: forward + upsample về img_size nếu cần.
+        return (k3_1 + k3_2 + self._pad_1x1_to_3x3(k1x1) + kid,
+                b3_1 + b3_2 + b1x1 + bid)
 
-        Args:
-            inputs: c6_feat hoặc (c4_feat, c6_feat).
-            img_size: (H, W) của ảnh gốc. Nếu None, không upsample.
+    def _pad_1x1_to_3x3(self, kernel1x1: Optional[Tensor]) -> Tensor:
+        if kernel1x1 is None:
+            return 0
+        return F.pad(kernel1x1, [1, 1, 1, 1])
 
-        Returns:
-            Tensor: Segmentation map (B, num_classes, H, W).
-        """
-        self.eval()
-        with torch.no_grad():
-            logit = self.forward(inputs)
-            if img_size is not None:
-                logit = resize(logit, size=img_size,
-                               mode='bilinear', align_corners=self.align_corners)
-        return logit
+    def _fuse_bn_tensor(self, conv: nn.Module) -> Tuple:
+        if conv is None:
+            return 0, 0
+
+        if isinstance(conv, ConvModule):
+            kernel       = conv.conv.weight
+            running_mean = conv.bn.running_mean
+            running_var  = conv.bn.running_var
+            gamma        = conv.bn.weight
+            beta         = conv.bn.bias
+            eps          = conv.bn.eps
+        else:
+            assert isinstance(conv, (nn.BatchNorm2d, nn.SyncBatchNorm))
+            if not hasattr(self, 'id_tensor'):
+                kv = np.zeros(
+                    (self.in_channels, self.in_channels, 3, 3), dtype=np.float32)
+                for i in range(self.in_channels):
+                    kv[i, i, 1, 1] = 1.0
+                self.id_tensor = torch.from_numpy(kv).to(conv.weight.device)
+            kernel       = self.id_tensor
+            running_mean = conv.running_mean
+            running_var  = conv.running_var
+            gamma        = conv.weight
+            beta         = conv.bias
+            eps          = conv.eps
+
+        std = (running_var + eps).sqrt()
+        t   = (gamma / std).reshape(-1, 1, 1, 1)
+        return kernel * t, beta - running_mean * gamma / std
+
+    def switch_to_deploy(self):
+        if hasattr(self, 'reparam_3x3'):
+            return
+        kernel, bias = self.get_equivalent_kernel_bias()
+        self.reparam_3x3 = nn.Conv2d(
+            self.in_channels, self.out_channels,
+            kernel_size=self.kernel_size, stride=self.stride,
+            padding=self.padding, bias=True)
+        self.reparam_3x3.weight.data = kernel
+        self.reparam_3x3.bias.data   = bias
+        for p in self.parameters():
+            p.detach_()
+        self.__delattr__('path_3x3_1')
+        self.__delattr__('path_3x3_2')
+        self.__delattr__('path_1x1')
+        if hasattr(self, 'path_residual'):
+            self.__delattr__('path_residual')
+        if hasattr(self, 'id_tensor'):
+            self.__delattr__('id_tensor')
+        self.deploy = True
