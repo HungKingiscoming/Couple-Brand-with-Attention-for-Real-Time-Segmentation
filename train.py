@@ -31,7 +31,34 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # PRETRAINED WEIGHT LOADER
 # [FIX 1] Load cả backbone lẫn head từ checkpoint
 # ============================================
+def load_full_checkpoint(model, ckpt_path):
+    """Load cả backbone + head với remap conv_seg → cls_seg."""
+    ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state = ckpt.get('state_dict', ckpt)
 
+    # Remap key: conv_seg → cls_seg
+    remapped = {}
+    for k, v in state.items():
+        new_k = k.replace('conv_seg', 'cls_seg')
+        remapped[new_k] = v
+
+    missing, unexpected = model.load_state_dict(remapped, strict=False)
+
+    # Phân loại missing keys
+    expected_missing = [k for k in missing if any(s in k for s in
+        ['dwsa', 'alpha', 'in_.', 'fog_bridge', 'FoggyAware',
+         'stem_conv1.1', 'stem_conv2.1'])]
+    unexpected_missing = [k for k in missing if k not in expected_missing]
+
+    print(f"Loaded: {len(remapped) - len(missing)} / {len(model.state_dict())} keys")
+    print(f"Expected missing (new layers): {len(expected_missing)}")
+    if unexpected_missing:
+        print(f"⚠️  Unexpected missing ({len(unexpected_missing)}):")
+        for k in unexpected_missing[:10]:
+            print(f"  - {k}")
+    else:
+        print("✓ Tất cả pretrained weights loaded thành công")
+    return model
 def _remap_stem_key(key: str, N2: int = 4):
     import re as _re
     for pref in ['backbone.', 'model.', 'module.']:
@@ -922,7 +949,7 @@ def main():
 
     # [FIX 1] Load cả backbone + head từ checkpoint
     if args.pretrained_weights:
-        load_pretrained_gcnet(model, args.pretrained_weights)
+        load_full_checkpoint(model, args.pretrained_weights)
 
     if args.freeze_backbone:
         freeze_backbone(model)
