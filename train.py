@@ -548,7 +548,7 @@ class ModelConfig:
             },
             "head": {
                 "in_channels"     : C * 4,
-                "channels"        : 128,
+                "channels"        : 64,
                 "align_corners"   : False,
                 "dropout_ratio"   : 0.1,
                 "loss_weight_aux" : 0.4,
