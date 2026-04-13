@@ -21,7 +21,7 @@ import warnings
 from torch.optim.lr_scheduler import LambdaLR
 warnings.filterwarnings('ignore')
 
-from model.backbone.model import GCNet
+from model.backbone.model import GCNet, FoggyAwareNorm
 from model.head.segmentation_head import GCNetHead
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
@@ -60,6 +60,9 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
 
     Backbone: dùng _remap_stem_key đã hoạt động ổn định (95.2% load rate).
     Head    : remap conv_seg → cls_seg rồi load theo key trực tiếp.
+
+    [FIX 1] Sau khi load, reset tất cả FoggyAwareNorm.alpha về 0.5 thay vì
+    giữ nguyên giá trị pretrained (-4.0 = pure BN, không phù hợp foggy domain).
     """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
@@ -137,7 +140,6 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     for ckpt_key, ckpt_val in state.items():
         if not ckpt_key.startswith('decode_head.'):
             continue
-        # Strip prefix + remap classifier name
         stripped_hd = ckpt_key[len('decode_head.'):]
         stripped_hd = stripped_hd.replace('conv_seg', 'cls_seg')
 
@@ -203,30 +205,38 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     print(sep + "\n")
 
     # ================================================================ #
-    # fog_bridge near-identity init                                      #
+    # [FIX 1] Reset TẤT CẢ FoggyAwareNorm.alpha về 0.5                 #
+    #                                                                    #
+    # Pretrained weights (clear Cityscapes) đã học alpha = -4.0         #
+    # (sigmoid(-4) ≈ 0.018 = pure BN) — hợp lý cho clear images.       #
+    # Nhưng với foggy domain, cần IN ảnh hưởng nhiều hơn.               #
+    #                                                                    #
+    # Reset về 0.5 (sigmoid(0.5) ≈ 0.62, cân bằng IN/BN) để:          #
+    #   - fog_bridge bắt đầu với IN đáng kể ngay từ epoch 1            #
+    #   - FAN trong stem_conv1/2 cũng bắt đầu balanced                  #
+    #   - alpha tự học drift về 1 (IN) khi thấy foggy data              #
+    #                                                                    #
+    # Dùng alpha_lr_factor=1.0 (thay vì 0.1 cũ) để alpha học nhanh.   #
     # ================================================================ #
-    # fog_bridge là layer MỚI (random init) nằm ngay trước split branches.
-    # Nếu alpha khởi tạo = 0.5 (random), output distribution của fog_bridge
-    # khác hoàn toàn so với backbone gốc → head pretrained "không nhận ra"
-    # features → mIoU epoch 1 ≈ 0 dù head load 100%.
-    #
-    # Fix: set alpha rất âm → sigmoid(-4) ≈ 0.018 → fog_bridge gần như
-    # pure BN → output ≈ identity so với không có fog_bridge → head
-    # pretrained hoạt động ngay từ epoch 1.
-    # alpha sẽ tự học tăng dần trong quá trình train foggy.
-    fog_bridge = getattr(model.backbone, 'fog_bridge', None)
-    if fog_bridge is not None:
-        with torch.no_grad():
-            fog_bridge.alpha.fill_(-4.0)   # sigmoid(-4) ≈ 0.018 ≈ pure BN
-            # BN trong fog_bridge: copy running stats từ stem_stage3
-            # để BN path của fog_bridge không gây distribution shift
-            fog_bridge.bn.weight.fill_(1.0)
-            fog_bridge.bn.bias.fill_(0.0)
-            fog_bridge.bn.running_mean.fill_(0.0)
-            fog_bridge.bn.running_var.fill_(1.0)
-        print("✓ fog_bridge alpha = -4.0 (near-identity, sẽ học dần)")
-        print(f"  sigmoid(-4.0) = {torch.sigmoid(torch.tensor(-4.0)).item():.4f} "
-              f"→ gần như pure BN\n")
+    n_fan_reset = 0
+    with torch.no_grad():
+        for name, module in model.backbone.named_modules():
+            if isinstance(module, FoggyAwareNorm):
+                module.alpha.fill_(0.5)   # sigmoid(0.5) ≈ 0.62, balanced IN/BN
+                # Reset BN stats về neutral để tránh distribution shift
+                module.bn.weight.fill_(1.0)
+                module.bn.bias.fill_(0.0)
+                module.bn.running_mean.fill_(0.0)
+                module.bn.running_var.fill_(1.0)
+                n_fan_reset += 1
+                print(f"  ✓ Reset FoggyAwareNorm alpha: backbone.{name} "
+                      f"→ 0.5 (sigmoid≈0.62, balanced)")
+
+    if n_fan_reset == 0:
+        print("  ⚠️  Không tìm thấy FoggyAwareNorm trong backbone!")
+    else:
+        print(f"  → {n_fan_reset} FoggyAwareNorm reset xong. "
+              f"Alpha sẽ học drift về 1.0 (IN) khi thấy foggy data.\n")
 
     return rate_bb
 
@@ -255,13 +265,21 @@ def build_optimizer(model, args):
 
     groups = []
     if head_params:
-        groups.append({'params': head_params,     'lr': args.lr,                           'name': 'head'})
+        groups.append({'params': head_params,     'lr': args.lr,
+                       'name': 'head'})
     if backbone_params:
-        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
+        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor,
+                       'name': 'backbone'})
     if dwsa_params:
-        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,     'name': 'dwsa'})
+        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,
+                       'name': 'dwsa'})
     if alpha_params:
-        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,    'name': 'alpha'})
+        # [FIX 2] alpha_lr_factor mặc định tăng lên 1.0 (bằng head lr).
+        # Alpha phải thoát khỏi vùng pretrained (-4.0 → 0.5) nhanh chóng.
+        # Với lr=3e-4 và alpha_lr_factor=1.0 → alpha lr = 3e-4.
+        # Trước đây alpha_lr_factor=0.1 → alpha lr = 3e-5, quá chậm.
+        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,
+                       'name': 'alpha'})
 
     optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
     for g in optimizer.param_groups:
@@ -442,16 +460,20 @@ def freeze_backbone(model):
                 dwsa_bn += 1
     print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn} BN unfrozen")
 
-    # Bước 3: Unfreeze fog_bridge
+    # Bước 3: Unfreeze fog_bridge (FoggyAwareNorm — alpha + BN + IN)
     fog_bridge = getattr(model.backbone, 'fog_bridge', None)
     if fog_bridge is not None:
         for p in fog_bridge.parameters():
             p.requires_grad = True
+        # [FIX 3] Để fog_bridge.bn ở train() mode để update running stats
+        # từ foggy data — nếu để eval(), nó dùng clear-domain stats mãi mãi.
         fog_bridge.bn.train()
+        fog_bridge.in_.train()
         if fog_bridge.bn.weight is not None: fog_bridge.bn.weight.requires_grad = True
         if fog_bridge.bn.bias   is not None: fog_bridge.bn.bias.requires_grad   = True
         print(f"  fog_bridge kept trainable: "
-              f"{sum(p.numel() for p in fog_bridge.parameters()):,} params")
+              f"{sum(p.numel() for p in fog_bridge.parameters()):,} params "
+              f"(BN + IN ở train() mode)")
     else:
         print("  ⚠️  fog_bridge not found — using old backbone?")
 
@@ -462,14 +484,16 @@ def freeze_backbone(model):
         if module is None:
             continue
         if len(module) > 1 and hasattr(module[1], 'alpha'):
-            for p in module[1].parameters():
+            fan = module[1]
+            for p in fan.parameters():
                 p.requires_grad = True
                 fan_params += p.numel()
-            fan_bn = module[1].bn
-            fan_bn.train()
-            if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
-            if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
-    print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
+            # [FIX 3] BN + IN trong FAN cũng train() để learn foggy stats
+            fan.bn.train()
+            fan.in_.train()
+            if fan.bn.weight is not None: fan.bn.weight.requires_grad = True
+            if fan.bn.bias   is not None: fan.bn.bias.requires_grad   = True
+    print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params (BN + IN ở train() mode)")
     print("Backbone frozen\n")
 
 
@@ -517,6 +541,17 @@ def log_dwsa_gamma(model, writer, epoch):
             writer.add_scalar(f'dwsa/{name}_gamma', module.gamma.item(), epoch)
 
 
+def log_fan_alpha(model, writer, epoch):
+    """[FIX MỚI] Log FoggyAwareNorm alpha values để monitor quá trình học."""
+    alpha_vals = {}
+    for name, module in model.backbone.named_modules():
+        if isinstance(module, FoggyAwareNorm):
+            alpha_sigmoid = torch.sigmoid(module.alpha).mean().item()
+            writer.add_scalar(f'fan/alpha_sigmoid_{name}', alpha_sigmoid, epoch)
+            alpha_vals[name] = alpha_sigmoid
+    return alpha_vals
+
+
 def print_backbone_structure(model):
     print(f"\n{'='*70}")
     print(" BACKBONE STRUCTURE (GCNet v3)")
@@ -555,7 +590,7 @@ class ModelConfig:
             },
             "head": {
                 "in_channels"     : C * 4,   # 128
-                "channels"        : 64,       # khớp với checkpoint gcnet-s_mIoU-76.9.pth
+                "channels"        : 64,
                 "align_corners"   : False,
                 "dropout_ratio"   : 0.1,
                 "loss_weight_aux" : 0.4,
@@ -654,30 +689,37 @@ class Trainer:
             json.dump(vars(self.args), f, indent=2, default=str)
 
     def _set_bn_train_for_trainable_layers(self):
-        """Set BN về eval cho frozen layers, train cho các layer đang trainable."""
-        # Trước tiên lock toàn bộ BN backbone về eval
+        """[FIX 3] Set BN/IN mode chính xác:
+        - Frozen backbone BN → eval() để dùng clear-domain running stats nhất quán
+        - FoggyAwareNorm (fog_bridge, stem FAN) → train() để update foggy stats
+        - DWSA BN → train() nếu DWSA đang trainable
+        - Head BN → train() luôn (head không bị freeze)
+        """
+        # Bước 1: Lock toàn bộ backbone BN về eval
         for m in self.model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
-        # Mở lại BN trong DWSA nếu đang trainable
+
+        # Bước 2: Mở FoggyAwareNorm (BN + IN) trong fog_bridge và stem_conv1/2
+        # Chúng cần train() để học foggy running stats và cho phép IN hoạt động
+        for name, module in self.model.backbone.named_modules():
+            if isinstance(module, FoggyAwareNorm):
+                if module.alpha.requires_grad:   # chỉ set train nếu đang trainable
+                    module.bn.train()
+                    module.in_.train()
+
+        # Bước 3: Mở BN trong DWSA nếu đang trainable
         for layer_name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
             layer = getattr(self.model.backbone, layer_name, None)
             if layer is not None:
                 for m in layer.modules():
-                    if isinstance(m, nn.BatchNorm2d) and m.weight.requires_grad:
+                    if isinstance(m, nn.BatchNorm2d) and (
+                        m.weight is not None and m.weight.requires_grad
+                    ):
                         m.train()
-        # Mở lại BN trong fog_bridge nếu trainable
-        fog_bridge = getattr(self.model.backbone, 'fog_bridge', None)
-        if fog_bridge is not None and hasattr(fog_bridge, 'bn'):
-            if fog_bridge.bn.weight is not None and fog_bridge.bn.weight.requires_grad:
-                fog_bridge.bn.train()
-        # Mở lại BN trong FoggyAwareNorm (stem_conv1/2)
-        for name in ['stem_conv1', 'stem_conv2']:
-            layer = getattr(self.model.backbone, name, None)
-            if layer is not None and len(layer) > 1 and hasattr(layer[1], 'bn'):
-                fan_bn = layer[1].bn
-                if fan_bn.weight is not None and fan_bn.weight.requires_grad:
-                    fan_bn.train()
+
+        # Bước 4: Head luôn train()
+        self.model.decode_head.train()
 
     def train_epoch(self, loader, epoch):
         self.model.train()
@@ -770,6 +812,7 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
+        # [FIX 3] Đảm bảo toàn bộ BN ở eval() trong validation
         for m in self.model.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
@@ -879,7 +922,12 @@ def main():
                              "E.g. '15,30,45,60'")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
     parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5)
-    parser.add_argument("--alpha_lr_factor",        type=float, default=0.1)
+    # [FIX 2] alpha_lr_factor mặc định tăng từ 0.1 → 1.0
+    # Lý do: alpha cần học nhanh để thoát khỏi pretrained value (-4.0 = pure BN)
+    # và drift về giá trị phù hợp với foggy domain (~0.5–1.0).
+    # alpha_lr_factor=0.1 (cũ) → alpha lr = 3e-5, quá chậm để học trong 20–40 epochs.
+    # alpha_lr_factor=1.0 (mới) → alpha lr = lr (mặc định 3e-4), học cùng tốc độ head.
+    parser.add_argument("--alpha_lr_factor",        type=float, default=1.0)
     parser.add_argument("--use_class_weights",      action="store_true")
 
     parser.add_argument("--train_txt",    required=True)
@@ -935,6 +983,9 @@ def main():
         print(f"  k=4 → semantic/detail[2], dwsa_stage6, spp")
     else:
         print(f"Unfreeze schedule: none")
+    # [FIX 2] In alpha_lr_factor để dễ debug
+    print(f"alpha_lr_factor: {args.alpha_lr_factor}  "
+          f"(alpha lr = {args.lr * args.alpha_lr_factor:.2e})")
     print(f"{'='*70}\n")
 
     cfg = ModelConfig.get_config()
@@ -964,6 +1015,7 @@ def main():
     check_model_health(model)
 
     # Load pretrained backbone + head
+    # [FIX 1] load_pretrained_gcnet bây giờ reset alpha về 0.5 thay vì -4.0
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights)
 
@@ -972,6 +1024,17 @@ def main():
 
     count_trainable_params(model)
     print_backbone_structure(model)
+
+    # [FIX MỚI] In alpha values sau reset để xác nhận
+    print("FoggyAwareNorm alpha values sau reset:")
+    for name, module in model.backbone.named_modules():
+        if isinstance(module, FoggyAwareNorm):
+            alpha_val = module.alpha.mean().item()
+            alpha_sig = torch.sigmoid(module.alpha).mean().item()
+            print(f"  backbone.{name}: alpha={alpha_val:.4f}, "
+                  f"sigmoid={alpha_sig:.4f} "
+                  f"({'IN-dominant' if alpha_sig > 0.6 else 'BN-dominant' if alpha_sig < 0.4 else 'balanced'})")
+    print()
 
     print("DWSA gamma values at init:")
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
@@ -1062,6 +1125,8 @@ def main():
         val_metrics   = trainer.validate(val_loader, epoch)
 
         log_dwsa_gamma(model, trainer.writer, epoch)
+        # [FIX MỚI] Log alpha values mỗi epoch để monitor fog adaptation
+        alpha_vals = log_fan_alpha(model, trainer.writer, epoch)
 
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{args.epochs}")
@@ -1074,6 +1139,10 @@ def main():
             m = getattr(model.backbone, name, None)
             if m is not None and hasattr(m, 'gamma'):
                 print(f"  {name}.gamma = {m.gamma.item():.6f}")
+        # [FIX MỚI] In alpha values để monitor từng epoch
+        for name, val in alpha_vals.items():
+            print(f"  FAN[{name}].alpha_sigmoid = {val:.4f} "
+                  f"({'→IN' if val > 0.65 else '→BN' if val < 0.45 else '~balanced'})")
         print(f"{'='*70}\n")
 
         trainer.writer.add_scalar('val/loss',     val_metrics['loss'],     epoch)
