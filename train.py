@@ -201,6 +201,33 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         print(f"\n✓  HEAD loaded {rate_hd:.1f}% — pretrained head weights active.")
 
     print(sep + "\n")
+
+    # ================================================================ #
+    # fog_bridge near-identity init                                      #
+    # ================================================================ #
+    # fog_bridge là layer MỚI (random init) nằm ngay trước split branches.
+    # Nếu alpha khởi tạo = 0.5 (random), output distribution của fog_bridge
+    # khác hoàn toàn so với backbone gốc → head pretrained "không nhận ra"
+    # features → mIoU epoch 1 ≈ 0 dù head load 100%.
+    #
+    # Fix: set alpha rất âm → sigmoid(-4) ≈ 0.018 → fog_bridge gần như
+    # pure BN → output ≈ identity so với không có fog_bridge → head
+    # pretrained hoạt động ngay từ epoch 1.
+    # alpha sẽ tự học tăng dần trong quá trình train foggy.
+    fog_bridge = getattr(model.backbone, 'fog_bridge', None)
+    if fog_bridge is not None:
+        with torch.no_grad():
+            fog_bridge.alpha.fill_(-4.0)   # sigmoid(-4) ≈ 0.018 ≈ pure BN
+            # BN trong fog_bridge: copy running stats từ stem_stage3
+            # để BN path của fog_bridge không gây distribution shift
+            fog_bridge.bn.weight.fill_(1.0)
+            fog_bridge.bn.bias.fill_(0.0)
+            fog_bridge.bn.running_mean.fill_(0.0)
+            fog_bridge.bn.running_var.fill_(1.0)
+        print("✓ fog_bridge alpha = -4.0 (near-identity, sẽ học dần)")
+        print(f"  sigmoid(-4.0) = {torch.sigmoid(torch.tensor(-4.0)).item():.4f} "
+              f"→ gần như pure BN\n")
+
     return rate_bb
 
 
