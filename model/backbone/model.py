@@ -360,8 +360,7 @@ class GCNet(BaseModule):
         # fog_bridge: FoggyAwareNorm trước khi split thành 2 branch.
         # Normalize fog-distribution tại điểm split để cả semantic và detail
         # branch bắt đầu từ fog-robust representation.
-        if hasattr(self, 'fog_bridge') and self.fog_bridge_active:
-            x = self.fog_bridge(x)           # 1/8, channels*2 (fog-normalized)
+        x = self.fog_bridge(x)
 
         # ---- Stage 4 ---------------------------------------------------- #
         x_s = self.semantic_branch_layers[0](x)      # 1/16, channels*4
