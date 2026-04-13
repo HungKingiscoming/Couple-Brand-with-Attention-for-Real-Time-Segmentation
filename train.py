@@ -29,110 +29,48 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 
 # ============================================
 # PRETRAINED WEIGHT LOADER
-# [FIX 1] Load cả backbone lẫn head từ checkpoint
 # ============================================
-def load_full_checkpoint(model, ckpt_path):
-    """Load cả backbone + head với remap stem key và bỏ qua shape mismatch."""
-    import re
-    ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = ckpt.get('state_dict', ckpt)
 
-    def remap_key(key):
-        # conv_seg → cls_seg
-        key = key.replace('conv_seg', 'cls_seg')
-
-        # backbone.stem.N.* → backbone.stem_conv1/2/stage2/stage3
-        m = re.match(r'(backbone\.)stem\.(\d+)\.(.+)$', key)
-        if m:
-            prefix = m.group(1)   # 'backbone.'
-            idx    = int(m.group(2))
-            rest   = m.group(3)
-
-            # stem.0 → stem_conv1.0 (Conv2d, bỏ BN vì đã thay bằng FAN)
-            if idx == 0:
-                if rest.startswith('conv.'):
-                    return f'{prefix}stem_conv1.0.{rest[5:]}'
-                return None   # BN của stem.0 → drop (FoggyAwareNorm thay thế)
-
-            # stem.1 → stem_conv2.0
-            elif idx == 1:
-                if rest.startswith('conv.'):
-                    return f'{prefix}stem_conv2.0.{rest[5:]}'
-                return None   # BN của stem.1 → drop
-
-            # stem.2..5 → stem_stage2.0..3
-            elif 2 <= idx <= 5:
-                return f'{prefix}stem_stage2.{idx - 2}.{rest}'
-
-            # stem.6..9 → stem_stage3.0..3
-            else:
-                return f'{prefix}stem_stage3.{idx - 6}.{rest}'
-
+def _remap_stem_key(key: str, N2: int = 4):
+    import re as _re
+    for pref in ['backbone.', 'model.', 'module.']:
+        if key.startswith(pref):
+            key = key[len(pref):]
+    m = _re.match(r'stem\.(\d+)\.(.+)$', key)
+    if not m:
         return key
-
-    # Remap tất cả keys
-    remapped = {}
-    for k, v in state.items():
-        new_k = remap_key(k)
-        if new_k is not None:
-            remapped[new_k] = v
-
-    # Load chỉ key có shape match
-    model_state    = model.state_dict()
-    filtered       = {}
-    shape_mismatch = []
-
-    for k, v in remapped.items():
-        if k not in model_state:
-            continue
-        if model_state[k].shape != v.shape:
-            shape_mismatch.append(
-                f"{k}: ckpt={tuple(v.shape)} model={tuple(model_state[k].shape)}")
-            continue
-        filtered[k] = v
-
-    missing, _ = model.load_state_dict(filtered, strict=False)
-
-    expected_missing = [k for k in missing if any(s in k for s in
-        ['dwsa', 'alpha', 'in_.', 'fog_bridge', 'stem_conv1.1', 'stem_conv2.1'])]
-    unexpected_missing = [k for k in missing if k not in expected_missing]
-
-    print(f"\n{'='*60}")
-    print("WEIGHT LOADING SUMMARY")
-    print(f"{'='*60}")
-    print(f"Loaded:            {len(filtered):>5} / {len(model_state)}")
-    print(f"Expected missing:  {len(expected_missing):>5}  (DWSA, fog_bridge, FAN)")
-    print(f"Shape mismatch:    {len(shape_mismatch):>5}  (head channels 64 vs 128)")
-    if shape_mismatch:
-        print(f"\nShape mismatch (skipped):")
-        for s in shape_mismatch[:5]:
-            print(f"  {s}")
-    if unexpected_missing:
-        print(f"\n⚠️  Unexpected missing ({len(unexpected_missing)}):")
-        for k in unexpected_missing[:5]:
-            print(f"  - {k}")
+    idx  = int(m.group(1))
+    rest = m.group(2)
+    def _map_convmodule(rest_str, target_prefix):
+        if rest_str.startswith('conv.'):
+            return f'{target_prefix}.{rest_str[len("conv."):].lstrip(".")}'
+        return None
+    if idx == 0:
+        return _map_convmodule(rest, 'stem_conv1.0')
+    elif idx == 1:
+        return _map_convmodule(rest, 'stem_conv2.0')
+    elif 2 <= idx <= 1 + N2:
+        return f'stem_stage2.{idx - 2}.{rest}'
     else:
-        print(f"\n✓ Backbone fully loaded. Head shape mismatch là expected")
-        print(f"  vì checkpoint channels=64, model channels=128.")
-        print(f"  → Đổi head.channels=64 trong ModelConfig để load head luôn.")
-    print(f"{'='*60}\n")
+        return f'stem_stage3.{idx - (2 + N2)}.{rest}'
 
 
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     """Load pretrained weights vào model.backbone VÀ model.decode_head.
 
-    [FIX 1] Bản gốc chỉ load backbone → head random init → mất ~10-15 mIoU.
-    Bản fix load cả head từ checkpoint nếu key match.
-    Head mới có thêm FAN/DWSA → một số key sẽ missing (expected).
+    Backbone: dùng _remap_stem_key đã hoạt động ổn định (95.2% load rate).
+    Head    : remap conv_seg → cls_seg rồi load theo key trực tiếp.
     """
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
-    # ---- Load backbone --------------------------------------------------- #
-    model_bb_state  = model.backbone.state_dict()
-    compatible_bb   = {}
-    skipped         = []
+    # ================================================================ #
+    # BACKBONE                                                           #
+    # ================================================================ #
+    model_bb_state = model.backbone.state_dict()
+    compatible_bb  = {}
+    skipped        = []
 
     model_key_map = {}
     for mk in model_bb_state.keys():
@@ -142,7 +80,7 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
                 norm = norm[len(pref):]
         model_key_map[norm] = mk
 
-    bn_dropped = []
+    bn_dropped            = []
     non_backbone_prefixes = ('decode_head.', 'aux_head.', 'head.')
 
     for ckpt_key, ckpt_val in state.items():
@@ -181,56 +119,43 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     total_bb  = len(model_bb_state)
     rate_bb   = 100 * loaded_bb / total_bb if total_bb > 0 else 0.0
 
-    # ---- [FIX 1] Load decode_head ---------------------------------------- #
-    # Checkpoint có thể có head dưới key 'decode_head.*' hoặc 'head.*'
-    model_hd_state  = model.decode_head.state_dict()
-    compatible_hd   = {}
-    head_prefixes   = ('decode_head.', 'head.', 'aux_head.')
+    missing_bb, _ = model.backbone.load_state_dict(compatible_bb, strict=False)
+
+    expected_skip_markers    = ('dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.')
+    truly_expected           = [k for k in skipped   if any(s in k for s in expected_skip_markers)]
+    truly_unmatched          = [k for k in skipped   if k not in truly_expected]
+    expected_missing_markers = ('dwsa', 'alpha', 'in_.', 'foggy', '.1.bn.', 'spp.', 'fog_bridge')
+    expected_missing_bb      = [k for k in missing_bb if any(s in k for s in expected_missing_markers)]
+    unexpected_missing_bb    = [k for k in missing_bb if k not in expected_missing_bb]
+
+    # ================================================================ #
+    # HEAD — remap conv_seg → cls_seg, load key trực tiếp               #
+    # ================================================================ #
+    model_hd_state = model.decode_head.state_dict()
+    compatible_hd  = {}
 
     for ckpt_key, ckpt_val in state.items():
-        # Tìm key thuộc head trong checkpoint
-        stripped_hd = None
-        for pref in head_prefixes:
-            if ckpt_key.startswith(pref):
-                stripped_hd = ckpt_key[len(pref):]
-                break
-        # Cũng thử với backbone. prefix trước head prefix (mmcv style)
-        if stripped_hd is None:
-            for bb_pref in ('backbone.', 'model.', 'module.'):
-                if ckpt_key.startswith(bb_pref):
-                    rest = ckpt_key[len(bb_pref):]
-                    for pref in head_prefixes:
-                        if rest.startswith(pref):
-                            stripped_hd = rest[len(pref):]
-                            break
-                    if stripped_hd is not None:
-                        break
-
-        if stripped_hd is None:
+        if not ckpt_key.startswith('decode_head.'):
             continue
+        # Strip prefix + remap classifier name
+        stripped_hd = ckpt_key[len('decode_head.'):]
+        stripped_hd = stripped_hd.replace('conv_seg', 'cls_seg')
 
-        if stripped_hd in model_hd_state:
-            if model_hd_state[stripped_hd].shape == ckpt_val.shape:
-                compatible_hd[stripped_hd] = ckpt_val
+        if stripped_hd not in model_hd_state:
+            continue
+        if model_hd_state[stripped_hd].shape != ckpt_val.shape:
+            continue
+        compatible_hd[stripped_hd] = ckpt_val
 
     loaded_hd = len(compatible_hd)
     total_hd  = len(model_hd_state)
     rate_hd   = 100 * loaded_hd / total_hd if total_hd > 0 else 0.0
 
-    # ---- Apply weights ---------------------------------------------------- #
-    missing_bb, _ = model.backbone.load_state_dict(compatible_bb, strict=False)
     missing_hd, _ = model.decode_head.load_state_dict(compatible_hd, strict=False)
 
-    expected_skip_markers = (
-        'dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.',
-    )
-    truly_expected  = [k for k in skipped if any(s in k for s in expected_skip_markers)]
-    truly_unmatched = [k for k in skipped if k not in truly_expected]
-
-    expected_missing_markers = ('dwsa', 'alpha', 'in_.', 'foggy', '.1.bn.', 'spp.', 'fog_bridge')
-    expected_missing_bb   = [k for k in missing_bb if any(s in k for s in expected_missing_markers)]
-    unexpected_missing_bb = [k for k in missing_bb if k not in expected_missing_bb]
-
+    # ================================================================ #
+    # SUMMARY                                                            #
+    # ================================================================ #
     sep = '=' * 70
     print(f"\n{sep}")
     print("WEIGHT LOADING SUMMARY")
@@ -238,30 +163,44 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     print(f"Backbone — Loaded: {loaded_bb:>5} / {total_bb} ({rate_bb:.1f}%)")
     print(f"Head     — Loaded: {loaded_hd:>5} / {total_hd} ({rate_hd:.1f}%)")
     print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm ✓)")
+
     if truly_unmatched:
-        print(f"\nUnexpected missing ({len(truly_unmatched)}) — cần kiểm tra:")
+        print(f"\nUnexpected backbone skipped ({len(truly_unmatched)}):")
         for k in truly_unmatched[:5]:
             print(f"  - {k}")
     if unexpected_missing_bb:
         print(f"\nBackbone unexpected missing ({len(unexpected_missing_bb)}):")
         for k in unexpected_missing_bb[:5]:
             print(f"  - {k}")
+
     print(f"\nExpected missing backbone: {len(expected_missing_bb)} keys "
           f"(fog_bridge / DWSA / FAN / DAPPM BN order) → OK")
-    # [FIX 1] Cảnh báo nếu head không load được gì
-    if loaded_hd == 0:
-        print(f"\n⚠️  HEAD: 0 keys loaded — checkpoint có thể không có head weights.")
-        print(f"   Head sẽ dùng random init. Kiểm tra key prefix trong checkpoint:")
-        sample_keys = [k for k in state.keys() if any(p in k for p in head_prefixes)][:5]
-        for k in sample_keys:
-            print(f"   {k}")
-    elif rate_hd < 50:
-        print(f"\n⚠️  HEAD: chỉ load được {rate_hd:.1f}% — "
-              f"một số layer head mới (aux_cls_seg_c4) là expected missing.")
-    else:
-        print(f"\n✓  HEAD loaded {rate_hd:.1f}% — head pretrained weights active.")
-    print(sep + "\n")
 
+    if loaded_hd == 0:
+        print(f"\n⚠️  HEAD: 0 keys loaded!")
+        print(f"   Kiểm tra key prefix trong checkpoint:")
+        for k in list(state.keys())[:5]:
+            print(f"   {k}")
+    elif rate_hd < 60:
+        print(f"\n⚠️  HEAD: {rate_hd:.1f}% loaded — shape mismatch ở một số layer.")
+        shape_issues = []
+        for ckpt_key, ckpt_val in state.items():
+            if not ckpt_key.startswith('decode_head.'):
+                continue
+            stripped_hd = ckpt_key[len('decode_head.'):].replace('conv_seg', 'cls_seg')
+            if stripped_hd in model_hd_state:
+                if model_hd_state[stripped_hd].shape != ckpt_val.shape:
+                    shape_issues.append(
+                        f"  {stripped_hd}: ckpt={tuple(ckpt_val.shape)} "
+                        f"model={tuple(model_hd_state[stripped_hd].shape)}")
+        for s in shape_issues[:5]:
+            print(s)
+        if shape_issues:
+            print(f"  → Đổi head.channels trong ModelConfig cho khớp checkpoint.")
+    else:
+        print(f"\n✓  HEAD loaded {rate_hd:.1f}% — pretrained head weights active.")
+
+    print(sep + "\n")
     return rate_bb
 
 
@@ -376,12 +315,12 @@ class OHEMLoss(nn.Module):
         self.class_weights = class_weights
 
     def forward(self, logits, labels):
-        weight      = self.class_weights.to(logits.device) if self.class_weights is not None else None
-        loss_pixel  = F.cross_entropy(logits, labels, weight=weight,
-                                      ignore_index=self.ignore_index, reduction='none').view(-1)
-        valid_mask  = (labels.view(-1) != self.ignore_index)
+        weight       = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        loss_pixel   = F.cross_entropy(logits, labels, weight=weight,
+                                       ignore_index=self.ignore_index, reduction='none').view(-1)
+        valid_mask   = (labels.view(-1) != self.ignore_index)
         valid_losses = loss_pixel[valid_mask]
-        n_valid     = valid_losses.numel()
+        n_valid      = valid_losses.numel()
         if n_valid == 0:
             return logits.sum() * 0
         n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
@@ -404,9 +343,9 @@ def clear_gpu_memory():
 
 
 def setup_memory_efficient_training():
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark      = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32     = True
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 
@@ -418,19 +357,18 @@ def check_gradients(model, threshold=10.0):
             total_sq += g ** 2
             if g > max_grad:
                 max_grad = g; max_name = name
-    total_norm = total_sq ** 0.5
     if max_grad > threshold:
         print(f"Large gradient: {max_name[:60]}... = {max_grad:.2f}")
-    return max_grad, total_norm
+    return max_grad, total_sq ** 0.5
 
 
 def count_trainable_params(model):
-    total     = sum(p.numel() for p in model.parameters())
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    bb_total  = sum(p.numel() for p in model.backbone.parameters())
-    bb_train  = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
-    hd_total  = sum(p.numel() for p in model.decode_head.parameters())
-    hd_train  = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
+    total    = sum(p.numel() for p in model.parameters())
+    trainable= sum(p.numel() for p in model.parameters() if p.requires_grad)
+    bb_total = sum(p.numel() for p in model.backbone.parameters())
+    bb_train = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    hd_total = sum(p.numel() for p in model.decode_head.parameters())
+    hd_train = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
     print(f"\n{'='*70}")
     print("PARAMETER STATISTICS")
     print(f"{'='*70}")
@@ -445,8 +383,10 @@ def count_trainable_params(model):
 
 
 def freeze_backbone(model):
-    """Freeze toàn bộ backbone trừ DWSA và FoggyAwareNorm."""
-    print("Freezing backbone (keeping DWSA + FoggyAwareNorm trainable)...")
+    """Freeze toàn bộ backbone trừ DWSA, fog_bridge và FoggyAwareNorm."""
+    print("Freezing backbone (keeping DWSA + fog_bridge + FoggyAwareNorm trainable)...")
+
+    # Bước 1: Freeze + lock BN toàn backbone
     for p in model.backbone.parameters():
         p.requires_grad = False
     bn_count = 0
@@ -458,44 +398,50 @@ def freeze_backbone(model):
             bn_count += 1
     print(f"  {bn_count} BN layers locked")
 
-    dwsa_params = 0; dwsa_bn_count = 0
+    # Bước 2: Unfreeze DWSA (+ BN trong DWSA)
+    dwsa_params = 0; dwsa_bn = 0
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
-        if module is not None:
-            for p in module.parameters():
-                p.requires_grad = True
-                dwsa_params += p.numel()
-            for m in module.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.train()
-                    if m.weight is not None: m.weight.requires_grad = True
-                    if m.bias   is not None: m.bias.requires_grad   = True
-                    dwsa_bn_count += 1
-    print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn_count} BN unfrozen")
+        if module is None:
+            continue
+        for p in module.parameters():
+            p.requires_grad = True
+            dwsa_params += p.numel()
+        for m in module.modules():
+            if isinstance(m, nn.BatchNorm2d):
+                m.train()
+                if m.weight is not None: m.weight.requires_grad = True
+                if m.bias   is not None: m.bias.requires_grad   = True
+                dwsa_bn += 1
+    print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn} BN unfrozen")
 
-    # [FIX 1b] Unfreeze fog_bridge — đây là layer quan trọng nhất
+    # Bước 3: Unfreeze fog_bridge
     fog_bridge = getattr(model.backbone, 'fog_bridge', None)
     if fog_bridge is not None:
         for p in fog_bridge.parameters():
             p.requires_grad = True
         fog_bridge.bn.train()
+        if fog_bridge.bn.weight is not None: fog_bridge.bn.weight.requires_grad = True
+        if fog_bridge.bn.bias   is not None: fog_bridge.bn.bias.requires_grad   = True
         print(f"  fog_bridge kept trainable: "
               f"{sum(p.numel() for p in fog_bridge.parameters()):,} params")
     else:
         print("  ⚠️  fog_bridge not found — using old backbone?")
 
+    # Bước 4: Unfreeze FoggyAwareNorm (alpha + BN + IN) trong stem_conv1/2
     fan_params = 0
     for name in ['stem_conv1', 'stem_conv2']:
         module = getattr(model.backbone, name, None)
-        if module is not None:
-            if len(module) > 1 and hasattr(module[1], 'alpha'):
-                for p in module[1].parameters():
-                    p.requires_grad = True
-                    fan_params += p.numel()
-                fan_bn = module[1].bn
-                fan_bn.train()
-                if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
-                if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
+        if module is None:
+            continue
+        if len(module) > 1 and hasattr(module[1], 'alpha'):
+            for p in module[1].parameters():
+                p.requires_grad = True
+                fan_params += p.numel()
+            fan_bn = module[1].bn
+            fan_bn.train()
+            if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
+            if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
     print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
     print("Backbone frozen\n")
 
@@ -541,8 +487,7 @@ def log_dwsa_gamma(model, writer, epoch):
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
         if module is not None and hasattr(module, 'gamma'):
-            g_val = module.gamma.item()
-            writer.add_scalar(f'dwsa/{name}_gamma', g_val, epoch)
+            writer.add_scalar(f'dwsa/{name}_gamma', module.gamma.item(), epoch)
 
 
 def print_backbone_structure(model):
@@ -582,8 +527,8 @@ class ModelConfig:
                 "deploy"               : False,
             },
             "head": {
-                "in_channels"     : C * 4,
-                "channels"        : 64,
+                "in_channels"     : C * 4,   # 128
+                "channels"        : 64,       # khớp với checkpoint gcnet-s_mIoU-76.9.pth
                 "align_corners"   : False,
                 "dropout_ratio"   : 0.1,
                 "loss_weight_aux" : 0.4,
@@ -591,9 +536,9 @@ class ModelConfig:
                 "act_cfg"         : dict(type='ReLU', inplace=True),
             },
             "loss": {
-                "ce_weight"    : 1.0,
-                "dice_weight"  : 0.5,
-                "dice_smooth"  : 1e-5,
+                "ce_weight"   : 1.0,
+                "dice_weight" : 0.5,
+                "dice_smooth" : 1e-5,
             },
         }
 
@@ -624,20 +569,20 @@ class Segmentor(nn.Module):
 
 class Trainer:
     def __init__(self, model, optimizer, scheduler, device, args, class_weights=None):
-        self.model        = model.to(device)
-        self.optimizer    = optimizer
-        self.scheduler    = scheduler
-        self.device       = device
-        self.args         = args
-        self.best_miou    = 0.0
-        self.start_epoch  = 0
-        self.global_step  = 0
+        self.model         = model.to(device)
+        self.optimizer     = optimizer
+        self.scheduler     = scheduler
+        self.device        = device
+        self.args          = args
+        self.best_miou     = 0.0
+        self.start_epoch   = 0
+        self.global_step   = 0
 
-        loss_cfg          = args.loss_config
-        self.ce_weight    = loss_cfg['ce_weight']
-        self.dice_weight  = loss_cfg['dice_weight']
+        loss_cfg           = args.loss_config
+        self.ce_weight     = loss_cfg['ce_weight']
+        self.dice_weight   = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
-        self.loss_phase   = 'full'
+        self.loss_phase    = 'full'
 
         cw_device = class_weights.to(device) if class_weights is not None else None
 
@@ -681,32 +626,39 @@ class Trainer:
         with open(self.save_dir / "config.json", "w") as f:
             json.dump(vars(self.args), f, indent=2, default=str)
 
-    def train_epoch(self, loader, epoch):
-        self.model.train()
-        # [FIX 2] Giữ BN của frozen layers ở eval mode
-        # Tránh BN running stats bị cập nhật bởi foggy/clear batch
+    def _set_bn_train_for_trainable_layers(self):
+        """Set BN về eval cho frozen layers, train cho các layer đang trainable."""
+        # Trước tiên lock toàn bộ BN backbone về eval
         for m in self.model.backbone.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
-        # Unfreeze lại BN trong các layer đang train
+        # Mở lại BN trong DWSA nếu đang trainable
         for layer_name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
             layer = getattr(self.model.backbone, layer_name, None)
             if layer is not None:
                 for m in layer.modules():
                     if isinstance(m, nn.BatchNorm2d) and m.weight.requires_grad:
                         m.train()
+        # Mở lại BN trong fog_bridge nếu trainable
         fog_bridge = getattr(self.model.backbone, 'fog_bridge', None)
-        if fog_bridge is not None and fog_bridge.bn.weight.requires_grad:
-            fog_bridge.bn.train()
+        if fog_bridge is not None and hasattr(fog_bridge, 'bn'):
+            if fog_bridge.bn.weight is not None and fog_bridge.bn.weight.requires_grad:
+                fog_bridge.bn.train()
+        # Mở lại BN trong FoggyAwareNorm (stem_conv1/2)
         for name in ['stem_conv1', 'stem_conv2']:
             layer = getattr(self.model.backbone, name, None)
             if layer is not None and len(layer) > 1 and hasattr(layer[1], 'bn'):
-                if layer[1].bn.weight.requires_grad:
-                    layer[1].bn.train()
+                fan_bn = layer[1].bn
+                if fan_bn.weight is not None and fan_bn.weight.requires_grad:
+                    fan_bn.train()
+
+    def train_epoch(self, loader, epoch):
+        self.model.train()
+        self._set_bn_train_for_trainable_layers()
 
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
-        max_grad = 0.0
+        max_grad       = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
@@ -721,7 +673,9 @@ class Trainer:
                 target_size = masks.shape[-2:]
                 c4_full = F.interpolate(c4_logit, size=target_size, mode='bilinear', align_corners=False)
                 c6_full = F.interpolate(c6_logit, size=target_size, mode='bilinear', align_corners=False)
+
                 ohem_loss = self.ohem(c6_full, masks)
+
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
                         masks.unsqueeze(1).float(), size=c6_logit.shape[-2:], mode='nearest'
@@ -729,11 +683,13 @@ class Trainer:
                     dice_loss = self.dice(c6_logit, masks_small)
                 else:
                     dice_loss = torch.tensor(0.0, device=self.device)
+
                 loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
+
                 if self.args.aux_weight > 0:
                     aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
-                    aux_loss   = self.ohem(c4_full, masks)
-                    loss       = loss + aux_weight * aux_loss
+                    loss       = loss + aux_weight * self.ohem(c4_full, masks)
+
                 loss = loss / self.args.accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -772,10 +728,10 @@ class Trainer:
                 clear_gpu_memory()
             if batch_idx % self.args.log_interval == 0:
                 self.writer.add_scalar('train/loss',     loss.item() * self.args.accumulation_steps, self.global_step)
-                self.writer.add_scalar('train/ohem',     ohem_loss.item(), self.global_step)
-                self.writer.add_scalar('train/dice',     dice_loss.item(), self.global_step)
+                self.writer.add_scalar('train/ohem',     ohem_loss.item(),  self.global_step)
+                self.writer.add_scalar('train/dice',     dice_loss.item(),  self.global_step)
                 self.writer.add_scalar('train/lr',       self.optimizer.param_groups[0]['lr'], self.global_step)
-                self.writer.add_scalar('train/max_grad', max_grad, self.global_step)
+                self.writer.add_scalar('train/max_grad', max_grad,          self.global_step)
 
         n = len(loader)
         print(f"\nEpoch {epoch+1} — Max gradient: {max_grad_epoch:.2f}")
@@ -787,7 +743,6 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
-        # [FIX 2] BN eval mode khi validate
         for m in self.model.modules():
             if isinstance(m, nn.BatchNorm2d):
                 m.eval()
@@ -803,10 +758,10 @@ class Trainer:
             if masks.dim() == 4:
                 masks = masks.squeeze(1)
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                logits = self.model(imgs)
+                logits      = self.model(imgs)
                 logits_full = F.interpolate(logits, size=masks.shape[-2:],
                                             mode='bilinear', align_corners=False)
-                ce_loss = self.ce(logits_full, masks)
+                ce_loss     = self.ce(logits_full, masks)
                 if self.dice_weight > 0:
                     masks_small = F.interpolate(
                         masks.unsqueeze(1).float(), size=logits.shape[-2:], mode='nearest'
@@ -816,6 +771,7 @@ class Trainer:
                     dice_loss = torch.tensor(0.0, device=self.device)
                 loss = self.ce_weight * ce_loss + self.dice_weight * dice_loss
             total_loss += loss.item()
+
             pred   = logits_full.argmax(1).cpu().numpy()
             target = masks.cpu().numpy()
             valid  = (target >= 0) & (target < num_classes)
@@ -893,7 +849,7 @@ def main():
     parser.add_argument("--freeze_backbone",        action="store_true", default=False)
     parser.add_argument("--unfreeze_schedule",      type=str,   default="",
                         help="Comma-separated epochs for progressive unfreeze. "
-                             "E.g. '10,20,30,40' unfreezes stem→stage4→stage5→stage6")
+                             "E.g. '15,30,45,60'")
     parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
     parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5)
     parser.add_argument("--alpha_lr_factor",        type=float, default=0.1)
@@ -920,15 +876,15 @@ def main():
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
 
-    parser.add_argument("--use_amp",        action="store_true", default=True)
-    parser.add_argument("--num_workers",    type=int, default=4)
-    parser.add_argument("--save_dir",       default="./checkpoints")
-    parser.add_argument("--resume",         type=str, default=None)
-    parser.add_argument("--resume_mode",    type=str, default="transfer",
+    parser.add_argument("--use_amp",           action="store_true", default=True)
+    parser.add_argument("--num_workers",       type=int, default=4)
+    parser.add_argument("--save_dir",          default="./checkpoints")
+    parser.add_argument("--resume",            type=str, default=None)
+    parser.add_argument("--resume_mode",       type=str, default="transfer",
                         choices=["transfer", "continue"])
-    parser.add_argument("--seed",           type=int, default=42)
-    parser.add_argument("--log_interval",   type=int, default=50)
-    parser.add_argument("--save_interval",  type=int, default=10)
+    parser.add_argument("--seed",              type=int, default=42)
+    parser.add_argument("--log_interval",      type=int, default=50)
+    parser.add_argument("--save_interval",     type=int, default=10)
     parser.add_argument("--reset_best_metric", action="store_true")
 
     args = parser.parse_args()
@@ -939,21 +895,19 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"\n{'='*70}")
-    print(f"GCNet v3 Training  |  FoggyAwareNorm + DWSA + fog_bridge")
+    print(f"GCNet v3  |  FoggyAwareNorm + DWSA + fog_bridge")
     print(f"{'='*70}")
     print(f"Device: {device}  |  Image: {args.img_h}x{args.img_w}")
     print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
-
-    # [FIX 3] In rõ unfreeze schedule để tránh bỏ sót
     if args.unfreeze_schedule:
-        print(f"Unfreeze schedule: epochs {args.unfreeze_schedule}")
-        print(f"  Stage mapping:")
-        print(f"  k=1 → stem_conv1/2, stem_stage2/3")
-        print(f"  k=2 → semantic/detail branch [0], dwsa_stage4, compression_1, down_1")
-        print(f"  k=3 → semantic/detail branch [1], dwsa_stage5, compression_2, down_2")
-        print(f"  k=4 → semantic/detail branch [2], dwsa_stage6, spp")
+        print(f"Unfreeze schedule: {args.unfreeze_schedule}")
+        print(f"  k=1 (epoch {args.unfreeze_schedule.split(',')[0] if args.unfreeze_schedule else '?'})"
+              f" → stem_conv1/2, stem_stage2/3")
+        print(f"  k=2 → semantic/detail[0], dwsa_stage4, compression_1, down_1")
+        print(f"  k=3 → semantic/detail[1], dwsa_stage5, compression_2, down_2")
+        print(f"  k=4 → semantic/detail[2], dwsa_stage6, spp")
     else:
-        print(f"Unfreeze schedule: none (static freeze)")
+        print(f"Unfreeze schedule: none")
     print(f"{'='*70}\n")
 
     cfg = ModelConfig.get_config()
@@ -982,9 +936,9 @@ def main():
     model.apply(init_weights)
     check_model_health(model)
 
-    # [FIX 1] Load cả backbone + head từ checkpoint
+    # Load pretrained backbone + head
     if args.pretrained_weights:
-        load_full_checkpoint(model, args.pretrained_weights)
+        load_pretrained_gcnet(model, args.pretrained_weights)
 
     if args.freeze_backbone:
         freeze_backbone(model)
@@ -992,13 +946,11 @@ def main():
     count_trainable_params(model)
     print_backbone_structure(model)
 
-    # [FIX 2] Comment đúng: gamma=0.5 là intentional, không phải bug
     print("DWSA gamma values at init:")
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         m = getattr(model.backbone, name, None)
         if m is not None and hasattr(m, 'gamma'):
-            print(f"  {name}.gamma = {m.gamma.item():.6f}  "
-                  f"(init=0.5, sẽ học trong quá trình train)")
+            print(f"  {name}.gamma = {m.gamma.item():.6f}  (init=0.5)")
     print()
 
     with torch.no_grad():
@@ -1028,13 +980,12 @@ def main():
             reset_best_metric=args.reset_best_metric,
         )
 
-    # [FIX 3] Parse unfreeze_schedule đúng cách
     unfreeze_epochs = []
     if args.unfreeze_schedule:
         try:
             unfreeze_epochs = sorted(int(e) for e in args.unfreeze_schedule.split(','))
         except Exception:
-            raise ValueError("unfreeze_schedule phải là chuỗi số nguyên, ví dụ: '10,20,30,40'")
+            raise ValueError("unfreeze_schedule phải là chuỗi số nguyên, ví dụ: '15,30,45,60'")
 
     UNFREEZE_STAGES = [
         ['stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3'],
@@ -1051,6 +1002,7 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
+        # Progressive unfreeze (cumulative)
         past    = [e for e in unfreeze_epochs if e <= epoch]
         k       = len(past)
         targets = []
@@ -1059,6 +1011,7 @@ def main():
         if targets:
             unfreeze_backbone_progressive(model, targets)
 
+        # Rebuild optimizer+scheduler tại epoch unfreeze
         if epoch in unfreeze_epochs:
             optimizer = build_optimizer(model, args)
             scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
@@ -1069,13 +1022,14 @@ def main():
                 print(f"  {g.get('name','?')}: {g['lr']:.2e}")
             print()
 
+        # Loss phase: ce_only ngay sau unfreeze, full sau đó
         if unfreeze_epochs:
             last_unfreeze = max((e for e in unfreeze_epochs if e <= epoch), default=None)
             if last_unfreeze is not None:
-                if epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
-                    trainer.set_loss_phase('full')
-                elif epoch == last_unfreeze:
+                if epoch == last_unfreeze:
                     trainer.set_loss_phase('ce_only')
+                elif epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
+                    trainer.set_loss_phase('full')
 
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics   = trainer.validate(val_loader, epoch)
