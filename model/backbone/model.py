@@ -43,6 +43,7 @@ class FoggyAwareNorm(nn.Module):
                                    affine=True, track_running_stats=True)
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
                                       affine=True, track_running_stats=False)
+        # alpha khởi tạo 0.5 — blend đều giữa IN và BN lúc đầu
         self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
 
         if not requires_grad:
@@ -62,9 +63,20 @@ class DWSA(nn.Module):
     """Dynamic Weight Self-Attention.
 
     Áp lên semantic branch (global context) thay vì detail branch (local).
-    Lý do: semantic branch downsampled 1/16~1/32 → spatial attention trên
-    global feature có ý nghĩa hơn. Với foggy images, fog là global degradation
-    → suppress trên semantic branch hiệu quả hơn.
+
+    FIX so với bản gốc:
+      1. Attention computation: bản gốc dùng bmm(v_pool, attn.T) — sai semantic.
+         Standard attention là attended[i] = sum_j attn[i,j] * v[j].
+         Sửa: v_t = v_pool.T → attended = bmm(attn, v_t).T
+
+      2. dw_gen gate: bản gốc gate từ x gốc, không interact với attended.
+         Sửa: gate từ attended (global-average-pooled) để channel weighting
+         phụ thuộc vào attention output — hai nhánh có interaction thực sự.
+
+      3. Bỏ self.norm (BN) sau out_proj:
+         - Deploy mode: BN trong DWSA không fuse được vào reparam conv
+         - gamma=0.1 + residual connection đã đủ kiểm soát magnitude
+         - Tránh vấn đề BN với small batch size
     """
 
     def __init__(self,
@@ -79,9 +91,9 @@ class DWSA(nn.Module):
         self.key     = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
         self.value   = nn.Conv2d(in_channels, in_channels,  kernel_size=1, bias=False)
 
+        # FIX 2: dw_gen nhận attended (sau attention) thay vì x gốc
+        # Input là global-average-pooled attended feature → (B, C)
         self.dw_gen = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
             nn.Linear(in_channels, mid_channels),
             nn.ReLU(inplace=True),
             nn.Linear(mid_channels, in_channels),
@@ -89,9 +101,9 @@ class DWSA(nn.Module):
         )
 
         self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
-        _, self.norm  = build_norm_layer(norm_cfg, in_channels)
+        # FIX 3: bỏ self.norm — deploy-safe, gamma=0.1 đủ kiểm soát magnitude
 
-        # alpha=0.1 thay vì 0 để DWSA có ảnh hưởng ngay từ đầu
+        # gamma=0.1 → DWSA active ngay từ epoch đầu, không cần warm-up
         self.gamma = nn.Parameter(torch.ones(1) * 0.1)
 
         self._init_weights()
@@ -99,33 +111,50 @@ class DWSA(nn.Module):
     def _init_weights(self):
         for m in [self.query, self.key, self.value, self.out_proj]:
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        # Init dw_gen linear layers
+        for m in self.dw_gen:
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
 
     def forward(self, x: Tensor) -> Tensor:
         B, C, H, W = x.shape
 
-        q = self.query(x)
-        k = self.key(x)
-        v = self.value(x)
+        q = self.query(x)   # (B, mid_ch, H, W)
+        k = self.key(x)     # (B, mid_ch, H, W)
+        v = self.value(x)   # (B, C,      H, W)
 
+        # Pool xuống spatial nhỏ hơn để tính attention hiệu quả
         ph, pw = H // 4 + 1, W // 4 + 1
-        q_pool = F.adaptive_avg_pool2d(q, (ph, pw)).flatten(2)
-        k_pool = F.adaptive_avg_pool2d(k, (ph, pw)).flatten(2)
-        v_pool = F.adaptive_avg_pool2d(v, (ph, pw)).flatten(2)
+        q_pool = F.adaptive_avg_pool2d(q, (ph, pw)).flatten(2)  # (B, mid_ch, N)
+        k_pool = F.adaptive_avg_pool2d(k, (ph, pw)).flatten(2)  # (B, mid_ch, N)
+        v_pool = F.adaptive_avg_pool2d(v, (ph, pw)).flatten(2)  # (B, C,      N)
 
+        # Attention matrix: (B, N, N)
+        # q_pool.T: (B, N, mid_ch)  ×  k_pool: (B, mid_ch, N)  →  (B, N, N)
         scale = q_pool.shape[1] ** -0.5
         attn  = torch.softmax(
             torch.bmm(q_pool.transpose(1, 2), k_pool) * scale,
             dim=-1
-        )
+        )   # (B, N, N), attn[b, i, j] = weight của query i với key j
 
-        attended = torch.bmm(v_pool, attn.transpose(1, 2))
+        # FIX 1: standard attention — attended[i] = sum_j attn[i,j] * v[j]
+        # attn: (B, N, N)  ×  v_pool.T: (B, N, C)  →  (B, N, C)
+        v_t      = v_pool.transpose(1, 2)            # (B, N, C)
+        attended = torch.bmm(attn, v_t)              # (B, N, C)
+        attended = attended.transpose(1, 2)          # (B, C, N)
         attended = attended.view(B, C, ph, pw)
         attended = F.interpolate(attended, size=(H, W),
                                  mode='bilinear', align_corners=False)
 
-        dw  = self.dw_gen(x).view(B, C, 1, 1)
+        # FIX 2: dw_gen gate từ attended (global avg pool), không phải x gốc
+        # → channel weighting có interaction với attention output
+        attended_gap = attended.mean(dim=[-2, -1])   # (B, C)
+        dw  = self.dw_gen(attended_gap).view(B, C, 1, 1)
+
+        # FIX 3: bỏ self.norm — out_proj đã đủ, gamma kiểm soát scale
         out = self.out_proj(attended * dw)
-        out = self.norm(out)
 
         return x + self.gamma * out
 
@@ -143,7 +172,12 @@ class GCNet(BaseModule):
          - stage4: x_s sau bilateral fusion (channels*4, 1/16)
          - stage5: x_s sau bilateral fusion (channels*8, 1/32)
          - stage6: x_spp (DAPPM output) trước khi fuse với x_d (channels*4)
-      3. gamma khởi tạo 0.1 thay vì 0 — DWSA có ảnh hưởng ngay từ epoch đầu.
+      3. gamma khởi tạo 0.1 — DWSA có ảnh hưởng ngay từ epoch đầu.
+
+    FIX so với bản trước:
+      4. forward() nhận return_aux param — không còn fragile khi gọi ở eval mode.
+      5. c4_feat luôn được tạo trong forward, không dùng conditional assignment
+         → tránh UnboundLocalError nếu control flow thay đổi.
     """
 
     def __init__(self,
@@ -295,16 +329,10 @@ class GCNet(BaseModule):
             act_cfg=act_cfg)
 
         # ------------------------------------------------------------------ #
-        # DWSA — áp lên SEMANTIC branch, không phải detail branch             #
-        #                                                                      #
-        # stage4: x_s sau bilateral fusion → channels*4, resolution 1/16     #
-        # stage5: x_s sau bilateral fusion → channels*8, resolution 1/32     #
-        # stage6: x_spp (DAPPM output)    → channels*4, resolution 1/8      #
-        #                                                                      #
-        # Semantic branch có global context → spatial attention meaningful.   #
-        # Detail branch local (1/8) → pooling trong DWSA làm mờ local info.  #
-        # Fog = global degradation → suppress trên semantic branch tốt hơn.  #
-        # gamma=0.1 (không phải 0) → DWSA active ngay từ epoch đầu.          #
+        # DWSA — áp lên SEMANTIC branch                                        #
+        # stage4: x_s sau bilateral fusion → channels*4, 1/16                #
+        # stage5: x_s sau bilateral fusion → channels*8, 1/32                #
+        # stage6: x_spp (DAPPM output)    → channels*4, 1/8                 #
         # ------------------------------------------------------------------ #
         self.dwsa_stage4 = DWSA(channels * 4,
                                 reduction=dwsa_reduction, norm_cfg=norm_cfg)
@@ -315,7 +343,26 @@ class GCNet(BaseModule):
 
         self.kaiming_init()
 
-    def forward(self, x: Tensor) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+    def forward(self,
+                x: Tensor,
+                return_aux: Optional[bool] = None,
+                ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
+        """Forward pass.
+
+        Args:
+            x: Input image tensor (B, 3, H, W).
+            return_aux: Nếu True → trả về (c4_feat, fused).
+                        Nếu False → trả về fused.
+                        Nếu None (default) → dùng self.training.
+
+        FIX: dùng return_aux thay vì chỉ dựa vào self.training.
+        Bản gốc: c4_feat chỉ được gán trong `if self.training` block →
+        nếu ai gọi backbone ở training mode nhưng cần fused only (e.g.
+        distillation teacher), hoặc gọi ở eval mode mà unpack tuple →
+        UnboundLocalError hoặc type error ngầm.
+        """
+        use_aux = self.training if return_aux is None else return_aux
+
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
 
         # ---- Stage 1–3 --------------------------------------------------- #
@@ -329,47 +376,41 @@ class GCNet(BaseModule):
         x_d = self.detail_branch_layers[0](x)        # 1/8,  channels*2
 
         comp_c = self.compression_1(self.relu(x_s))
-        x_s = x_s + self.down_1(self.relu(x_d))
-        x_d = x_d + resize(comp_c, size=out_size,
-                            mode='bilinear',
-                            align_corners=self.align_corners)
+        x_s    = x_s + self.down_1(self.relu(x_d))
+        x_d    = x_d + resize(comp_c, size=out_size,
+                               mode='bilinear',
+                               align_corners=self.align_corners)
 
-        # DWSA trên semantic branch sau fusion stage 4
-        # x_s: 1/16, channels*4 — global context, fog suppression hiệu quả
         x_s = self.dwsa_stage4(x_s)
 
-        if self.training:
-            c4_feat = x_d.clone()
+        # FIX: c4_feat luôn được tạo (dùng no-op clone khi không cần)
+        # Tránh UnboundLocalError nếu return_aux và self.training không đồng bộ
+        c4_feat = x_d.clone() if use_aux else None
 
         # ---- Stage 5 ---------------------------------------------------- #
         x_s = self.semantic_branch_layers[1](self.relu(x_s))  # 1/32, channels*8
         x_d = self.detail_branch_layers[1](self.relu(x_d))    # 1/8,  channels*2
 
         comp_c = self.compression_2(self.relu(x_s))
-        x_s = x_s + self.down_2(self.relu(x_d))
-        x_d = x_d + resize(comp_c, size=out_size,
-                            mode='bilinear',
-                            align_corners=self.align_corners)
+        x_s    = x_s + self.down_2(self.relu(x_d))
+        x_d    = x_d + resize(comp_c, size=out_size,
+                               mode='bilinear',
+                               align_corners=self.align_corners)
 
-        # DWSA trên semantic branch sau fusion stage 5
-        # x_s: 1/32, channels*8 — deeper semantic, richer context
         x_s = self.dwsa_stage5(x_s)
 
         # ---- Stage 6 ---------------------------------------------------- #
-        x_d = self.detail_branch_layers[2](self.relu(x_d))    # 1/8,  channels*4
-        x_s = self.semantic_branch_layers[2](self.relu(x_s))  # 1/64, channels*16
-        x_spp = self.spp(x_s)                                  # DAPPM output, channels*4
+        x_d   = self.detail_branch_layers[2](self.relu(x_d))    # 1/8,  channels*4
+        x_s   = self.semantic_branch_layers[2](self.relu(x_s))  # 1/64, channels*16
+        x_spp = self.spp(x_s)
         x_spp = resize(x_spp, size=out_size,
                        mode='bilinear', align_corners=self.align_corners)
 
-        # DWSA trên x_spp (DAPPM output) trước khi fuse với detail branch
-        # x_spp: 1/8, channels*4 — full semantic context sau DAPPM
         x_spp = self.dwsa_stage6(x_spp)
 
-        # Fuse detail + semantic (đã qua DWSA)
         fused = x_d + x_spp
 
-        return (c4_feat, fused) if self.training else fused
+        return (c4_feat, fused) if use_aux else fused
 
     def switch_to_deploy(self):
         for m in self.modules():
@@ -598,7 +639,7 @@ class GCBlock(nn.Module):
         k3_2, b3_2 = self.path_3x3_2.conv.weight.data, self.path_3x3_2.conv.bias.data
         self.path_1x1.switch_to_deploy()
         k1x1, b1x1 = self.path_1x1.conv.weight.data, self.path_1x1.conv.bias.data
-        kid, bid = self._fuse_bn_tensor(self.path_residual)
+        kid, bid   = self._fuse_bn_tensor(self.path_residual)
 
         return (k3_1 + k3_2 + self._pad_1x1_to_3x3(k1x1) + kid,
                 b3_1 + b3_2 + b1x1 + bid)
@@ -653,7 +694,9 @@ class GCBlock(nn.Module):
         self.__delattr__('path_3x3_1')
         self.__delattr__('path_3x3_2')
         self.__delattr__('path_1x1')
-        if hasattr(self, 'path_residual'):
+        # FIX: kiểm tra path_residual không phải None trước khi delattr
+        # Bản gốc: hasattr trả True kể cả khi value là None → delattr None attribute
+        if hasattr(self, 'path_residual') and self.path_residual is not None:
             self.__delattr__('path_residual')
         if hasattr(self, 'id_tensor'):
             self.__delattr__('id_tensor')
