@@ -66,11 +66,35 @@ def _remap_stem_key(key: str, N2: int = 4):
 
 
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
-    """Load pretrained weights vào model.backbone (GCNet v3)."""
+    """Load pretrained weights vào model.backbone (GCNet v3) + model.decode_head."""
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
 
+    # ------------------------------------------------------------------ #
+    # HEAD key mapping: decode_head.* (pretrained) → decode_head.* (model)
+    #
+    # Pretrained key                              Model key
+    # decode_head.conv_seg.*                   →  decode_head.cls_seg.*
+    # decode_head.head.*                       →  decode_head.head.*      (same)
+    # decode_head.aux_head_c4.*               →  decode_head.aux_head_c4.* (same)
+    # decode_head.aux_cls_seg_c4.*            →  decode_head.aux_cls_seg_c4.* (same)
+    # ------------------------------------------------------------------ #
+    HEAD_KEY_MAP = {}
+    for k in state.keys():
+        if not k.startswith('decode_head.'):
+            continue
+        suffix = k[len('decode_head.'):]
+        # conv_seg → cls_seg (tên khác nhau)
+        if suffix.startswith('conv_seg.'):
+            dst = 'cls_seg.' + suffix[len('conv_seg.'):]
+        else:
+            dst = suffix   # head.*, aux_head_c4.*, aux_cls_seg_c4.* — giữ nguyên
+        HEAD_KEY_MAP[k] = dst   # dst là key trong model.decode_head.state_dict()
+
+    # ------------------------------------------------------------------ #
+    # Load backbone (giữ nguyên logic cũ)
+    # ------------------------------------------------------------------ #
     model_state = model.backbone.state_dict()
     compatible  = {}
     skipped     = []
@@ -84,19 +108,19 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         model_key_map[norm] = mk
 
     bn_dropped = []
-    non_backbone_prefixes = ('decode_head.', 'aux_head.', 'head.')
 
     for ckpt_key, ckpt_val in state.items():
+        # --- Head keys: xử lý riêng bên dưới ---
+        if ckpt_key.startswith('decode_head.'):
+            continue
+
         stripped = ckpt_key
         for pref in ('backbone.', 'model.', 'module.'):
             if stripped.startswith(pref):
                 stripped = stripped[len(pref):]
                 break
-        if any(stripped.startswith(p) for p in non_backbone_prefixes):
-            continue
 
         norm_ckpt = _remap_stem_key(ckpt_key)
-
         if norm_ckpt is None:
             bn_dropped.append(ckpt_key)
             continue
@@ -119,55 +143,83 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
         if not matched:
             skipped.append(ckpt_key)
 
-    loaded = len(compatible)
-    total  = len(model_state)
-    rate   = 100 * loaded / total if total > 0 else 0.0
+    # ------------------------------------------------------------------ #
+    # Load head
+    # ------------------------------------------------------------------ #
+    head_state   = model.decode_head.state_dict()
+    head_loaded  = {}
+    head_skipped_shape   = []
+    head_skipped_missing = []
 
-    expected_skip_markers = (
-        'dwsa_stage', 'foggy', 'alpha', 'in_.',
-        '.spp.',
-        'backbone.spp.',
-    )
-    truly_expected = [k for k in skipped if any(s in k for s in expected_skip_markers)]
-    truly_unmatched = [k for k in skipped if k not in truly_expected]
+    for ckpt_key, dst_suffix in HEAD_KEY_MAP.items():
+        ckpt_val = state[ckpt_key]
+        if dst_suffix not in head_state:
+            head_skipped_missing.append(f"{ckpt_key} → {dst_suffix}")
+            continue
+        if head_state[dst_suffix].shape != ckpt_val.shape:
+            head_skipped_shape.append(
+                f"{ckpt_key}: ckpt{list(ckpt_val.shape)} vs model{list(head_state[dst_suffix].shape)}"
+            )
+            continue
+        head_loaded[dst_suffix] = ckpt_val
+
+    # ------------------------------------------------------------------ #
+    # Summary
+    # ------------------------------------------------------------------ #
+    loaded_bb = len(compatible)
+    loaded_hd = len(head_loaded)
+    total_bb  = len(model_state)
+    total_hd  = len(head_state)
+
+    expected_skip_markers = ('dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.')
+    truly_expected   = [k for k in skipped if any(s in k for s in expected_skip_markers)]
+    truly_unmatched  = [k for k in skipped if k not in truly_expected]
 
     sep = '=' * 70
     print(f"\n{sep}")
     print("WEIGHT LOADING SUMMARY")
     print(sep)
-    print(f"Loaded:                  {loaded:>5} / {total} ({rate:.1f}%)")
-    print(f"BN dropped (expected):   {len(bn_dropped):>5}  (stem BN → FoggyAwareNorm ✓)")
-    print(f"Skipped total:           {len(skipped):>5}")
-    print(f"  Expected (shape/new):  {len(truly_expected):>5}  (DWSA / FoggyNorm / DAPPM BN order ✓)")
+    print(f"Backbone:  {loaded_bb:>5} / {total_bb}  ({100*loaded_bb/max(total_bb,1):.1f}%)")
+    print(f"Head:      {loaded_hd:>5} / {total_hd}  ({100*loaded_hd/max(total_hd,1):.1f}%)  ← NEW")
+    print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm ✓)")
+    if head_skipped_shape:
+        print(f"Head shape mismatch:   {len(head_skipped_shape)}")
+        for s in head_skipped_shape:
+            print(f"    SHAPE: {s}")
+    if head_skipped_missing:
+        print(f"Head key missing:      {len(head_skipped_missing)}")
+        for s in head_skipped_missing:
+            print(f"    MISSING: {s}")
     if truly_unmatched:
-        print(f"  Unmatched:             {len(truly_unmatched):>5}  ← cần kiểm tra")
+        print(f"Backbone unmatched:    {len(truly_unmatched)}  ← cần kiểm tra")
         for k in truly_unmatched[:5]:
-            print(f"      {k}")
+            print(f"    {k}")
     print(sep + "\n")
 
-    if truly_unmatched:
-        print(f"WARNING: {len(truly_unmatched)} key không match — kiểm tra checkpoint format\n")
+    # Apply
+    missing_bb, _ = model.backbone.load_state_dict(compatible, strict=False)
+    missing_hd, _ = model.decode_head.load_state_dict(head_loaded, strict=False)
 
-    missing, _ = model.backbone.load_state_dict(compatible, strict=False)
+    expected_missing_markers = ('dwsa', 'alpha', 'in_.', 'foggy', '.1.bn.', 'spp.',
+                                'loss_', 'fog_consistency')
+    unexpected_bb = [k for k in missing_bb
+                     if not any(s in k for s in expected_missing_markers)]
+    unexpected_hd = [k for k in missing_hd
+                     if not any(s in k for s in expected_missing_markers)]
 
-    expected_missing_markers = (
-        'dwsa',
-        'alpha',
-        'in_.',
-        'foggy',
-        '.1.bn.',
-        'spp.',
-    )
-    expected_missing   = [k for k in missing if any(s in k for s in expected_missing_markers)]
-    unexpected_missing = [k for k in missing if k not in expected_missing]
-
-    if unexpected_missing:
-        print(f"Unexpected missing ({len(unexpected_missing)}) — cần kiểm tra:")
-        for k in unexpected_missing[:10]:
+    if unexpected_bb:
+        print(f"Unexpected backbone missing ({len(unexpected_bb)}):")
+        for k in unexpected_bb[:5]:
             print(f"  - {k}")
-        print()
-    print(f"Expected missing: {len(expected_missing)} keys (new modules + DAPPM BN order) → OK\n")
-    return rate
+    if unexpected_hd:
+        print(f"Unexpected head missing ({len(unexpected_hd)}):")
+        for k in unexpected_hd[:5]:
+            print(f"  - {k}")
+
+    n_expected_missing = len(missing_bb) - len(unexpected_bb) + len(missing_hd) - len(unexpected_hd)
+    print(f"Expected missing: {n_expected_missing} keys (DWSA / FoggyNorm / loss buffers) → OK\n")
+
+    return 100 * (loaded_bb + loaded_hd) / max(total_bb + total_hd, 1)
 
 
 # ============================================
