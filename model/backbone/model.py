@@ -30,10 +30,6 @@ class FoggyAwareNorm(nn.Module):
 
     Khi alpha → 1: thiên về IN (tốt cho foggy / unseen domain).
     Khi alpha → 0: thiên về BN (tốt cho clear images / in-domain).
-
-    [CITYSCAPES FOGGY] alpha khởi tạo 0.5 — cân bằng IN/BN ngay từ đầu.
-    Khi fine-tune từ Cityscapes clear, alpha sẽ tự học dịch về 1 (IN)
-    để thích nghi với distribution shift của fog.
     """
 
     def __init__(self,
@@ -47,9 +43,6 @@ class FoggyAwareNorm(nn.Module):
                                    affine=True, track_running_stats=True)
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
                                       affine=True, track_running_stats=False)
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2b]
-        # alpha init 0.5 → balanced. Khi fine-tune foggy, alpha drift về 1 (IN).
-        # Nếu train trực tiếp trên foggy không qua pretrain clear, có thể init 0.7.
         self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
 
         if not requires_grad:
@@ -72,12 +65,6 @@ class DWSA(nn.Module):
     Lý do: semantic branch downsampled 1/16~1/32 → spatial attention trên
     global feature có ý nghĩa hơn. Với foggy images, fog là global degradation
     → suppress trên semantic branch hiệu quả hơn.
-
-    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1]
-    - gamma: 0.1 → 0.5 — DWSA có ảnh hưởng mạnh hơn ngay từ đầu training.
-      Fog là global degradation; attention cần suppress fog-region mạnh hơn.
-    - pooling: H//4+1 → max(H//8, 4) — pooling thô hơn để bắt fog-pattern
-      toàn cục, tránh bị nhiễu bởi local texture.
     """
 
     def __init__(self,
@@ -104,12 +91,8 @@ class DWSA(nn.Module):
         self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
         _, self.norm  = build_norm_layer(norm_cfg, in_channels)
 
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1a]
-        # gamma: 0.1 → 0.5
-        # Fog = global degradation → DWSA cần có ảnh hưởng mạnh hơn ngay từ
-        # epoch đầu để học suppress fog-region trên semantic branch.
-        # Nếu thấy training không ổn định, có thể hạ về 0.3.
-        self.gamma = nn.Parameter(torch.ones(1) * 0.5)
+        # alpha=0.1 thay vì 0 để DWSA có ảnh hưởng ngay từ đầu
+        self.gamma = nn.Parameter(torch.ones(1) * 0.1)
 
         self._init_weights()
 
@@ -124,14 +107,7 @@ class DWSA(nn.Module):
         k = self.key(x)
         v = self.value(x)
 
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1b]
-        # Pooling thô hơn: H//8 thay vì H//4
-        # Fog là degradation toàn cục → pooling thô bắt fog-pattern tốt hơn,
-        # không bị nhiễu bởi local texture (vỉa hè, tường, biển báo).
-        # clamp min=4 để tránh tensor quá nhỏ ở resolution thấp.
-        ph = max(H // 8, 4)
-        pw = max(W // 8, 4)
-
+        ph, pw = H // 4 + 1, W // 4 + 1
         q_pool = F.adaptive_avg_pool2d(q, (ph, pw)).flatten(2)
         k_pool = F.adaptive_avg_pool2d(k, (ph, pw)).flatten(2)
         v_pool = F.adaptive_avg_pool2d(v, (ph, pw)).flatten(2)
@@ -159,7 +135,7 @@ class DWSA(nn.Module):
 # =============================================================================
 
 class GCNet(BaseModule):
-    """GCNet backbone với DWSA trên semantic branch và FoggyAwareNorm.
+    """GCNet backbone với DWSA trên semantic branch và FoggyAwareNorm ở stem.
 
     Thay đổi so với bản gốc:
       1. Stem dùng FoggyAwareNorm thay BN ở 2 conv đầu.
@@ -167,13 +143,7 @@ class GCNet(BaseModule):
          - stage4: x_s sau bilateral fusion (channels*4, 1/16)
          - stage5: x_s sau bilateral fusion (channels*8, 1/32)
          - stage6: x_spp (DAPPM output) trước khi fuse với x_d (channels*4)
-      3. gamma khởi tạo 0.5 — DWSA có ảnh hưởng mạnh hơn ngay từ epoch đầu.
-
-    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2]
-    Thêm fog_bridge (FoggyAwareNorm) sau stem_stage3, trước khi split thành
-    semantic và detail branch. Đây là điểm mà feature fog bắt đầu "thấm sâu"
-    — một FoggyAwareNorm tại đây giúp cả hai branch bắt đầu từ fog-robust
-    representation, thay vì chỉ normalize ở 2 conv đầu.
+      3. gamma khởi tạo 0.1 thay vì 0 — DWSA có ảnh hưởng ngay từ epoch đầu.
     """
 
     def __init__(self,
@@ -227,13 +197,6 @@ class GCNet(BaseModule):
                       norm_cfg=norm_cfg, act_cfg=act_cfg, deploy=deploy)
               for _ in range(num_blocks_per_stage[1] - 1)]
         )
-
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2]
-        # FoggyAwareNorm bridge sau stem_stage3, trước khi split branches.
-        # stem_stage3 output: channels*2, resolution 1/8.
-        # Tại đây fog đã "thấm" qua 3 stage — normalize fog-distribution
-        # trước khi chia semantic/detail giúp cả hai branch bắt đầu ổn định.
-        self.fog_bridge = FoggyAwareNorm(channels * 2)
 
         self.relu = build_activation_layer(act_cfg)
 
@@ -332,11 +295,16 @@ class GCNet(BaseModule):
             act_cfg=act_cfg)
 
         # ------------------------------------------------------------------ #
-        # DWSA — áp lên SEMANTIC branch                                       #
+        # DWSA — áp lên SEMANTIC branch, không phải detail branch             #
         #                                                                      #
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 1]                                  #
-        # gamma=0.5, pooling=H//8 (thô hơn để bắt fog-pattern toàn cục).    #
-        # Chi tiết xem class DWSA.                                            #
+        # stage4: x_s sau bilateral fusion → channels*4, resolution 1/16     #
+        # stage5: x_s sau bilateral fusion → channels*8, resolution 1/32     #
+        # stage6: x_spp (DAPPM output)    → channels*4, resolution 1/8      #
+        #                                                                      #
+        # Semantic branch có global context → spatial attention meaningful.   #
+        # Detail branch local (1/8) → pooling trong DWSA làm mờ local info.  #
+        # Fog = global degradation → suppress trên semantic branch tốt hơn.  #
+        # gamma=0.1 (không phải 0) → DWSA active ngay từ epoch đầu.          #
         # ------------------------------------------------------------------ #
         self.dwsa_stage4 = DWSA(channels * 4,
                                 reduction=dwsa_reduction, norm_cfg=norm_cfg)
@@ -354,13 +322,7 @@ class GCNet(BaseModule):
         x = self.stem_conv1(x)
         x = self.stem_conv2(x)
         x = self.stem_stage2(x)
-        x = self.stem_stage3(x)           # 1/8, channels*2
-
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 2]
-        # fog_bridge: FoggyAwareNorm trước khi split thành 2 branch.
-        # Normalize fog-distribution tại điểm split để cả semantic và detail
-        # branch bắt đầu từ fog-robust representation.
-        x = self.fog_bridge(x)
+        x = self.stem_stage3(x)      # 1/8, channels*2
 
         # ---- Stage 4 ---------------------------------------------------- #
         x_s = self.semantic_branch_layers[0](x)      # 1/16, channels*4
@@ -373,6 +335,7 @@ class GCNet(BaseModule):
                             align_corners=self.align_corners)
 
         # DWSA trên semantic branch sau fusion stage 4
+        # x_s: 1/16, channels*4 — global context, fog suppression hiệu quả
         x_s = self.dwsa_stage4(x_s)
 
         if self.training:
@@ -389,6 +352,7 @@ class GCNet(BaseModule):
                             align_corners=self.align_corners)
 
         # DWSA trên semantic branch sau fusion stage 5
+        # x_s: 1/32, channels*8 — deeper semantic, richer context
         x_s = self.dwsa_stage5(x_s)
 
         # ---- Stage 6 ---------------------------------------------------- #
@@ -399,6 +363,7 @@ class GCNet(BaseModule):
                        mode='bilinear', align_corners=self.align_corners)
 
         # DWSA trên x_spp (DAPPM output) trước khi fuse với detail branch
+        # x_spp: 1/8, channels*4 — full semantic context sau DAPPM
         x_spp = self.dwsa_stage6(x_spp)
 
         # Fuse detail + semantic (đã qua DWSA)
