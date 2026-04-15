@@ -25,17 +25,8 @@ from components.components import (
 def accuracy(pred: Tensor,
              target: Tensor,
              ignore_index: int = 255) -> Tensor:
-    """Tính pixel accuracy, bỏ qua các pixel có nhãn = ignore_index.
-
-    Args:
-        pred (Tensor): Logits shape (B, C, H, W).
-        target (Tensor): Ground truth shape (B, H, W).
-        ignore_index (int): Label value to ignore. Default: 255.
-
-    Returns:
-        Tensor: Scalar accuracy in [0, 100].
-    """
-    pred_label = pred.argmax(dim=1)             # (B, H, W)
+    """Tính pixel accuracy, bỏ qua các pixel có nhãn = ignore_index."""
+    pred_label = pred.argmax(dim=1)
     mask       = target != ignore_index
     correct    = (pred_label[mask] == target[mask]).sum().float()
     total      = mask.sum().float().clamp(min=1)
@@ -47,13 +38,6 @@ def accuracy(pred: Tensor,
 # =============================================================================
 
 class CrossEntropyLoss(nn.Module):
-    """Wrapper nhỏ quanh F.cross_entropy để tương thích với loss_decode API.
-
-    Args:
-        ignore_index (int): Label value to ignore. Default: 255.
-        loss_weight (float): Scalar weight applied to this loss. Default: 1.0.
-    """
-
     def __init__(self,
                  ignore_index: int = 255,
                  loss_weight: float = 1.0):
@@ -73,44 +57,32 @@ class CrossEntropyLoss(nn.Module):
 class OHEMCrossEntropyLoss(nn.Module):
     """Online Hard Example Mining Cross-Entropy Loss.
 
-    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 3]
-    Thay CrossEntropyLoss thuần bằng OHEM cho loss_c6 (main loss).
+    FIX: thresh mặc định đổi từ 0.7 → 1.5.
 
-    Lý do: Cityscapes Foggy có class imbalance nặng hơn Cityscapes thường —
-    fog che khuất nhiều pixel của các class nhỏ (người đi bộ, xe đạp, biển báo),
-    khiến model dễ dominated bởi background và road (class lớn, loss thấp).
-    OHEM giải quyết bằng cách chỉ backprop qua các pixel "khó" (loss cao),
-    buộc model focus vào các vùng bị fog che phủ.
+    Lý do: với 19 classes, random prediction cho loss ≈ ln(19) ≈ 2.94.
+    Threshold 0.7 quá thấp → gần như mọi pixel đều vượt ngưỡng ở early
+    training → OHEM hoạt động giống CE thường, không có tác dụng filtering.
 
-    Cơ chế:
-      1. Tính per-pixel CE loss với reduction='none'.
-      2. Loại bỏ pixel ignore_index.
-      3. Sort loss giảm dần.
-      4. Giữ lại top-K pixel: K = max(n_pixel_with_loss > thresh, min_kept).
-      5. Backprop qua mean loss của K pixel đó.
+    thresh=1.5 ≈ 51% của loss random → chỉ giữ pixel mà model đang sai
+    đáng kể, buộc focus vào các vùng bị fog che phủ nặng.
+
+    Guideline chọn thresh:
+      - thresh ≈ ln(C) * 0.5  (C = num_classes) là điểm khởi đầu tốt
+      - Tăng thresh → strict hơn, gradient thưa hơn
+      - Giảm thresh → tiệm cận CE thường
+      - min_kept đảm bảo gradient không quá thưa khi fog nhẹ
 
     Args:
         ignore_index (int): Label value to ignore. Default: 255.
-        loss_weight (float): Scalar weight applied to this loss. Default: 1.0.
-        thresh (float): Loss threshold để xác định "hard example".
-            Pixel có loss > thresh đều được giữ. Default: 0.7.
-            Tăng thresh → strict hơn (chỉ lấy pixel rất khó).
-            Giảm thresh → lấy nhiều pixel hơn (gần với CE thường).
-        min_kept (int): Số pixel tối thiểu được giữ dù loss < thresh.
-            Đảm bảo gradient không quá thưa khi fog nhẹ. Default: 100_000.
-            Với Cityscapes (1024×2048 → ~2M pixel/image), 100k ≈ 5% pixel/image.
-
-    Lưu ý training:
-        - Với batch_size nhỏ (< 4), có thể tăng min_kept lên 200_000.
-        - Nếu model diverge sớm, thử tăng thresh lên 0.9 (chỉ lấy pixel
-          rất khó, giảm gradient noise).
-        - OHEM không áp dụng cho loss_c4 (auxiliary) — CE thường là đủ.
+        loss_weight (float): Scalar weight. Default: 1.0.
+        thresh (float): Loss threshold. Default: 1.5 (FIX từ 0.7).
+        min_kept (int): Số pixel tối thiểu giữ lại. Default: 100_000.
     """
 
     def __init__(self,
                  ignore_index: int = 255,
                  loss_weight: float = 1.0,
-                 thresh: float = 0.7,
+                 thresh: float = 1.5,
                  min_kept: int = 100_000):
         super().__init__()
         self.ignore_index = ignore_index
@@ -119,35 +91,23 @@ class OHEMCrossEntropyLoss(nn.Module):
         self.min_kept     = min_kept
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        """
-        Args:
-            pred   (Tensor): Logits shape (B, C, H, W).
-            target (Tensor): Ground truth shape (B, H, W), dtype=torch.long.
-
-        Returns:
-            Tensor: Scalar OHEM loss.
-        """
-        # Per-pixel CE, không reduce
         losses = F.cross_entropy(
             pred, target,
             ignore_index=self.ignore_index,
             reduction='none'
-        ).view(-1)                                   # (B*H*W,)
+        ).view(-1)
 
-        # Loại pixel ignore
         valid_mask = target.view(-1) != self.ignore_index
-        losses     = losses[valid_mask]              # (N_valid,)
+        losses     = losses[valid_mask]
 
         if losses.numel() == 0:
-            return pred.sum() * 0.0                 # safe zero-grad
+            return pred.sum() * 0.0
 
-        # Sort giảm dần, giữ top-K
         losses_sorted, _ = losses.sort(descending=True)
 
-        # K = max(số pixel có loss > thresh, min_kept)
         n_above_thresh = (losses_sorted > self.thresh).sum().item()
         n_keep         = int(max(n_above_thresh, self.min_kept))
-        n_keep         = min(n_keep, losses_sorted.numel())   # clamp to available
+        n_keep         = min(n_keep, losses_sorted.numel())
 
         return self.loss_weight * losses_sorted[:n_keep].mean()
 
@@ -160,38 +120,28 @@ class FogConsistencyLoss(nn.Module):
     """Fog Consistency Loss — KL divergence giữa predictions của cùng scene
     ở hai mức fog khác nhau.
 
-    [CITYSCAPES FOGGY - ĐIỀU CHỈNH 4]
-    Cityscapes Foggy cung cấp 3 mức fog (beta = 0.005, 0.01, 0.02) cho cùng
-    scene. Loss này khuyến khích model cho prediction nhất quán giữa các mức
-    fog: p(y | foggy_light) ≈ p(y | foggy_heavy).
+    FIX: làm rõ KL direction — light fog là TEACHER (target P), heavy fog
+    là STUDENT (distribution Q được tối ưu).
 
-    Ý tưởng: Nhãn ground-truth là như nhau cho cả 3 mức → model không nên
-    thay đổi prediction đột ngột khi fog thay đổi mức độ.
+    Lý do chọn chiều này:
+      - Light fog ít degraded hơn → prediction ổn định, distribution sắc nét
+        hơn → làm target tốt hơn
+      - Heavy fog prediction noisy → nếu dùng làm target thì KL loss dạy
+        student học noise
+      - KL(P=light || Q=heavy) → heavy fog model học phân phối của light fog
 
-    Cơ chế:
-      KL(softmax(logit_a/T) || softmax(logit_b/T)) * T²
-      Temperature T làm mềm distribution, tập trung vào "dark knowledge".
+    Gọi đúng cách:
+        fog_loss = loss_fog(logit_light.detach(), logit_heavy)
+        # logit_light là teacher → detach
+        # logit_heavy là student → được update
+
+    Không nên:
+        fog_loss = loss_fog(logit_light, logit_heavy.detach())
+        # heavy fog làm target → dạy model học noise
 
     Args:
         temperature (float): Softmax temperature. Default: 4.0.
-            T cao → soft distribution, focus vào class-level similarity.
-            T thấp → hard distribution, gần với CE thường.
         loss_weight (float): Scalar weight. Default: 0.1.
-            Giữ nhỏ để không át loss_c6 chính. Tăng lên 0.2 nếu
-            train multi-beta với batch cân bằng giữa các mức fog.
-
-    Cách dùng trong training loop:
-        # Giả sử mỗi batch có ảnh foggy ở 2 mức beta khác nhau:
-        logit_light = head(backbone(img_light))   # beta=0.005
-        logit_heavy = head(backbone(img_heavy))   # beta=0.02
-        loss_fog = fog_consistency(logit_light, logit_heavy)
-
-    Lưu ý:
-        - Chỉ có ý nghĩa khi train với NHIỀU MỨC fog trong cùng batch.
-          Nếu chỉ dùng một mức beta, bỏ loss này — không có tác dụng.
-        - logit_a và logit_b phải cùng shape (B, C, H, W).
-        - Nên detach() một trong hai nếu muốn one-way KL (thường detach logit_b
-          để logit_a học về phía logit_b — heavy fog học từ light fog).
     """
 
     def __init__(self,
@@ -201,28 +151,31 @@ class FogConsistencyLoss(nn.Module):
         self.T           = temperature
         self.loss_weight = loss_weight
 
-    def forward(self, logit_a: Tensor, logit_b: Tensor) -> Tensor:
+    def forward(self,
+                logit_light: Tensor,
+                logit_heavy: Tensor) -> Tensor:
         """
         Args:
-            logit_a (Tensor): Logits shape (B, C, H, W) — ảnh foggy mức A.
-            logit_b (Tensor): Logits shape (B, C, H, W) — ảnh foggy mức B.
-                Nên .detach() logit_b nếu muốn one-way KL
-                (logit_a học về phía logit_b).
+            logit_light (Tensor): Logits của ảnh foggy NHẸ, shape (B, C, H, W).
+                Nên .detach() trước khi truyền vào (light fog = teacher).
+            logit_heavy (Tensor): Logits của ảnh foggy NẶNG, shape (B, C, H, W).
+                Đây là student → KHÔNG detach, để gradient chạy qua.
 
         Returns:
-            Tensor: Scalar consistency loss.
+            Tensor: Scalar KL divergence loss (heavy fog học từ light fog).
         """
-        assert logit_a.shape == logit_b.shape, (
+        assert logit_light.shape == logit_heavy.shape, (
             f"FogConsistencyLoss: shape mismatch "
-            f"{logit_a.shape} vs {logit_b.shape}"
+            f"{logit_light.shape} vs {logit_heavy.shape}"
         )
 
-        log_p = F.log_softmax(logit_a / self.T, dim=1)   # log Q
-        q     = F.softmax(logit_b / self.T, dim=1)        # P (target)
+        # Q = heavy fog distribution (student, được tối ưu)
+        # P = light fog distribution (teacher, target)
+        # Minimize KL(P || Q) = sum P * log(P/Q)
+        log_q = F.log_softmax(logit_heavy / self.T, dim=1)   # log Q (student)
+        p     = F.softmax(logit_light  / self.T, dim=1)       # P     (teacher)
 
-        # KL(P || Q) * T² — scale back bởi T² để gradient magnitude
-        # không phụ thuộc vào lựa chọn temperature
-        kl = F.kl_div(log_p, q, reduction='batchmean') * (self.T ** 2)
+        kl = F.kl_div(log_q, p, reduction='batchmean') * (self.T ** 2)
 
         return self.loss_weight * kl
 
@@ -234,33 +187,16 @@ class FogConsistencyLoss(nn.Module):
 class GCNetHead(BaseModule):
     """Decode head for GCNet.
 
-    Nhận output từ GCNet backbone:
-      - Training  : (c4_feat, c6_feat) — c4 cho auxiliary loss, c6 cho main loss
-      - Inference : c6_feat only
-
-    Loss:
-      loss_c4 = CE(upsample(c4_logit), gt)           weight = loss_weight_aux
-      loss_c6 = OHEM_CE(upsample(c6_logit), gt)      weight = 1.0   [ĐIỀU CHỈNH 3]
-      loss_fog = FogConsistency(logit_a, logit_b)     weight = 0.1   [ĐIỀU CHỈNH 4]
-      acc_seg  = pixel accuracy trên c6_logit
-
-    Args:
-        in_channels (int): Channels của c6_feat (backbone output chính).
-            Với GCNet-S/M channels=32: in_channels = channels*4 = 128.
-        channels (int): Hidden channels bên trong head.
-        num_classes (int): Số lớp phân đoạn (bao gồm background).
-        norm_cfg (dict): Norm config. Default: BN.
-        act_cfg (dict): Activation config. Default: ReLU.
-        align_corners (bool): F.interpolate align_corners. Default: False.
-        ignore_index (int): Label ignored trong loss và accuracy. Default: 255.
-        loss_weight_aux (float): Weight của auxiliary loss (c4). Default: 0.4.
-        dropout_ratio (float): Dropout trước cls_seg. Default: 0.1.
-        ohem_thresh (float): OHEM threshold cho loss_c6. Default: 0.7.
-        ohem_min_kept (int): OHEM min pixel kept cho loss_c6. Default: 100_000.
-        fog_consistency_weight (float): Weight của FogConsistencyLoss.
-            Set 0.0 để disable nếu không train multi-beta. Default: 0.1.
-        fog_temperature (float): Temperature cho FogConsistencyLoss. Default: 4.0.
-        init_cfg (dict, optional): Init config. Default: None.
+    FIX so với bản gốc:
+      1. ohem_thresh default: 0.7 → 1.5 (phù hợp với 19-class Cityscapes)
+      2. seg_label shape: dùng shape[-2:] thay vì shape[1:] — an toàn với
+         (B, 1, H, W) input
+      3. forward() thêm assertion khi training mode để debug type error sớm
+      4. _make_base_head: đổi sang post-activation (Conv→BN→ReLU) để nhất
+         quán với GCBlock và backbone — tránh BN statistics mismatch khi
+         load pretrained weights
+      5. FogConsistencyLoss API: đổi tên param logit_a/b → logit_light/heavy
+         để tường minh hơn
     """
 
     def __init__(self,
@@ -273,10 +209,9 @@ class GCNetHead(BaseModule):
                  ignore_index: int = 255,
                  loss_weight_aux: float = 0.4,
                  dropout_ratio: float = 0.1,
-                 # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 3] OHEM params
-                 ohem_thresh: float = 0.7,
+                 # FIX: thresh default 1.5 (từ 0.7) — xem OHEMCrossEntropyLoss
+                 ohem_thresh: float = 1.5,
                  ohem_min_kept: int = 100_000,
-                 # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 4] Fog consistency params
                  fog_consistency_weight: float = 0.1,
                  fog_temperature: float = 4.0,
                  init_cfg: OptConfigType = None):
@@ -295,6 +230,7 @@ class GCNetHead(BaseModule):
         self.head = self._make_base_head(in_channels, channels)
 
         # ---- Auxiliary head (c4) ----------------------------------------- #
+        # in_channels // 2: c4_feat là channels*2 = in_channels // 2
         self.aux_head_c4    = self._make_base_head(in_channels // 2, channels)
         self.aux_cls_seg_c4 = nn.Conv2d(channels, num_classes, kernel_size=1)
 
@@ -303,13 +239,10 @@ class GCNetHead(BaseModule):
         self.cls_seg  = nn.Conv2d(channels, num_classes, kernel_size=1)
 
         # ---- Loss functions ---------------------------------------------- #
-        # Auxiliary loss (c4): CE thường — đủ cho supervision ở feature level
         self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
                                          loss_weight=loss_weight_aux)
 
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 3]
-        # Main loss (c6): OHEM-CE thay CE thường.
-        # Fog che khuất class nhỏ → OHEM focus backprop vào pixel khó.
+        # FIX: thresh=1.5 (default đã sửa ở param)
         self.loss_c6 = OHEMCrossEntropyLoss(
             ignore_index=ignore_index,
             loss_weight=1.0,
@@ -317,9 +250,6 @@ class GCNetHead(BaseModule):
             min_kept=ohem_min_kept,
         )
 
-        # [CITYSCAPES FOGGY - ĐIỀU CHỈNH 4]
-        # Fog consistency loss: chỉ active khi train multi-beta.
-        # Set fog_consistency_weight=0.0 để disable hoàn toàn.
         self.fog_consistency_weight = fog_consistency_weight
         if fog_consistency_weight > 0.0:
             self.loss_fog = FogConsistencyLoss(
@@ -356,8 +286,17 @@ class GCNetHead(BaseModule):
 
         Training  : inputs = (c4_feat, c6_feat) → returns (c4_logit, c6_logit)
         Inference : inputs = c6_feat            → returns c6_logit
+
+        FIX: thêm assertion để bắt type error sớm.
+        Bản gốc: nếu training mode nhưng nhận Tensor đơn → unpack error
+        không rõ ràng. Assert giúp debug nhanh hơn.
         """
         if self.training:
+            assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, (
+                f"GCNetHead training mode expects (c4_feat, c6_feat) tuple, "
+                f"got {type(inputs)}. "
+                f"Kiểm tra backbone.forward() có return_aux=True không."
+            )
             c4_feat, c6_feat = inputs
 
             c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
@@ -366,8 +305,14 @@ class GCNetHead(BaseModule):
             return c4_logit, c6_logit
 
         else:
-            c6_logit = self.cls_seg(self.dropout(self.head(inputs)))
-            return c6_logit
+            # Inference: inputs có thể là tuple (nếu backbone.return_aux=True)
+            # hoặc Tensor đơn — handle cả hai
+            if isinstance(inputs, (tuple, list)):
+                # Lấy c6_feat (index 1), bỏ c4_feat
+                c6_feat = inputs[1]
+            else:
+                c6_feat = inputs
+            return self.cls_seg(self.dropout(self.head(c6_feat)))
 
     # ---------------------------------------------------------------------- #
     # Loss                                                                     #
@@ -378,27 +323,28 @@ class GCNetHead(BaseModule):
              seg_label: Tensor) -> Dict[str, Tensor]:
         """Tính loss từ logits và ground-truth label.
 
+        FIX: dùng seg_label.shape[-2:] thay vì shape[1:].
+        Bản gốc: shape[1:] đúng khi seg_label là (B, H, W), nhưng nếu
+        caller truyền vào (B, 1, H, W) thì target_size = (1, H, W) →
+        resize tạo ra logit sai shape, lỗi ngầm không bắt được.
+        shape[-2:] luôn lấy đúng (H, W) bất kể có dim=1 hay không.
+
         Args:
-            seg_logits: (c4_logit, c6_logit) — output của forward() khi training.
-                c4_logit: (B, num_classes, H4, W4)
-                c6_logit: (B, num_classes, H6, W6)
-            seg_label: Ground-truth shape (B, H, W), dtype=torch.long.
-                Pixels cần ignore mang giá trị ignore_index.
+            seg_logits: (c4_logit, c6_logit) từ forward() khi training.
+            seg_label: Ground-truth shape (B, H, W) hoặc (B, 1, H, W).
 
         Returns:
-            dict với keys: 'loss_c4', 'loss_c6', 'acc_seg'.
-            Nếu loss_fog được enable, dict thêm key 'loss_fog_consistency'.
-
-        Lưu ý [ĐIỀU CHỈNH 4]:
-            FogConsistencyLoss KHÔNG được tính ở đây — nó cần logits của
-            HAI ảnh khác mức beta, trong khi loss() chỉ nhận một batch.
-            Gọi compute_fog_consistency() riêng từ training loop khi có
-            cặp (logit_light, logit_heavy).
+            dict: 'loss_c4', 'loss_c6', 'acc_seg'.
         """
         c4_logit, c6_logit = seg_logits
-        target_size = seg_label.shape[1:]   # (H, W)
 
-        # Upsample logits về kích thước gt
+        # FIX: normalize seg_label shape → luôn (B, H, W)
+        if seg_label.dim() == 4:
+            seg_label = seg_label.squeeze(1)
+
+        # FIX: dùng shape[-2:] thay vì shape[1:]
+        target_size = seg_label.shape[-2:]
+
         c4_logit = resize(c4_logit, size=target_size,
                           mode='bilinear', align_corners=self.align_corners)
         c6_logit = resize(c6_logit, size=target_size,
@@ -406,7 +352,6 @@ class GCNetHead(BaseModule):
 
         losses = {
             'loss_c4': self.loss_c4(c4_logit, seg_label),
-            # [ĐIỀU CHỈNH 3] OHEM-CE thay CE thường cho main loss
             'loss_c6': self.loss_c6(c6_logit, seg_label),
             'acc_seg': accuracy(c6_logit, seg_label,
                                 ignore_index=self.ignore_index),
@@ -414,53 +359,47 @@ class GCNetHead(BaseModule):
         return losses
 
     def compute_fog_consistency(self,
-                                 logit_a: Tensor,
-                                 logit_b: Tensor) -> Optional[Tensor]:
-        """[CITYSCAPES FOGGY - ĐIỀU CHỈNH 4]
-        Tính FogConsistencyLoss giữa logits của cùng scene ở 2 mức fog.
+                                 logit_light: Tensor,
+                                 logit_heavy: Tensor) -> Optional[Tensor]:
+        """Tính FogConsistencyLoss giữa logits của cùng scene ở 2 mức fog.
 
-        Gọi từ training loop khi có cặp ảnh multi-beta trong cùng batch.
-        Trả về None nếu loss_fog bị disable (fog_consistency_weight=0.0).
+        FIX: đổi tên param logit_a/b → logit_light/heavy để tường minh.
+        API mới buộc caller phải nghĩ về chiều KL đúng:
+          logit_light = teacher (detach trước khi truyền vào)
+          logit_heavy = student (không detach)
+
+        Gọi đúng:
+            fog_loss = head.compute_fog_consistency(
+                logit_light.detach(),   # light fog = teacher, frozen
+                logit_heavy             # heavy fog = student, trainable
+            )
 
         Args:
-            logit_a (Tensor): Logits của ảnh foggy nhẹ, shape (B, C, H, W).
-            logit_b (Tensor): Logits của ảnh foggy nặng, shape (B, C, H, W).
-                .detach() logit_b để one-way KL (heavy fog học từ light fog):
-                    logit_b = logit_b.detach()
+            logit_light: Logits ảnh foggy nhẹ (B, C, H, W). Nên .detach().
+            logit_heavy: Logits ảnh foggy nặng (B, C, H, W). Không detach.
 
         Returns:
-            Tensor hoặc None: Scalar fog consistency loss.
-
-        Ví dụ sử dụng trong training loop:
-            feat_light = backbone(img_light)    # beta=0.005
-            feat_heavy = backbone(img_heavy)    # beta=0.02
-
-            logit_light = head(feat_light)
-            logit_heavy = head(feat_heavy)
-
-            losses = head.loss((c4, logit_light), label)
-
-            fog_loss = head.compute_fog_consistency(
-                logit_light,
-                logit_heavy.detach()   # one-way: light học từ heavy distribution
-            )
-            if fog_loss is not None:
-                losses['loss_fog_consistency'] = fog_loss
-                total_loss = sum(losses.values())
+            Tensor hoặc None nếu fog_consistency_weight=0.
         """
         if self.loss_fog is None:
             return None
-        return self.loss_fog(logit_a, logit_b)
+        return self.loss_fog(logit_light, logit_heavy)
 
     # ---------------------------------------------------------------------- #
     # Helper                                                                   #
     # ---------------------------------------------------------------------- #
 
     def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
-        """BN → ReLU → Conv3×3(BN, ReLU)."""
+        """Post-activation: Conv→BN→ReLU (nhất quán với GCBlock/backbone).
+
+        FIX: bản gốc dùng pre-activation (BN→ReLU→Conv) — không nhất quán
+        với GCBlock và ConvModule trong backbone. Sự không nhất quán này
+        gây khó khăn khi load pretrained weights vì BN statistics được train
+        theo hai convention khác nhau.
+
+        Post-activation (Conv→BN→ReLU) là convention chuẩn trong model này.
+        """
         return nn.Sequential(
-            build_norm_layer(self.norm_cfg, in_channels)[1],
-            build_activation_layer(self.act_cfg),
             ConvModule(
                 in_channels,
                 channels,
@@ -468,7 +407,8 @@ class GCNetHead(BaseModule):
                 padding=1,
                 norm_cfg=self.norm_cfg,
                 act_cfg=self.act_cfg,
-                order=('conv', 'norm', 'act')),
+                order=('conv', 'norm', 'act'),   # Conv→BN→ReLU
+            ),
         )
 
     # ---------------------------------------------------------------------- #
