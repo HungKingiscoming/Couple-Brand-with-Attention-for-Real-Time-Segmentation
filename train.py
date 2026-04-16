@@ -663,6 +663,8 @@ class Trainer:
         # Adapter: nếu teacher channel != student channel, cần 1x1 conv
         self._kd_feat_adapter   = None
         self._kd_active         = True   # False khi ce_only phase
+        self._teacher_cache     = None   # cache teacher output để tránh forward mỗi batch
+        self._teacher_cache_idx = -1     # batch_idx của cache hiện tại
 
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
@@ -728,7 +730,7 @@ class Trainer:
             return 1.0
         return min(1.0, epoch / self.kd_warmup_epochs)
 
-    def _compute_kd_loss(self, student_outputs, imgs, epoch):
+    def _compute_kd_loss(self, student_outputs, imgs, epoch, batch_idx=0):
         """Tính KD loss (feature + logit).
 
         Feature distillation (PKD-style):
@@ -754,12 +756,22 @@ class Trainer:
             zero = torch.tensor(0.0, device=self.device)
             return zero, zero
 
-        with torch.no_grad():
-            # Gọi backbone với return_aux=False vì chỉ cần fused_feat
-            # Tránh dùng forward_train để không cần toggle head train/eval
-            t_feat  = self.teacher.backbone(imgs, return_aux=False).detach()
-            # Logit distillation: cần inference logit từ teacher head
-            t_logit = self.teacher.decode_head(t_feat).detach()
+        # FIX memory: cache teacher output trong cùng accumulation window
+        # Tránh teacher forward 2 lần khi accumulation_steps=2 — tiết kiệm ~0.5GB
+        accum = getattr(self.args, 'accumulation_steps', 1)
+        accum_group = batch_idx // accum  # cùng group = cùng accumulation window
+        if self._teacher_cache is not None and self._teacher_cache_idx == accum_group:
+            t_feat, t_logit = self._teacher_cache
+        else:
+
+            # Teacher forward bên ngoài autocast: frozen model không cần AMP,
+            # BN trong teacher cần float32 để tránh numerical issues.
+            with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
+                imgs_f32 = imgs.float()
+                t_feat   = self.teacher.backbone(imgs_f32, return_aux=False).detach()
+                t_logit  = self.teacher.decode_head(t_feat).detach()
+            self._teacher_cache     = (t_feat, t_logit)
+            self._teacher_cache_idx = accum_group
 
         s_feat  = student_outputs['fused_feat']
         s_c4, s_c6 = student_outputs['main']
@@ -776,10 +788,12 @@ class Trainer:
             t_feat = F.interpolate(t_feat, size=s_feat_proj.shape[-2:],
                                    mode='bilinear', align_corners=False)
 
-        # PKD: normalize trên dim=1 trước MSE
-        s_norm = F.normalize(s_feat_proj, dim=1)
-        t_norm = F.normalize(t_feat,      dim=1)
+        # PKD: normalize trên dim=1 trước MSE — dùng float32 để tránh NaN
+        s_norm = F.normalize(s_feat_proj.float(), dim=1)
+        t_norm = F.normalize(t_feat.float(),      dim=1)
         loss_feat = F.mse_loss(s_norm, t_norm) * kd_w * self.kd_feat_weight
+        if torch.isnan(loss_feat) or torch.isinf(loss_feat):
+            loss_feat = torch.tensor(0.0, device=self.device)
 
         # ---- Logit distillation ------------------------------------------ #
         T = self.kd_temperature
@@ -787,9 +801,16 @@ class Trainer:
             t_logit = F.interpolate(t_logit, size=s_logit.shape[-2:],
                                     mode='bilinear', align_corners=False)
 
-        log_p    = F.log_softmax(s_logit / T, dim=1)
-        q        = F.softmax(t_logit  / T, dim=1)
+        # Clamp logits trước softmax để tránh overflow/NaN
+        # Teacher logit có thể có range lớn sau load partial weights
+        s_logit_c = s_logit.float().clamp(-50, 50)
+        t_logit_c = t_logit.float().clamp(-50, 50)
+        log_p    = F.log_softmax(s_logit_c / T, dim=1)
+        q        = F.softmax(t_logit_c  / T, dim=1).clamp(min=1e-7)
         loss_kd  = F.kl_div(log_p, q, reduction='batchmean') * (T ** 2)
+        # Guard NaN — có thể xảy ra ở early training khi logits unstable
+        if torch.isnan(loss_kd) or torch.isinf(loss_kd):
+            loss_kd = torch.tensor(0.0, device=self.device)
         loss_logit = loss_kd * kd_w * self.kd_logit_weight
 
         return loss_feat, loss_logit
@@ -840,6 +861,8 @@ class Trainer:
         self.model.train()
         if self.teacher is not None:
             self.teacher.eval()
+            self._teacher_cache     = None  # clear cache ở đầu epoch
+            self._teacher_cache_idx = -1
 
         total_loss   = total_ohem = total_dice = 0.0
         total_kd_feat = total_kd_logit = 0.0
@@ -883,7 +906,7 @@ class Trainer:
                     loss       = loss + aux_weight * aux_loss
 
                 # ---- Knowledge Distillation ------------------------------ #
-                loss_feat, loss_logit = self._compute_kd_loss(outputs, imgs, epoch)
+                loss_feat, loss_logit = self._compute_kd_loss(outputs, imgs, epoch, batch_idx)
                 loss = loss + loss_feat + loss_logit
 
                 loss = loss / self.args.accumulation_steps
