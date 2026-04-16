@@ -192,11 +192,10 @@ class GCNetHead(BaseModule):
       2. seg_label shape: dùng shape[-2:] thay vì shape[1:] — an toàn với
          (B, 1, H, W) input
       3. forward() thêm assertion khi training mode để debug type error sớm
-      4. _make_base_head: đổi sang post-activation (Conv→BN→ReLU) để nhất
-         quán với GCBlock và backbone — tránh BN statistics mismatch khi
-         load pretrained weights
-      5. FogConsistencyLoss API: đổi tên param logit_a/b → logit_light/heavy
-         để tường minh hơn
+      4. FogConsistencyLoss API: đổi tên param logit_a/b → logit_light/heavy
+         để tường minh hơn, đồng thời sửa KL direction
+      5. _make_base_head: giữ nguyên pre-activation (BN→ReLU→ConvModule)
+         để khớp với checkpoint structure — model_loader.py xử lý key remap
     """
 
     def __init__(self,
@@ -390,24 +389,33 @@ class GCNetHead(BaseModule):
     # ---------------------------------------------------------------------- #
 
     def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
-        """Post-activation: Conv→BN→ReLU (nhất quán với GCBlock/backbone).
+        """Pre-activation: BN → ReLU → ConvModule(Conv→BN→ReLU).
 
-        FIX: bản gốc dùng pre-activation (BN→ReLU→Conv) — không nhất quán
-        với GCBlock và ConvModule trong backbone. Sự không nhất quán này
-        gây khó khăn khi load pretrained weights vì BN statistics được train
-        theo hai convention khác nhau.
+        Giữ nguyên pre-activation để khớp với checkpoint structure:
+          head.0.*       = BN standalone  (in_channels)
+          head.1         = ReLU
+          head.2.conv.*  = Conv 3×3
+          head.2.bn.*    = BN trong ConvModule
 
-        Post-activation (Conv→BN→ReLU) là convention chuẩn trong model này.
+        model_loader.py xử lý việc remap:
+          head.2.conv.* → head.0.conv.*  (trong ConvModule)
+          head.2.bn.*   → head.0.bn.*    (trong ConvModule)
+          head.0.*      → dropped        (BN standalone pre-act không có trong post-act)
+
+        Nếu muốn đổi sang post-activation trong tương lai, phải train lại
+        từ đầu hoặc không dùng pretrained checkpoint cũ.
         """
         return nn.Sequential(
-            ConvModule(
+            build_norm_layer(self.norm_cfg, in_channels)[1],   # [0] BN standalone
+            build_activation_layer(self.act_cfg),              # [1] ReLU
+            ConvModule(                                        # [2] Conv→BN→ReLU
                 in_channels,
                 channels,
                 kernel_size=3,
                 padding=1,
                 norm_cfg=self.norm_cfg,
                 act_cfg=self.act_cfg,
-                order=('conv', 'norm', 'act'),   # Conv→BN→ReLU
+                order=('conv', 'norm', 'act'),
             ),
         )
 
