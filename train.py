@@ -22,7 +22,41 @@ import torch.optim as optim
 from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    _TENSORBOARD_AVAILABLE = True
+except Exception:
+    _TENSORBOARD_AVAILABLE = False
+
+class _DummyWriter:
+    """Fallback khi tensorboard/tensorflow bị conflict (thường xảy ra trên Kaggle).
+    Ghi metrics ra CSV thay vì tensorboard.
+    """
+    def __init__(self, log_dir):
+        import pathlib, csv
+        self._log_dir = pathlib.Path(log_dir)
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        self._csv_path = self._log_dir / "metrics.csv"
+        self._file = open(self._csv_path, 'w', newline='')
+        self._csv = csv.writer(self._file)
+        self._csv.writerow(['tag', 'step', 'value'])
+        self._file.flush()
+        print(f"TensorBoard unavailable — logging metrics to {self._csv_path}")
+
+    def add_scalar(self, tag, value, step):
+        self._csv.writerow([tag, step, f"{value:.6f}"])
+        self._file.flush()
+
+    def close(self):
+        self._file.close()
+
+def _make_writer(log_dir):
+    if _TENSORBOARD_AVAILABLE:
+        try:
+            return SummaryWriter(log_dir=str(log_dir))
+        except Exception:
+            pass
+    return _DummyWriter(log_dir)
 import numpy as np
 from tqdm import tqdm
 import argparse
@@ -636,7 +670,7 @@ class Trainer:
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.writer   = SummaryWriter(log_dir=self.save_dir / "tensorboard")
+        self.writer   = _make_writer(self.save_dir / "tensorboard")
 
         self.save_config()
         self._print_config(loss_cfg)
