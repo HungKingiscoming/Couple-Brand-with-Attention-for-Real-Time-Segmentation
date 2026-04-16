@@ -1068,11 +1068,9 @@ def main():
         try:
             out = model.forward_train(sample)
             c4_logit, c6_logit = out["main"]
-            fused = out["fused_feat"]
             print(f"Forward pass OK:")
-            print(f"  c4_logit:    {c4_logit.shape}")
-            print(f"  c6_logit:    {c6_logit.shape}")
-            print(f"  fused_feat:  {fused.shape}\n")
+            print(f"  c4_logit: {c4_logit.shape}")
+            print(f"  c6_logit: {c6_logit.shape}\n")
         except Exception as e:
             print(f"Forward pass FAILED: {e}")
             raise
