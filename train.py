@@ -657,6 +657,7 @@ class Trainer:
         self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
             ignore_index=args.ignore_index,
+            class_weights=class_weights,   # FIX: truyền class_weights vào Dice
         )
         self.ce = nn.CrossEntropyLoss(
             weight=cw_device,
@@ -968,7 +969,14 @@ def main():
                         help="LR factor cho DWSA. >= 0.3 để gamma thoát 0.")
     parser.add_argument("--alpha_lr_factor",        type=float, default=0.1,
                         help="LR factor cho FoggyAwareNorm.alpha")
-    parser.add_argument("--use_class_weights",      action="store_true")
+    parser.add_argument("--use_class_weights",      action="store_true",
+                        help="Compute class weights từ training data (chậm, chạy 1 lần).")
+    parser.add_argument("--class_weights_file",     type=str, default=None,
+                        help="Load precomputed weights từ file .pt (nhanh hơn compute lại). "
+                             "Tạo bằng: python analyze_distribution.py --save_weights w.pt")
+    parser.add_argument("--class_weights_method",   type=str, default="median_freq",
+                        choices=["inverse_freq", "sqrt_inverse", "median_freq"],
+                        help="Phương pháp tính weights. median_freq khuyến nghị cho Cityscapes.")
 
 
     # Dataset
@@ -1061,6 +1069,31 @@ def main():
         dataset_type=args.dataset_type,
     )
     print("Dataloaders ready\n")
+
+    # ------------------------------------------------------------------ #
+    # Class weights — load từ file hoặc dùng kết quả compute từ dataloader
+    # ------------------------------------------------------------------ #
+    if getattr(args, "class_weights_file", None):
+        import pathlib
+        cw_path = pathlib.Path(args.class_weights_file)
+        if cw_path.exists():
+            class_weights = torch.load(cw_path, map_location="cpu")
+            print(f"Class weights loaded from: {cw_path}")
+            print(f"  min={class_weights.min():.3f}  max={class_weights.max():.3f}  "
+                  f"mean={class_weights.mean():.3f}")
+        else:
+            print(f"WARNING: {cw_path} not found — class_weights_file ignored")
+            class_weights = None
+
+    if class_weights is not None:
+        print("\nClass weights summary:")
+        cnames = ["road","sidewalk","building","wall","fence","pole",
+                  "t.light","t.sign","vegetation","terrain","sky",
+                  "person","rider","car","truck","bus","train","moto","bicycle"]
+        for i, (name, w) in enumerate(zip(cnames, class_weights)):
+            bar = "█" * int(w.item() * 4)
+            print(f"  {name:<12} {w.item():5.2f}  {bar}")
+        print()
 
     print(f"{'='*70}")
     print("BUILDING MODEL")
