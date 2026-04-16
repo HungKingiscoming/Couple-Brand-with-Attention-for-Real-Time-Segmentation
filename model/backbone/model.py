@@ -51,7 +51,7 @@ class FoggyAwareNorm(nn.Module):
                 p.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tensor:
-        alpha = torch.sigmoid(self.alpha)
+        alpha = torch.sigmoid(self.alpha).clamp(0.05, 0.95)
         return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
 
 
