@@ -1007,6 +1007,9 @@ def main():
     parser.add_argument("--log_interval",  type=int, default=50)
     parser.add_argument("--save_interval", type=int, default=10)
     parser.add_argument("--reset_best_metric", action="store_true")
+    parser.add_argument("--freeze_stem_conv",  action="store_true", default=False,
+                        help="Freeze stem_conv1/2 conv weights (giữ FoggyAwareNorm trainable). "
+                             "Dùng khi resume để chống gradient inf ở stem.")
 
     args = parser.parse_args()
 
@@ -1131,6 +1134,35 @@ def main():
             load_optimizer=(args.resume_mode == "continue"),
             reset_best_metric=args.reset_best_metric,
         )
+
+    # Freeze stem conv weights nếu được yêu cầu
+    # Giữ FoggyAwareNorm (alpha, bn, in_) trainable — chỉ freeze conv weight
+    # Lý do: stem_conv1.0.weight nhận gradient từ toàn network → spike khi batch khó
+    # Sau nhiều epochs fine-tune, conv stem đã converge, không cần train thêm
+    if getattr(args, "freeze_stem_conv", False):
+        frozen_stem = 0
+        for stem_name in ["stem_conv1", "stem_conv2"]:
+            module = getattr(model.backbone, stem_name, None)
+            if module is None:
+                continue
+            for pname, param in module.named_parameters():
+                # Chỉ freeze conv weight (index 0) — giữ FAN params
+                is_fan = any(k in pname for k in ("alpha", "bn.", "in_."))
+                if not is_fan:
+                    param.requires_grad = False
+                    frozen_stem += param.numel()
+        print(f"Stem conv frozen: {frozen_stem:,} params "
+              f"(FoggyAwareNorm still trainable)")
+        # Rebuild optimizer để loại frozen params khỏi groups
+        optimizer = build_optimizer(model, args)
+        scheduler = build_scheduler(optimizer, args, train_loader,
+                                    start_epoch=trainer.start_epoch)
+        trainer.optimizer = optimizer
+        trainer.scheduler = scheduler
+        print("Optimizer rebuilt after stem freeze")
+        for g in optimizer.param_groups:
+            print(f"  {g["name"]}: lr={g["lr"]:.2e}, params={len(g["params"])}")
+
 
     print(f"\n{'='*70}")
     print("STARTING TRAINING")
