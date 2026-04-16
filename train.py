@@ -586,32 +586,9 @@ class Segmentor(nn.Module):
         return self.decode_head(feat)
 
     def forward_train(self, x):
-        """
-        Returns:
-            dict với keys:
-              'main'       : (c4_logit, c6_logit)
-              'fused_feat' : fused backbone feature (B, ch*4, H/8, W/8)
-                             dùng cho feature-level distillation
-
-        FIX: dùng return_aux=True explicit thay vì phụ thuộc self.training.
-        Teacher model bị set eval() nên self.training=False → backbone trả
-        về Tensor đơn thay vì tuple → ValueError khi unpack.
-        return_aux=True buộc backbone luôn trả về (c4_feat, fused) tuple.
-        """
-        # return_aux=True: luôn trả về (c4_feat, fused) dù training hay eval mode
-        feats              = self.backbone(x, return_aux=True)
-        c4_feat, fused_feat = feats
-        # Head cần training mode để nhận tuple input và trả về (c4_logit, c6_logit)
-        # Tạm thời set head sang train mode nếu đang ở eval (teacher case)
-        head_was_training = self.decode_head.training
-        self.decode_head.train()
+        feats  = self.backbone(x)      # training: (c4_feat, fused)
         logits = self.decode_head(feats)
-        if not head_was_training:
-            self.decode_head.eval()
-        return {
-            "main"       : logits,
-            "fused_feat" : fused_feat,
-        }
+        return {"main": logits}
 
 
 # ============================================
@@ -655,16 +632,6 @@ class Trainer:
         # ------------------------------------------------------------------ #
         # Distillation state
         # ------------------------------------------------------------------ #
-        self.teacher            = None   # set via set_teacher()
-        self.kd_feat_weight     = getattr(args, 'kd_feat_weight',  0.5)
-        self.kd_logit_weight    = getattr(args, 'kd_logit_weight', 0.5)
-        self.kd_temperature     = getattr(args, 'kd_temperature',  4.0)
-        self.kd_warmup_epochs   = getattr(args, 'kd_warmup_epochs', 10)
-        # Adapter: nếu teacher channel != student channel, cần 1x1 conv
-        self._kd_feat_adapter   = None
-        self._kd_active         = True   # False khi ce_only phase
-        self._teacher_cache     = None   # cache teacher output để tránh forward mỗi batch
-        self._teacher_cache_idx = -1     # batch_idx của cache hiện tại
 
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
@@ -675,147 +642,7 @@ class Trainer:
         self._print_config(loss_cfg)
 
     # ---------------------------------------------------------------------- #
-    # Distillation setup                                                       #
-    # ---------------------------------------------------------------------- #
-
-    def set_teacher(self, teacher_model, teacher_feat_channels=None):
-        """Load teacher model cho knowledge distillation.
-
-        Args:
-            teacher_model: nn.Module đã load weights, sẽ bị freeze hoàn toàn.
-            teacher_feat_channels: số channels của fused_feat trong teacher.
-                Nếu None → giả sử bằng student (args.model_channels * 4).
-                Nếu khác student → tạo 1×1 conv adapter để align.
-        """
-        self.teacher = teacher_model.to(self.device)
-        self.teacher.eval()
-        for p in self.teacher.parameters():
-            p.requires_grad = False
-
-        cfg            = ModelConfig.get_config()
-        student_ch     = cfg['backbone']['channels'] * 4
-        teacher_ch     = teacher_feat_channels if teacher_feat_channels else student_ch
-
-        if teacher_ch != student_ch:
-            # Adapter: project student → teacher space để MSE có nghĩa hơn
-            self._kd_feat_adapter = nn.Conv2d(
-                student_ch, teacher_ch, kernel_size=1, bias=False
-            ).to(self.device)
-            nn.init.kaiming_normal_(self._kd_feat_adapter.weight,
-                                    mode='fan_out', nonlinearity='relu')
-            # Thêm adapter vào optimizer
-            self.optimizer.add_param_group({
-                'params'     : list(self._kd_feat_adapter.parameters()),
-                'lr'         : self.args.lr,
-                'name'       : 'kd_adapter',
-                'initial_lr' : self.args.lr,
-            })
-            print(f"KD feat adapter: {student_ch} → {teacher_ch} channels")
-        else:
-            self._kd_feat_adapter = None
-
-        print(f"Teacher model loaded and frozen.")
-        print(f"  KD feat weight:   {self.kd_feat_weight}")
-        print(f"  KD logit weight:  {self.kd_logit_weight}")
-        print(f"  KD temperature:   {self.kd_temperature}")
-        print(f"  KD warmup epochs: {self.kd_warmup_epochs}\n")
-
-    def _get_kd_weight(self, epoch):
-        """Ramp-up KD weight từ 0 → target trong kd_warmup_epochs.
-
-        Lý do ramp-up: ở epoch đầu teacher logits với foggy input cũng không
-        ổn định, KD loss lớn ngay từ đầu sẽ lấn át OHEM loss.
-        """
-        if self.teacher is None or self.kd_warmup_epochs == 0:
-            return 1.0
-        return min(1.0, epoch / self.kd_warmup_epochs)
-
-    def _compute_kd_loss(self, student_outputs, imgs, epoch, batch_idx=0):
-        """Tính KD loss (feature + logit).
-
-        Feature distillation (PKD-style):
-          - Normalize cả student và teacher feature trước MSE
-          - Giúp tránh scale mismatch khi teacher/student có channels khác nhau
-          - Detach teacher hoàn toàn
-
-        Logit distillation (KL với temperature):
-          - KL(student || teacher) * T²
-          - T=4 làm mềm distribution, focus vào dark knowledge
-          - Detach teacher logit
-
-        Returns:
-            loss_feat  (Tensor): scalar hoặc 0.0
-            loss_logit (Tensor): scalar hoặc 0.0
-        """
-        if self.teacher is None or not self._kd_active:
-            zero = torch.tensor(0.0, device=self.device)
-            return zero, zero
-
-        kd_w = self._get_kd_weight(epoch)
-        if kd_w == 0.0:
-            zero = torch.tensor(0.0, device=self.device)
-            return zero, zero
-
-        # FIX memory: cache teacher output trong cùng accumulation window
-        # Tránh teacher forward 2 lần khi accumulation_steps=2 — tiết kiệm ~0.5GB
-        accum = getattr(self.args, 'accumulation_steps', 1)
-        accum_group = batch_idx // accum  # cùng group = cùng accumulation window
-        if self._teacher_cache is not None and self._teacher_cache_idx == accum_group:
-            t_feat, t_logit = self._teacher_cache
-        else:
-
-            # Teacher forward bên ngoài autocast: frozen model không cần AMP,
-            # BN trong teacher cần float32 để tránh numerical issues.
-            with torch.no_grad(), torch.autocast(device_type='cuda', enabled=False):
-                imgs_f32 = imgs.float()
-                t_feat   = self.teacher.backbone(imgs_f32, return_aux=False).detach()
-                t_logit  = self.teacher.decode_head(t_feat).detach()
-            self._teacher_cache     = (t_feat, t_logit)
-            self._teacher_cache_idx = accum_group
-
-        s_feat  = student_outputs['fused_feat']
-        s_c4, s_c6 = student_outputs['main']
-        s_logit = s_c6
-
-        # ---- Feature distillation ---------------------------------------- #
-        if self._kd_feat_adapter is not None:
-            s_feat_proj = self._kd_feat_adapter(s_feat)
-        else:
-            s_feat_proj = s_feat
-
-        # Upsample nếu spatial size khác (teacher có thể channels=64)
-        if s_feat_proj.shape[-2:] != t_feat.shape[-2:]:
-            t_feat = F.interpolate(t_feat, size=s_feat_proj.shape[-2:],
-                                   mode='bilinear', align_corners=False)
-
-        # PKD: normalize trên dim=1 trước MSE — dùng float32 để tránh NaN
-        s_norm = F.normalize(s_feat_proj.float(), dim=1)
-        t_norm = F.normalize(t_feat.float(),      dim=1)
-        loss_feat = F.mse_loss(s_norm, t_norm) * kd_w * self.kd_feat_weight
-        if torch.isnan(loss_feat) or torch.isinf(loss_feat):
-            loss_feat = torch.tensor(0.0, device=self.device)
-
-        # ---- Logit distillation ------------------------------------------ #
-        T = self.kd_temperature
-        if s_logit.shape[-2:] != t_logit.shape[-2:]:
-            t_logit = F.interpolate(t_logit, size=s_logit.shape[-2:],
-                                    mode='bilinear', align_corners=False)
-
-        # Clamp logits trước softmax để tránh overflow/NaN
-        # Teacher logit có thể có range lớn sau load partial weights
-        s_logit_c = s_logit.float().clamp(-50, 50)
-        t_logit_c = t_logit.float().clamp(-50, 50)
-        log_p    = F.log_softmax(s_logit_c / T, dim=1)
-        q        = F.softmax(t_logit_c  / T, dim=1).clamp(min=1e-7)
-        loss_kd  = F.kl_div(log_p, q, reduction='batchmean') * (T ** 2)
-        # Guard NaN — có thể xảy ra ở early training khi logits unstable
-        if torch.isnan(loss_kd) or torch.isinf(loss_kd):
-            loss_kd = torch.tensor(0.0, device=self.device)
-        loss_logit = loss_kd * kd_w * self.kd_logit_weight
-
-        return loss_feat, loss_logit
-
-    # ---------------------------------------------------------------------- #
+    # Loss phase    # ---------------------------------------------------------------------- #
     # Loss phase                                                               #
     # ---------------------------------------------------------------------- #
 
@@ -824,13 +651,10 @@ class Trainer:
             return
         if phase == 'ce_only':
             self.dice_weight = 0.0
-            # FIX: tắt KD trong ce_only để tránh gradient shock sau unfreeze
-            self._kd_active = False
         elif phase == 'full':
             self.dice_weight = self.base_loss_cfg['dice_weight']
-            self._kd_active = True
         self.loss_phase = phase
-        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight}, KD={self._kd_active})")
+        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight})")
 
     def _print_config(self, loss_cfg):
         print(f"\n{'='*70}")
@@ -842,11 +666,6 @@ class Trainer:
         print(f"Mixed precision:        {self.args.use_amp}")
         print(f"Gradient clipping:      {self.args.grad_clip}")
         print(f"Loss: CE({loss_cfg['ce_weight']}) + Dice({loss_cfg['dice_weight']})")
-        kd_on = getattr(self.args, 'teacher_weights', None) is not None
-        if kd_on:
-            print(f"Distillation: feat_w={self.kd_feat_weight}, "
-                  f"logit_w={self.kd_logit_weight}, T={self.kd_temperature}, "
-                  f"warmup={self.kd_warmup_epochs}")
         print(f"{'='*70}\n")
 
     def save_config(self):
@@ -859,13 +678,8 @@ class Trainer:
 
     def train_epoch(self, loader, epoch):
         self.model.train()
-        if self.teacher is not None:
-            self.teacher.eval()
-            self._teacher_cache     = None  # clear cache ở đầu epoch
-            self._teacher_cache_idx = -1
 
         total_loss   = total_ohem = total_dice = 0.0
-        total_kd_feat = total_kd_logit = 0.0
         max_grad_epoch = 0.0
         max_grad       = 0.0
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
@@ -905,10 +719,6 @@ class Trainer:
                     aux_loss   = self.ohem(c4_full, masks)
                     loss       = loss + aux_weight * aux_loss
 
-                # ---- Knowledge Distillation ------------------------------ #
-                loss_feat, loss_logit = self._compute_kd_loss(outputs, imgs, epoch, batch_idx)
-                loss = loss + loss_feat + loss_logit
-
                 loss = loss / self.args.accumulation_steps
 
             if torch.isnan(loss) or torch.isinf(loss):
@@ -935,8 +745,6 @@ class Trainer:
             total_loss    += loss.item() * self.args.accumulation_steps
             total_ohem    += ohem_loss.item()
             total_dice    += dice_loss.item()
-            total_kd_feat  += loss_feat.item() if isinstance(loss_feat, torch.Tensor) else 0.0
-            total_kd_logit += loss_logit.item() if isinstance(loss_logit, torch.Tensor) else 0.0
 
             postfix = {
                 'loss'    : f'{loss.item() * self.args.accumulation_steps:.4f}',
@@ -945,9 +753,6 @@ class Trainer:
                 'lr'      : f'{self.optimizer.param_groups[0]["lr"]:.6f}',
                 'max_g'   : f'{max_grad:.2f}',
             }
-            if self.teacher is not None:
-                postfix['kd_f'] = f'{loss_feat.item():.4f}'
-                postfix['kd_l'] = f'{loss_logit.item():.4f}'
             pbar.set_postfix(postfix)
 
             if batch_idx % 50 == 0:
@@ -959,10 +764,6 @@ class Trainer:
                 self.writer.add_scalar('train/dice',     dice_loss.item(),  self.global_step)
                 self.writer.add_scalar('train/lr',       self.optimizer.param_groups[0]['lr'], self.global_step)
                 self.writer.add_scalar('train/max_grad', max_grad,          self.global_step)
-                if self.teacher is not None:
-                    self.writer.add_scalar('train/kd_feat',  loss_feat.item(),  self.global_step)
-                    self.writer.add_scalar('train/kd_logit', loss_logit.item(), self.global_step)
-                    self.writer.add_scalar('train/kd_weight', self._get_kd_weight(epoch), self.global_step)
 
         n = len(loader)
         print(f"\nEpoch {epoch+1} — Max gradient: {max_grad_epoch:.2f}")
@@ -975,8 +776,6 @@ class Trainer:
             'loss'     : total_loss   / n,
             'ohem'     : total_ohem   / n,
             'dice'     : total_dice   / n,
-            'kd_feat'  : total_kd_feat  / n,
-            'kd_logit' : total_kd_logit / n,
         }
 
     # ---------------------------------------------------------------------- #
@@ -1137,24 +936,6 @@ def main():
                         help="LR factor cho FoggyAwareNorm.alpha")
     parser.add_argument("--use_class_weights",      action="store_true")
 
-    # Knowledge Distillation
-    parser.add_argument("--teacher_weights",        type=str,   default=None,
-                        help="Path tới checkpoint của teacher model (GCNet-L hoặc tương tự). "
-                             "Nếu None → không dùng distillation.")
-    parser.add_argument("--teacher_channels",       type=int,   default=64,
-                        help="'channels' param của teacher backbone. "
-                             "Student=32 → teacher=64 thì teacher_feat_ch=256.")
-    parser.add_argument("--kd_feat_weight",         type=float, default=0.5,
-                        help="Weight cho feature distillation loss (PKD-style MSE).")
-    parser.add_argument("--kd_logit_weight",        type=float, default=0.5,
-                        help="Weight cho logit distillation loss (KL divergence).")
-    parser.add_argument("--kd_temperature",         type=float, default=4.0,
-                        help="Temperature T cho softmax trong logit KD. T=4 là default.")
-    parser.add_argument("--kd_warmup_epochs",       type=int,   default=10,
-                        help="Số epoch ramp-up KD weight từ 0 → 1. "
-                             "0 = bật ngay từ epoch đầu (không khuyến nghị).")
-    parser.add_argument("--teacher_head_channels",  type=int,   default=None,
-                        help="channels của teacher head. Mặc định = teacher_channels * 2.")
 
     # Dataset
     parser.add_argument("--train_txt",    required=True)
@@ -1224,10 +1005,6 @@ def main():
     print(f"Grad clip:  {args.grad_clip}  |  AMP: {args.use_amp}")
     print(f"LR DWSA:    {args.lr * args.dwsa_lr_factor:.2e}  (factor={args.dwsa_lr_factor})")
     print(f"LR alpha:   {args.lr * args.alpha_lr_factor:.2e}  (factor={args.alpha_lr_factor})")
-    if args.teacher_weights:
-        print(f"Distillation: teacher={args.teacher_weights}")
-        print(f"  feat_w={args.kd_feat_weight}, logit_w={args.kd_logit_weight}, "
-              f"T={args.kd_temperature}, warmup={args.kd_warmup_epochs}")
     if unfreeze_list:
         print(f"Unfreeze schedule: epochs {unfreeze_list}")
     print(f"{'='*70}\n")
@@ -1313,31 +1090,6 @@ def main():
     )
 
     # ------------------------------------------------------------------ #
-    # Load teacher nếu có
-    # ------------------------------------------------------------------ #
-    if args.teacher_weights:
-        teacher_cfg = ModelConfig.get_config()
-        teacher_cfg["backbone"]["channels"] = args.teacher_channels
-        teacher_cfg["head"]["in_channels"]  = args.teacher_channels * 4
-        # FIX: teacher_head_channels tự động = teacher_channels * 2 nếu không chỉ định
-        t_head_ch = (args.teacher_head_channels
-                     if args.teacher_head_channels is not None
-                     else args.teacher_channels * 2)
-        teacher_cfg["head"]["channels"]     = t_head_ch
-
-        t_backbone = GCNet(**teacher_cfg["backbone"])
-        t_head     = GCNetHead(
-            **teacher_cfg["head"],
-            num_classes=args.num_classes,
-            ignore_index=args.ignore_index,
-        )
-        teacher_model = Segmentor(backbone=t_backbone, head=t_head)
-        load_pretrained_gcnet(teacher_model, args.teacher_weights)
-
-        teacher_feat_channels = args.teacher_channels * 4
-        trainer.set_teacher(teacher_model, teacher_feat_channels=teacher_feat_channels)
-
-    # ------------------------------------------------------------------ #
     # Resume checkpoint
     # ------------------------------------------------------------------ #
     if args.resume:
@@ -1377,16 +1129,6 @@ def main():
                 trainer.optimizer = optimizer
                 trainer.scheduler = scheduler
 
-                # FIX: re-add kd_feat_adapter vào optimizer mới nếu tồn tại
-                # Adapter không thuộc model.parameters() nên bị mất sau rebuild
-                if trainer._kd_feat_adapter is not None:
-                    optimizer.add_param_group({
-                        'params'     : list(trainer._kd_feat_adapter.parameters()),
-                        'lr'         : args.lr,
-                        'name'       : 'kd_adapter',
-                        'initial_lr' : args.lr,
-                    })
-                    print("  kd_feat_adapter re-added to optimizer")
 
                 # Tắt Dice + KD tạm thời sau unfreeze để ổn định gradient
                 trainer.set_loss_phase('ce_only')
@@ -1423,9 +1165,6 @@ def main():
         print(f"Train — Loss: {train_metrics['loss']:.4f} | "
               f"OHEM: {train_metrics['ohem']:.4f} | "
               f"Dice: {train_metrics['dice']:.4f}", end="")
-        if trainer.teacher is not None:
-            print(f" | KD_feat: {train_metrics['kd_feat']:.4f} | "
-                  f"KD_logit: {train_metrics['kd_logit']:.4f}", end="")
         print()
         print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
               f"mIoU: {val_metrics['miou']:.4f}  | "
