@@ -592,10 +592,22 @@ class Segmentor(nn.Module):
               'main'       : (c4_logit, c6_logit)
               'fused_feat' : fused backbone feature (B, ch*4, H/8, W/8)
                              dùng cho feature-level distillation
+
+        FIX: dùng return_aux=True explicit thay vì phụ thuộc self.training.
+        Teacher model bị set eval() nên self.training=False → backbone trả
+        về Tensor đơn thay vì tuple → ValueError khi unpack.
+        return_aux=True buộc backbone luôn trả về (c4_feat, fused) tuple.
         """
-        feats  = self.backbone(x)      # training: (c4_feat, fused)
-        logits = self.decode_head(feats)
+        # return_aux=True: luôn trả về (c4_feat, fused) dù training hay eval mode
+        feats              = self.backbone(x, return_aux=True)
         c4_feat, fused_feat = feats
+        # Head cần training mode để nhận tuple input và trả về (c4_logit, c6_logit)
+        # Tạm thời set head sang train mode nếu đang ở eval (teacher case)
+        head_was_training = self.decode_head.training
+        self.decode_head.train()
+        logits = self.decode_head(feats)
+        if not head_was_training:
+            self.decode_head.eval()
         return {
             "main"       : logits,
             "fused_feat" : fused_feat,
@@ -743,10 +755,11 @@ class Trainer:
             return zero, zero
 
         with torch.no_grad():
-            teacher_outputs = self.teacher.forward_train(imgs)
-            t_feat   = teacher_outputs['fused_feat'].detach()
-            t_c4, t_c6 = teacher_outputs['main']
-            t_logit  = t_c6.detach()
+            # Gọi backbone với return_aux=False vì chỉ cần fused_feat
+            # Tránh dùng forward_train để không cần toggle head train/eval
+            t_feat  = self.teacher.backbone(imgs, return_aux=False).detach()
+            # Logit distillation: cần inference logit từ teacher head
+            t_logit = self.teacher.decode_head(t_feat).detach()
 
         s_feat  = student_outputs['fused_feat']
         s_c4, s_c6 = student_outputs['main']
