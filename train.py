@@ -27,7 +27,6 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 from pathlib import Path
-import re
 import json
 import time
 import gc
@@ -44,271 +43,171 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # PRETRAINED WEIGHT LOADER
 # ============================================
 
-def _remap_stem_key(key: str, N2: int = 4) -> str | None:
-    """Remap backbone.stem.N.* → model v3 key.
- 
-    Returns None nếu key cần bỏ (ví dụ BN standalone của stem_conv1/2
-    khi model v3 dùng FoggyAwareNorm thay thế).
-    """
-    m = re.match(r'stem\.(\d+)\.(.+)$', key)
+def _remap_stem_key(key: str, N2: int = 4):
+    import re as _re
+
+    for pref in ['backbone.', 'model.', 'module.']:
+        if key.startswith(pref):
+            key = key[len(pref):]
+
+    m = _re.match(r'stem\.(\d+)\.(.+)$', key)
     if not m:
-        return key   # không phải stem key, trả nguyên
- 
+        return key
+
     idx  = int(m.group(1))
     rest = m.group(2)
- 
+
+    def _map_convmodule(rest_str, target_prefix):
+        if rest_str.startswith('conv.'):
+            return f'{target_prefix}.{rest_str[len("conv."):].lstrip(".")}'
+        return None
+
     if idx == 0:
-        # ConvModule: conv.weight → stem_conv1.0.conv.weight
-        #             bn.*       → DROPPED (FoggyAwareNorm thay BN)
-        if rest.startswith('conv.'):
-            return f'stem_conv1.0.{rest[len("conv."):]}'
-        # bn.* → bỏ, FoggyAwareNorm không dùng BN đơn thuần
-        return None
- 
+        return _map_convmodule(rest, 'stem_conv1.0')
     elif idx == 1:
-        if rest.startswith('conv.'):
-            return f'stem_conv2.0.{rest[len("conv."):]}'
-        return None
- 
+        return _map_convmodule(rest, 'stem_conv2.0')
     elif 2 <= idx <= 1 + N2:
-        # stem_stage2 blocks
         return f'stem_stage2.{idx - 2}.{rest}'
- 
     else:
-        # stem_stage3 blocks
         return f'stem_stage3.{idx - (2 + N2)}.{rest}'
 
-def _remap_head_key(suffix: str) -> str | None:
-    """Remap decode_head suffix → model v3 head state_dict key.
- 
-    Args:
-        suffix: key sau 'decode_head.' prefix.
- 
-    Returns:
-        Model key string, hoặc None nếu nên bỏ key này.
-    """
-    # conv_seg → cls_seg
-    if suffix.startswith('conv_seg.'):
-        return 'cls_seg.' + suffix[len('conv_seg.'):]
- 
-    # aux_cls_seg_c4 — giữ nguyên
-    if suffix.startswith('aux_cls_seg_c4.'):
-        return suffix
- 
-    # head.0.* = BN standalone trong pre-activation → bỏ
-    if re.match(r'^head\.0\.', suffix):
-        return None
- 
-    # head.2.conv.* → head.0.conv.*
-    if suffix.startswith('head.2.conv.'):
-        return 'head.0.conv.' + suffix[len('head.2.conv.'):]
- 
-    # head.2.bn.* → head.0.bn.*
-    if suffix.startswith('head.2.bn.'):
-        return 'head.0.bn.' + suffix[len('head.2.bn.'):]
- 
-    # aux_head_c4.0.* = BN standalone → bỏ
-    if re.match(r'^aux_head_c4\.0\.', suffix):
-        return None
- 
-    # aux_head_c4.2.conv.* → aux_head_c4.0.conv.*
-    if suffix.startswith('aux_head_c4.2.conv.'):
-        return 'aux_head_c4.0.conv.' + suffix[len('aux_head_c4.2.conv.'):]
- 
-    # aux_head_c4.2.bn.* → aux_head_c4.0.bn.*
-    if suffix.startswith('aux_head_c4.2.bn.'):
-        return 'aux_head_c4.0.bn.' + suffix[len('aux_head_c4.2.bn.'):]
- 
-    # fallback — giữ nguyên
-    return suffix
 
-def load_pretrained_gcnet(model, ckpt_path: str,
-                          strict_match: bool = False,
-                          n2: int = 4) -> float:
-    """Load pretrained GCNet weights vào Segmentor (backbone + decode_head).
- 
-    Args:
-        model: Segmentor instance với .backbone (GCNet) và .decode_head (GCNetHead).
-        ckpt_path: Đường dẫn tới checkpoint .pth.
-        strict_match: Nếu True, chỉ load keys khớp chính xác.
-        n2: num_blocks_per_stage[0] — số GCBlock trong stem_stage2. Default: 4.
- 
-    Returns:
-        float: % keys loaded (backbone + head) / total model keys.
-    """
+def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = ckpt.get('state_dict', ckpt.get('model', ckpt))
- 
-    # ------------------------------------------------------------------ #
-    # 1. Phân loại keys: backbone vs head                                  #
-    # ------------------------------------------------------------------ #
-    bb_ckpt   = {}   # {normalized_key: tensor}
-    head_ckpt = {}   # {model_head_key: tensor}
-    bn_dropped = []
-    head_dropped = []
- 
-    for ckpt_key, val in state.items():
-        # Strip common prefixes
-        stripped = ckpt_key
-        for pref in ('backbone.', 'model.backbone.', 'module.backbone.',
-                     'model.', 'module.'):
-            if stripped.startswith(pref):
-                stripped = stripped[len(pref):]
-                break
- 
-        # HEAD keys
-        if ckpt_key.startswith('decode_head.'):
-            suffix  = ckpt_key[len('decode_head.'):]
-            dst_key = _remap_head_key(suffix)
-            if dst_key is None:
-                head_dropped.append(ckpt_key)
-            else:
-                head_ckpt[dst_key] = val
+    state = ckpt.get('state_dict', ckpt)
+
+    HEAD_KEY_MAP = {}
+    for k in state.keys():
+        if not k.startswith('decode_head.'):
             continue
- 
-        # BACKBONE keys — remap stem
-        if stripped.startswith('stem.'):
-            remapped = _remap_stem_key(stripped, N2=n2)
-            if remapped is None:
-                bn_dropped.append(ckpt_key)
-                continue
-            stripped = remapped
- 
-        bb_ckpt[stripped] = val
- 
-    # ------------------------------------------------------------------ #
-    # 2. Load backbone                                                     #
-    # ------------------------------------------------------------------ #
-    model_bb_state = model.backbone.state_dict()
- 
-    # Build normalized → original key map cho model backbone
+        suffix = k[len('decode_head.'):]
+        if suffix.startswith('conv_seg.'):
+            dst = 'cls_seg.' + suffix[len('conv_seg.'):]
+        else:
+            dst = suffix
+        HEAD_KEY_MAP[k] = dst
+
+    model_state   = model.backbone.state_dict()
+    compatible    = {}
+    skipped       = []
     model_key_map = {}
-    for mk in model_bb_state:
+    for mk in model_state.keys():
         norm = mk
-        for pref in ('backbone.', 'model.', 'module.'):
+        for pref in ['backbone.', 'model.', 'module.']:
             if norm.startswith(pref):
                 norm = norm[len(pref):]
         model_key_map[norm] = mk
- 
-    compatible_bb  = {}
-    skipped_bb     = []
- 
-    for norm_ckpt, val in bb_ckpt.items():
+
+    bn_dropped = []
+
+    for ckpt_key, ckpt_val in state.items():
+        if ckpt_key.startswith('decode_head.'):
+            continue
+
+        stripped = ckpt_key
+        for pref in ('backbone.', 'model.', 'module.'):
+            if stripped.startswith(pref):
+                stripped = stripped[len(pref):]
+                break
+
+        norm_ckpt = _remap_stem_key(ckpt_key)
+        if norm_ckpt is None:
+            bn_dropped.append(ckpt_key)
+            continue
+
         matched = False
- 
-        # Exact match
         if norm_ckpt in model_key_map:
             mk = model_key_map[norm_ckpt]
-            if model_bb_state[mk].shape == val.shape:
-                compatible_bb[mk] = val
+            if model_state[mk].shape == ckpt_val.shape:
+                compatible[mk] = ckpt_val
                 matched = True
- 
-        # Fuzzy match (suffix)
+
         if not matched and not strict_match:
             for norm_model, mk in model_key_map.items():
-                if (norm_model.endswith(norm_ckpt)
-                        or norm_ckpt.endswith(norm_model)):
-                    if model_bb_state[mk].shape == val.shape:
-                        compatible_bb[mk] = val
+                if (norm_model.endswith(norm_ckpt) or norm_ckpt.endswith(norm_model)):
+                    if model_state[mk].shape == ckpt_val.shape:
+                        compatible[mk] = ckpt_val
                         matched = True
                         break
- 
+
         if not matched:
-            skipped_bb.append(norm_ckpt)
- 
-    # ------------------------------------------------------------------ #
-    # 3. Load head                                                         #
-    # ------------------------------------------------------------------ #
-    model_hd_state   = model.decode_head.state_dict()
-    compatible_hd    = {}
-    skipped_hd_shape = []
-    skipped_hd_miss  = []
- 
-    for dst_key, val in head_ckpt.items():
-        if dst_key not in model_hd_state:
-            skipped_hd_miss.append(dst_key)
+            skipped.append(ckpt_key)
+
+    head_state           = model.decode_head.state_dict()
+    head_loaded          = {}
+    head_skipped_shape   = []
+    head_skipped_missing = []
+
+    for ckpt_key, dst_suffix in HEAD_KEY_MAP.items():
+        ckpt_val = state[ckpt_key]
+        if dst_suffix not in head_state:
+            head_skipped_missing.append(f"{ckpt_key} → {dst_suffix}")
             continue
-        if model_hd_state[dst_key].shape != val.shape:
-            skipped_hd_shape.append(
-                f"{dst_key}: ckpt{list(val.shape)} "
-                f"vs model{list(model_hd_state[dst_key].shape)}"
+        if head_state[dst_suffix].shape != ckpt_val.shape:
+            head_skipped_shape.append(
+                f"{ckpt_key}: ckpt{list(ckpt_val.shape)} vs model{list(head_state[dst_suffix].shape)}"
             )
             continue
-        compatible_hd[dst_key] = val
- 
-    # ------------------------------------------------------------------ #
-    # 4. Summary                                                           #
-    # ------------------------------------------------------------------ #
-    loaded_bb = len(compatible_bb)
-    loaded_hd = len(compatible_hd)
-    total_bb  = len(model_bb_state)
-    total_hd  = len(model_hd_state)
- 
-    expected_markers = ('dwsa', 'alpha', 'in_.', 'foggy',
-                        'loss_', 'fog_consistency', 'spp.')
-    truly_unmatched_bb = [k for k in skipped_bb
-                          if not any(s in k for s in expected_markers)]
- 
+        head_loaded[dst_suffix] = ckpt_val
+
+    loaded_bb = len(compatible)
+    loaded_hd = len(head_loaded)
+    total_bb  = len(model_state)
+    total_hd  = len(head_state)
+
+    expected_skip_markers = ('dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.')
+    truly_unmatched = [k for k in skipped if not any(s in k for s in expected_skip_markers)]
+
     sep = '=' * 70
     print(f"\n{sep}")
     print("WEIGHT LOADING SUMMARY")
     print(sep)
-    print(f"Backbone:  {loaded_bb:>5} / {total_bb}  "
-          f"({100*loaded_bb/max(total_bb,1):.1f}%)")
-    print(f"Head:      {loaded_hd:>5} / {total_hd}  "
-          f"({100*loaded_hd/max(total_hd,1):.1f}%)")
-    print(f"BN dropped (stem→FoggyAwareNorm):  {len(bn_dropped)}")
-    print(f"Head dropped (pre-act BN):         {len(head_dropped)}")
- 
-    if skipped_hd_shape:
-        print(f"\nHead shape mismatch ({len(skipped_hd_shape)}):")
-        for s in skipped_hd_shape:
+    print(f"Backbone:  {loaded_bb:>5} / {total_bb}  ({100*loaded_bb/max(total_bb,1):.1f}%)")
+    print(f"Head:      {loaded_hd:>5} / {total_hd}  ({100*loaded_hd/max(total_hd,1):.1f}%)")
+    print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm)")
+    if head_skipped_shape:
+        print(f"Head shape mismatch:   {len(head_skipped_shape)}")
+        for s in head_skipped_shape:
             print(f"    SHAPE: {s}")
- 
-    if skipped_hd_miss:
-        print(f"\nHead key not found in model ({len(skipped_hd_miss)}):")
-        for s in skipped_hd_miss[:5]:
+    if head_skipped_missing:
+        print(f"Head key missing:      {len(head_skipped_missing)}")
+        for s in head_skipped_missing:
             print(f"    MISSING: {s}")
- 
-    if truly_unmatched_bb:
-        print(f"\nBackbone unmatched ({len(truly_unmatched_bb)}) ← kiểm tra:")
-        for k in truly_unmatched_bb[:5]:
+    if truly_unmatched:
+        print(f"Backbone unmatched:    {len(truly_unmatched)}  ← cần kiểm tra")
+        for k in truly_unmatched[:5]:
             print(f"    {k}")
- 
-    print(sep)
- 
-    # ------------------------------------------------------------------ #
-    # 5. Apply                                                             #
-    # ------------------------------------------------------------------ #
-    missing_bb, unexpected_bb = model.backbone.load_state_dict(
-        compatible_bb, strict=False)
-    missing_hd, unexpected_hd = model.decode_head.load_state_dict(
-        compatible_hd, strict=False)
- 
-    # Filter expected missing (new modules không có trong checkpoint cũ)
-    unexpected_bb_filtered = [k for k in missing_bb
-                               if not any(s in k for s in expected_markers)]
-    unexpected_hd_filtered = [k for k in missing_hd
-                               if not any(s in k for s in expected_markers)]
- 
-    if unexpected_bb_filtered:
-        print(f"\nUnexpected backbone missing ({len(unexpected_bb_filtered)}):")
-        for k in unexpected_bb_filtered[:5]:
+    print(sep + "\n")
+
+    missing_bb, _ = model.backbone.load_state_dict(compatible, strict=False)
+    missing_hd, _ = model.decode_head.load_state_dict(head_loaded, strict=False)
+
+    # stem_conv1.1 / stem_conv2.1 = FoggyAwareNorm — module mới, expected missing
+    expected_missing_markers = ('dwsa', 'alpha', 'in_.', 'foggy', '.1.bn.', 'spp.',
+                                'loss_', 'fog_consistency',
+                                'stem_conv1.1.', 'stem_conv2.1.')
+    unexpected_bb = [k for k in missing_bb
+                     if not any(s in k for s in expected_missing_markers)]
+    unexpected_hd = [k for k in missing_hd
+                     if not any(s in k for s in expected_missing_markers)]
+
+    if unexpected_bb:
+        print(f"Unexpected backbone missing ({len(unexpected_bb)}):")
+        for k in unexpected_bb[:5]:
             print(f"  - {k}")
- 
-    if unexpected_hd_filtered:
-        print(f"\nUnexpected head missing ({len(unexpected_hd_filtered)}):")
-        for k in unexpected_hd_filtered[:5]:
+    if unexpected_hd:
+        print(f"Unexpected head missing ({len(unexpected_hd)}):")
+        for k in unexpected_hd[:5]:
             print(f"  - {k}")
- 
-    n_expected = (len(missing_bb) - len(unexpected_bb_filtered)
-                  + len(missing_hd) - len(unexpected_hd_filtered))
-    print(f"\nExpected missing: {n_expected} keys "
-          f"(DWSA / FoggyNorm / loss buffers) → OK\n")
- 
-    coverage = 100 * (loaded_bb + loaded_hd) / max(total_bb + total_hd, 1)
-    return coverage
+
+    n_expected_missing = (len(missing_bb) - len(unexpected_bb)
+                          + len(missing_hd) - len(unexpected_hd))
+    print(f"Expected missing: {n_expected_missing} keys (DWSA/FoggyNorm/loss buffers) → OK\n")
+
+    return 100 * (loaded_bb + loaded_hd) / max(total_bb + total_hd, 1)
+
+
 # ============================================
 # OPTIMIZER
 # ============================================
@@ -751,6 +650,7 @@ class Trainer:
         self.kd_warmup_epochs   = getattr(args, 'kd_warmup_epochs', 10)
         # Adapter: nếu teacher channel != student channel, cần 1x1 conv
         self._kd_feat_adapter   = None
+        self._kd_active         = True   # False khi ce_only phase
 
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
@@ -833,7 +733,7 @@ class Trainer:
             loss_feat  (Tensor): scalar hoặc 0.0
             loss_logit (Tensor): scalar hoặc 0.0
         """
-        if self.teacher is None:
+        if self.teacher is None or not self._kd_active:
             zero = torch.tensor(0.0, device=self.device)
             return zero, zero
 
@@ -890,10 +790,13 @@ class Trainer:
             return
         if phase == 'ce_only':
             self.dice_weight = 0.0
+            # FIX: tắt KD trong ce_only để tránh gradient shock sau unfreeze
+            self._kd_active = False
         elif phase == 'full':
             self.dice_weight = self.base_loss_cfg['dice_weight']
+            self._kd_active = True
         self.loss_phase = phase
-        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight})")
+        print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight}, KD={self._kd_active})")
 
     def _print_config(self, loss_cfg):
         print(f"\n{'='*70}")
@@ -1214,6 +1117,8 @@ def main():
     parser.add_argument("--kd_warmup_epochs",       type=int,   default=10,
                         help="Số epoch ramp-up KD weight từ 0 → 1. "
                              "0 = bật ngay từ epoch đầu (không khuyến nghị).")
+    parser.add_argument("--teacher_head_channels",  type=int,   default=None,
+                        help="channels của teacher head. Mặc định = teacher_channels * 2.")
 
     # Dataset
     parser.add_argument("--train_txt",    required=True)
@@ -1378,7 +1283,11 @@ def main():
         teacher_cfg = ModelConfig.get_config()
         teacher_cfg["backbone"]["channels"] = args.teacher_channels
         teacher_cfg["head"]["in_channels"]  = args.teacher_channels * 4
-        teacher_cfg["head"]["channels"]     = 128  # teacher head thường lớn hơn
+        # FIX: teacher_head_channels tự động = teacher_channels * 2 nếu không chỉ định
+        t_head_ch = (args.teacher_head_channels
+                     if args.teacher_head_channels is not None
+                     else args.teacher_channels * 2)
+        teacher_cfg["head"]["channels"]     = t_head_ch
 
         t_backbone = GCNet(**teacher_cfg["backbone"])
         t_head     = GCNetHead(
@@ -1431,6 +1340,17 @@ def main():
                 scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=epoch)
                 trainer.optimizer = optimizer
                 trainer.scheduler = scheduler
+
+                # FIX: re-add kd_feat_adapter vào optimizer mới nếu tồn tại
+                # Adapter không thuộc model.parameters() nên bị mất sau rebuild
+                if trainer._kd_feat_adapter is not None:
+                    optimizer.add_param_group({
+                        'params'     : list(trainer._kd_feat_adapter.parameters()),
+                        'lr'         : args.lr,
+                        'name'       : 'kd_adapter',
+                        'initial_lr' : args.lr,
+                    })
+                    print("  kd_feat_adapter re-added to optimizer")
 
                 # Tắt Dice + KD tạm thời sau unfreeze để ổn định gradient
                 trainer.set_loss_phase('ce_only')
