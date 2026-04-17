@@ -1003,6 +1003,12 @@ def main():
     # Image
     parser.add_argument("--img_h", type=int, default=512)
     parser.add_argument("--img_w", type=int, default=1024)
+    parser.add_argument("--high_res_h", type=int, default=640,
+                        help="Resolution cao cho phase đầu (head-only training).")
+    parser.add_argument("--high_res_w", type=int, default=1280)
+    parser.add_argument("--high_res_epochs", type=int, default=0,
+                        help="Số epochs train ở high_res trước khi switch về img_h/img_w. "
+                             "0 = không dùng high resolution phase.")
 
     # System
     parser.add_argument("--use_amp",       action="store_true", default=True)
@@ -1048,6 +1054,8 @@ def main():
     print(f"Image size: {args.img_h}x{args.img_w}")
     print(f"Epochs:     {args.epochs}  |  Scheduler: {args.scheduler}")
     print(f"Grad clip:  {args.grad_clip}  |  AMP: {args.use_amp}")
+    if getattr(args, "high_res_epochs", 0) > 0:
+        print(f"High-res phase:  {args.high_res_h}x{args.high_res_w} for {args.high_res_epochs} epochs, then {args.img_h}x{args.img_w}")
     print(f"LR DWSA:    {args.lr * args.dwsa_lr_factor:.2e}  (factor={args.dwsa_lr_factor})")
     print(f"LR alpha:   {args.lr * args.alpha_lr_factor:.2e}  (factor={args.alpha_lr_factor})")
     if unfreeze_list:
@@ -1068,6 +1076,28 @@ def main():
         compute_class_weights=args.use_class_weights,
         dataset_type=args.dataset_type,
     )
+
+    # High-resolution dataloader cho phase đầu (nếu được yêu cầu)
+    # Batch size nhỏ hơn vì resolution lớn hơn tốn memory
+    high_res_train_loader = None
+    if getattr(args, "high_res_epochs", 0) > 0:
+        hi_h, hi_w = args.high_res_h, args.high_res_w
+        # Tự động tính batch size phù hợp: scale theo diện tích
+        area_ratio = (args.img_h * args.img_w) / (hi_h * hi_w)
+        hi_batch   = max(4, int(args.batch_size * area_ratio))
+        print(f"High-res dataloader: {hi_h}x{hi_w}, "
+              f"batch_size={hi_batch} (auto from area ratio {area_ratio:.2f})")
+        high_res_train_loader, _, _ = create_dataloaders(
+            train_txt=args.train_txt,
+            val_txt=args.val_txt,
+            batch_size=hi_batch,
+            num_workers=args.num_workers,
+            img_size=(hi_h, hi_w),
+            pin_memory=True,
+            compute_class_weights=False,
+            dataset_type=args.dataset_type,
+        )
+        print(f"  {len(high_res_train_loader)} batches/epoch at high res")
     print("Dataloaders ready\n")
 
     # ------------------------------------------------------------------ #
@@ -1246,9 +1276,30 @@ def main():
                 trainer.set_loss_phase('full')
 
         # ------------------------------------------------------------------ #
+        # Resolution switching: dùng high_res trong high_res_epochs đầu
+        # ------------------------------------------------------------------ #
+        hi_epochs = getattr(args, "high_res_epochs", 0)
+        if hi_epochs > 0 and high_res_train_loader is not None and epoch < hi_epochs:
+            active_loader = high_res_train_loader
+            if epoch == 0:
+                print(f"[Resolution] Using HIGH RES "
+                      f"({args.high_res_h}x{args.high_res_w}) for epochs 1-{hi_epochs}")
+        else:
+            active_loader = train_loader
+            if hi_epochs > 0 and epoch == hi_epochs:
+                print(f"[Resolution] Switching to NORMAL RES "
+                      f"({args.img_h}x{args.img_w}) from epoch {epoch+1}")
+                # Reset scheduler để cosine decay tính lại từ epoch này
+                scheduler = build_scheduler(
+                    trainer.optimizer, args, train_loader,
+                    start_epoch=epoch)
+                trainer.scheduler = scheduler
+                print("  Scheduler reset for remaining epochs")
+
+        # ------------------------------------------------------------------ #
         # Train + Validate
         # ------------------------------------------------------------------ #
-        train_metrics = trainer.train_epoch(train_loader, epoch)
+        train_metrics = trainer.train_epoch(active_loader, epoch)
         val_metrics   = trainer.validate(val_loader, epoch)
 
         log_dwsa_gamma(model, trainer.writer, epoch)
