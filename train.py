@@ -714,6 +714,14 @@ class Trainer:
     def train_epoch(self, loader, epoch):
         self.model.train()
 
+        # FIX: SPP BN eval mode để tránh gradient inf ở spp.scales.N.bn
+        if getattr(self.args, "freeze_spp_bn", False):
+            spp = getattr(self.model.backbone, "spp", None)
+            if spp is not None:
+                for m in spp.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
+
         total_loss   = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
         max_grad       = 0.0
@@ -1024,6 +1032,9 @@ def main():
     parser.add_argument("--freeze_stem_conv",  action="store_true", default=False,
                         help="Freeze stem_conv1/2 conv weights (giữ FoggyAwareNorm trainable). "
                              "Dùng khi resume để chống gradient inf ở stem.")
+    parser.add_argument("--freeze_spp_bn",     action="store_true", default=False,
+                        help="Set SPP BN sang eval mode khi train. "
+                             "Loại bỏ gradient inf ở spp.scales.N.bn.")
 
     args = parser.parse_args()
 
