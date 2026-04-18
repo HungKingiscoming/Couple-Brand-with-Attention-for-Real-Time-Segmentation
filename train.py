@@ -330,6 +330,12 @@ def build_scheduler(optimizer, args, train_loader, start_epoch=0):
         )
         print(f"OneCycleLR (total_steps={total_steps})")
 
+    elif args.scheduler == 'cosine_wr':
+        T_0 = getattr(args, 'cosine_wr_t0', 10)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer, T_0=T_0, T_mult=1, eta_min=1e-7)
+        print(f"CosineAnnealingWarmRestarts (T_0={T_0})")
+
     else:  # poly
         scheduler = optim.lr_scheduler.LambdaLR(
             optimizer,
@@ -599,7 +605,7 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight"    : 1.0,
-                "dice_weight"  : 0.5,
+                "dice_weight"  : 1.0,
                 "dice_smooth"  : 1e-5,
             },
         }
@@ -1002,8 +1008,15 @@ def main():
     parser.add_argument("--weight_decay",       type=float, default=1e-4)
     parser.add_argument("--grad_clip",          type=float, default=5.0)
     parser.add_argument("--aux_weight",         type=float, default=0.4)
-    parser.add_argument("--scheduler",          default="onecycle",
-                        choices=["onecycle", "poly", "cosine"])
+    parser.add_argument("--dice_weight",        type=float, default=None,
+                        help="Override dice loss weight. None=dùng config (1.0). "
+                             "Tăng lên 1.5-2.0 để boost class nhỏ.")
+    parser.add_argument("--ce_weight",          type=float, default=None,
+                        help="Override CE loss weight. None=dùng config (1.0).")
+    parser.add_argument("--scheduler",          default="cosine",
+                        choices=["onecycle", "poly", "cosine", "cosine_wr"])
+    parser.add_argument("--cosine_wr_t0",       type=int, default=10,
+                        help="Restart period cho cosine_wr (epochs).")
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3,
                         help="Số epoch chỉ dùng CE loss ngay sau mỗi lần unfreeze "
                              "(Dice + KD tắt tạm để tránh gradient shock).")
@@ -1197,6 +1210,15 @@ def main():
         args=args,
         class_weights=class_weights if args.use_class_weights else None,
     )
+
+    # Override loss weights từ command line nếu được chỉ định
+    if getattr(args, "dice_weight", None) is not None:
+        trainer.dice_weight = args.dice_weight
+        trainer.base_loss_cfg["dice_weight"] = args.dice_weight
+        print(f"Dice weight overridden: {args.dice_weight}")
+    if getattr(args, "ce_weight", None) is not None:
+        trainer.ce_weight = args.ce_weight
+        print(f"CE weight overridden: {args.ce_weight}")
 
     # ------------------------------------------------------------------ #
     # Resume checkpoint
