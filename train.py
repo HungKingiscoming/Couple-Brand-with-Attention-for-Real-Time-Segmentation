@@ -1042,6 +1042,13 @@ UNFREEZE_STAGES = [
 def main():
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
 
+    # Model variant
+    parser.add_argument("--model_variant",         type=str,   default="fan_dwsa",
+                        choices=["fan_dwsa", "fan_only", "dwsa_only"],
+                        help="fan_dwsa: FoggyAwareNorm+DWSA | "
+                             "fan_only: FAN only | "
+                             "dwsa_only: DWSA only, BN stem")
+
     # Transfer learning
     parser.add_argument("--pretrained_weights",    type=str,   default=None)
     parser.add_argument("--freeze_backbone",        action="store_true", default=False)
