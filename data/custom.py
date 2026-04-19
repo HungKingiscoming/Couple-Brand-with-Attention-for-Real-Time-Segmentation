@@ -125,7 +125,7 @@ def get_train_transforms(
     # Bản gốc scale_limit=0.4 → scale có thể xuống 0.6× → sau PadIfNeeded
     # phần lớn crop là padding (mask=255) → gradient thưa, OHEM không hiệu quả
     base_list = [
-        A.RandomScale(scale_limit=(-0.25, 0.5), p=1.0),  # FIX: [0.75, 1.5]
+        A.RandomScale(scale_limit=(-0.25, 0.5), p=0.9),  # 10% samples giữ nguyên scale
 
         A.PadIfNeeded(
             min_height=img_size[0],
@@ -139,6 +139,17 @@ def get_train_transforms(
         A.RandomCrop(height=img_size[0], width=img_size[1], p=1.0),
 
         A.HorizontalFlip(p=0.5),
+
+        # GridDistortion: tạo biến thể hình học nhẹ
+        # Đặc biệt hiệu quả cho boundary của object nhỏ (rider, motorcycle)
+        A.GridDistortion(
+            num_steps=5,
+            distort_limit=0.1,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+            mask_value=255,
+            p=0.2
+        ),
     ]
 
     # ===== DATASET-SPECIFIC =====
@@ -163,7 +174,8 @@ def get_train_transforms(
 
             # FIX: thêm CLAHE để augment low-contrast foggy images
             # CLAHE tăng local contrast → model học được features dù bị fog che
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.2),
+            # Tăng p 0.2→0.35 và clip_limit range để hiệu quả hơn với foggy
+            A.CLAHE(clip_limit=(1.0, 4.0), tile_grid_size=(8, 8), p=0.35),
 
             A.OneOf([
                 A.RandomBrightnessContrast(
@@ -175,17 +187,20 @@ def get_train_transforms(
             ], p=0.3),
 
             # FIX: thêm ISONoise — simulates camera noise trong điều kiện sương
+            # Giảm ISONoise: fog + noise cùng lúc confuse model
             A.ISONoise(
-                color_shift=(0.01, 0.03),
-                intensity=(0.05, 0.15),
-                p=0.1
+                color_shift=(0.01, 0.02),
+                intensity=(0.02, 0.08),
+                p=0.05
             ),
 
+            # Tăng fog_coef_upper 0.15→0.30: cover fog nặng hơn
+            # Cityscapes Foggy có 3 beta levels, 0.15 chỉ cover beta=0.005
             A.RandomFog(
                 fog_coef_lower=0.05,
-                fog_coef_upper=0.15,
-                alpha_coef=0.05,
-                p=0.1
+                fog_coef_upper=0.30,
+                alpha_coef=0.08,
+                p=0.2
             ),
         ]
 
