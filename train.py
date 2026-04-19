@@ -384,11 +384,18 @@ class DiceLoss(nn.Module):
 
 
 class OHEMLoss(nn.Module):
-    def __init__(self, ignore_index=255, keep_ratio=0.3, min_kept=100000, class_weights=None):
+    def __init__(self, ignore_index=255, keep_ratio=0.3, min_kept=100000,
+                 thresh=None, class_weights=None):
+        """OHEM Cross Entropy.
+        thresh    : threshold-based OHEM như config gốc GCNet-S (thres=0.9).
+                    Giữ pixel có max_prob < thresh (hard pixels).
+        keep_ratio: ratio-based OHEM nếu thresh=None.
+        """
         super().__init__()
         self.ignore_index  = ignore_index
         self.keep_ratio    = keep_ratio
         self.min_kept      = min_kept
+        self.thresh        = thresh
         self.class_weights = class_weights
 
     def forward(self, logits, labels):
@@ -400,11 +407,25 @@ class OHEMLoss(nn.Module):
         n_valid      = valid_losses.numel()
         if n_valid == 0:
             return logits.sum() * 0
-        n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
-        n_keep = min(n_keep, n_valid)
-        if n_keep < n_valid:
-            threshold    = torch.sort(valid_losses, descending=True)[0][n_keep - 1].detach()
-            valid_losses = valid_losses[valid_losses >= threshold]
+
+        if self.thresh is not None:
+            # Threshold-based: giữ pixel có confidence thấp (hard pixels)
+            with torch.no_grad():
+                max_probs = torch.softmax(logits.detach(), dim=1).max(1)[0].view(-1)[valid_mask]
+                hard_mask = max_probs < self.thresh
+                if hard_mask.sum() < self.min_kept:
+                    _, idx    = torch.topk(max_probs, min(self.min_kept, n_valid), largest=False)
+                    hard_mask = torch.zeros(n_valid, dtype=torch.bool, device=logits.device)
+                    hard_mask[idx] = True
+            valid_losses = valid_losses[hard_mask]
+        else:
+            # Ratio-based: giữ top-K% pixels có loss cao nhất
+            n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
+            n_keep = min(n_keep, n_valid)
+            if n_keep < n_valid:
+                threshold    = torch.sort(valid_losses, descending=True)[0][n_keep - 1].detach()
+                valid_losses = valid_losses[valid_losses >= threshold]
+
         return valid_losses.mean()
 
 
@@ -656,12 +677,18 @@ class Trainer:
 
         _ohem_kr  = getattr(args, 'ohem_keep_ratio', 0.3)
         _ohem_mk  = getattr(args, 'ohem_min_kept',   100000)
+        _ohem_thr = getattr(args, 'ohem_thresh',     None)
         self.ohem = OHEMLoss(
             ignore_index=args.ignore_index,
             keep_ratio=_ohem_kr,
             min_kept=_ohem_mk,
+            thresh=_ohem_thr,
             class_weights=class_weights,
         )
+        if _ohem_thr:
+            print(f"OHEM: threshold-based (thres={_ohem_thr}, min_kept={_ohem_mk})")
+        else:
+            print(f"OHEM: ratio-based (keep_ratio={_ohem_kr}, min_kept={_ohem_mk})")
         self.dice = DiceLoss(
             smooth=loss_cfg['dice_smooth'],
             ignore_index=args.ignore_index,
@@ -1014,6 +1041,8 @@ def main():
     parser.add_argument("--weight_decay",       type=float, default=1e-4)
     parser.add_argument("--grad_clip",          type=float, default=5.0)
     parser.add_argument("--aux_weight",         type=float, default=0.4)
+    parser.add_argument("--aux_decay_exp",      type=float, default=0.9,
+                        help="Exponent cho aux decay. 0.5=chậm hơn, giữ signal lâu hơn.")
     parser.add_argument("--dice_weight",        type=float, default=None,
                         help="Override dice loss weight. None=dùng config (1.0). "
                              "Tăng lên 1.5-2.0 để boost class nhỏ.")
@@ -1022,6 +1051,9 @@ def main():
     parser.add_argument("--ohem_keep_ratio",    type=float, default=0.3,
                         help="OHEM keep ratio (0.5 giữ nhiều hard pixels hơn).")
     parser.add_argument("--ohem_min_kept",      type=int,   default=100000)
+    parser.add_argument("--ohem_thresh",        type=float, default=None,
+                        help="Threshold-based OHEM như GCNet-S config (thres=0.9). "
+                             "Nếu set, override keep_ratio.")
     parser.add_argument("--ce_weight",          type=float, default=None,
                         help="Override CE loss weight. None=dùng config (1.0).")
     parser.add_argument("--scheduler",          default="cosine",
