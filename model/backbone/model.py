@@ -51,7 +51,7 @@ class FoggyAwareNorm(nn.Module):
                 p.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tensor:
-        alpha = torch.sigmoid(self.alpha).clamp(0.05, 0.95)
+        alpha = torch.sigmoid(self.alpha)
         return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
 
 
@@ -110,11 +110,11 @@ class DWSA(nn.Module):
 
     def _init_weights(self):
         for m in [self.query, self.key, self.value, self.out_proj]:
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
         # Init dw_gen linear layers
         for m in self.dw_gen:
             if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
@@ -421,7 +421,7 @@ class GCNet(BaseModule):
     def kaiming_init(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
@@ -471,7 +471,8 @@ class Block1x1(BaseModule):
 
     def _fuse_bn_tensor(self, conv: ConvModule):
         kernel       = conv.conv.weight
-        bias         = conv.conv.bias
+        bias         = (conv.conv.bias if conv.conv.bias is not None
+                        else torch.zeros(kernel.shape[0], device=kernel.device))
         running_mean = conv.bn.running_mean
         running_var  = conv.bn.running_var
         gamma        = conv.bn.weight
@@ -491,8 +492,8 @@ class Block1x1(BaseModule):
                               padding=self.padding, bias=True)
         self.conv.weight.data = torch.einsum(
             'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
-        self.conv.bias.data   = (bias2
-                                 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1))
+        # Fix: 1x1 conv bias composition = matrix-vector product
+        self.conv.bias.data   = bias2 + kernel2.squeeze(-1).squeeze(-1) @ bias1
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
@@ -539,7 +540,8 @@ class Block3x3(BaseModule):
 
     def _fuse_bn_tensor(self, conv: ConvModule):
         kernel       = conv.conv.weight
-        bias         = conv.conv.bias
+        bias         = (conv.conv.bias if conv.conv.bias is not None
+                        else torch.zeros(kernel.shape[0], device=kernel.device))
         running_mean = conv.bn.running_mean
         running_var  = conv.bn.running_var
         gamma        = conv.bn.weight
@@ -559,8 +561,8 @@ class Block3x3(BaseModule):
                               padding=self.padding, bias=True)
         self.conv.weight.data = torch.einsum(
             'oi,icjk->ocjk', kernel2.squeeze(3).squeeze(2), kernel1)
-        self.conv.bias.data   = (bias2
-                                 + (bias1.view(1, -1, 1, 1) * kernel2).sum(3).sum(2).sum(1))
+        # Fix: 1x1 conv bias composition = matrix-vector product
+        self.conv.bias.data   = bias2 + kernel2.squeeze(-1).squeeze(-1) @ bias1
         self.__delattr__('conv1')
         self.__delattr__('conv2')
         self.deploy = True
