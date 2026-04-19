@@ -67,8 +67,12 @@ import gc
 import warnings
 warnings.filterwarnings('ignore')
 
-from model.backbone.model import GCNet
+# Dynamic import — được chọn theo --model_variant
+# fan_dwsa: model.py (FoggyAwareNorm + DWSA) — default
+# fan_only: model_fan_only.py (FoggyAwareNorm, no DWSA)
+# dwsa_only: model_dwsa_only.py (DWSA, no FoggyAwareNorm, BN stem)
 from model.head.segmentation_head import GCNetHead
+# GCNet được import dynamically trong main() theo args.model_variant
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
@@ -190,7 +194,12 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     total_bb  = len(model_state)
     total_hd  = len(head_state)
 
-    expected_skip_markers = ('dwsa_stage', 'foggy', 'alpha', 'in_.', '.spp.', 'backbone.spp.')
+    # Skip markers: keys trong checkpoint không có trong model (expected mismatch)
+    _v = getattr(args, 'model_variant', 'fan_dwsa')
+    _skip_base = ['.spp.', 'backbone.spp.']
+    if 'dwsa' not in _v:  _skip_base.append('dwsa_stage')  # model không có DWSA
+    if 'fan'  not in _v:  _skip_base += ['foggy', 'alpha', 'in_.']  # không có FAN
+    expected_skip_markers = tuple(_skip_base)
     truly_unmatched = [k for k in skipped if not any(s in k for s in expected_skip_markers)]
 
     sep = '=' * 70
@@ -218,9 +227,11 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     missing_hd, _ = model.decode_head.load_state_dict(head_loaded, strict=False)
 
     # stem_conv1.1 / stem_conv2.1 = FoggyAwareNorm — module mới, expected missing
-    expected_missing_markers = ('dwsa', 'alpha', 'in_.', 'foggy', '.1.bn.', 'spp.',
-                                'loss_', 'fog_consistency',
-                                'stem_conv1.1.', 'stem_conv2.1.')
+    # Missing markers: keys trong model không có trong checkpoint (expected new)
+    _miss = ['.1.bn.', 'spp.', 'loss_', 'fog_consistency']
+    if 'dwsa' in _v: _miss.append('dwsa')
+    if 'fan'  in _v: _miss += ['alpha', 'in_.', 'foggy', 'stem_conv1.1.', 'stem_conv2.1.']
+    expected_missing_markers = tuple(_miss)
     unexpected_bb = [k for k in missing_bb
                      if not any(s in k for s in expected_missing_markers)]
     unexpected_hd = [k for k in missing_hd
@@ -237,7 +248,11 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
 
     n_expected_missing = (len(missing_bb) - len(unexpected_bb)
                           + len(missing_hd) - len(unexpected_hd))
-    print(f"Expected missing: {n_expected_missing} keys (DWSA/FoggyNorm/loss buffers) → OK\n")
+    _comp = []
+    if 'dwsa' in _v: _comp.append('DWSA')
+    if 'fan'  in _v: _comp.append('FoggyNorm')
+    _comp.append('loss buffers')
+    print(f"Expected missing: {n_expected_missing} keys ({'/ '.join(_comp)}) → OK\n")
 
     return 100 * (loaded_bb + loaded_hd) / max(total_bb + total_hd, 1)
 
@@ -482,9 +497,21 @@ def count_trainable_params(model):
     return trainable, total - trainable
 
 
-def freeze_backbone(model):
-    """Freeze toàn bộ backbone trừ DWSA và FoggyAwareNorm."""
-    print("Freezing backbone (keeping DWSA + FoggyAwareNorm trainable)...")
+def freeze_backbone(model, variant='fan_dwsa'):
+    """Freeze toàn bộ backbone.
+    Tự động detect variant để giữ đúng components trainable:
+      fan_dwsa : giữ DWSA + FoggyAwareNorm trainable
+      fan_only : giữ FoggyAwareNorm trainable
+      dwsa_only: giữ DWSA trainable
+    """
+    has_dwsa = hasattr(model.backbone, 'dwsa_stage4')
+    has_fan  = (hasattr(model.backbone, 'stem_conv1') and
+                len(model.backbone.stem_conv1) > 1 and
+                hasattr(model.backbone.stem_conv1[1], 'alpha'))
+    keep = []
+    if has_dwsa: keep.append('DWSA')
+    if has_fan:  keep.append('FoggyAwareNorm')
+    print(f"Freezing backbone (keeping {' + '.join(keep) if keep else 'nothing'} trainable)...")
 
     for p in model.backbone.parameters():
         p.requires_grad = False
@@ -499,33 +526,35 @@ def freeze_backbone(model):
     print(f"  {bn_count} BN layers locked")
 
     dwsa_params = 0; dwsa_bn_count = 0
-    for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
-        module = getattr(model.backbone, name, None)
-        if module is not None:
-            for p in module.parameters():
-                p.requires_grad = True
-                dwsa_params += p.numel()
-            for m in module.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.train()
-                    if m.weight is not None: m.weight.requires_grad = True
-                    if m.bias   is not None: m.bias.requires_grad   = True
-                    dwsa_bn_count += 1
-    print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn_count} BN unfrozen")
+    if has_dwsa:
+        for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
+            module = getattr(model.backbone, name, None)
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = True
+                    dwsa_params += p.numel()
+                for m in module.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.train()
+                        if m.weight is not None: m.weight.requires_grad = True
+                        if m.bias   is not None: m.bias.requires_grad   = True
+                        dwsa_bn_count += 1
+        print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn_count} BN unfrozen")
 
     fan_params = 0
-    for name in ['stem_conv1', 'stem_conv2']:
-        module = getattr(model.backbone, name, None)
-        if module is not None:
-            if len(module) > 1 and hasattr(module[1], 'alpha'):
-                for p in module[1].parameters():
-                    p.requires_grad = True
-                    fan_params += p.numel()
-                fan_bn = module[1].bn
-                fan_bn.train()
-                if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
-                if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
-    print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
+    if has_fan:
+        for name in ['stem_conv1', 'stem_conv2']:
+            module = getattr(model.backbone, name, None)
+            if module is not None:
+                if len(module) > 1 and hasattr(module[1], 'alpha'):
+                    for p in module[1].parameters():
+                        p.requires_grad = True
+                        fan_params += p.numel()
+                    fan_bn = module[1].bn
+                    fan_bn.train()
+                    if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
+                    if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
+        print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
     print("Backbone frozen\n")
 
 
@@ -601,20 +630,27 @@ def print_backbone_structure(model):
 
 class ModelConfig:
     @staticmethod
-    def get_config():
+    def get_config(variant='fan_dwsa'):
+        """variant: 'fan_dwsa' | 'fan_only' | 'dwsa_only'"""
         C = 32
+        backbone_base = {
+            "in_channels"          : 3,
+            "channels"             : C,
+            "ppm_channels"         : 128,
+            "num_blocks_per_stage" : [4, 4, [5, 4], [5, 4], [2, 2]],
+            "align_corners"        : False,
+            "norm_cfg"             : dict(type='BN', requires_grad=True),
+            "act_cfg"              : dict(type='ReLU', inplace=True),
+            "deploy"               : False,
+        }
+        # fan_dwsa và fan_only cần dwsa_reduction; dwsa_only không có FAN
+        if variant == 'fan_dwsa':
+            backbone_base["dwsa_reduction"] = 8
+        elif variant == 'dwsa_only':
+            backbone_base["dwsa_reduction"] = 8
+        # fan_only: không có dwsa_reduction param
         return {
-            "backbone": {
-                "in_channels"          : 3,
-                "channels"             : C,
-                "ppm_channels"         : 128,
-                "num_blocks_per_stage" : [4, 4, [5, 4], [5, 4], [2, 2]],
-                "align_corners"        : False,
-                "norm_cfg"             : dict(type='BN', requires_grad=True),
-                "act_cfg"              : dict(type='ReLU', inplace=True),
-                "dwsa_reduction"       : 8,
-                "deploy"               : False,
-            },
+            "backbone": backbone_base,
             "head": {
                 "in_channels"     : C * 4,
                 "channels"        : 64,
@@ -1115,7 +1151,12 @@ def main():
     args.scheduler = effective_scheduler
 
     print(f"\n{'='*70}")
-    print(f"GCNet v3 Training  |  FoggyAwareNorm + DWSA stage 4/5/6")
+    _variant_label = {
+        'fan_dwsa' : 'FoggyAwareNorm + DWSA',
+        'fan_only' : 'FoggyAwareNorm only',
+        'dwsa_only': 'DWSA only (BN stem)',
+    }.get(getattr(args, 'model_variant', 'fan_dwsa'), 'Unknown')
+    print(f"GCNet v3 Training  |  {_variant_label}")
     print(f"{'='*70}")
     print(f"Device:     {device}")
     print(f"Image size: {args.img_h}x{args.img_w}")
@@ -1123,13 +1164,28 @@ def main():
     print(f"Grad clip:  {args.grad_clip}  |  AMP: {args.use_amp}")
     if getattr(args, "high_res_epochs", 0) > 0:
         print(f"High-res phase:  {args.high_res_h}x{args.high_res_w} for {args.high_res_epochs} epochs, then {args.img_h}x{args.img_w}")
-    print(f"LR DWSA:    {args.lr * args.dwsa_lr_factor:.2e}  (factor={args.dwsa_lr_factor})")
-    print(f"LR alpha:   {args.lr * args.alpha_lr_factor:.2e}  (factor={args.alpha_lr_factor})")
+    _v = getattr(args, 'model_variant', 'fan_dwsa')
+    if 'dwsa' in _v:
+        print(f"LR DWSA:    {args.lr * args.dwsa_lr_factor:.2e}  (factor={args.dwsa_lr_factor})")
+    if 'fan' in _v:
+        print(f"LR alpha:   {args.lr * args.alpha_lr_factor:.2e}  (factor={args.alpha_lr_factor})")
     if unfreeze_list:
         print(f"Unfreeze schedule: epochs {unfreeze_list}")
     print(f"{'='*70}\n")
 
-    cfg              = ModelConfig.get_config()
+    # Dynamic import GCNet theo variant
+    variant = getattr(args, 'model_variant', 'fan_dwsa')
+    if variant == 'fan_dwsa':
+        from model.backbone.model import GCNet
+    elif variant == 'fan_only':
+        from model.backbone.model_fan_only import GCNet
+    elif variant == 'dwsa_only':
+        from model.backbone.model_dwsa_only import GCNet
+    else:
+        raise ValueError(f"Unknown model_variant: {variant}")
+    print(f"Model variant: {variant}")
+
+    cfg = ModelConfig.get_config(variant=variant)
     args.loss_config = cfg["loss"]
 
     print("Creating dataloaders...")
@@ -1217,7 +1273,7 @@ def main():
         load_pretrained_gcnet(model, args.pretrained_weights)
 
     if args.freeze_backbone:
-        freeze_backbone(model)
+        freeze_backbone(model, variant=getattr(args, 'model_variant', 'fan_dwsa'))
 
     count_trainable_params(model)
     print_backbone_structure(model)
