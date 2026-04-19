@@ -1360,10 +1360,31 @@ def main():
         trainer.writer.add_scalar('val/loss',     val_metrics['loss'],     epoch)
         trainer.writer.add_scalar('val/miou',     val_metrics['miou'],     epoch)
         trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
+        # Log per-class IoU — cực hữu ích để debug class nào đang kéo mIoU xuống
+        CLASS_NAMES = ['road','sidewalk','building','wall','fence','pole',
+                       'traffic_light','traffic_sign','vegetation','terrain',
+                       'sky','person','rider','car','truck','bus',
+                       'train','motorcycle','bicycle']
+        for ci, (cname, ciou) in enumerate(
+                zip(CLASS_NAMES, val_metrics['per_class_iou'])):
+            trainer.writer.add_scalar(f'val/iou_{cname}', float(ciou), epoch)
 
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
             trainer.best_miou = val_metrics['miou']
+            # In per-class IoU khi đạt best model để dễ debug
+            print("  Per-class IoU (best model):")
+            cnames = ['road','sidewalk','building','wall','fence','pole',
+                      'traffic_light','traffic_sign','vegetation','terrain',
+                      'sky','person','rider','car','truck','bus',
+                      'train','motorcycle','bicycle']
+            low_classes = []
+            for cn, ciou in zip(cnames, val_metrics['per_class_iou']):
+                mark = ' ←LOW' if ciou < 0.4 else ''
+                print(f"    {cn:<16} {ciou:.4f}{mark}")
+                if ciou < 0.4: low_classes.append(cn)
+            if low_classes:
+                print(f"  Classes below 0.40: {low_classes}")
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
 
     trainer.writer.close()
