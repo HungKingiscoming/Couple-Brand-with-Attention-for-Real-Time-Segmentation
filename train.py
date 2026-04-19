@@ -110,7 +110,7 @@ def _remap_stem_key(key: str, N2: int = 4):
         return f'stem_stage3.{idx - (2 + N2)}.{rest}'
 
 
-def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
+def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dwsa"):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = ckpt.get('state_dict', ckpt)
@@ -195,7 +195,7 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False):
     total_hd  = len(head_state)
 
     # Skip markers: keys trong checkpoint không có trong model (expected mismatch)
-    _v = getattr(args, 'model_variant', 'fan_dwsa')
+    _v = variant
     _skip_base = ['.spp.', 'backbone.spp.']
     if 'dwsa' not in _v:  _skip_base.append('dwsa_stage')  # model không có DWSA
     if 'fan'  not in _v:  _skip_base += ['foggy', 'alpha', 'in_.']  # không có FAN
@@ -1185,9 +1185,9 @@ def main():
     if variant == 'fan_dwsa':
         from model.backbone.model import GCNet
     elif variant == 'fan_only':
-        from model.backbone.fan import GCNet
+        from model.backbone.model_fan_only import GCNet
     elif variant == 'dwsa_only':
-        from model.backbone.dwsa import GCNet
+        from model.backbone.model_dwsa_only import GCNet
     else:
         raise ValueError(f"Unknown model_variant: {variant}")
     print(f"Model variant: {variant}")
@@ -1277,7 +1277,8 @@ def main():
     print(f"{'='*70}\n")
 
     if args.pretrained_weights:
-        load_pretrained_gcnet(model, args.pretrained_weights)
+        load_pretrained_gcnet(model, args.pretrained_weights,
+                          variant=getattr(args, 'model_variant', 'fan_dwsa'))
 
     if args.freeze_backbone:
         freeze_backbone(model, variant=getattr(args, 'model_variant', 'fan_dwsa'))
