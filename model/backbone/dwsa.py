@@ -253,9 +253,12 @@ class GCNet(BaseModule):
             num_scales=5, norm_cfg=norm_cfg, act_cfg=act_cfg)
 
         # ── DWSA trên semantic branch stage 4/5/6 ─────────────────────────────
-        self.dwsa_stage4 = DWSA(channels * 2,  reduction=dwsa_reduction, norm_cfg=norm_cfg)
+        # stage4: sau semantic[0] fusion → channels*4
+        # stage5: sau semantic[1] fusion → channels*8
+        # stage6: áp lên SPP output (DAPPM) → channels*4
+        self.dwsa_stage4 = DWSA(channels * 4,  reduction=dwsa_reduction, norm_cfg=norm_cfg)
         self.dwsa_stage5 = DWSA(channels * 8,  reduction=dwsa_reduction, norm_cfg=norm_cfg)
-        self.dwsa_stage6 = DWSA(channels * 16, reduction=dwsa_reduction, norm_cfg=norm_cfg)
+        self.dwsa_stage6 = DWSA(channels * 4,  reduction=dwsa_reduction, norm_cfg=norm_cfg)
 
         self.kaiming_init()
 
@@ -277,13 +280,13 @@ class GCNet(BaseModule):
         x_s = self.semantic_branch_layers[0](x)
         x_d = self.detail_branch_layers[0](x)
 
-        # DWSA trên semantic stage 4
-        x_s = self.dwsa_stage4(self.relu(x_s))
-
         comp_c = self.compression_1(self.relu(x_s))
         x_s    = x_s + self.down_1(self.relu(x_d))
         x_d    = x_d + resize(comp_c, size=out_size,
                                mode='bilinear', align_corners=self.align_corners)
+
+        # DWSA stage4: sau bilateral fusion, channels*4
+        x_s = self.dwsa_stage4(x_s)
 
         c4_feat = x_d.clone() if use_aux else None
 
@@ -291,24 +294,23 @@ class GCNet(BaseModule):
         x_s = self.semantic_branch_layers[1](self.relu(x_s))
         x_d = self.detail_branch_layers[1](self.relu(x_d))
 
-        # DWSA trên semantic stage 5
-        x_s = self.dwsa_stage5(self.relu(x_s))
-
         comp_c = self.compression_2(self.relu(x_s))
         x_s    = x_s + self.down_2(self.relu(x_d))
         x_d    = x_d + resize(comp_c, size=out_size,
                                mode='bilinear', align_corners=self.align_corners)
 
+        # DWSA stage5: sau bilateral fusion, channels*8
+        x_s = self.dwsa_stage5(x_s)
+
         # Stage 6
         x_d   = self.detail_branch_layers[2](self.relu(x_d))
         x_s   = self.semantic_branch_layers[2](self.relu(x_s))
-
-        # DWSA trên semantic stage 6
-        x_s   = self.dwsa_stage6(self.relu(x_s))
-
         x_spp = self.spp(x_s)
         x_spp = resize(x_spp, size=out_size,
                        mode='bilinear', align_corners=self.align_corners)
+
+        # DWSA stage6: áp lên SPP output, channels*4
+        x_spp = self.dwsa_stage6(x_spp)
 
         fused = x_d + x_spp
 
