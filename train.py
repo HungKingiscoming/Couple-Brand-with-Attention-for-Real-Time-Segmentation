@@ -1185,9 +1185,9 @@ def main():
     if variant == 'fan_dwsa':
         from model.backbone.model import GCNet
     elif variant == 'fan_only':
-        from model.backbone.model_fan_only import GCNet
+        from model.backbone.fan import GCNet
     elif variant == 'dwsa_only':
-        from model.backbone.model_dwsa_only import GCNet
+        from model.backbone.dwsa import GCNet
     else:
         raise ValueError(f"Unknown model_variant: {variant}")
     print(f"Model variant: {variant}")
