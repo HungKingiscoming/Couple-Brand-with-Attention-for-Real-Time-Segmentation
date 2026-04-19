@@ -654,10 +654,12 @@ class Trainer:
 
         cw_device = class_weights.to(device) if class_weights is not None else None
 
+        _ohem_kr  = getattr(args, 'ohem_keep_ratio', 0.3)
+        _ohem_mk  = getattr(args, 'ohem_min_kept',   100000)
         self.ohem = OHEMLoss(
             ignore_index=args.ignore_index,
-            keep_ratio=0.3,
-            min_kept=100000,
+            keep_ratio=_ohem_kr,
+            min_kept=_ohem_mk,
             class_weights=class_weights,
         )
         self.dice = DiceLoss(
@@ -665,10 +667,13 @@ class Trainer:
             ignore_index=args.ignore_index,
             class_weights=class_weights,   # FIX: truyền class_weights vào Dice
         )
+        _ls = getattr(args, 'label_smoothing', 0.0)
         self.ce = nn.CrossEntropyLoss(
             weight=cw_device,
             ignore_index=args.ignore_index,
+            label_smoothing=_ls,
         )
+        if _ls > 0: print(f"Label smoothing: {_ls}")
 
         # ------------------------------------------------------------------ #
         # Distillation state
@@ -764,7 +769,8 @@ class Trainer:
                 loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
 
                 if self.args.aux_weight > 0:
-                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** 0.9
+                    aux_exp    = getattr(self.args, 'aux_decay_exp', 0.9)
+                    aux_weight = self.args.aux_weight * (1 - epoch / self.args.epochs) ** aux_exp
                     aux_loss   = self.ohem(c4_full, masks)
                     loss       = loss + aux_weight * aux_loss
 
@@ -1011,6 +1017,11 @@ def main():
     parser.add_argument("--dice_weight",        type=float, default=None,
                         help="Override dice loss weight. None=dùng config (1.0). "
                              "Tăng lên 1.5-2.0 để boost class nhỏ.")
+    parser.add_argument("--label_smoothing",    type=float, default=0.0,
+                        help="Label smoothing cho CE (0.05-0.1).")
+    parser.add_argument("--ohem_keep_ratio",    type=float, default=0.3,
+                        help="OHEM keep ratio (0.5 giữ nhiều hard pixels hơn).")
+    parser.add_argument("--ohem_min_kept",      type=int,   default=100000)
     parser.add_argument("--ce_weight",          type=float, default=None,
                         help="Override CE loss weight. None=dùng config (1.0).")
     parser.add_argument("--scheduler",          default="cosine",
