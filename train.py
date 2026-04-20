@@ -290,11 +290,19 @@ def build_optimizer(model, args):
     if alpha_params:
         groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,    'name': 'alpha'})
 
-    optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+    opt_type = getattr(args, 'optimizer', 'adamw').lower()
+    if opt_type == 'sgd':
+        momentum = getattr(args, 'sgd_momentum', 0.9)
+        optimizer = torch.optim.SGD(
+            groups, momentum=momentum,
+            weight_decay=args.weight_decay, nesterov=True)
+        print(f"Optimizer: SGD (momentum={momentum}, nesterov=True)")
+    else:
+        optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
+        print("Optimizer: AdamW (Discriminative LR)")
+
     for g in optimizer.param_groups:
         g.setdefault('initial_lr', g['lr'])
-
-    print("Optimizer: AdamW (Discriminative LR)")
     for g in optimizer.param_groups:
         print(f"  group '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
 
@@ -1082,6 +1090,11 @@ def main():
     parser.add_argument("--accumulation_steps", type=int,   default=2)
     parser.add_argument("--lr",                 type=float, default=5e-4)
     parser.add_argument("--weight_decay",       type=float, default=1e-4)
+    parser.add_argument("--optimizer",          type=str,   default="adamw",
+                        choices=["adamw", "sgd"],
+                        help="adamw (default) hoặc sgd (như config gốc GCNet-S).")
+    parser.add_argument("--sgd_momentum",       type=float, default=0.9,
+                        help="Momentum cho SGD.")
     parser.add_argument("--grad_clip",          type=float, default=5.0)
     parser.add_argument("--aux_weight",         type=float, default=0.4)
     parser.add_argument("--aux_decay_exp",      type=float, default=0.9,
@@ -1185,9 +1198,9 @@ def main():
     if variant == 'fan_dwsa':
         from model.backbone.model import GCNet
     elif variant == 'fan_only':
-        from model.backbone.fan import GCNet
+        from model.backbone.model_fan_only import GCNet
     elif variant == 'dwsa_only':
-        from model.backbone.dwsa import GCNet
+        from model.backbone.model_dwsa_only import GCNet
     else:
         raise ValueError(f"Unknown model_variant: {variant}")
     print(f"Model variant: {variant}")
