@@ -117,10 +117,10 @@ def build_model(variant: str, ckpt_path: str, device: torch.device,
         from model.backbone.model import GCNet
         backbone_cfg['dwsa_reduction'] = 8
     elif variant == 'fan_only':
-        from model.backbone.model_fan_only import GCNet
+        from model.backbone.fan import GCNet
         # không có dwsa_reduction
     elif variant == 'dwsa_only':
-        from model.backbone.model_dwsa_only import GCNet
+        from model.backbone.dwsa import GCNet
         backbone_cfg['dwsa_reduction'] = 8
     else:
         raise ValueError(f"Unknown variant: {variant}")
