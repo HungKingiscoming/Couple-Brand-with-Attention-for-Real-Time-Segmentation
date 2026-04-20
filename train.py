@@ -989,7 +989,12 @@ class Trainer:
 
     def load_checkpoint(self, path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.model.load_state_dict(ckpt['model'])
+        # Handle cả hai format key: 'model' (train.py) và 'model_state_dict' (legacy)
+        state = (ckpt.get('model')
+                 or ckpt.get('model_state_dict')
+                 or ckpt.get('state_dict')
+                 or ckpt)
+        self.model.load_state_dict(state, strict=False)
 
         if load_optimizer and ckpt.get('optimizer'):
             try:
