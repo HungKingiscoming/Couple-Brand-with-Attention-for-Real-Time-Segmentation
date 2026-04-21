@@ -42,6 +42,33 @@ from model.head.segmentation_head import GCNetHead
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _fuse_conv_bn(conv, bn):
+    """Fuse Conv+BN — giống torch_speed.py của GCNet."""
+    w = conv.weight
+    b = conv.bias if conv.bias is not None else torch.zeros_like(bn.running_mean)
+    f = bn.weight / torch.sqrt(bn.running_var + bn.eps)
+    conv.weight = nn.Parameter(w * f.reshape([conv.out_channels, 1, 1, 1]))
+    conv.bias   = nn.Parameter((b - bn.running_mean) * f + bn.bias)
+    return conv
+
+def fuse_conv_bn(m):
+    """Recursive Conv+BN fusion."""
+    last, lname = None, None
+    try:
+        for name, child in m.named_children():
+            if isinstance(child, (nn.modules.batchnorm._BatchNorm, nn.SyncBatchNorm)):
+                if last is not None:
+                    m._modules[lname] = _fuse_conv_bn(last, child)
+                    m._modules[name]  = nn.Identity()
+                    last = None
+            elif isinstance(child, nn.Conv2d):
+                last, lname = child, name
+            else:
+                fuse_conv_bn(child)
+    except Exception:
+        pass
+    return m
+
 @contextmanager
 def cuda_timer():
     """Context manager đo thời gian CUDA chính xác."""
@@ -137,7 +164,10 @@ def build_model(variant: str, ckpt_path: str, device: torch.device,
 
     if ckpt_path and os.path.exists(ckpt_path):
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-        state = ckpt.get('model_state_dict', ckpt.get('state_dict', ckpt))
+        state = (ckpt.get('model')
+                 or ckpt.get('model_state_dict')
+                 or ckpt.get('state_dict')
+                 or ckpt)
         model.load_state_dict(state, strict=False)
         epoch = ckpt.get('epoch', '?')
         miou  = ckpt.get('best_miou', ckpt.get('miou', '?'))
@@ -156,15 +186,16 @@ def build_model(variant: str, ckpt_path: str, device: torch.device,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def benchmark_model(model, variant, img_h, img_w, batch_size,
-                    warmup, runs, device, deploy=False):
+                    warmup, runs, device, deploy=False, **kwargs):
     """Đo FPS, latency, memory cho một model."""
 
     dummy = torch.randn(batch_size, 3, img_h, img_w, device=device)
 
-    # Switch to deploy mode nếu cần
+    # Switch to deploy mode — always apply fuse_conv_bn (như torch_speed.py)
     if deploy and hasattr(model.backbone, 'switch_to_deploy'):
         model.backbone.switch_to_deploy()
-        print(f"    [deploy mode ON]")
+        fuse_conv_bn(model)
+        print(f"    [deploy + fuse_conv_bn ON]")
 
     # Warmup
     print(f"    Warmup ({warmup} iters)...", end='', flush=True)
@@ -215,6 +246,9 @@ def benchmark_model(model, variant, img_h, img_w, batch_size,
         'gflops'     : gflops,
         'flop_lib'   : flop_lib,
         'deploy'     : deploy,
+        'miou'       : kwargs.get('miou', None),
+        'mdice'      : kwargs.get('mdice', None),
+        'macc'       : kwargs.get('macc', None),
     }
 
 
@@ -228,30 +262,55 @@ def print_result(r):
     print(f"    Params:    {r['params_m']:.2f} M")
     if r['gflops'] is not None:
         print(f"    GFLOPs:    {r['gflops']:.2f}  (via {r['flop_lib']})")
+    if r.get('miou') is not None:
+        print(f"    mIoU:      {r['miou']:.4f}")
+    if r.get('mdice') is not None:
+        print(f"    mDice:     {r['mdice']:.4f}")
+    if r.get('macc') is not None:
+        print(f"    mAcc:      {r['macc']:.4f}")
 
 
 def print_comparison_table(results):
     if not results:
         return
-    print(f"\n{'='*75}")
+    has_metrics = any(r.get('miou') is not None for r in results)
+    width = 95 if has_metrics else 75
+    print(f"\n{'='*width}")
     print("COMPARISON TABLE")
-    print(f"{'='*75}")
-    header = f"{'Variant':<18} {'Deploy':>7} {'FPS':>8} {'Latency(ms)':>12} {'Mem(MB)':>9} {'Params(M)':>10} {'GFLOPs':>8}"
+    print(f"{'='*width}")
+    if has_metrics:
+        header = (f"{'Variant':<18} {'Deploy':>7} {'FPS':>8} {'Lat(ms)':>9} "
+                  f"{'Params':>8} {'mIoU':>7} {'mDice':>7} {'mAcc':>7} {'GFLOPs':>8}")
+    else:
+        header = (f"{'Variant':<18} {'Deploy':>7} {'FPS':>8} {'Latency(ms)':>12} "
+                  f"{'Mem(MB)':>9} {'Params(M)':>10} {'GFLOPs':>8}")
     print(header)
-    print('-'*75)
+    print('-'*width)
     for r in results:
-        gf = f"{r['gflops']:.2f}" if r['gflops'] else 'N/A'
+        gf = f"{r['gflops']:.2f}" if r.get('gflops') else 'N/A'
         dp = '✓' if r['deploy'] else '✗'
-        print(f"  {r['variant']:<16} {dp:>7} {r['fps']:>8.1f} "
-              f"{r['lat_mean_ms']:>12.2f} {r['peak_mem_mb']:>9.0f} "
-              f"{r['params_m']:>10.2f} {gf:>8}")
-    print('='*75)
+        if has_metrics:
+            miou  = f"{r['miou']:.4f}"  if r.get('miou')  is not None else '-'
+            mdice = f"{r['mdice']:.4f}" if r.get('mdice') is not None else '-'
+            macc  = f"{r['macc']:.4f}"  if r.get('macc')  is not None else '-'
+            print(f"  {r['variant']:<16} {dp:>7} {r['fps']:>8.1f} "
+                  f"{r['lat_mean_ms']:>9.2f} {r['params_m']:>8.2f} "
+                  f"{miou:>7} {mdice:>7} {macc:>7} {gf:>8}")
+        else:
+            print(f"  {r['variant']:<16} {dp:>7} {r['fps']:>8.1f} "
+                  f"{r['lat_mean_ms']:>12.2f} {r['peak_mem_mb']:>9.0f} "
+                  f"{r['params_m']:>10.2f} {gf:>8}")
+    print('='*width)
 
-    # Highlight fastest
-    fps_vals  = [(r['fps'], r['variant'], r['deploy']) for r in results]
-    best_fps  = max(fps_vals, key=lambda x: x[0])
+    fps_vals = [(r['fps'], r['variant'], r['deploy']) for r in results]
+    best_fps = max(fps_vals, key=lambda x: x[0])
     print(f"\n  Fastest: {best_fps[1]}{'[deploy]' if best_fps[2] else ''} "
           f"@ {best_fps[0]:.1f} FPS")
+    if has_metrics:
+        miou_vals = [(r['miou'], r['variant']) for r in results if r.get('miou') is not None]
+        if miou_vals:
+            best_miou = max(miou_vals, key=lambda x: x[0])
+            print(f"  Best mIoU: {best_miou[1]} @ {best_miou[0]:.4f}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -272,10 +331,23 @@ def main():
                         help="Số iter đo chính thức.")
     parser.add_argument("--deploy",   action="store_true",
                         help="Switch sang deploy mode (reparameterize conv).")
+    parser.add_argument("--gcnet_style", action="store_true",
+                        help="Match torch_speed.py của GCNet: "
+                             "1024x2048 input, deploy+fuse_conv_bn, thêm resize pass.")
     parser.add_argument("--multi_res", action="store_true",
                         help="Benchmark trên nhiều resolutions.")
     parser.add_argument("--no_ckpt",  action="store_true",
                         help="Chạy không cần checkpoint (random weights).")
+    # Metrics — truyền vào thủ công từ training log
+    parser.add_argument("--fan_dwsa_miou",  type=float, default=None)
+    parser.add_argument("--fan_dwsa_mdice", type=float, default=None)
+    parser.add_argument("--fan_dwsa_macc",  type=float, default=None)
+    parser.add_argument("--fan_only_miou",  type=float, default=None)
+    parser.add_argument("--fan_only_mdice", type=float, default=None)
+    parser.add_argument("--fan_only_macc",  type=float, default=None)
+    parser.add_argument("--dwsa_only_miou",  type=float, default=None)
+    parser.add_argument("--dwsa_only_mdice", type=float, default=None)
+    parser.add_argument("--dwsa_only_macc",  type=float, default=None)
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -301,7 +373,11 @@ def main():
         return
 
     # Resolutions
-    if args.multi_res:
+    if args.gcnet_style:
+        resolutions = [(1024, 2048)]  # GCNet official benchmark resolution
+        args.deploy = True
+        print("GCNet-style benchmark: 1024x2048, deploy+fuse_conv_bn")
+    elif args.multi_res:
         resolutions = [(512, 1024), (384, 768), (256, 512), (720, 1280)]
     else:
         resolutions = [(args.img_h, args.img_w)]
@@ -317,9 +393,14 @@ def main():
 
         for h, w in resolutions:
             print(f"\n  Resolution: {h}×{w}")
+            vname = variant.replace('-', '_')
             r = benchmark_model(
                 model, variant, h, w, args.batch_size,
-                args.warmup, args.runs, device, deploy=False)
+                args.warmup, args.runs, device, deploy=False,
+                gcnet_style=getattr(args, 'gcnet_style', False),
+                miou=getattr(args, f"{vname}_miou", None),
+                mdice=getattr(args, f"{vname}_mdice", None),
+                macc=getattr(args, f"{vname}_macc", None))
             print_result(r)
             all_results.append(r)
 
@@ -328,7 +409,11 @@ def main():
                 model_d = build_model(variant, ckpt, device, deploy=True)
                 r_d = benchmark_model(
                     model_d, variant, h, w, args.batch_size,
-                    args.warmup, args.runs, device, deploy=True)
+                    args.warmup, args.runs, device, deploy=True,
+                    gcnet_style=getattr(args, 'gcnet_style', False),
+                    miou=getattr(args, f"{vname}_miou", None),
+                    mdice=getattr(args, f"{vname}_mdice", None),
+                    macc=getattr(args, f"{vname}_macc", None))
                 print_result(r_d)
                 all_results.append(r_d)
                 del model_d
