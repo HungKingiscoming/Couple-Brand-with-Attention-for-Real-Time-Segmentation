@@ -244,22 +244,64 @@ def validate(model, loader, device):
     }
 
 
+# ─── Speed optimizations ────────────────────────────────────
+def apply_fp16(model):
+    """Priority 1: FP16 inference — fuse trước rồi mới convert."""
+    model.half()
+    print("  [FP16 applied]")
+    return model
+
+
+def apply_compile(model):
+    """Priority 2: torch.compile() với reduce-overhead mode."""
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+        print("  [torch.compile() applied]")
+    except Exception as e:
+        print(f"  [torch.compile() FAILED: {e}]")
+    return model
+
+
+def apply_tensorrt(model, img_h, img_w, device, fp16=False):
+    """Priority 3: Export TensorRT engine qua torch2trt."""
+    try:
+        from torch2trt import torch2trt
+        dummy = torch.randn(1, 3, img_h, img_w, device=device)
+        if fp16:
+            dummy = dummy.half()
+        model_trt = torch2trt(
+            model, [dummy],
+            fp16_mode=fp16,
+            max_workspace_size=1 << 30,  # 1GB
+        )
+        print(f"  [TensorRT exported  fp16={fp16}]")
+        return model_trt, True
+    except ImportError:
+        print("  [torch2trt not installed — skipping TensorRT]")
+        print("  Install: pip install torch2trt")
+        return model, False
+    except Exception as e:
+        print(f"  [TensorRT FAILED: {e}]")
+        return model, False
+
+
 # ─── Benchmark ───────────────────────────────────────────────
-def benchmark(model, img_h, img_w, device, warmup_runs=2):
+def benchmark(model, img_h, img_w, device, warmup_runs=2, fp16=False):
     """Methodology = torch_speed.py: deploy + fuse_conv_bn + auto-calibrate + FPS*6."""
     torch.backends.cudnn.enabled   = True
     torch.backends.cudnn.benchmark = True
 
-    # Deploy + fuse
-    if hasattr(model.backbone, 'switch_to_deploy'):
-        model.backbone.switch_to_deploy()
-    fuse_conv_bn(model)
-    print(f"  [deploy + fuse_conv_bn applied]")
+    # Deploy + fuse đã được apply trong main() trước khi gọi benchmark()
 
     inp = torch.randn(1, 3, img_h, img_w, device=device)
+    if fp16:
+        inp = inp.half()
 
     def run():
         out = model(inp)
+        # Ensure float32 for interpolate (TRT output có thể là FP16)
+        if out.dtype != torch.float32:
+            out = out.float()
         F.interpolate(out, size=(img_h, img_w), mode='bilinear', align_corners=False)
 
     fps_list = []
@@ -297,7 +339,7 @@ def benchmark(model, img_h, img_w, device, warmup_runs=2):
     avg_lat = 1000 / avg_fps
     params  = sum(p.numel() for p in model.parameters()) / 1e6
 
-    return {'fps': avg_fps, 'latency': avg_lat, 'params': params}
+    return {'fps': avg_fps, 'latency': avg_lat, 'params': params, 'fp16': fp16}
 
 
 # ─── Print ────────────────────────────────────────────────────
@@ -318,7 +360,12 @@ def print_results(variant, val_metrics, bm_metrics, img_h, img_w):
             print(f"    {name:<16} {iou:.4f}  {bar}")
 
     if bm_metrics:
-        print(f"\n  Benchmark (deploy + fuse_conv_bn):")
+        mode_tags = []
+        if bm_metrics.get("fp16"):    mode_tags.append("FP16")
+        if bm_metrics.get("compiled"): mode_tags.append("compiled")
+        if bm_metrics.get("tensorrt"): mode_tags.append("TensorRT")
+        mode_str = " + ".join(mode_tags) if mode_tags else "FP32"
+        print(f"\n  Benchmark (deploy + fuse_conv_bn + {mode_str}):")
         print(f"    FPS:      {bm_metrics['fps']:.1f}")
         print(f"    Latency:  {bm_metrics['latency']:.2f} ms")
         print(f"    Params:   {bm_metrics['params']:.2f} M")
@@ -352,6 +399,13 @@ def main():
                         help="Bỏ qua validate, chỉ benchmark.")
     parser.add_argument('--no_benchmark',  action='store_true',
                         help="Bỏ qua benchmark, chỉ validate.")
+    # Speed optimization flags
+    parser.add_argument('--fp16',    action='store_true',
+                        help="FP16 inference (Priority 1 — +20-30 FPS).")
+    parser.add_argument('--compile', action='store_true',
+                        help="torch.compile() (Priority 2 — +10-20 FPS).")
+    parser.add_argument('--tensorrt', action='store_true',
+                        help="TensorRT export + benchmark (Priority 3 — +30-50 FPS).")
     args = parser.parse_args()
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -363,6 +417,28 @@ def main():
 
     val_metrics = None
     bm_metrics  = None
+
+    # ── Apply speed optimizations ──
+    opt_flags = {'fp16': False, 'compiled': False, 'tensorrt': False}
+    if not args.no_benchmark:
+        # Deploy + fuse trước (phải làm trước FP16/compile)
+        if hasattr(model.backbone, 'switch_to_deploy'):
+            model.backbone.switch_to_deploy()
+        fuse_conv_bn(model)
+        print('  [deploy + fuse_conv_bn]')
+
+        if getattr(args, 'tensorrt', False):
+            model, ok = apply_tensorrt(model, args.img_h, args.img_w, device,
+                                       fp16=getattr(args, 'fp16', False))
+            opt_flags['tensorrt'] = ok
+            opt_flags['fp16']     = getattr(args, 'fp16', False) and ok
+        else:
+            if getattr(args, 'fp16', False):
+                model = apply_fp16(model)
+                opt_flags['fp16'] = True
+            if getattr(args, 'compile', False):
+                model = apply_compile(model)
+                opt_flags['compiled'] = True
 
     # ── Validate ──
     if not args.no_validate:
@@ -379,7 +455,9 @@ def main():
     if not args.no_benchmark:
         print(f"\nBenchmarking ({args.benchmark_runs} runs)...")
         bm_metrics = benchmark(model, args.img_h, args.img_w,
-                               device, warmup_runs=args.benchmark_runs)
+                               device, warmup_runs=args.benchmark_runs,
+                               fp16=opt_flags['fp16'])
+        bm_metrics.update(opt_flags)
 
     # ── Print ──
     print_results(args.model_variant, val_metrics, bm_metrics,
