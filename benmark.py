@@ -148,12 +148,45 @@ def build_dataloader(val_txt, dataset_type, img_h, img_w, num_workers=4):
 
         class SimpleDataset(Dataset):
             def __init__(self, txt, h, w):
+                items_raw = []
                 with open(txt) as f:
-                    self.items = [l.strip().split() for l in f if l.strip()]
+                    for l in f:
+                        l = l.strip()
+                        if l:
+                            # Support comma-separated và space-separated
+                            sep = ',' if ',' in l else None
+                            items_raw.append(l.split(sep))
+                self.items = items_raw
                 self.h, self.w = h, w
+                # Detect format
+                if len(items_raw) > 0:
+                    if len(items_raw[0]) == 1:
+                        print(f"  val.txt format: img_only ({len(items_raw)} samples)")
+                        print("  WARNING: mask path missing — inferring from img path")
+                    else:
+                        print(f"  val.txt format: img+mask ({len(items_raw)} samples)")
+
             def __len__(self): return len(self.items)
+
+            def _get_mask_path(self, img_path):
+                """Infer mask path từ img path (Foggy Cityscapes convention)."""
+                p = img_path
+                for suffix in [
+                    '_leftImg8bit_foggy_beta_0.005.png',
+                    '_leftImg8bit_foggy_beta_0.01.png',
+                    '_leftImg8bit_foggy_beta_0.02.png',
+                    '_leftImg8bit.png',
+                ]:
+                    if p.endswith(suffix):
+                        p = p[:-len(suffix)]
+                        break
+                p = p.replace('/train-city/', '/gt-city/gtFine/')
+                p = p.replace('/val-city/',   '/gt-city/gtFine/')
+                return p + '_gtFine_labelIds.png'
             def __getitem__(self, idx):
-                img_path, mask_path = self.items[idx]
+                row = self.items[idx]
+                img_path = row[0]
+                mask_path = row[1] if len(row) >= 2 else self._get_mask_path(img_path)
                 img  = cv2.imread(img_path)
                 img  = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 img  = cv2.resize(img, (self.w, self.h))
