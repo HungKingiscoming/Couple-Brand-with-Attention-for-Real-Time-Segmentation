@@ -133,7 +133,13 @@ def step2_fp16(model):
 
 
 def step3_compile(model):
-    """Step 3: torch.compile() với reduce-overhead mode."""
+    """Step 3: torch.compile() — yêu cầu CUDA Capability >= 7.0 (Triton backend)."""
+    if torch.cuda.is_available():
+        major, minor = torch.cuda.get_device_capability()
+        if major < 7:
+            print(f"  ✗ Step 3: torch.compile() skipped — "
+                  f"GPU Capability {major}.{minor} < 7.0 (P100=6.0 không hỗ trợ Triton)")
+            return model
     try:
         compiled = torch.compile(model, mode='reduce-overhead')
         print(f"  ✓ Step 3: torch.compile(mode='reduce-overhead')")
@@ -243,13 +249,21 @@ def main():
 
     if args.compare_all:
         # ── So sánh tất cả modes ──────────────────────────────
-        modes = [
-            ("FP32 (baseline)",    False, False, False),
-            ("FP32 + compile",     False, True,  False),
-            ("FP16",               True,  False, False),
-            ("FP16 + compile",     True,  True,  False),
-            ("FP16 + TensorRT",    True,  False, True),
-        ]
+        # Check CUDA capability để quyết định modes
+        major, minor = torch.cuda.get_device_capability() if torch.cuda.is_available() else (0, 0)
+        supports_compile = (major >= 7)
+
+        modes = [("FP32 (baseline)", False, False, False)]
+        if supports_compile:
+            modes.append(("FP32 + compile", False, True, False))
+        modes.append(("FP16", True, False, False))
+        if supports_compile:
+            modes.append(("FP16 + compile", True, True, False))
+        modes.append(("FP16 + TensorRT", True, False, True))
+
+        if not supports_compile:
+            print(f"  Note: torch.compile() skipped (GPU Capability {major}.{minor} < 7.0)")
+            print()
         results = []
 
         for mode_name, use_fp16, use_compile, use_trt in modes:
