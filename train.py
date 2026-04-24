@@ -333,19 +333,45 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
 # ============================================
 
 def build_optimizer(model, args):
-    dwsa_params = []; alpha_params = []; backbone_params = []; head_params = []
+    dwsa_params     = []
+    alpha_params    = []
+    stem_params     = []
+    backbone_params = []
+    head_params     = []
+     STEM_MODULES = {'stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3'}
+
     for name, param in model.named_parameters():
-        if not param.requires_grad: continue
-        if 'dwsa'   in name: dwsa_params.append(param)
-        elif 'alpha' in name: alpha_params.append(param)
-        elif 'backbone' in name: backbone_params.append(param)
-        else: head_params.append(param)
+        if not param.requires_grad:
+            continue
+        if 'dwsa' in name:
+            dwsa_params.append(param)
+        elif 'alpha' in name:
+            alpha_params.append(param)
+        elif 'backbone' in name:
+            # Lấy tên module đầu tiên sau 'backbone.'
+            parts = name.split('.')
+            # parts[0]='backbone', parts[1]=module_name
+            module_name = parts[1] if len(parts) > 1 else ''
+            if module_name in STEM_MODULES:
+                stem_params.append(param)
+            else:
+                backbone_params.append(param)
+        else:
+            head_params.append(param)
+
+    stem_lr_factor = getattr(args, 'stem_lr_factor', 0.01)  # default 10x lower than backbone
 
     groups = []
-    if head_params:     groups.append({'params': head_params,     'lr': args.lr,                           'name': 'head'})
-    if backbone_params: groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor, 'name': 'backbone'})
-    if dwsa_params:     groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,     'name': 'dwsa'})
-    if alpha_params:    groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,    'name': 'alpha'})
+    if head_params:
+        groups.append({'params': head_params,     'lr': args.lr,                                    'name': 'head'})
+    if backbone_params:
+        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor,           'name': 'backbone'})
+    if stem_params:
+        groups.append({'params': stem_params,     'lr': args.lr * stem_lr_factor,                   'name': 'stem'})
+    if dwsa_params:
+        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,              'name': 'dwsa'})
+    if alpha_params:
+        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,             'name': 'alpha'})
 
     opt_type = getattr(args, 'optimizer', 'adamw').lower()
     if opt_type == 'sgd':
@@ -1203,6 +1229,9 @@ def main():
     parser.add_argument("--weight_decay",       type=float, default=1e-4)
     parser.add_argument("--optimizer",          type=str,   default="adamw",
                         choices=["adamw", "sgd"])
+    parser.add_argument("--stem_lr_factor", type=float, default=0.01,
+                    help="LR factor cho stem (conv1/2/stage2/3). "
+                         "Thấp hơn backbone vì stem đã converge sau nhiều epochs.")
     parser.add_argument("--sgd_momentum",       type=float, default=0.9)
     parser.add_argument("--grad_clip",          type=float, default=5.0)
     parser.add_argument("--aux_weight",         type=float, default=0.4)
