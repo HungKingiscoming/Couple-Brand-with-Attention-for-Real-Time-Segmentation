@@ -26,7 +26,7 @@ class FoggyAwareNorm(nn.Module):
     def __init__(self,
                  num_channels: int,
                  requires_grad: bool = True,
-                 eps: float = 1e-3,       # FIX: tăng từ 1e-5 → 1e-3 để tránh div-by-zero trong fp16
+                 eps: float = 1e-5,      
                  momentum: float = 0.1):
         super().__init__()
         self.bn  = nn.BatchNorm2d(num_channels, eps=eps, momentum=momentum,
@@ -41,10 +41,8 @@ class FoggyAwareNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         alpha = torch.sigmoid(self.alpha)
-        # FIX: clamp output để tránh inf propagate qua stem khi IN gặp
-        # near-zero variance (foggy uniform regions trong fp16)
         out = alpha * self.in_(x) + (1 - alpha) * self.bn(x)
-        return out.clamp(-1e4, 1e4)
+        return out
 
 
 # =============================================================================
