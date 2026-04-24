@@ -423,6 +423,58 @@ def build_scheduler(optimizer, args, train_loader, start_epoch=0):
 # LOSS FUNCTIONS
 # ============================================
 
+class OHEMLoss(nn.Module):
+    def __init__(self, ignore_index=255, keep_ratio=0.3, min_kept=100000,
+                 thresh=None, class_weights=None):
+        super().__init__()
+        self.ignore_index = ignore_index
+        self.keep_ratio   = keep_ratio
+        self.min_kept     = min_kept
+        self.thresh       = thresh
+        self.class_weights = class_weights
+        self.last_hard_ratio = 0.0
+
+    def forward(self, logits, labels):
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+
+        # FIX: fp32 để tránh log(0)→inf khi logit lớn trong fp16
+        loss_pixel = F.cross_entropy(
+            logits.float(),
+            labels,
+            weight=weight.float() if weight is not None else None,
+            ignore_index=self.ignore_index,
+            reduction='none'
+        ).view(-1)
+
+        valid_mask   = (labels.view(-1) != self.ignore_index)
+        valid_losses = loss_pixel[valid_mask]
+        n_valid      = valid_losses.numel()
+        if n_valid == 0:
+            self.last_hard_ratio = 0.0
+            return logits.sum() * 0
+
+        if self.thresh is not None:
+            with torch.no_grad():
+                # FIX: softmax cũng cần fp32
+                max_probs = torch.softmax(logits.detach().float(), dim=1).max(1)[0].view(-1)[valid_mask]
+                hard_mask = max_probs < self.thresh
+                if hard_mask.sum() < self.min_kept:
+                    _, idx    = torch.topk(max_probs, min(self.min_kept, n_valid), largest=False)
+                    hard_mask = torch.zeros(n_valid, dtype=torch.bool, device=logits.device)
+                    hard_mask[idx] = True
+            self.last_hard_ratio = hard_mask.float().mean().item()
+            valid_losses = valid_losses[hard_mask]
+        else:
+            n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
+            n_keep = min(n_keep, n_valid)
+            self.last_hard_ratio = n_keep / n_valid
+            if n_keep < n_valid:
+                threshold    = torch.sort(valid_losses, descending=True)[0][n_keep - 1].detach()
+                valid_losses = valid_losses[valid_losses >= threshold]
+
+        return valid_losses.mean()
+
+
 class DiceLoss(nn.Module):
     def __init__(self, smooth=1e-5, ignore_index=255, log_loss=False, class_weights=None):
         super().__init__()
@@ -433,6 +485,9 @@ class DiceLoss(nn.Module):
                              class_weights if class_weights is not None else None)
 
     def forward(self, logits, targets):
+        # FIX: fp32 để tránh softmax underflow và log(0) trong fp16
+        logits = logits.float()
+
         B, C, H, W   = logits.shape
         valid_mask   = (targets != self.ignore_index)
         tgt_clamped  = targets.clamp(0, C - 1)
@@ -447,58 +502,11 @@ class DiceLoss(nn.Module):
         dice_loss    = (-torch.log(dice_score.clamp(min=self.smooth))
                        if self.log_loss else 1.0 - dice_score)
         if self.class_weights is not None:
-            dice_loss = dice_loss * self.class_weights.unsqueeze(0)
+            dice_loss = dice_loss * self.class_weights.float().unsqueeze(0)
         class_present = target_flat.sum(2) > 0
         dice_loss     = dice_loss * class_present.float()
         n_present     = class_present.float().sum(1).clamp(min=1)
         return (dice_loss.sum(1) / n_present).mean()
-
-
-class OHEMLoss(nn.Module):
-    def __init__(self, ignore_index=255, keep_ratio=0.3, min_kept=100000,
-                 thresh=None, class_weights=None):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.keep_ratio   = keep_ratio
-        self.min_kept     = min_kept
-        self.thresh       = thresh
-        self.class_weights = class_weights
-        # L9: track hard pixel ratio
-        self.last_hard_ratio = 0.0
-
-    def forward(self, logits, labels):
-        weight     = self.class_weights.to(logits.device) if self.class_weights is not None else None
-        loss_pixel = F.cross_entropy(logits, labels, weight=weight,
-                                     ignore_index=self.ignore_index,
-                                     reduction='none').view(-1)
-        valid_mask   = (labels.view(-1) != self.ignore_index)
-        valid_losses = loss_pixel[valid_mask]
-        n_valid      = valid_losses.numel()
-        if n_valid == 0:
-            self.last_hard_ratio = 0.0
-            return logits.sum() * 0
-
-        if self.thresh is not None:
-            with torch.no_grad():
-                max_probs = torch.softmax(logits.detach(), dim=1).max(1)[0].view(-1)[valid_mask]
-                hard_mask = max_probs < self.thresh
-                if hard_mask.sum() < self.min_kept:
-                    _, idx    = torch.topk(max_probs, min(self.min_kept, n_valid), largest=False)
-                    hard_mask = torch.zeros(n_valid, dtype=torch.bool, device=logits.device)
-                    hard_mask[idx] = True
-            # L9: record hard ratio
-            self.last_hard_ratio = hard_mask.float().mean().item()
-            valid_losses = valid_losses[hard_mask]
-        else:
-            n_keep = max(int(self.keep_ratio * n_valid), min(self.min_kept, n_valid))
-            n_keep = min(n_keep, n_valid)
-            # L9: record hard ratio
-            self.last_hard_ratio = n_keep / n_valid
-            if n_keep < n_valid:
-                threshold    = torch.sort(valid_losses, descending=True)[0][n_keep - 1].detach()
-                valid_losses = valid_losses[valid_losses >= threshold]
-
-        return valid_losses.mean()
 
 
 # ============================================
