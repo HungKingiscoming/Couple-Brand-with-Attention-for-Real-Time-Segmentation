@@ -1120,30 +1120,24 @@ class Trainer:
                  ckpt.get('state_dict') or ckpt)
         self.model.load_state_dict(state, strict=False)
     
-        if load_optimizer and ckpt.get('optimizer'):
+        # FIX: khi reset_epoch=True (transfer mode), KHÔNG load optimizer state.
+        # Lý do: optimizer được rebuild với param groups mới (LR mới, frozen params mới).
+        # Load state cũ vào optimizer mới → id(param) không match → momentum restore
+        # vào wrong slots hoặc bị ignored silently, nhưng đôi khi PyTorch vẫn restore
+        # được nếu group structure khớp → stale momentum từ epoch 77 explode ngay batch 1.
+        if load_optimizer and not reset_epoch:
+            # Chỉ load optimizer khi CONTINUE mode (không reset epoch)
             try:
                 self.optimizer.load_state_dict(ckpt['optimizer'])
-            except ValueError as e:
+            except (ValueError, KeyError) as e:
                 print(f"Optimizer state not loaded: {e}")
+            if self.scheduler and ckpt.get('scheduler'):
+                try:
+                    self.scheduler.load_state_dict(ckpt['scheduler'])
+                except Exception as e:
+                    print(f"Scheduler state not loaded: {e}")
     
-        # ------------------------------------------------------------------ #
-        # FIX: Khi reset_epoch=True (transfer mode), xóa momentum buffer
-        # của tất cả params để tránh exploding gradient từ stale momentum.
-        # Đặc biệt quan trọng với SGD + Nesterov khi resume từ checkpoint cũ.
-        # ------------------------------------------------------------------ #
-        if reset_epoch and load_optimizer:
-            cleared = 0
-            for group in self.optimizer.param_groups:
-                for p in group['params']:
-                    if p in self.optimizer.state:
-                        self.optimizer.state[p] = {}
-                        cleared += 1
-            if cleared:
-                print(f"Optimizer momentum buffers cleared: {cleared} params "
-                      f"(transfer mode — prevents stale momentum explosion)")
-        # ------------------------------------------------------------------ #
-    
-        if load_optimizer and 'scaler' in ckpt and ckpt['scaler']:
+        if load_optimizer and 'scaler' in ckpt and ckpt['scaler'] and not reset_epoch:
             try:
                 self.scaler.load_state_dict(ckpt['scaler'])
             except Exception as e:
@@ -1154,15 +1148,11 @@ class Trainer:
             self.global_step = 0
             self.best_miou   = 0.0 if reset_best_metric else ckpt.get('best_miou', 0.0)
             print(f"Weights loaded (epoch {ckpt['epoch']}), starting from epoch 0")
+            print(f"Optimizer state NOT loaded (transfer mode — fresh momentum)")
         else:
             self.start_epoch = ckpt['epoch'] + 1
             self.best_miou   = ckpt.get('best_miou', 0.0)
             self.global_step = ckpt.get('global_step', 0)
-            if self.scheduler and ckpt.get('scheduler') and load_optimizer:
-                try:
-                    self.scheduler.load_state_dict(ckpt['scheduler'])
-                except Exception as e:
-                    print(f"Scheduler state not loaded: {e}")
             print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
@@ -1355,10 +1345,11 @@ def main():
 
     if args.resume:
         trainer.load_checkpoint(
-            args.resume,
-            reset_epoch=(args.resume_mode == "transfer"),
-            load_optimizer=(args.resume_mode == "continue"),
-            reset_best_metric=args.reset_best_metric)
+        args.resume,
+        reset_epoch=(args.resume_mode == "transfer"),
+        load_optimizer=(args.resume_mode == "continue"),  # ← giữ nguyên dòng này
+        reset_best_metric=args.reset_best_metric,
+        )
 
     if getattr(args, "freeze_stem_conv", False):
         frozen_stem = 0
