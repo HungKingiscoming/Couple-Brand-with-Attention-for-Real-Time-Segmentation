@@ -825,7 +825,7 @@ class ModelConfig:
             },
             "loss": {
                 "ce_weight"    : 1.0,
-                "dice_weight"  : 1.0,
+                "dice_weight"  : 0.5,
                 "dice_smooth"  : 1e-5,
             },
         }
