@@ -1119,14 +1119,39 @@ class Trainer:
         state = (ckpt.get('model') or ckpt.get('model_state_dict') or
                  ckpt.get('state_dict') or ckpt)
         self.model.load_state_dict(state, strict=False)
+    
         if load_optimizer and ckpt.get('optimizer'):
-            try: self.optimizer.load_state_dict(ckpt['optimizer'])
-            except ValueError as e: print(f"Optimizer state not loaded: {e}")
+            try:
+                self.optimizer.load_state_dict(ckpt['optimizer'])
+            except ValueError as e:
+                print(f"Optimizer state not loaded: {e}")
+    
+        # ------------------------------------------------------------------ #
+        # FIX: Khi reset_epoch=True (transfer mode), xóa momentum buffer
+        # của tất cả params để tránh exploding gradient từ stale momentum.
+        # Đặc biệt quan trọng với SGD + Nesterov khi resume từ checkpoint cũ.
+        # ------------------------------------------------------------------ #
+        if reset_epoch and load_optimizer:
+            cleared = 0
+            for group in self.optimizer.param_groups:
+                for p in group['params']:
+                    if p in self.optimizer.state:
+                        self.optimizer.state[p] = {}
+                        cleared += 1
+            if cleared:
+                print(f"Optimizer momentum buffers cleared: {cleared} params "
+                      f"(transfer mode — prevents stale momentum explosion)")
+        # ------------------------------------------------------------------ #
+    
         if load_optimizer and 'scaler' in ckpt and ckpt['scaler']:
-            try: self.scaler.load_state_dict(ckpt['scaler'])
-            except Exception as e: print(f"Scaler state not loaded: {e}")
+            try:
+                self.scaler.load_state_dict(ckpt['scaler'])
+            except Exception as e:
+                print(f"Scaler state not loaded: {e}")
+    
         if reset_epoch:
-            self.start_epoch = 0; self.global_step = 0
+            self.start_epoch = 0
+            self.global_step = 0
             self.best_miou   = 0.0 if reset_best_metric else ckpt.get('best_miou', 0.0)
             print(f"Weights loaded (epoch {ckpt['epoch']}), starting from epoch 0")
         else:
@@ -1134,8 +1159,10 @@ class Trainer:
             self.best_miou   = ckpt.get('best_miou', 0.0)
             self.global_step = ckpt.get('global_step', 0)
             if self.scheduler and ckpt.get('scheduler') and load_optimizer:
-                try: self.scheduler.load_state_dict(ckpt['scheduler'])
-                except Exception as e: print(f"Scheduler state not loaded: {e}")
+                try:
+                    self.scheduler.load_state_dict(ckpt['scheduler'])
+                except Exception as e:
+                    print(f"Scheduler state not loaded: {e}")
             print(f"Checkpoint loaded, resuming from epoch {self.start_epoch}")
 
 
