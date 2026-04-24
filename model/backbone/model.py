@@ -23,27 +23,16 @@ from components.components import (
 # =============================================================================
 
 class FoggyAwareNorm(nn.Module):
-    """Foggy-aware Normalization.
-
-    Kết hợp Instance Normalization (robust với distribution shift của foggy
-    images) và Batch Normalization thông qua một learnable gate `alpha`.
-
-    Khi alpha → 1: thiên về IN (tốt cho foggy / unseen domain).
-    Khi alpha → 0: thiên về BN (tốt cho clear images / in-domain).
-    """
-
     def __init__(self,
                  num_channels: int,
                  requires_grad: bool = True,
-                 eps: float = 1e-5,
+                 eps: float = 1e-3,       # FIX: tăng từ 1e-5 → 1e-3 để tránh div-by-zero trong fp16
                  momentum: float = 0.1):
         super().__init__()
-
         self.bn  = nn.BatchNorm2d(num_channels, eps=eps, momentum=momentum,
                                    affine=True, track_running_stats=True)
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
                                       affine=True, track_running_stats=False)
-        # alpha khởi tạo 0.5 — blend đều giữa IN và BN lúc đầu
         self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
 
         if not requires_grad:
@@ -52,7 +41,10 @@ class FoggyAwareNorm(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         alpha = torch.sigmoid(self.alpha)
-        return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
+        # FIX: clamp output để tránh inf propagate qua stem khi IN gặp
+        # near-zero variance (foggy uniform regions trong fp16)
+        out = alpha * self.in_(x) + (1 - alpha) * self.bn(x)
+        return out.clamp(-1e4, 1e4)
 
 
 # =============================================================================
