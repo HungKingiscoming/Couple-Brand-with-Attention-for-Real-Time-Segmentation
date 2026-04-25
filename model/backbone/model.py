@@ -23,27 +23,26 @@ from components.components import (
 # =============================================================================
 
 class FoggyAwareNorm(nn.Module):
-    """FoggyAwareNorm — track_running_stats=False cho InstanceNorm."""
- 
     def __init__(self,
                  num_channels: int,
                  requires_grad: bool = True,
-                 eps: float = 1e-5,
+                 eps: float = 1e-5,      
                  momentum: float = 0.1):
         super().__init__()
         self.bn  = nn.BatchNorm2d(num_channels, eps=eps, momentum=momentum,
                                    affine=True, track_running_stats=True)
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
-                              affine=True, track_running_stats=False)
+                                      affine=True, track_running_stats=False)
         self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
- 
+
         if not requires_grad:
             for p in self.parameters():
                 p.requires_grad_(False)
- 
+
     def forward(self, x: Tensor) -> Tensor:
         alpha = torch.sigmoid(self.alpha)
-        return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
+        out = alpha * self.in_(x) + (1 - alpha) * self.bn(x)
+        return out
 
 
 # =============================================================================
