@@ -487,8 +487,7 @@ class DiceLoss(nn.Module):
         dice_loss    = (-torch.log(dice_score.clamp(min=self.smooth))
                        if self.log_loss else 1.0 - dice_score)
         if self.class_weights is not None:
-            cw = self.class_weights.float().to(logits.device)
-            dice_loss = dice_loss * cw.unsqueeze(0)
+            dice_loss = dice_loss * self.class_weights.float().unsqueeze(0)
         class_present = target_flat.sum(2) > 0
         dice_loss     = dice_loss * class_present.float()
         n_present     = class_present.float().sum(1).clamp(min=1)
@@ -693,7 +692,7 @@ def count_trainable_params(model):
     return trainable, total - trainable
 
 
-def freeze_backbone(model, variant='fan_dwsa', unfreeze_stem=False):
+def freeze_backbone(model, variant='fan_dwsa'):
     has_dwsa = hasattr(model.backbone, 'dwsa_stage4')
     has_fan  = (hasattr(model.backbone, 'stem_conv1') and
                 len(model.backbone.stem_conv1) > 1 and
@@ -701,10 +700,7 @@ def freeze_backbone(model, variant='fan_dwsa', unfreeze_stem=False):
     keep = []
     if has_dwsa: keep.append('DWSA')
     if has_fan:  keep.append('FoggyAwareNorm')
-    if unfreeze_stem: keep.append('StemConv')
-
     print(f"Freezing backbone (keeping {' + '.join(keep) if keep else 'nothing'} trainable)...")
-
     for p in model.backbone.parameters():
         p.requires_grad = False
     bn_count = 0
@@ -715,18 +711,20 @@ def freeze_backbone(model, variant='fan_dwsa', unfreeze_stem=False):
             if m.bias   is not None: m.bias.requires_grad   = False
             bn_count += 1
     print(f"  {bn_count} BN layers locked")
-
-    # --- DWSA ---
-    dwsa_params = 0
+    dwsa_params = 0; dwsa_bn_count = 0
     if has_dwsa:
         for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
             module = getattr(model.backbone, name, None)
             if module is not None:
                 for p in module.parameters():
                     p.requires_grad = True; dwsa_params += p.numel()
-        print(f"  DWSA kept trainable: {dwsa_params:,} params")
-
-    # --- FAN alpha ---
+                for m in module.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.train()
+                        if m.weight is not None: m.weight.requires_grad = True
+                        if m.bias   is not None: m.bias.requires_grad   = True
+                        dwsa_bn_count += 1
+        print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn_count} BN unfrozen")
     fan_params = 0
     if has_fan:
         for name in ['stem_conv1', 'stem_conv2']:
@@ -738,28 +736,8 @@ def freeze_backbone(model, variant='fan_dwsa', unfreeze_stem=False):
                 if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
                 if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
         print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
+    print("Backbone frozen\n")
 
-    # --- STEM CONV (mới) ---
-    stem_conv_params = 0
-    if unfreeze_stem:
-        for stem_name in ['stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3']:
-            module = getattr(model.backbone, stem_name, None)
-            if module is None: continue
-            for pname, param in module.named_parameters():
-                # Bỏ qua FAN params (đã handle ở trên)
-                is_fan = any(k in pname for k in ('alpha', 'in_.', 'bn.'))
-                if not is_fan:
-                    param.requires_grad = True
-                    stem_conv_params += param.numel()
-            # Unfreeze BN trong stem
-            for m in module.modules():
-                if isinstance(m, nn.BatchNorm2d):
-                    m.train()
-                    if m.weight is not None: m.weight.requires_grad = True
-                    if m.bias   is not None: m.bias.requires_grad   = True
-        print(f"  StemConv unfreeze: {stem_conv_params:,} params")
-
-    print("Backbone frozen (partial)\n")
 
 def unfreeze_backbone_progressive(model, stage_names):
     if isinstance(stage_names, str):
@@ -1223,7 +1201,6 @@ def main():
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
     parser.add_argument("--model_variant",         type=str,   default="fan_dwsa",
                         choices=["fan_dwsa", "fan_only", "dwsa_only"])
-    parser.add_argument("--reinit_dwsa6",        action="store_true", default=False)
     parser.add_argument("--pretrained_weights",    type=str,   default=None)
     parser.add_argument("--freeze_backbone",        action="store_true", default=False)
     parser.add_argument("--unfreeze_schedule",      type=str,   default="")
@@ -1234,8 +1211,6 @@ def main():
     parser.add_argument("--class_weights_file",     type=str,   default=None)
     parser.add_argument("--class_weights_method",   type=str,   default="median_freq",
                         choices=["inverse_freq", "sqrt_inverse", "median_freq"])
-    parser.add_argument("--unfreeze_stem", action="store_true", default=False,
-                    help="Unfreeze stem conv layers khi freeze_backbone=True")
     parser.add_argument("--train_txt",    required=True)
     parser.add_argument("--val_txt",      required=True)
     parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
@@ -1367,8 +1342,7 @@ def main():
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights, variant=variant)
     if args.freeze_backbone:
-        freeze_backbone(model, variant=variant,
-                    unfreeze_stem=getattr(args, 'unfreeze_stem', False))
+        freeze_backbone(model, variant=variant)
 
     count_trainable_params(model)
     print_backbone_structure(model)
@@ -1413,16 +1387,7 @@ def main():
         optimizer = build_optimizer(model, args)
         scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=trainer.start_epoch)
         trainer.optimizer = optimizer; trainer.scheduler = scheduler
-    if getattr(args, 'reinit_dwsa6', False):
-        dwsa6 = getattr(model.backbone, 'dwsa_stage6', None)
-        if dwsa6 is not None:
-            old_gamma = dwsa6.gamma.item()
-            dwsa6.gamma.data.fill_(0.25)
-            print(f"[REINIT] dwsa_stage6.gamma: {old_gamma:.4f} → 0.25")
-            nn.init.kaiming_normal_(dwsa6.out_proj.weight, mode='fan_in', nonlinearity='relu')
-            print(f"[REINIT] dwsa_stage6.out_proj weight reinitialized")
-        else:
-            print("[REINIT] WARNING: dwsa_stage6 not found — skipped")
+
     print(f"\n{'='*70}\nSTARTING TRAINING\n{'='*70}\n")
 
     applied_unfreeze_stages = set()
