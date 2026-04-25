@@ -487,7 +487,8 @@ class DiceLoss(nn.Module):
         dice_loss    = (-torch.log(dice_score.clamp(min=self.smooth))
                        if self.log_loss else 1.0 - dice_score)
         if self.class_weights is not None:
-            dice_loss = dice_loss * self.class_weights.float().unsqueeze(0)
+            cw = self.class_weights.float().to(logits.device)
+            dice_loss = dice_loss * cw.unsqueeze(0)
         class_present = target_flat.sum(2) > 0
         dice_loss     = dice_loss * class_present.float()
         n_present     = class_present.float().sum(1).clamp(min=1)
