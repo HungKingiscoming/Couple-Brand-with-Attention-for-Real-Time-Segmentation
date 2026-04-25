@@ -344,10 +344,8 @@ def build_optimizer(model, args):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'dwsa' in name:
-            dwsa_params.append(param)
-        elif 'alpha' in name:
-            alpha_params.append(param)
+        if 'dwsa'   in name: dwsa_params.append(param)
+        elif 'alpha' in name: alpha_params.append(param)
         elif 'backbone' in name:
             parts       = name.split('.')
             module_name = parts[1] if len(parts) > 1 else ''
@@ -358,19 +356,35 @@ def build_optimizer(model, args):
         else:
             head_params.append(param)
 
-    stem_lr_factor = getattr(args, 'stem_lr_factor', 0.001)
+    stem_lr_factor    = getattr(args, 'stem_lr_factor',    0.001)
+    dwsa_lr_factor    = getattr(args, 'dwsa_lr_factor',    0.5)
+    alpha_lr_factor   = getattr(args, 'alpha_lr_factor',   0.1)
+    backbone_lr_factor = args.backbone_lr_factor
 
     groups = []
     if head_params:
-        groups.append({'params': head_params,     'lr': args.lr,                              'name': 'head'})
-    if backbone_params:
-        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor,    'name': 'backbone'})
-    if stem_params:
-        groups.append({'params': stem_params,     'lr': args.lr * stem_lr_factor,             'name': 'stem'})
-    if dwsa_params:
-        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,        'name': 'dwsa'})
-    if alpha_params:
-        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,       'name': 'alpha'})
+        groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
+    # FIX: chỉ thêm group nếu lr_factor > 0 VÀ có params
+    if backbone_params and backbone_lr_factor > 0:
+        groups.append({'params': backbone_params,
+                       'lr': args.lr * backbone_lr_factor, 'name': 'backbone'})
+    if stem_params and stem_lr_factor > 0:
+        groups.append({'params': stem_params,
+                       'lr': args.lr * stem_lr_factor, 'name': 'stem'})
+    if dwsa_params and dwsa_lr_factor > 0:
+        groups.append({'params': dwsa_params,
+                       'lr': args.lr * dwsa_lr_factor, 'name': 'dwsa'})
+    if alpha_params and alpha_lr_factor > 0:
+        groups.append({'params': alpha_params,
+                       'lr': args.lr * alpha_lr_factor, 'name': 'alpha'})
+
+    # Khi lr_factor=0, freeze params đó luôn
+    for param in (backbone_params if backbone_lr_factor == 0 else []):
+        param.requires_grad_(False)
+    for param in (stem_params if stem_lr_factor == 0 else []):
+        param.requires_grad_(False)
+    for param in (dwsa_params if dwsa_lr_factor == 0 else []):
+        param.requires_grad_(False)
 
     opt_type = getattr(args, 'optimizer', 'adamw').lower()
     if opt_type == 'sgd':
@@ -381,12 +395,11 @@ def build_optimizer(model, args):
         print(f"Optimizer: SGD (momentum={momentum}, nesterov=True)")
     else:
         optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-        print("Optimizer: AdamW (Discriminative LR)")
+        print("Optimizer: AdamW")
 
     for g in optimizer.param_groups:
         g.setdefault('initial_lr', g['lr'])
         print(f"  group '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
-
     return optimizer
 
 def build_scheduler(optimizer, args, train_loader, start_epoch=0):
