@@ -76,45 +76,41 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # =============================================================================
 
 def _patch_fan_in_layers(model: nn.Module) -> int:
-    """Set track_running_stats=False cho InstanceNorm2d bên trong FoggyAwareNorm.
+    """Verify và patch track_running_stats=False cho InstanceNorm2d trong FoggyAwareNorm.
 
-    FoggyAwareNorm lưu InstanceNorm2d trong attribute self.in_, không phải
-    là submodule type InstanceNorm2d trực tiếp ở top-level. Patch cần tìm
-    qua attribute in_ của FoggyAwareNorm, không phải isinstance scan.
-
-    Gọi TRƯỚC load_pretrained — không ảnh hưởng checkpoint loading.
+    Logic:
+    - track_running_stats=True  -> patch ve False (backbone.py chua sua)
+    - track_running_stats=False -> bao OK, khong lam gi (backbone.py da dung)
+    - Khong tim thay IN nao     -> FAN khong active, bo qua
     """
-    count    = 0
+    patched  = 0
+    verified = 0
     backbone = getattr(model, 'backbone', model)
 
     for stem_name in ('stem_conv1', 'stem_conv2'):
         stem_mod = getattr(backbone, stem_name, None)
         if stem_mod is None:
             continue
-        # Duyệt tất cả submodules — tìm object có attribute in_ là InstanceNorm2d
         for sub in stem_mod.modules():
             in_norm = getattr(sub, 'in_', None)
-            if in_norm is not None and isinstance(in_norm, nn.InstanceNorm2d):
-                if in_norm.track_running_stats:
-                    in_norm.track_running_stats   = False
-                    in_norm.running_mean          = None
-                    in_norm.running_var           = None
-                    in_norm.num_batches_tracked   = None
-                    count += 1
-            # Fallback: trường hợp InstanceNorm2d là submodule trực tiếp
-            elif isinstance(sub, nn.InstanceNorm2d) and sub.track_running_stats:
-                sub.track_running_stats   = False
-                sub.running_mean          = None
-                sub.running_var           = None
-                sub.num_batches_tracked   = None
-                count += 1
+            if in_norm is None and isinstance(sub, nn.InstanceNorm2d):
+                in_norm = sub
+            if in_norm is None or not isinstance(in_norm, nn.InstanceNorm2d):
+                continue
+            if in_norm.track_running_stats:
+                in_norm.track_running_stats = False
+                in_norm.running_mean        = None
+                in_norm.running_var         = None
+                in_norm.num_batches_tracked = None
+                patched += 1
+            else:
+                verified += 1
 
-    if count > 0:
-        print(f"[FIX-1] Patched {count} InstanceNorm2d: track_running_stats=False")
-    else:
-        print(f"[FIX-1] WARNING: No InstanceNorm2d found — "
-              f"kiểm tra FoggyAwareNorm trong backbone.py có attribute self.in_ không.")
-    return count
+    total = patched + verified
+    if patched  > 0: print(f'[FIX-1] Patched {patched} IN: track_running_stats=False')
+    if verified > 0: print(f'[FIX-1] Verified {verified} IN: track_running_stats already False OK')
+    if total   == 0: print(f'[FIX-1] No InstanceNorm2d in stem -- FAN not active, skip.')
+    return total
 
 
 # =============================================================================
@@ -509,7 +505,7 @@ class OHEMLoss(nn.Module):
         self.ignore_index    = ignore_index
         self.keep_ratio      = keep_ratio
         self.min_kept        = min_kept
-        self.thresh          = thresh   
+        self.thresh          = thresh   # FIX-2: None = ratio-based, 1.5 = threshold-based
         self.class_weights   = class_weights
         self.last_hard_ratio = 0.0
 
