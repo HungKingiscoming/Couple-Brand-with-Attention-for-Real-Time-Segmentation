@@ -34,8 +34,7 @@ class FoggyAwareNorm(nn.Module):
         self.bn  = nn.BatchNorm2d(num_channels, eps=eps, momentum=momentum,
                                    affine=True, track_running_stats=True)
         self.in_ = nn.InstanceNorm2d(num_channels, eps=eps,
-                                      affine=True,
-                                      track_running_stats=False)  # ← FIX
+                              affine=True, track_running_stats=False)
         self.alpha = nn.Parameter(torch.ones(1, num_channels, 1, 1) * 0.5)
  
         if not requires_grad:
