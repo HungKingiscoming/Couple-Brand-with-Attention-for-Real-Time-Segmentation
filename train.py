@@ -692,7 +692,7 @@ def count_trainable_params(model):
     return trainable, total - trainable
 
 
-def freeze_backbone(model, variant='fan_dwsa'):
+def freeze_backbone(model, variant='fan_dwsa', unfreeze_stem=False):
     has_dwsa = hasattr(model.backbone, 'dwsa_stage4')
     has_fan  = (hasattr(model.backbone, 'stem_conv1') and
                 len(model.backbone.stem_conv1) > 1 and
@@ -700,7 +700,10 @@ def freeze_backbone(model, variant='fan_dwsa'):
     keep = []
     if has_dwsa: keep.append('DWSA')
     if has_fan:  keep.append('FoggyAwareNorm')
+    if unfreeze_stem: keep.append('StemConv')
+
     print(f"Freezing backbone (keeping {' + '.join(keep) if keep else 'nothing'} trainable)...")
+
     for p in model.backbone.parameters():
         p.requires_grad = False
     bn_count = 0
@@ -711,20 +714,18 @@ def freeze_backbone(model, variant='fan_dwsa'):
             if m.bias   is not None: m.bias.requires_grad   = False
             bn_count += 1
     print(f"  {bn_count} BN layers locked")
-    dwsa_params = 0; dwsa_bn_count = 0
+
+    # --- DWSA ---
+    dwsa_params = 0
     if has_dwsa:
         for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
             module = getattr(model.backbone, name, None)
             if module is not None:
                 for p in module.parameters():
                     p.requires_grad = True; dwsa_params += p.numel()
-                for m in module.modules():
-                    if isinstance(m, nn.BatchNorm2d):
-                        m.train()
-                        if m.weight is not None: m.weight.requires_grad = True
-                        if m.bias   is not None: m.bias.requires_grad   = True
-                        dwsa_bn_count += 1
-        print(f"  DWSA kept trainable: {dwsa_params:,} params, {dwsa_bn_count} BN unfrozen")
+        print(f"  DWSA kept trainable: {dwsa_params:,} params")
+
+    # --- FAN alpha ---
     fan_params = 0
     if has_fan:
         for name in ['stem_conv1', 'stem_conv2']:
@@ -736,8 +737,28 @@ def freeze_backbone(model, variant='fan_dwsa'):
                 if fan_bn.weight is not None: fan_bn.weight.requires_grad = True
                 if fan_bn.bias   is not None: fan_bn.bias.requires_grad   = True
         print(f"  FoggyAwareNorm kept trainable: {fan_params:,} params")
-    print("Backbone frozen\n")
 
+    # --- STEM CONV (mới) ---
+    stem_conv_params = 0
+    if unfreeze_stem:
+        for stem_name in ['stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3']:
+            module = getattr(model.backbone, stem_name, None)
+            if module is None: continue
+            for pname, param in module.named_parameters():
+                # Bỏ qua FAN params (đã handle ở trên)
+                is_fan = any(k in pname for k in ('alpha', 'in_.', 'bn.'))
+                if not is_fan:
+                    param.requires_grad = True
+                    stem_conv_params += param.numel()
+            # Unfreeze BN trong stem
+            for m in module.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.train()
+                    if m.weight is not None: m.weight.requires_grad = True
+                    if m.bias   is not None: m.bias.requires_grad   = True
+        print(f"  StemConv unfreeze: {stem_conv_params:,} params")
+
+    print("Backbone frozen (partial)\n")
 
 def unfreeze_backbone_progressive(model, stage_names):
     if isinstance(stage_names, str):
