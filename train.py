@@ -76,32 +76,44 @@ from model.model_utils import replace_bn_with_gn, init_weights, check_model_heal
 # =============================================================================
 
 def _patch_fan_in_layers(model: nn.Module) -> int:
-    """Set track_running_stats=False cho tất cả InstanceNorm2d trong FAN stem.
+    """Set track_running_stats=False cho InstanceNorm2d bên trong FoggyAwareNorm.
 
-    Lý do dùng patch thay vì sửa backbone.py:
-    - Không phá vỡ checkpoint loading (state dict key vẫn khớp)
-    - Gọi sau Segmentor() tạo xong, TRƯỚC load_pretrained
-    - Dễ disable nếu cần rollback: comment dòng _patch_fan_in_layers(model)
+    FoggyAwareNorm lưu InstanceNorm2d trong attribute self.in_, không phải
+    là submodule type InstanceNorm2d trực tiếp ở top-level. Patch cần tìm
+    qua attribute in_ của FoggyAwareNorm, không phải isinstance scan.
 
-    Returns số InstanceNorm2d đã được patch.
+    Gọi TRƯỚC load_pretrained — không ảnh hưởng checkpoint loading.
     """
     count    = 0
     backbone = getattr(model, 'backbone', model)
+
     for stem_name in ('stem_conv1', 'stem_conv2'):
         stem_mod = getattr(backbone, stem_name, None)
         if stem_mod is None:
             continue
+        # Duyệt tất cả submodules — tìm object có attribute in_ là InstanceNorm2d
         for sub in stem_mod.modules():
-            if isinstance(sub, nn.InstanceNorm2d) and sub.track_running_stats:
+            in_norm = getattr(sub, 'in_', None)
+            if in_norm is not None and isinstance(in_norm, nn.InstanceNorm2d):
+                if in_norm.track_running_stats:
+                    in_norm.track_running_stats   = False
+                    in_norm.running_mean          = None
+                    in_norm.running_var           = None
+                    in_norm.num_batches_tracked   = None
+                    count += 1
+            # Fallback: trường hợp InstanceNorm2d là submodule trực tiếp
+            elif isinstance(sub, nn.InstanceNorm2d) and sub.track_running_stats:
                 sub.track_running_stats   = False
                 sub.running_mean          = None
                 sub.running_var           = None
                 sub.num_batches_tracked   = None
                 count += 1
+
     if count > 0:
         print(f"[FIX-1] Patched {count} InstanceNorm2d: track_running_stats=False")
     else:
-        print(f"[FIX-1] No InstanceNorm2d found in stem (FAN not active or already patched)")
+        print(f"[FIX-1] WARNING: No InstanceNorm2d found — "
+              f"kiểm tra FoggyAwareNorm trong backbone.py có attribute self.in_ không.")
     return count
 
 
@@ -517,11 +529,15 @@ class OHEMLoss(nn.Module):
             return logits.sum() * 0
 
         if self.thresh is not None:
+            # FIX-2 (v2): loss threshold, không phải probability threshold.
+            # thresh=1.5 so sánh với CE loss (0→inf), không phải prob (0→1).
+            # Bản cũ: max_probs < 1.5 → luôn True → Hard%=1.000 (vô hiệu).
+            # Đúng: giữ pixel có loss > thresh (pixel model đang sai nhiều nhất).
             with torch.no_grad():
-                max_probs = torch.softmax(logits.detach().float(), dim=1).max(1)[0].view(-1)[valid_mask]
-                hard_mask = max_probs < self.thresh
+                hard_mask = valid_losses.detach() > self.thresh
                 if hard_mask.sum() < self.min_kept:
-                    _, idx    = torch.topk(max_probs, min(self.min_kept, n_valid), largest=False)
+                    n_take    = min(self.min_kept, n_valid)
+                    _, idx    = torch.topk(valid_losses.detach(), n_take, largest=True)
                     hard_mask = torch.zeros(n_valid, dtype=torch.bool, device=logits.device)
                     hard_mask[idx] = True
             self.last_hard_ratio = hard_mask.float().mean().item()
