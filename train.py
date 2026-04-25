@@ -1222,6 +1222,7 @@ def main():
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
     parser.add_argument("--model_variant",         type=str,   default="fan_dwsa",
                         choices=["fan_dwsa", "fan_only", "dwsa_only"])
+    parser.add_argument("--reinit_dwsa6",        action="store_true", default=False)
     parser.add_argument("--pretrained_weights",    type=str,   default=None)
     parser.add_argument("--freeze_backbone",        action="store_true", default=False)
     parser.add_argument("--unfreeze_schedule",      type=str,   default="")
@@ -1232,6 +1233,8 @@ def main():
     parser.add_argument("--class_weights_file",     type=str,   default=None)
     parser.add_argument("--class_weights_method",   type=str,   default="median_freq",
                         choices=["inverse_freq", "sqrt_inverse", "median_freq"])
+    parser.add_argument("--unfreeze_stem", action="store_true", default=False,
+                    help="Unfreeze stem conv layers khi freeze_backbone=True")
     parser.add_argument("--train_txt",    required=True)
     parser.add_argument("--val_txt",      required=True)
     parser.add_argument("--dataset_type", default="foggy", choices=["normal", "foggy"])
@@ -1363,7 +1366,8 @@ def main():
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights, variant=variant)
     if args.freeze_backbone:
-        freeze_backbone(model, variant=variant)
+        freeze_backbone(model, variant=variant,
+                    unfreeze_stem=getattr(args, 'unfreeze_stem', False))
 
     count_trainable_params(model)
     print_backbone_structure(model)
@@ -1408,7 +1412,16 @@ def main():
         optimizer = build_optimizer(model, args)
         scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=trainer.start_epoch)
         trainer.optimizer = optimizer; trainer.scheduler = scheduler
-
+    if getattr(args, 'reinit_dwsa6', False):
+        dwsa6 = getattr(model.backbone, 'dwsa_stage6', None)
+        if dwsa6 is not None:
+            old_gamma = dwsa6.gamma.item()
+            dwsa6.gamma.data.fill_(0.25)
+            print(f"[REINIT] dwsa_stage6.gamma: {old_gamma:.4f} → 0.25")
+            nn.init.kaiming_normal_(dwsa6.out_proj.weight, mode='fan_in', nonlinearity='relu')
+            print(f"[REINIT] dwsa_stage6.out_proj weight reinitialized")
+        else:
+            print("[REINIT] WARNING: dwsa_stage6 not found — skipped")
     print(f"\n{'='*70}\nSTARTING TRAINING\n{'='*70}\n")
 
     applied_unfreeze_stages = set()
