@@ -509,7 +509,7 @@ class OHEMLoss(nn.Module):
         self.ignore_index    = ignore_index
         self.keep_ratio      = keep_ratio
         self.min_kept        = min_kept
-        self.thresh          = thresh   # FIX-2: None = ratio-based, 1.5 = threshold-based
+        self.thresh          = thresh   
         self.class_weights   = class_weights
         self.last_hard_ratio = 0.0
 
