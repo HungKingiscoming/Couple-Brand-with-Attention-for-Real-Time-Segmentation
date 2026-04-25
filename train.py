@@ -1,16 +1,3 @@
-# ============================================
-# train.py — GCNet v3 + GCNetHead v2
-# FIXES v3 (so với bản gốc):
-#   FIX-1: FoggyAwareNorm — track_running_stats=False cho InstanceNorm
-#           Áp dụng qua _patch_fan_in_layers() gọi sau khi model được tạo.
-#   FIX-2: OHEM thresh=0.9 → 1.5 (hoặc dùng --ohem_thresh 1.5 explicit)
-#           ln(19)≈2.94, thresh=0.9 chỉ loại ~3% pixel dễ nhất.
-#   FIX-3: DWSA stage6 LR group riêng (dwsa6_lr_factor = 2× dwsa_lr_factor)
-#           stage6 xử lý x_spp sau DAPPM, gradient xa hơn → cần LR cao hơn.
-#   FIX-4: SGDR T_mult=2 (thay vì 1), step per batch (không phải per epoch)
-#   FIX-5: clip_grads_safe() — zero inf/nan grad trước khi clip
-# ============================================
-
 import os
 import torch
 import torch.nn as nn
@@ -62,6 +49,7 @@ from tqdm import tqdm
 import argparse
 from pathlib import Path
 import json
+import time
 import gc
 import warnings
 warnings.filterwarnings('ignore')
@@ -71,88 +59,20 @@ from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
 
 
-# =============================================================================
-# FIX-1: _patch_fan_in_layers
-# =============================================================================
-
-def _patch_fan_in_layers(model: nn.Module) -> int:
-    """Verify và patch track_running_stats=False cho InstanceNorm2d trong FoggyAwareNorm.
-
-    Logic:
-    - track_running_stats=True  -> patch ve False (backbone.py chua sua)
-    - track_running_stats=False -> bao OK, khong lam gi (backbone.py da dung)
-    - Khong tim thay IN nao     -> FAN khong active, bo qua
-    """
-    patched  = 0
-    verified = 0
-    backbone = getattr(model, 'backbone', model)
-
-    for stem_name in ('stem_conv1', 'stem_conv2'):
-        stem_mod = getattr(backbone, stem_name, None)
-        if stem_mod is None:
-            continue
-        for sub in stem_mod.modules():
-            in_norm = getattr(sub, 'in_', None)
-            if in_norm is None and isinstance(sub, nn.InstanceNorm2d):
-                in_norm = sub
-            if in_norm is None or not isinstance(in_norm, nn.InstanceNorm2d):
-                continue
-            if in_norm.track_running_stats:
-                in_norm.track_running_stats = False
-                in_norm.running_mean        = None
-                in_norm.running_var         = None
-                in_norm.num_batches_tracked = None
-                patched += 1
-            else:
-                verified += 1
-
-    total = patched + verified
-    if patched  > 0: print(f'[FIX-1] Patched {patched} IN: track_running_stats=False')
-    if verified > 0: print(f'[FIX-1] Verified {verified} IN: track_running_stats already False OK')
-    if total   == 0: print(f'[FIX-1] No InstanceNorm2d in stem -- FAN not active, skip.')
-    return total
-
-
-# =============================================================================
-# FIX-5: clip_grads_safe
-# =============================================================================
-
-def clip_grads_safe(model: nn.Module, max_norm: float = 5.0) -> dict:
-    """Zero inf/nan grad trước, sau đó clip_grad_norm_ trên phần còn lại.
-
-    clip_grad_norm_ tính tổng norm trước clip. Nếu có bất kỳ grad inf nào,
-    tổng norm = inf → clip ratio = 0 → tất cả grad bị zero hoặc skip.
-    Fix: zero out các param có inf/nan grad TRƯỚC khi tính norm.
-    """
-    clean_params = []
-    inf_names    = []
-    for name, param in model.named_parameters():
-        if param.grad is None:
-            continue
-        if not torch.isfinite(param.grad).all():
-            inf_names.append(name)
-            param.grad.zero_()
-        else:
-            clean_params.append(param)
-    total_norm = torch.nn.utils.clip_grad_norm_(clean_params, max_norm=max_norm)
-    norm_val   = total_norm.item() if torch.is_tensor(total_norm) else float(total_norm)
-    return {
-        'total_norm': norm_val,
-        'clipped':    norm_val > max_norm,
-        'n_inf':      len(inf_names),
-        'inf_layers': inf_names,
-    }
-
-
 # ============================================
 # L1. DIAGNOSTIC LOGGER
+# Tập trung tất cả metrics → in bảng tóm tắt + lưu CSV
 # ============================================
 
 class DiagnosticLogger:
+    """
+    Ghi lại tất cả diagnostic metrics theo epoch.
+    Cuối training in bảng so sánh toàn bộ run.
+    """
     def __init__(self, save_dir: Path, class_names: list):
         self.save_dir    = Path(save_dir)
         self.class_names = class_names
-        self.history     = defaultdict(list)
+        self.history     = defaultdict(list)   # key → list of (epoch, value)
         self._csv_path   = self.save_dir / "diagnostics.csv"
         self._csv_file   = open(self._csv_path, 'w', newline='')
         import csv
@@ -170,11 +90,17 @@ class DiagnosticLogger:
             self.log(epoch, f"{prefix}{k}" if prefix else k, float(v))
 
     def print_epoch_summary(self, epoch: int):
+        """In bảng tóm tắt 1 dòng cho epoch này."""
+        def _last(key, fmt='.4f'):
+            h = self.history.get(key, [])
+            return f"{h[-1][1]:{fmt}}" if h else '—'
+
         print(f"\n{'─'*80}")
         print(f"  EPOCH {epoch+1:>3} SUMMARY")
         print(f"{'─'*80}")
         print(f"  {'Metric':<28}  {'Value':>10}  {'Trend':>12}")
         print(f"  {'─'*28}  {'─'*10}  {'─'*12}")
+
         metrics = [
             ('val/miou',          'Val mIoU',        '.4f'),
             ('val/accuracy',      'Val Accuracy',    '.4f'),
@@ -194,6 +120,7 @@ class DiagnosticLogger:
             if not h:
                 continue
             val = h[-1][1]
+            # Trend: so sánh 3 epoch gần nhất
             if len(h) >= 3:
                 delta = h[-1][1] - h[-3][1]
                 arrow = '↑' if delta > 1e-4 else ('↓' if delta < -1e-4 else '→')
@@ -204,6 +131,7 @@ class DiagnosticLogger:
         print(f"{'─'*80}\n")
 
     def print_full_history(self):
+        """In bảng tóm tắt toàn bộ run — gọi cuối training."""
         print(f"\n{'='*80}")
         print("  FULL TRAINING HISTORY")
         print(f"{'='*80}")
@@ -212,6 +140,7 @@ class DiagnosticLogger:
             best_ep, best_val = max(key_miou, key=lambda x: x[1])
             print(f"  Best mIoU: {best_val:.4f} at epoch {best_ep+1}")
             print(f"  Final mIoU: {key_miou[-1][1]:.4f}")
+            # Plateau detection
             if len(key_miou) >= 10:
                 last10 = [v for _, v in key_miou[-10:]]
                 spread = max(last10) - min(last10)
@@ -224,14 +153,14 @@ class DiagnosticLogger:
             def _g(key):
                 h = self.history.get(key, [])
                 return h[i][1] if i < len(h) else float('nan')
-            miou   = _g('val/miou')
-            ohem   = _g('train/ohem')
-            dice   = _g('train/dice')
-            g4     = _g('dwsa/gamma4')
-            g5     = _g('dwsa/gamma5')
-            hratio = _g('train/hard_ratio')
-            mark   = ' ← BEST' if not math.isnan(miou) and miou == max(
-                v for _, v in self.history.get('val/miou', [(0, 0)])) else ''
+            miou  = _g('val/miou')
+            ohem  = _g('train/ohem')
+            dice  = _g('train/dice')
+            g4    = _g('dwsa/gamma4')
+            g5    = _g('dwsa/gamma5')
+            hratio= _g('train/hard_ratio')
+            mark  = ' ← BEST' if not math.isnan(miou) and miou == max(
+                v for _, v in self.history.get('val/miou', [(0,0)])) else ''
             print(f"  {i+1:>5} │ {miou:.4f} │ {ohem:.4f} │ {dice:.4f} │ "
                   f"{g4:.4f} │ {g5:.4f} │ {hratio:.3f}{mark}")
         print(f"{'='*80}\n")
@@ -279,7 +208,10 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
         if not k.startswith('decode_head.'):
             continue
         suffix = k[len('decode_head.'):]
-        dst    = 'cls_seg.' + suffix[len('conv_seg.'):] if suffix.startswith('conv_seg.') else suffix
+        if suffix.startswith('conv_seg.'):
+            dst = 'cls_seg.' + suffix[len('conv_seg.'):]
+        else:
+            dst = suffix
         HEAD_KEY_MAP[k] = dst
 
     model_state   = model.backbone.state_dict()
@@ -304,17 +236,21 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
                 break
         norm_ckpt = _remap_stem_key(ckpt_key)
         if norm_ckpt is None:
-            bn_dropped.append(ckpt_key); continue
+            bn_dropped.append(ckpt_key)
+            continue
         matched = False
         if norm_ckpt in model_key_map:
             mk = model_key_map[norm_ckpt]
             if model_state[mk].shape == ckpt_val.shape:
-                compatible[mk] = ckpt_val; matched = True
+                compatible[mk] = ckpt_val
+                matched = True
         if not matched and not strict_match:
             for norm_model, mk in model_key_map.items():
-                if norm_model.endswith(norm_ckpt) or norm_ckpt.endswith(norm_model):
+                if (norm_model.endswith(norm_ckpt) or norm_ckpt.endswith(norm_model)):
                     if model_state[mk].shape == ckpt_val.shape:
-                        compatible[mk] = ckpt_val; matched = True; break
+                        compatible[mk] = ckpt_val
+                        matched = True
+                        break
         if not matched:
             skipped.append(ckpt_key)
 
@@ -325,13 +261,16 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
     for ckpt_key, dst_suffix in HEAD_KEY_MAP.items():
         ckpt_val = state[ckpt_key]
         if dst_suffix not in head_state:
-            head_skipped_missing.append(f"{ckpt_key} → {dst_suffix}"); continue
+            head_skipped_missing.append(f"{ckpt_key} → {dst_suffix}")
+            continue
         if head_state[dst_suffix].shape != ckpt_val.shape:
-            head_skipped_shape.append(f"{ckpt_key}: ckpt{list(ckpt_val.shape)} vs model{list(head_state[dst_suffix].shape)}"); continue
+            head_skipped_shape.append(
+                f"{ckpt_key}: ckpt{list(ckpt_val.shape)} vs model{list(head_state[dst_suffix].shape)}")
+            continue
         head_loaded[dst_suffix] = ckpt_val
 
-    loaded_bb = len(compatible); loaded_hd = len(head_loaded)
-    total_bb  = len(model_state); total_hd = len(head_state)
+    loaded_bb = len(compatible);  loaded_hd = len(head_loaded)
+    total_bb  = len(model_state); total_hd  = len(head_state)
     _v = variant
     _skip_base = ['.spp.', 'backbone.spp.']
     if 'dwsa' not in _v: _skip_base.append('dwsa_stage')
@@ -345,13 +284,13 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
     print(f"Head:      {loaded_hd:>5} / {total_hd}  ({100*loaded_hd/max(total_hd,1):.1f}%)")
     print(f"BN dropped (expected): {len(bn_dropped):>3}  (stem BN → FoggyAwareNorm)")
     if head_skipped_shape:
-        print(f"Head shape mismatch: {len(head_skipped_shape)}")
+        print(f"Head shape mismatch:   {len(head_skipped_shape)}")
         for s in head_skipped_shape: print(f"    SHAPE: {s}")
     if head_skipped_missing:
-        print(f"Head key missing: {len(head_skipped_missing)}")
+        print(f"Head key missing:      {len(head_skipped_missing)}")
         for s in head_skipped_missing: print(f"    MISSING: {s}")
     if truly_unmatched:
-        print(f"Backbone unmatched: {len(truly_unmatched)}  ← cần kiểm tra")
+        print(f"Backbone unmatched:    {len(truly_unmatched)}  ← cần kiểm tra")
         for k in truly_unmatched[:5]: print(f"    {k}")
     print(sep + "\n")
 
@@ -375,16 +314,13 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
 
 
 # ============================================
-# OPTIMIZER  (FIX-3 bên trong)
+# OPTIMIZER
 # ============================================
 
 def build_optimizer(model, args):
-    # FIX-3: tách dwsa_stage6 thành group riêng
-    # dwsa_stage4/5 dùng dwsa_lr_factor (0.5), dwsa_stage6 dùng dwsa6_lr_factor (1.0)
     STEM_MODULES = {'stem_conv1', 'stem_conv2', 'stem_stage2', 'stem_stage3'}
 
-    dwsa45_params   = []
-    dwsa6_params    = []    # FIX-3: group riêng
+    dwsa_params     = []
     alpha_params    = []
     stem_params     = []
     backbone_params = []
@@ -393,10 +329,8 @@ def build_optimizer(model, args):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if 'dwsa_stage6' in name:
-            dwsa6_params.append(param)        # FIX-3
-        elif 'dwsa_stage4' in name or 'dwsa_stage5' in name:
-            dwsa45_params.append(param)
+        if 'dwsa' in name:
+            dwsa_params.append(param)
         elif 'alpha' in name:
             alpha_params.append(param)
         elif 'backbone' in name:
@@ -409,39 +343,19 @@ def build_optimizer(model, args):
         else:
             head_params.append(param)
 
-    stem_lr_factor     = getattr(args, 'stem_lr_factor',    0.001)
-    dwsa_lr_factor     = getattr(args, 'dwsa_lr_factor',    0.5)
-    dwsa6_lr_factor    = getattr(args, 'dwsa6_lr_factor',   dwsa_lr_factor * 2.0)  # FIX-3
-    alpha_lr_factor    = getattr(args, 'alpha_lr_factor',   0.1)
-    backbone_lr_factor = args.backbone_lr_factor
+    stem_lr_factor = getattr(args, 'stem_lr_factor', 0.001)
 
     groups = []
     if head_params:
-        groups.append({'params': head_params, 'lr': args.lr, 'name': 'head'})
-    if backbone_params and backbone_lr_factor > 0:
-        groups.append({'params': backbone_params,
-                       'lr': args.lr * backbone_lr_factor, 'name': 'backbone'})
-    if stem_params and stem_lr_factor > 0:
-        groups.append({'params': stem_params,
-                       'lr': args.lr * stem_lr_factor, 'name': 'stem'})
-    if dwsa45_params and dwsa_lr_factor > 0:
-        groups.append({'params': dwsa45_params,
-                       'lr': args.lr * dwsa_lr_factor, 'name': 'dwsa'})
-    if dwsa6_params and dwsa6_lr_factor > 0:              # FIX-3
-        groups.append({'params': dwsa6_params,
-                       'lr': args.lr * dwsa6_lr_factor, 'name': 'dwsa6'})
-    if alpha_params and alpha_lr_factor > 0:
-        groups.append({'params': alpha_params,
-                       'lr': args.lr * alpha_lr_factor, 'name': 'alpha'})
-
-    for param in (backbone_params if backbone_lr_factor == 0 else []):
-        param.requires_grad_(False)
-    for param in (stem_params if stem_lr_factor == 0 else []):
-        param.requires_grad_(False)
-    for param in (dwsa45_params if dwsa_lr_factor == 0 else []):
-        param.requires_grad_(False)
-    for param in (dwsa6_params if dwsa6_lr_factor == 0 else []):
-        param.requires_grad_(False)
+        groups.append({'params': head_params,     'lr': args.lr,                              'name': 'head'})
+    if backbone_params:
+        groups.append({'params': backbone_params, 'lr': args.lr * args.backbone_lr_factor,    'name': 'backbone'})
+    if stem_params:
+        groups.append({'params': stem_params,     'lr': args.lr * stem_lr_factor,             'name': 'stem'})
+    if dwsa_params:
+        groups.append({'params': dwsa_params,     'lr': args.lr * args.dwsa_lr_factor,        'name': 'dwsa'})
+    if alpha_params:
+        groups.append({'params': alpha_params,    'lr': args.lr * args.alpha_lr_factor,       'name': 'alpha'})
 
     opt_type = getattr(args, 'optimizer', 'adamw').lower()
     if opt_type == 'sgd':
@@ -452,13 +366,13 @@ def build_optimizer(model, args):
         print(f"Optimizer: SGD (momentum={momentum}, nesterov=True)")
     else:
         optimizer = torch.optim.AdamW(groups, weight_decay=args.weight_decay)
-        print("Optimizer: AdamW")
+        print("Optimizer: AdamW (Discriminative LR)")
 
     for g in optimizer.param_groups:
         g.setdefault('initial_lr', g['lr'])
         print(f"  group '{g['name']}': lr={g['lr']:.2e}, params={len(g['params'])}")
-    return optimizer
 
+    return optimizer
 
 def build_scheduler(optimizer, args, train_loader, start_epoch=0):
     n_groups   = len(optimizer.param_groups)
@@ -479,14 +393,10 @@ def build_scheduler(optimizer, args, train_loader, start_epoch=0):
             div_factor=25, final_div_factor=100000)
         print(f"OneCycleLR (total_steps={total_steps})")
     elif args.scheduler == 'cosine_wr':
-        T_0    = getattr(args, 'cosine_wr_t0',    10)
-        # FIX-4: T_mult=2 (từ 1). Cycle dài dần: T_0, 2*T_0, 4*T_0, ...
-        # T_mult=1 → restart mỗi T_0 epoch, LR oscillate vô tận
-        # T_mult=2 → model có thêm time fine-tune sau mỗi restart
-        T_mult = getattr(args, 'cosine_wr_tmult', 2)
+        T_0 = getattr(args, 'cosine_wr_t0', 10)
         scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=T_0, T_mult=T_mult, eta_min=1e-7)
-        print(f"CosineAnnealingWarmRestarts (T_0={T_0}, T_mult={T_mult})")
+            optimizer, T_0=T_0, T_mult=1, eta_min=1e-7)
+        print(f"CosineAnnealingWarmRestarts (T_0={T_0})")
     else:
         scheduler = optim.lr_scheduler.LambdaLR(
             optimizer, lr_lambda=lambda epoch: (1 - epoch / args.epochs) ** 0.9)
@@ -502,19 +412,23 @@ class OHEMLoss(nn.Module):
     def __init__(self, ignore_index=255, keep_ratio=0.3, min_kept=100000,
                  thresh=None, class_weights=None):
         super().__init__()
-        self.ignore_index    = ignore_index
-        self.keep_ratio      = keep_ratio
-        self.min_kept        = min_kept
-        self.thresh          = thresh   # FIX-2: None = ratio-based, 1.5 = threshold-based
-        self.class_weights   = class_weights
+        self.ignore_index = ignore_index
+        self.keep_ratio   = keep_ratio
+        self.min_kept     = min_kept
+        self.thresh       = thresh
+        self.class_weights = class_weights
         self.last_hard_ratio = 0.0
 
     def forward(self, logits, labels):
-        weight     = self.class_weights.to(logits.device) if self.class_weights is not None else None
+        weight = self.class_weights.to(logits.device) if self.class_weights is not None else None
+
+        # FIX: fp32 để tránh log(0)→inf khi logit lớn trong fp16
         loss_pixel = F.cross_entropy(
-            logits.float(), labels,
+            logits.float(),
+            labels,
             weight=weight.float() if weight is not None else None,
-            ignore_index=self.ignore_index, reduction='none'
+            ignore_index=self.ignore_index,
+            reduction='none'
         ).view(-1)
 
         valid_mask   = (labels.view(-1) != self.ignore_index)
@@ -525,15 +439,12 @@ class OHEMLoss(nn.Module):
             return logits.sum() * 0
 
         if self.thresh is not None:
-            # FIX-2 (v2): loss threshold, không phải probability threshold.
-            # thresh=1.5 so sánh với CE loss (0→inf), không phải prob (0→1).
-            # Bản cũ: max_probs < 1.5 → luôn True → Hard%=1.000 (vô hiệu).
-            # Đúng: giữ pixel có loss > thresh (pixel model đang sai nhiều nhất).
             with torch.no_grad():
-                hard_mask = valid_losses.detach() > self.thresh
+                # FIX: softmax cũng cần fp32
+                max_probs = torch.softmax(logits.detach().float(), dim=1).max(1)[0].view(-1)[valid_mask]
+                hard_mask = max_probs < self.thresh
                 if hard_mask.sum() < self.min_kept:
-                    n_take    = min(self.min_kept, n_valid)
-                    _, idx    = torch.topk(valid_losses.detach(), n_take, largest=True)
+                    _, idx    = torch.topk(max_probs, min(self.min_kept, n_valid), largest=False)
                     hard_mask = torch.zeros(n_valid, dtype=torch.bool, device=logits.device)
                     hard_mask[idx] = True
             self.last_hard_ratio = hard_mask.float().mean().item()
@@ -559,7 +470,9 @@ class DiceLoss(nn.Module):
                              class_weights if class_weights is not None else None)
 
     def forward(self, logits, targets):
-        logits       = logits.float()
+        # FIX: fp32 để tránh softmax underflow và log(0) trong fp16
+        logits = logits.float()
+
         B, C, H, W   = logits.shape
         valid_mask   = (targets != self.ignore_index)
         tgt_clamped  = targets.clamp(0, C - 1)
@@ -593,7 +506,7 @@ def clear_gpu_memory():
 
 
 def setup_memory_efficient_training():
-    torch.backends.cudnn.benchmark        = True
+    torch.backends.cudnn.benchmark       = True
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32       = True
     os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -615,22 +528,30 @@ def check_gradients(model, threshold=10.0):
     return max_grad, total_norm, grad_map
 
 
+# L5: Gradient flow map — top-K layers theo grad norm
 def log_gradient_flow(grad_map: dict, writer, epoch: int, top_k: int = 5):
+    """In top-K layers có gradient lớn nhất — phát hiện exploding/vanishing."""
     if not grad_map:
         return
     sorted_grads = sorted(grad_map.items(), key=lambda x: x[1], reverse=True)
-    inf_layers   = [(n, g) for n, g in sorted_grads if not math.isfinite(g)]
-    top_finite   = [(n, g) for n, g in sorted_grads if math.isfinite(g)][:top_k]
+    # Lọc nan/inf riêng
+    inf_layers = [(n, g) for n, g in sorted_grads if not math.isfinite(g)]
+    top_finite = [(n, g) for n, g in sorted_grads if math.isfinite(g)][:top_k]
+
     if inf_layers:
         print(f"  ⚠️  INF gradient layers ({len(inf_layers)}):")
         for n, g in inf_layers[:3]:
             print(f"      {n[:70]}")
+
     print(f"  Top-{top_k} gradient layers (epoch {epoch+1}):")
     for i, (name, g) in enumerate(top_finite):
-        bar = '█' * min(int(g * 5), 30)
+        bar  = '█' * min(int(g * 5), 30)
         print(f"    {i+1}. {name[-55:]:<55} {g:7.4f}  {bar}")
+
+    # Log to writer
     if top_finite:
         writer.add_scalar('grad/top1_norm', top_finite[0][1], epoch)
+    # Vanishing check: bottom-5 trainable layers
     bottom5 = [(n, g) for n, g in reversed(sorted_grads) if math.isfinite(g) and g > 0][:5]
     if bottom5:
         min_grad = bottom5[-1][1]
@@ -639,18 +560,30 @@ def log_gradient_flow(grad_map: dict, writer, epoch: int, top_k: int = 5):
             print(f"  ⚠️  VANISHING gradient: {bottom5[-1][0][-55:]} = {min_grad:.2e}")
 
 
+# L2: DWSA health check
 def log_dwsa_health(model, writer, epoch: int, diag: DiagnosticLogger):
+    """
+    Kiểm tra sức khỏe DWSA:
+    - gamma value (nên tăng dần, mục tiêu 0.3-0.5)
+    - dw_gen gate stats (mean/std → biết gate có saturate không)
+    """
     print(f"\n  DWSA Health (epoch {epoch+1}):")
     print(f"  {'Stage':<12} {'gamma':>8}  {'Δgamma':>8}  {'Status'}")
     print(f"  {'─'*50}")
+
+    gamma_targets = {'dwsa_stage4': 0.0, 'dwsa_stage5': 0.0, 'dwsa_stage6': 0.0}
+
     for name in ['dwsa_stage4', 'dwsa_stage5', 'dwsa_stage6']:
         module = getattr(model.backbone, name, None)
         if module is None:
             continue
+        gamma_val = torch.sigmoid(module.gamma).item() if hasattr(module, 'gamma') else module.gamma.item()
+        # gamma trong DWSA là raw parameter, không qua sigmoid
         gamma_val = module.gamma.item()
         writer.add_scalar(f'dwsa/{name}_gamma', gamma_val, epoch)
-        gkey = f'dwsa/{"gamma4" if "4" in name else "gamma5" if "5" in name else "gamma6"}'
-        diag.log(epoch, gkey, gamma_val)
+        diag.log(epoch, f'dwsa/{"gamma4" if "4" in name else "gamma5" if "5" in name else "gamma6"}', gamma_val)
+
+        # Status
         if gamma_val < 0.11:
             status = '⚠️  NOT LEARNING (LR too low?)'
         elif gamma_val < 0.2:
@@ -659,13 +592,25 @@ def log_dwsa_health(model, writer, epoch: int, diag: DiagnosticLogger):
             status = '✅ Active'
         else:
             status = '🔥 Highly active'
-        h         = diag.history.get(gkey, [])
+
+        # Lấy delta từ diag history
+        key = f'dwsa/{"gamma4" if "4" in name else "gamma5" if "5" in name else "gamma6"}'
+        h   = diag.history.get(key, [])
         delta_str = f"{gamma_val - h[-2][1]:+.5f}" if len(h) >= 2 else '(first)'
+
         print(f"  {name:<12} {gamma_val:>8.5f}  {delta_str:>8}  {status}")
+
     print()
 
 
+# L3: FoggyAwareNorm alpha monitor
 def log_fan_health(model, writer, epoch: int, diag: DiagnosticLogger):
+    """
+    Monitor FoggyAwareNorm:
+    - alpha value (sau sigmoid → blend ratio IN vs BN)
+    - alpha → 1: model thiên về IN (foggy domain)
+    - alpha → 0: model thiên về BN (clear domain)
+    """
     fan_info = []
     for stem_name in ['stem_conv1', 'stem_conv2']:
         module = getattr(model.backbone, stem_name, None)
@@ -674,7 +619,8 @@ def log_fan_health(model, writer, epoch: int, diag: DiagnosticLogger):
         fan = module[1]
         if not hasattr(fan, 'alpha'):
             continue
-        alpha_sig  = torch.sigmoid(fan.alpha.data)
+        alpha_raw  = fan.alpha.data                     # (1, C, 1, 1)
+        alpha_sig  = torch.sigmoid(alpha_raw)           # blend ratio
         alpha_mean = alpha_sig.mean().item()
         alpha_std  = alpha_sig.std().item()
         alpha_min  = alpha_sig.min().item()
@@ -684,6 +630,7 @@ def log_fan_health(model, writer, epoch: int, diag: DiagnosticLogger):
         writer.add_scalar(f'fan/alpha{tag}_mean', alpha_mean, epoch)
         writer.add_scalar(f'fan/alpha{tag}_std',  alpha_std,  epoch)
         diag.log(epoch, f'fan/alpha{tag}_mean', alpha_mean)
+
     if fan_info:
         print(f"  FoggyAwareNorm alpha (epoch {epoch+1}):")
         print(f"  {'Layer':<12} {'mean':>7} {'std':>7} {'min':>7} {'max':>7}  {'Blend'}")
@@ -695,37 +642,45 @@ def log_fan_health(model, writer, epoch: int, diag: DiagnosticLogger):
         print()
 
 
+# L6: SPP BN health check — detect trước khi inf xảy ra
 def check_spp_bn_health(model, epoch: int):
+    """
+    Kiểm tra running_var của SPP BN layers.
+    Nếu running_var < 1e-6 hoặc > 1e6 → nguy cơ inf gradient cao.
+    """
     spp = getattr(model.backbone, 'spp', None)
     if spp is None:
         return
     issues = []
     for name, m in spp.named_modules():
-        if isinstance(m, nn.BatchNorm2d) and m.running_var is not None:
-            rv = m.running_var
-            if rv.min().item() < 1e-6:
-                issues.append(f"spp.{name}: running_var_min={rv.min().item():.2e} ← near zero!")
-            if rv.max().item() > 1e6:
-                issues.append(f"spp.{name}: running_var_max={rv.max().item():.2e} ← exploding!")
-            if torch.isnan(rv).any():
-                issues.append(f"spp.{name}: running_var has NaN!")
-            if torch.isinf(rv).any():
-                issues.append(f"spp.{name}: running_var has INF!")
+        if isinstance(m, nn.BatchNorm2d):
+            if m.running_var is not None:
+                rv = m.running_var
+                if rv.min().item() < 1e-6:
+                    issues.append(f"spp.{name}: running_var_min={rv.min().item():.2e} ← near zero!")
+                if rv.max().item() > 1e6:
+                    issues.append(f"spp.{name}: running_var_max={rv.max().item():.2e} ← exploding!")
+                if torch.isnan(rv).any():
+                    issues.append(f"spp.{name}: running_var has NaN!")
+                if torch.isinf(rv).any():
+                    issues.append(f"spp.{name}: running_var has INF!")
     if issues:
         print(f"\n  ⚠️  SPP BN HEALTH WARNING (epoch {epoch+1}):")
-        for iss in issues: print(f"    {iss}")
+        for iss in issues:
+            print(f"    {iss}")
         print(f"    → Recommend: add --freeze_spp_bn to next run\n")
-    elif epoch % 5 == 0:
-        print(f"  ✅ SPP BN health OK (epoch {epoch+1})")
+    else:
+        if epoch % 5 == 0:
+            print(f"  ✅ SPP BN health OK (epoch {epoch+1})")
 
 
 def count_trainable_params(model):
-    total    = sum(p.numel() for p in model.parameters())
-    trainable= sum(p.numel() for p in model.parameters() if p.requires_grad)
-    bb_total = sum(p.numel() for p in model.backbone.parameters())
-    bb_train = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
-    hd_total = sum(p.numel() for p in model.decode_head.parameters())
-    hd_train = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
+    total     = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    bb_total  = sum(p.numel() for p in model.backbone.parameters())
+    bb_train  = sum(p.numel() for p in model.backbone.parameters() if p.requires_grad)
+    hd_total  = sum(p.numel() for p in model.decode_head.parameters())
+    hd_train  = sum(p.numel() for p in model.decode_head.parameters() if p.requires_grad)
     print(f"\n{'='*70}\nPARAMETER STATISTICS\n{'='*70}")
     print(f"Total:      {total:>15,} | 100%")
     print(f"Trainable:  {trainable:>15,} | {100*trainable/total:.1f}%")
@@ -905,18 +860,18 @@ class Trainer:
         self.best_miou    = 0.0
         self.start_epoch  = 0
         self.global_step  = 0
-        self.diag         = diag
+        self.diag         = diag   # L1: diagnostic logger
 
-        loss_cfg           = args.loss_config
-        self.ce_weight     = loss_cfg['ce_weight']
-        self.dice_weight   = loss_cfg['dice_weight']
+        loss_cfg          = args.loss_config
+        self.ce_weight    = loss_cfg['ce_weight']
+        self.dice_weight  = loss_cfg['dice_weight']
         self.base_loss_cfg = loss_cfg
-        self.loss_phase    = 'full'
+        self.loss_phase   = 'full'
 
         cw_device = class_weights.to(device) if class_weights is not None else None
         _ohem_kr  = getattr(args, 'ohem_keep_ratio', 0.3)
         _ohem_mk  = getattr(args, 'ohem_min_kept',   100000)
-        _ohem_thr = getattr(args, 'ohem_thresh',      None)
+        _ohem_thr = getattr(args, 'ohem_thresh',     None)
         self.ohem = OHEMLoss(
             ignore_index=args.ignore_index, keep_ratio=_ohem_kr,
             min_kept=_ohem_mk, thresh=_ohem_thr, class_weights=class_weights)
@@ -942,8 +897,8 @@ class Trainer:
 
     def set_loss_phase(self, phase: str):
         if phase == self.loss_phase: return
-        if phase == 'ce_only':   self.dice_weight = 0.0
-        elif phase == 'full':    self.dice_weight = self.base_loss_cfg['dice_weight']
+        if phase == 'ce_only':    self.dice_weight = 0.0
+        elif phase == 'full':     self.dice_weight = self.base_loss_cfg['dice_weight']
         self.loss_phase = phase
         print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight})")
 
@@ -961,6 +916,10 @@ class Trainer:
         with open(self.save_dir / "config.json", "w") as f:
             json.dump(vars(self.args), f, indent=2, default=str)
 
+    # ---------------------------------------------------------------------- #
+    # Training
+    # ---------------------------------------------------------------------- #
+
     def train_epoch(self, loader, epoch):
         self.model.train()
 
@@ -974,9 +933,8 @@ class Trainer:
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
         max_grad       = 0.0
-        last_grad_map  = {}
-        hard_ratio_acc = 0.0
-        n_inf_total    = 0
+        last_grad_map  = {}                # L5: store for end-of-epoch report
+        hard_ratio_acc = 0.0              # L9: accumulate hard ratio
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
@@ -1022,40 +980,31 @@ class Trainer:
                 self.scaler.unscale_(self.optimizer)
                 max_grad, _, last_grad_map = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
-
                 if self.args.grad_clip > 0:
-                    # FIX-5: clip_grads_safe thay clip_grad_norm_
-                    grad_info = clip_grads_safe(self.model, max_norm=self.args.grad_clip)
-                    if grad_info['n_inf'] > 0:
-                        n_inf_total += grad_info['n_inf']
-                        print(f"\n  [FIX-5] Zeroed {grad_info['n_inf']} inf grad "
-                              f"@ batch {batch_idx}: {grad_info['inf_layers'][:1]}")
-
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
 
-                # FIX-4: cosine_wr step per batch với fractional epoch
-                # CosineAnnealingWarmRestarts cần fractional epoch để interpolate mượt
-                if self.scheduler and self.args.scheduler == 'cosine_wr':
-                    self.scheduler.step(epoch + batch_idx / len(loader))
-                elif self.scheduler and self.args.scheduler == 'onecycle':
+                if self.scheduler and self.args.scheduler == 'onecycle':
                     self.scheduler.step()
 
-            total_loss     += loss.item() * self.args.accumulation_steps
-            total_ohem     += ohem_loss.item()
-            total_dice     += dice_loss.item()
+            total_loss  += loss.item() * self.args.accumulation_steps
+            total_ohem  += ohem_loss.item()
+            total_dice  += dice_loss.item()
+            # L9: accumulate hard pixel ratio
             hard_ratio_acc += self.ohem.last_hard_ratio
 
-            pbar.set_postfix({
-                'loss'  : f'{loss.item() * self.args.accumulation_steps:.4f}',
-                'ohem'  : f'{ohem_loss.item():.4f}',
-                'dice'  : f'{dice_loss.item():.4f}',
-                'lr'    : f'{self.optimizer.param_groups[0]["lr"]:.2e}',
-                'hard%' : f'{self.ohem.last_hard_ratio:.2f}',
-                'max_g' : f'{max_grad:.2f}',
-            })
+            postfix = {
+                'loss'   : f'{loss.item() * self.args.accumulation_steps:.4f}',
+                'ohem'   : f'{ohem_loss.item():.4f}',
+                'dice'   : f'{dice_loss.item():.4f}',
+                'lr'     : f'{self.optimizer.param_groups[0]["lr"]:.2e}',
+                'hard%'  : f'{self.ohem.last_hard_ratio:.2f}',   # L9
+                'max_g'  : f'{max_grad:.2f}',
+            }
+            pbar.set_postfix(postfix)
 
             if batch_idx % 50 == 0:
                 clear_gpu_memory()
@@ -1066,28 +1015,25 @@ class Trainer:
                 self.writer.add_scalar('train/dice',       dice_loss.item(),  self.global_step)
                 self.writer.add_scalar('train/lr',         self.optimizer.param_groups[0]['lr'], self.global_step)
                 self.writer.add_scalar('train/max_grad',   max_grad,          self.global_step)
-                self.writer.add_scalar('train/hard_ratio', self.ohem.last_hard_ratio, self.global_step)
+                self.writer.add_scalar('train/hard_ratio', self.ohem.last_hard_ratio, self.global_step)  # L9
 
         n = len(loader)
         avg_hard_ratio = hard_ratio_acc / n
 
-        print(f"\nEpoch {epoch+1} — Max gradient: {max_grad_epoch:.2f}  |  "
-              f"Avg hard pixel ratio: {avg_hard_ratio:.3f}")
-        if n_inf_total > 0:
-            print(f"  [FIX-5] Total inf grad events this epoch: {n_inf_total}")
+        print(f"\nEpoch {epoch+1} — Max gradient: {max_grad_epoch:.2f}  |  Avg hard pixel ratio: {avg_hard_ratio:.3f}")
 
+        # L5: Gradient flow report cuối epoch
         if last_grad_map:
             log_gradient_flow(last_grad_map, self.writer, epoch, top_k=5)
 
+        # L8: Log tất cả LR groups
         print(f"  Learning rates:")
         for g in self.optimizer.param_groups:
             print(f"    {g.get('name','?'):<12} lr={g['lr']:.2e}")
             self.writer.add_scalar(f"lr/{g.get('name','group')}", g['lr'], epoch)
 
         torch.cuda.empty_cache()
-
-        # Step per epoch cho scheduler không phải cosine_wr và onecycle
-        if self.scheduler and self.args.scheduler not in ('onecycle', 'cosine_wr'):
+        if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
 
         result = {
@@ -1096,10 +1042,17 @@ class Trainer:
             'dice'       : total_dice  / n,
             'hard_ratio' : avg_hard_ratio,
         }
+
+        # L7: Log loss decomposition trend
         if self.diag:
             self.diag.log_dict(epoch, result, prefix='train/')
             self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
+
         return result
+
+    # ---------------------------------------------------------------------- #
+    # Validation
+    # ---------------------------------------------------------------------- #
 
     @torch.no_grad()
     def validate(self, loader, epoch):
@@ -1144,23 +1097,35 @@ class Trainer:
         iou          = intersection / (union + 1e-10)
         miou         = np.nanmean(iou)
         acc          = intersection.sum() / (conf_matrix.sum() + 1e-10)
+
         result = {
-            'loss': total_loss / len(loader),
-            'miou': miou, 'accuracy': acc, 'per_class_iou': iou,
+            'loss'         : total_loss / len(loader),
+            'miou'         : miou,
+            'accuracy'     : acc,
+            'per_class_iou': iou,
         }
+
         if self.diag:
             self.diag.log(epoch, 'val/miou',     miou)
             self.diag.log(epoch, 'val/accuracy', acc)
             self.diag.log(epoch, 'val/loss',     result['loss'])
+
         return result
+
+    # ---------------------------------------------------------------------- #
+    # Checkpoint
+    # ---------------------------------------------------------------------- #
 
     def save_checkpoint(self, epoch, metrics, is_best=False):
         ckpt = {
-            'epoch': epoch, 'model': self.model.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'scheduler': self.scheduler.state_dict() if self.scheduler else None,
-            'scaler': self.scaler.state_dict(), 'best_miou': self.best_miou,
-            'metrics': metrics, 'global_step': self.global_step,
+            'epoch'      : epoch,
+            'model'      : self.model.state_dict(),
+            'optimizer'  : self.optimizer.state_dict(),
+            'scheduler'  : self.scheduler.state_dict() if self.scheduler else None,
+            'scaler'     : self.scaler.state_dict(),
+            'best_miou'  : self.best_miou,
+            'metrics'    : metrics,
+            'global_step': self.global_step,
         }
         torch.save(ckpt, self.save_dir / "last.pth")
         if is_best:
@@ -1174,7 +1139,14 @@ class Trainer:
         state = (ckpt.get('model') or ckpt.get('model_state_dict') or
                  ckpt.get('state_dict') or ckpt)
         self.model.load_state_dict(state, strict=False)
+    
+        # FIX: khi reset_epoch=True (transfer mode), KHÔNG load optimizer state.
+        # Lý do: optimizer được rebuild với param groups mới (LR mới, frozen params mới).
+        # Load state cũ vào optimizer mới → id(param) không match → momentum restore
+        # vào wrong slots hoặc bị ignored silently, nhưng đôi khi PyTorch vẫn restore
+        # được nếu group structure khớp → stale momentum từ epoch 77 explode ngay batch 1.
         if load_optimizer and not reset_epoch:
+            # Chỉ load optimizer khi CONTINUE mode (không reset epoch)
             try:
                 self.optimizer.load_state_dict(ckpt['optimizer'])
             except (ValueError, KeyError) as e:
@@ -1184,11 +1156,13 @@ class Trainer:
                     self.scheduler.load_state_dict(ckpt['scheduler'])
                 except Exception as e:
                     print(f"Scheduler state not loaded: {e}")
+    
         if load_optimizer and 'scaler' in ckpt and ckpt['scaler'] and not reset_epoch:
             try:
                 self.scaler.load_state_dict(ckpt['scaler'])
             except Exception as e:
                 print(f"Scaler state not loaded: {e}")
+    
         if reset_epoch:
             self.start_epoch = 0
             self.global_step = 0
@@ -1225,21 +1199,17 @@ CLASS_NAMES = ['road','sidewalk','building','wall','fence','pole',
 
 def main():
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
-    parser.add_argument("--model_variant",      type=str, default="fan_dwsa",
+    parser.add_argument("--model_variant",         type=str,   default="fan_dwsa",
                         choices=["fan_dwsa", "fan_only", "dwsa_only"])
-    parser.add_argument("--pretrained_weights", type=str, default=None)
-    parser.add_argument("--freeze_backbone",    action="store_true", default=False)
-    parser.add_argument("--unfreeze_schedule",  type=str, default="")
-    parser.add_argument("--backbone_lr_factor", type=float, default=0.1)
-    parser.add_argument("--dwsa_lr_factor",     type=float, default=0.5)
-    # FIX-3: dwsa6 LR group riêng
-    parser.add_argument("--dwsa6_lr_factor",    type=float, default=None,
-                        help="LR factor cho dwsa_stage6 (default: 2× dwsa_lr_factor). "
-                             "stage6 cần LR cao hơn do gradient backprop xa hơn.")
-    parser.add_argument("--alpha_lr_factor",    type=float, default=0.1)
-    parser.add_argument("--use_class_weights",  action="store_true")
-    parser.add_argument("--class_weights_file", type=str, default=None)
-    parser.add_argument("--class_weights_method", type=str, default="median_freq",
+    parser.add_argument("--pretrained_weights",    type=str,   default=None)
+    parser.add_argument("--freeze_backbone",        action="store_true", default=False)
+    parser.add_argument("--unfreeze_schedule",      type=str,   default="")
+    parser.add_argument("--backbone_lr_factor",     type=float, default=0.1)
+    parser.add_argument("--dwsa_lr_factor",         type=float, default=0.5)
+    parser.add_argument("--alpha_lr_factor",        type=float, default=0.1)
+    parser.add_argument("--use_class_weights",      action="store_true")
+    parser.add_argument("--class_weights_file",     type=str,   default=None)
+    parser.add_argument("--class_weights_method",   type=str,   default="median_freq",
                         choices=["inverse_freq", "sqrt_inverse", "median_freq"])
     parser.add_argument("--train_txt",    required=True)
     parser.add_argument("--val_txt",      required=True)
@@ -1253,7 +1223,9 @@ def main():
     parser.add_argument("--weight_decay",       type=float, default=1e-4)
     parser.add_argument("--optimizer",          type=str,   default="adamw",
                         choices=["adamw", "sgd"])
-    parser.add_argument("--stem_lr_factor",     type=float, default=0.01)
+    parser.add_argument("--stem_lr_factor", type=float, default=0.01,
+                    help="LR factor cho stem (conv1/2/stage2/3). "
+                         "Thấp hơn backbone vì stem đã converge sau nhiều epochs.")
     parser.add_argument("--sgd_momentum",       type=float, default=0.9)
     parser.add_argument("--grad_clip",          type=float, default=5.0)
     parser.add_argument("--aux_weight",         type=float, default=0.4)
@@ -1262,20 +1234,11 @@ def main():
     parser.add_argument("--label_smoothing",    type=float, default=0.0)
     parser.add_argument("--ohem_keep_ratio",    type=float, default=0.3)
     parser.add_argument("--ohem_min_kept",      type=int,   default=100000)
-    # FIX-2: ohem_thresh default None (ratio-based). Dùng --ohem_thresh 1.5 để bật.
-    # KHÔNG dùng 0.9 — với 19 classes quá thấp (ln(19)≈2.94, 0.9 chỉ loại ~3% pixel)
-    parser.add_argument("--ohem_thresh",        type=float, default=None,
-                        help="OHEM threshold. Khuyến nghị: 1.5 cho 19-class. "
-                             "Không set → ratio-based (keep_ratio). "
-                             "KHÔNG dùng < 1.0 với 19 classes.")
+    parser.add_argument("--ohem_thresh",        type=float, default=None)
     parser.add_argument("--ce_weight",          type=float, default=None)
     parser.add_argument("--scheduler",          default="cosine",
                         choices=["onecycle", "poly", "cosine", "cosine_wr"])
     parser.add_argument("--cosine_wr_t0",       type=int,   default=10)
-    # FIX-4: cosine_wr_tmult default 2
-    parser.add_argument("--cosine_wr_tmult",    type=int,   default=2,
-                        help="T_mult cho SGDR. Default 2 (cycle dài dần). "
-                             "1 = restart cố định mỗi T_0 epoch — không khuyến nghị.")
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
     parser.add_argument("--img_h",              type=int,   default=512)
     parser.add_argument("--img_w",              type=int,   default=1024)
@@ -1294,13 +1257,12 @@ def main():
     parser.add_argument("--reset_best_metric",  action="store_true")
     parser.add_argument("--freeze_stem_conv",   action="store_true", default=False)
     parser.add_argument("--freeze_spp_bn",      action="store_true", default=False)
-    parser.add_argument("--diag_interval",      type=int,   default=1)
+    # L2: how often to run DWSA+FAN health check (default every epoch)
+    parser.add_argument("--diag_interval",      type=int,   default=1,
+                        help="Run DWSA/FAN health check every N epochs. "
+                             "1=every epoch, 5=every 5 epochs.")
 
     args = parser.parse_args()
-
-    # FIX-3: resolve dwsa6_lr_factor
-    if args.dwsa6_lr_factor is None:
-        args.dwsa6_lr_factor = args.dwsa_lr_factor * 2.0
 
     if args.freeze_backbone and args.unfreeze_schedule:
         unfreeze_list = sorted(int(e) for e in args.unfreeze_schedule.split(','))
@@ -1325,10 +1287,6 @@ def main():
     print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
     print(f"Grad clip: {args.grad_clip}  |  AMP: {args.use_amp}")
     print(f"Diag interval: every {args.diag_interval} epoch(s)")
-    if args.ohem_thresh:
-        print(f"OHEM: threshold-based, thresh={args.ohem_thresh}")
-    else:
-        print(f"OHEM: ratio-based, keep_ratio={args.ohem_keep_ratio}")
     print(f"{'='*70}\n")
 
     variant = getattr(args, 'model_variant', 'fan_dwsa')
@@ -1341,7 +1299,7 @@ def main():
     else:
         raise ValueError(f"Unknown model_variant: {variant}")
 
-    cfg              = ModelConfig.get_config(variant=variant)
+    cfg          = ModelConfig.get_config(variant=variant)
     args.loss_config = cfg["loss"]
 
     train_loader, val_loader, class_weights = create_dataloaders(
@@ -1363,7 +1321,8 @@ def main():
             compute_class_weights=False, dataset_type=args.dataset_type)
 
     if getattr(args, "class_weights_file", None):
-        cw_path = Path(args.class_weights_file)
+        import pathlib
+        cw_path = pathlib.Path(args.class_weights_file)
         if cw_path.exists():
             class_weights = torch.load(cw_path, map_location="cpu")
             print(f"Class weights loaded from: {cw_path}  "
@@ -1380,10 +1339,6 @@ def main():
     model.apply(init_weights)
     check_model_health(model)
 
-    # FIX-1: patch InstanceNorm2d ngay sau khi model tạo xong
-    # TRƯỚC load_pretrained — patch không ảnh hưởng checkpoint loading
-    _patch_fan_in_layers(model)
-
     if args.pretrained_weights:
         load_pretrained_gcnet(model, args.pretrained_weights, variant=variant)
     if args.freeze_backbone:
@@ -1395,6 +1350,7 @@ def main():
     optimizer = build_optimizer(model, args)
     scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=0)
 
+    # L1: Init DiagnosticLogger
     save_path = Path(args.save_dir)
     save_path.mkdir(parents=True, exist_ok=True)
     diag = DiagnosticLogger(save_dir=save_path, class_names=CLASS_NAMES)
@@ -1412,10 +1368,10 @@ def main():
 
     if args.resume:
         trainer.load_checkpoint(
-            args.resume,
-            reset_epoch=(args.resume_mode == "transfer"),
-            load_optimizer=(args.resume_mode == "continue"),
-            reset_best_metric=args.reset_best_metric,
+        args.resume,
+        reset_epoch=(args.resume_mode == "transfer"),
+        load_optimizer=(args.resume_mode == "continue"),  # ← giữ nguyên dòng này
+        reset_best_metric=args.reset_best_metric,
         )
 
     if getattr(args, "freeze_stem_conv", False):
@@ -1438,6 +1394,7 @@ def main():
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
+        # Progressive unfreeze
         if epoch in unfreeze_list and epoch not in applied_unfreeze_stages:
             stage_idx = unfreeze_list.index(epoch)
             if stage_idx < len(UNFREEZE_STAGES):
@@ -1455,6 +1412,7 @@ def main():
             if last_unfreeze is not None and epoch >= last_unfreeze + args.ce_only_epochs_after_unfreeze:
                 trainer.set_loss_phase('full')
 
+        # Resolution switch
         hi_epochs = getattr(args, "high_res_epochs", 0)
         if hi_epochs > 0 and high_res_train_loader is not None and epoch < hi_epochs:
             active_loader = high_res_train_loader
@@ -1464,15 +1422,25 @@ def main():
                 scheduler = build_scheduler(trainer.optimizer, args, train_loader, start_epoch=epoch)
                 trainer.scheduler = scheduler
 
+        # ------------------------------------------------------------------ #
+        # L6: SPP BN health check trước khi train
+        # ------------------------------------------------------------------ #
         check_spp_bn_health(model, epoch)
 
+        # Train + Validate
         train_metrics = trainer.train_epoch(active_loader, epoch)
         val_metrics   = trainer.validate(val_loader, epoch)
 
+        # ------------------------------------------------------------------ #
+        # L2 + L3: DWSA & FAN health check mỗi diag_interval epoch
+        # ------------------------------------------------------------------ #
         if epoch % args.diag_interval == 0:
             log_dwsa_health(model, trainer.writer, epoch, diag)
             log_fan_health(model,  trainer.writer, epoch, diag)
 
+        # ------------------------------------------------------------------ #
+        # L4: Per-class IoU EVERY epoch (không chỉ khi best)
+        # ------------------------------------------------------------------ #
         iou_arr    = val_metrics['per_class_iou']
         low_thresh = 0.4
         low_cls    = [(n, v) for n, v in zip(CLASS_NAMES, iou_arr) if v < low_thresh]
@@ -1487,17 +1455,21 @@ def main():
         if low_cls:
             print(f"\n  ⚠️  LOW classes (<{low_thresh}): {[n for n,_ in low_cls]}")
 
+        # L4: log per-class to writer & diag
         for cname, ciou in zip(CLASS_NAMES, iou_arr):
             trainer.writer.add_scalar(f'val/iou_{cname}', float(ciou), epoch)
             diag.log(epoch, f'iou/{cname}', float(ciou))
 
+        # ------------------------------------------------------------------ #
+        # Standard logging
+        # ------------------------------------------------------------------ #
         print(f"\n{'='*70}")
         print(f"Epoch {epoch+1}/{args.epochs}")
         print(f"{'='*70}")
         print(f"Train — Loss: {train_metrics['loss']:.4f} | "
               f"OHEM: {train_metrics['ohem']:.4f} | "
               f"Dice: {train_metrics['dice']:.4f} | "
-              f"Hard%: {train_metrics['hard_ratio']:.3f}")
+              f"Hard%: {train_metrics['hard_ratio']:.3f}")    # L9
         print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
               f"mIoU: {val_metrics['miou']:.4f}  | "
               f"Acc: {val_metrics['accuracy']:.4f}")
@@ -1507,6 +1479,7 @@ def main():
         trainer.writer.add_scalar('val/miou',     val_metrics['miou'],     epoch)
         trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
 
+        # L1: epoch summary table từ DiagnosticLogger
         diag.print_epoch_summary(epoch)
 
         is_best = val_metrics['miou'] > trainer.best_miou
@@ -1515,6 +1488,9 @@ def main():
             print(f"  ★ NEW BEST mIoU: {trainer.best_miou:.4f}")
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
 
+    # ------------------------------------------------------------------ #
+    # L10: Full history table cuối training
+    # ------------------------------------------------------------------ #
     diag.print_full_history()
     diag.close()
     trainer.writer.close()
