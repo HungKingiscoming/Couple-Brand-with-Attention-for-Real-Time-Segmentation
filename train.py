@@ -1360,8 +1360,7 @@ def main():
 
     trainer = Trainer(model=model, optimizer=optimizer, scheduler=scheduler,
                       device=device, args=args,
-                      class_weights=class_weights if args.use_class_weights else None,
-                      diag=diag)
+                     class_weights=class_weights)
 
     if getattr(args, "dice_weight", None) is not None:
         trainer.dice_weight = args.dice_weight
