@@ -1257,7 +1257,10 @@ def main():
     parser.add_argument("--reset_best_metric",  action="store_true")
     parser.add_argument("--freeze_stem_conv",   action="store_true", default=False)
     parser.add_argument("--freeze_spp_bn",      action="store_true", default=False)
-    # L2: how often to run DWSA+FAN health check (default every epoch)
+    parser.add_argument("--unfreeze_stem",       action="store_true", default=False,
+                    help="Unfreeze stem conv layers khi freeze_backbone=True")
+    parser.add_argument("--reinit_dwsa6",        action="store_true", default=False,
+                    help="Reset gamma và out_proj của dwsa_stage6 để thoát local minimum")
     parser.add_argument("--diag_interval",      type=int,   default=1,
                         help="Run DWSA/FAN health check every N epochs. "
                              "1=every epoch, 5=every 5 epochs.")
