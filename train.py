@@ -956,12 +956,12 @@ class Trainer:
                     if isinstance(m, nn.BatchNorm2d):
                         m.eval()
         if getattr(self.args, "freeze_stem_conv", False):
-        for stem_name in ["stem_stage2", "stem_stage3"]:
-            module = getattr(self.model.backbone, stem_name, None)
-            if module is not None:
-                for m in module.modules():
-                    if isinstance(m, nn.BatchNorm2d):
-                        m.eval()
+            for stem_name in ["stem_stage2", "stem_stage3"]:
+                module = getattr(self.model.backbone, stem_name, None)
+                if module is not None:
+                    for m in module.modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.eval()
 
         total_loss = total_ohem = total_dice = 0.0
         max_grad_epoch = 0.0
