@@ -1,18 +1,11 @@
 """
 make_foggy_weights.py
 ─────────────────────
-Tạo class weights từ Foggy Cityscapes training set thực tế.
-
-Có 2 chế độ — chỉnh CONFIG bên dưới rồi chạy:
+Chỉnh CONFIG rồi chạy:
     python make_foggy_weights.py
 
-SCAN_MODE = True  → scan label files thực (~90s cho 8925 files)
-SCAN_MODE = False → dùng preset đã tính sẵn (~1 giây)
-
-FIX: hỗ trợ cả hai loại label file:
-  - labelTrainIds: pixel values 0-18 (+ 255 ignore) — phổ biến hơn
-  - labelIds:      pixel values gốc 7,8,11... — cần remap
-Tự detect qua LABEL_FORMAT config.
+Label format của Cityscapes Kaggle thường là labelIds gốc (7,8,11...)
+→ LABEL_FORMAT = 'label_id'  (default đúng)
 """
 import os
 import time
@@ -23,18 +16,23 @@ from multiprocessing import Pool
 from tqdm import tqdm
 
 # ============================================================
-# ★ CONFIG — chỉnh ở đây ★
+# ★ CONFIG ★
 # ============================================================
 
 SCAN_MODE    = True
 TRAIN_TXT    = '/kaggle/working/train.txt'
-METHOD       = 'median_freq'    # 'median_freq' hoặc 'inverse_freq'
-WORKERS      = 0                # 0 = auto (min(cpu_count, 8))
+METHOD       = 'median_freq'    # 'median_freq' | 'inverse_freq'
+WORKERS      = 0                # 0 = auto
 OUTPUT       = '/kaggle/working/class_weights_foggy.pt'
 
-# 'train_id' : label files chứa pixel 0-18 + 255 (labelTrainIds) ← kaggle thường dùng
-# 'label_id' : label files chứa pixel gốc 7,8,11... (labelIds)
-LABEL_FORMAT = 'train_id'
+# 'label_id'  → pixel values gốc: 7=road, 8=sidewalk, 11=building...  ← ĐÚNG
+# 'train_id'  → pixel values 0-18 đã map sẵn
+LABEL_FORMAT = 'label_id'
+
+# Clamp max weight — tránh rare class bị thổi quá cao
+# 3.0 = class rare nhất được weight tối đa 3× class phổ biến nhất
+# Tăng lên 5.0 nếu muốn aggressive hơn
+CLAMP_MAX    = 3.0
 
 # ============================================================
 
@@ -44,7 +42,6 @@ CLASSES = [
     'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
 ]
 
-# remap cho labelIds format (không dùng nếu LABEL_FORMAT='train_id')
 _ID_TO_TRAINID = {
     7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
     21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
@@ -55,47 +52,18 @@ for _k, _v in _ID_TO_TRAINID.items():
     _LABEL_MAP[_k] = _v
 
 FOGGY_WEIGHTS_PRESET = torch.tensor([
-    0.837,  # 0  road
-    0.918,  # 1  sidewalk
-    0.866,  # 2  building
-    1.050,  # 3  wall
-    1.150,  # 4  fence        — stuck IoU 0.488
-    1.250,  # 5  pole         — stuck IoU 0.476
-    0.975,  # 6  traffic_light
-    1.049,  # 7  traffic_sign
-    0.879,  # 8  vegetation
-    1.002,  # 9  terrain
-    0.954,  # 10 sky
-    1.100,  # 11 person
-    1.300,  # 12 rider        — stuck IoU 0.490
-    0.904,  # 13 car
-    1.087,  # 14 truck
-    1.096,  # 15 bus
-    1.087,  # 16 train
-    1.400,  # 17 motorcycle   — stuck IoU 0.452
-    1.051,  # 18 bicycle
+    0.837, 0.918, 0.866, 1.050, 1.150, 1.250, 0.975, 1.049,
+    0.879, 1.002, 0.954, 1.100, 1.300, 0.904, 1.087, 1.096,
+    1.087, 1.400, 1.051,
 ], dtype=torch.float32)
 
 
 # ============================================================
-# WORKER — module-level để multiprocessing pickle được
+# WORKERS — module-level để pickle được
 # ============================================================
 
-def _count_train_id(label_path: str) -> np.ndarray:
-    """
-    Cho labelTrainIds: pixel values đã là 0-18, 255=ignore.
-    Không cần remap — đọc thẳng và bincount.
-    """
-    from PIL import Image
-    raw   = np.array(Image.open(label_path), dtype=np.uint8).ravel()
-    valid = raw[raw < 19]                          # loại 255 (ignore)
-    return np.bincount(valid, minlength=19).astype(np.int64)
-
-
 def _count_label_id(label_path: str) -> np.ndarray:
-    """
-    Cho labelIds: pixel values gốc (7,8,11...) → remap về train_id trước.
-    """
+    """labelIds gốc (7,8,11...) → remap → bincount."""
     from PIL import Image
     raw    = np.array(Image.open(label_path), dtype=np.uint8)
     mapped = _LABEL_MAP[raw].ravel()
@@ -103,12 +71,19 @@ def _count_label_id(label_path: str) -> np.ndarray:
     return np.bincount(valid, minlength=19).astype(np.int64)
 
 
+def _count_train_id(label_path: str) -> np.ndarray:
+    """trainIds (0-18, 255=ignore) → bincount trực tiếp."""
+    from PIL import Image
+    raw   = np.array(Image.open(label_path), dtype=np.uint8).ravel()
+    valid = raw[raw < 19]
+    return np.bincount(valid, minlength=19).astype(np.int64)
+
+
 # ============================================================
 # CORE
 # ============================================================
 
-def scan_weights(train_txt: str, method: str, workers: int,
-                 label_format: str) -> torch.Tensor:
+def scan_weights(train_txt, method, workers, label_format, clamp_max):
     label_paths = []
     with open(train_txt, 'r') as f:
         for line in f:
@@ -121,10 +96,9 @@ def scan_weights(train_txt: str, method: str, workers: int,
     if workers <= 0:
         workers = min(os.cpu_count() or 4, 8)
 
-    worker_fn = _count_train_id if label_format == 'train_id' else _count_label_id
+    worker_fn = _count_label_id if label_format == 'label_id' else _count_train_id
     print(f"  Files: {n:,}  |  workers: {workers}  |  method: {method}")
-    print(f"  Label format: {label_format}  "
-          f"({'pixel 0-18 direct' if label_format == 'train_id' else 'orig labelIds → remap'})")
+    print(f"  Label format: {label_format}  |  clamp_max: {clamp_max}")
 
     t0        = time.time()
     chunksize = max(1, n // (workers * 4))
@@ -138,13 +112,19 @@ def scan_weights(train_txt: str, method: str, workers: int,
     class_counts = np.sum(results, axis=0)
     total_valid  = class_counts.sum()
     elapsed      = time.time() - t0
-    print(f"  Done in {elapsed:.1f}s  ({n / elapsed:.0f} files/sec)\n")
+    print(f"  Done in {elapsed:.1f}s  ({n/elapsed:.0f} files/sec)\n")
 
     freq = class_counts / max(total_valid, 1)
     print(f"  {'Class':<16} {'Pixels':>15} {'Freq%':>8}")
     print(f"  {'-'*42}")
     for cls, cnt, fr in zip(CLASSES, class_counts, freq):
-        print(f"  {cls:<16} {cnt:>15,} {fr*100:>7.3f}%")
+        flag = ' ⚠️ ' if cnt == 0 else ''
+        print(f"  {cls:<16} {cnt:>15,} {fr*100:>7.3f}%{flag}")
+
+    if np.any(class_counts == 0):
+        print("\n  ⚠️  Có class count = 0 → LABEL_FORMAT có thể sai!")
+        print(f"     Thử đổi LABEL_FORMAT = "
+              f"'{'train_id' if label_format == 'label_id' else 'label_id'}'")
 
     if method == 'median_freq':
         median_f = np.median(freq[freq > 0])
@@ -153,17 +133,17 @@ def scan_weights(train_txt: str, method: str, workers: int,
         raw_w = 1.0 / (freq + 1e-10)
 
     weights = torch.tensor(raw_w, dtype=torch.float32)
-    weights = torch.clamp(weights, min=0.1, max=10.0)   # clamp max 10x thay vì 50x
+    weights = torch.clamp(weights, min=0.1, max=clamp_max)
     weights = weights / weights.mean()
     return weights
 
 
-def preset_weights() -> torch.Tensor:
+def preset_weights():
     w = FOGGY_WEIGHTS_PRESET
     return w / w.mean()
 
 
-def print_table(weights: torch.Tensor, title: str):
+def print_table(weights, title):
     print(f"\n  {'='*60}")
     print(f"  {title}")
     print(f"  {'='*60}")
@@ -191,11 +171,11 @@ if __name__ == '__main__':
     print_table(official, "Official GCNet-S (Clear Cityscapes) — reference")
 
     if SCAN_MODE:
-        weights = scan_weights(TRAIN_TXT, METHOD, WORKERS, LABEL_FORMAT)
-        title   = f"Scanned from Foggy data ({METHOD}, {LABEL_FORMAT})"
+        weights = scan_weights(TRAIN_TXT, METHOD, WORKERS, LABEL_FORMAT, CLAMP_MAX)
+        title   = f"Scanned ({METHOD}, {LABEL_FORMAT}, clamp={CLAMP_MAX})"
     else:
         weights = preset_weights()
-        title   = "Foggy-aware preset (boosted stuck classes)"
+        title   = "Foggy-aware preset"
 
     print_table(weights, title)
 
@@ -211,4 +191,5 @@ if __name__ == '__main__':
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(weights, out_path)
     print(f"\n  ✅ Saved → {out_path}")
-    print(f"     Usage: --class_weights_file {out_path}\n")
+    print(f"     ratio={weights.max()/weights.min():.2f}x  "
+          f"(target: 1.5-4.0x)\n")
