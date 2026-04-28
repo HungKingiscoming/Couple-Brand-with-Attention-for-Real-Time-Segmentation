@@ -1,11 +1,18 @@
 """
 make_foggy_weights.py
 ─────────────────────
-Chạy trực tiếp — không cần argument:
+Tạo class weights từ Foggy Cityscapes training set thực tế.
 
+Có 2 chế độ — chỉnh CONFIG bên dưới rồi chạy:
     python make_foggy_weights.py
 
-Cấu hình ở phần CONFIG bên dưới.
+SCAN_MODE = True  → scan label files thực (~90s cho 8925 files)
+SCAN_MODE = False → dùng preset đã tính sẵn (~1 giây)
+
+FIX: hỗ trợ cả hai loại label file:
+  - labelTrainIds: pixel values 0-18 (+ 255 ignore) — phổ biến hơn
+  - labelIds:      pixel values gốc 7,8,11... — cần remap
+Tự detect qua LABEL_FORMAT config.
 """
 import os
 import time
@@ -19,11 +26,15 @@ from tqdm import tqdm
 # ★ CONFIG — chỉnh ở đây ★
 # ============================================================
 
-SCAN_MODE  = True    # True = scan data thực | False = dùng preset
-TRAIN_TXT  = '/kaggle/working/train.txt'
-METHOD     = 'median_freq'   # 'median_freq' hoặc 'inverse_freq'
-WORKERS    = 0               # 0 = auto (min(cpu_count, 8))
-OUTPUT     = '/kaggle/working/class_weights_foggy.pt'
+SCAN_MODE    = True
+TRAIN_TXT    = '/kaggle/working/train.txt'
+METHOD       = 'median_freq'    # 'median_freq' hoặc 'inverse_freq'
+WORKERS      = 0                # 0 = auto (min(cpu_count, 8))
+OUTPUT       = '/kaggle/working/class_weights_foggy.pt'
+
+# 'train_id' : label files chứa pixel 0-18 + 255 (labelTrainIds) ← kaggle thường dùng
+# 'label_id' : label files chứa pixel gốc 7,8,11... (labelIds)
+LABEL_FORMAT = 'train_id'
 
 # ============================================================
 
@@ -33,6 +44,7 @@ CLASSES = [
     'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
 ]
 
+# remap cho labelIds format (không dùng nếu LABEL_FORMAT='train_id')
 _ID_TO_TRAINID = {
     7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
     21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
@@ -69,7 +81,21 @@ FOGGY_WEIGHTS_PRESET = torch.tensor([
 # WORKER — module-level để multiprocessing pickle được
 # ============================================================
 
-def _count_one(label_path: str) -> np.ndarray:
+def _count_train_id(label_path: str) -> np.ndarray:
+    """
+    Cho labelTrainIds: pixel values đã là 0-18, 255=ignore.
+    Không cần remap — đọc thẳng và bincount.
+    """
+    from PIL import Image
+    raw   = np.array(Image.open(label_path), dtype=np.uint8).ravel()
+    valid = raw[raw < 19]                          # loại 255 (ignore)
+    return np.bincount(valid, minlength=19).astype(np.int64)
+
+
+def _count_label_id(label_path: str) -> np.ndarray:
+    """
+    Cho labelIds: pixel values gốc (7,8,11...) → remap về train_id trước.
+    """
     from PIL import Image
     raw    = np.array(Image.open(label_path), dtype=np.uint8)
     mapped = _LABEL_MAP[raw].ravel()
@@ -81,7 +107,8 @@ def _count_one(label_path: str) -> np.ndarray:
 # CORE
 # ============================================================
 
-def scan_weights(train_txt: str, method: str, workers: int) -> torch.Tensor:
+def scan_weights(train_txt: str, method: str, workers: int,
+                 label_format: str) -> torch.Tensor:
     label_paths = []
     with open(train_txt, 'r') as f:
         for line in f:
@@ -94,13 +121,17 @@ def scan_weights(train_txt: str, method: str, workers: int) -> torch.Tensor:
     if workers <= 0:
         workers = min(os.cpu_count() or 4, 8)
 
+    worker_fn = _count_train_id if label_format == 'train_id' else _count_label_id
     print(f"  Files: {n:,}  |  workers: {workers}  |  method: {method}")
+    print(f"  Label format: {label_format}  "
+          f"({'pixel 0-18 direct' if label_format == 'train_id' else 'orig labelIds → remap'})")
+
     t0        = time.time()
     chunksize = max(1, n // (workers * 4))
 
     with Pool(processes=workers) as pool:
         results = list(tqdm(
-            pool.imap(_count_one, label_paths, chunksize=chunksize),
+            pool.imap(worker_fn, label_paths, chunksize=chunksize),
             total=n, desc="  Scanning", unit="file", ncols=80,
         ))
 
@@ -122,8 +153,9 @@ def scan_weights(train_txt: str, method: str, workers: int) -> torch.Tensor:
         raw_w = 1.0 / (freq + 1e-10)
 
     weights = torch.tensor(raw_w, dtype=torch.float32)
-    weights = torch.clamp(weights, min=0.1, max=50.0)
-    return weights / weights.mean()
+    weights = torch.clamp(weights, min=0.1, max=10.0)   # clamp max 10x thay vì 50x
+    weights = weights / weights.mean()
+    return weights
 
 
 def preset_weights() -> torch.Tensor:
@@ -132,18 +164,18 @@ def preset_weights() -> torch.Tensor:
 
 
 def print_table(weights: torch.Tensor, title: str):
-    print(f"\n  {'='*58}")
+    print(f"\n  {'='*60}")
     print(f"  {title}")
-    print(f"  {'='*58}")
+    print(f"  {'='*60}")
     print(f"  {'Class':<16} {'Weight':>8}  Bar")
-    print(f"  {'-'*56}")
+    print(f"  {'-'*58}")
     for cls, w in zip(CLASSES, weights):
         bar  = '█' * int(w.item() * 12)
         mark = ' ← boosted' if w.item() > 1.15 else ''
         print(f"  {cls:<16} {w.item():>8.4f}  {bar}{mark}")
     print(f"\n  min={weights.min():.4f}  max={weights.max():.4f}  "
           f"mean={weights.mean():.4f}  ratio={weights.max()/weights.min():.2f}x")
-    print(f"  {'='*58}\n")
+    print(f"  {'='*60}\n")
 
 
 # ============================================================
@@ -159,8 +191,8 @@ if __name__ == '__main__':
     print_table(official, "Official GCNet-S (Clear Cityscapes) — reference")
 
     if SCAN_MODE:
-        weights = scan_weights(TRAIN_TXT, METHOD, WORKERS)
-        title   = f"Scanned from Foggy data ({METHOD})"
+        weights = scan_weights(TRAIN_TXT, METHOD, WORKERS, LABEL_FORMAT)
+        title   = f"Scanned from Foggy data ({METHOD}, {LABEL_FORMAT})"
     else:
         weights = preset_weights()
         title   = "Foggy-aware preset (boosted stuck classes)"
