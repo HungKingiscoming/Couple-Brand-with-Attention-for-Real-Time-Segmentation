@@ -48,17 +48,34 @@ def _fuse_conv_bn(conv: nn.Conv2d, bn: nn.BatchNorm2d) -> nn.Conv2d:
 
 
 def fuse_conv_bn(module: nn.Module) -> nn.Module:
-    """Duyệt toàn bộ module tree, fuse mọi cặp Conv→BN liền kề."""
-    prev_name, prev_mod = None, None
-    for name, mod in list(module.named_children()):
-        if isinstance(mod, (nn.BatchNorm2d, nn.SyncBatchNorm)) \
-                and isinstance(prev_mod, nn.Conv2d):
-            module._modules[prev_name] = _fuse_conv_bn(prev_mod, mod)
-            module._modules[name]      = nn.Identity()
-            prev_name, prev_mod = None, None
+    """
+    Fuse mọi cặp Conv→BN liền kề trong cùng một container.
+
+    FIX: bản cũ track prev_mod across named_children() rồi recurse vào child —
+    nếu child cuối của iteration i là Conv và child đầu của iteration i+1 là BN
+    (thuộc subtree khác) thì bị fuse nhầm → shape mismatch.
+
+    Bản mới: chỉ fuse khi cả hai là DIRECT children của cùng module
+    (Sequential, ModuleList, etc.) — recurse vào subtree TRƯỚC khi check fuse.
+    """
+    # Recurse vào tất cả children trước
+    for child in module.children():
+        fuse_conv_bn(child)
+
+    # Sau khi đã recurse xong, fuse các cặp Conv→BN là direct children
+    children = list(module.named_children())
+    i = 0
+    while i < len(children) - 1:
+        name_a, mod_a = children[i]
+        name_b, mod_b = children[i + 1]
+        if isinstance(mod_a, nn.Conv2d) and \
+                isinstance(mod_b, (nn.BatchNorm2d, nn.SyncBatchNorm)) and \
+                mod_a.out_channels == mod_b.num_features:
+            module._modules[name_a] = _fuse_conv_bn(mod_a, mod_b)
+            module._modules[name_b] = nn.Identity()
+            i += 2   # skip cả hai
         else:
-            fuse_conv_bn(mod)
-            prev_name, prev_mod = name, mod
+            i += 1
     return module
 
 
