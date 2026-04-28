@@ -310,16 +310,11 @@ def build_model(variant, ckpt_path, device):
 # FREEZE STRATEGY
 # ============================================================
 
-def freeze_for_finetune(model, variant='fan_dwsa'):
+def freeze_for_finetune(model, variant='fan_dwsa', unfreeze_detail=False):
     """
     Freeze backbone hoàn toàn trừ DWSA và FAN alpha.
-    Chỉ train: head (full) + DWSA gammas + FAN alpha.
-
-    Lý do:
-      - Backbone đã converge tốt (mIoU 0.678) → không cần thay đổi features
-      - Head là nơi quyết định boundary → train full head
-      - DWSA có thể fine-adjust global context → giữ trainable
-      - Tránh catastrophic forgetting với LR thấp
+    unfreeze_detail=True: thêm detail_branch_layers[0,1] và compression layers
+    → cho phép model học boundary tốt hơn cho small objects.
     """
     # Freeze toàn bộ
     for p in model.backbone.parameters():
@@ -346,6 +341,39 @@ def freeze_for_finetune(model, variant='fan_dwsa'):
                 p.requires_grad = True
                 fan_params += p.numel()
 
+    # Unfreeze detail branch (small object boundaries)
+    detail_params = 0
+    if unfreeze_detail:
+        # detail_branch_layers[0,1]: 1/8 resolution, quyết định boundary
+        # compression_1, down_1, compression_2, down_2: bilateral fusion
+        detail_modules = [
+            'detail_branch_layers',
+            'compression_1', 'down_1',
+            'compression_2', 'down_2',
+        ]
+        for mname in detail_modules:
+            mod = getattr(model.backbone, mname, None)
+            if mod is None:
+                continue
+            # Chỉ unfreeze stage 0,1 của detail_branch (không phải stage 2)
+            if mname == 'detail_branch_layers':
+                for idx in [0, 1]:
+                    for p in mod[idx].parameters():
+                        p.requires_grad = True
+                        detail_params += p.numel()
+                    for m in mod[idx].modules():
+                        if isinstance(m, nn.BatchNorm2d):
+                            m.train()
+                            m.weight.requires_grad = True
+                            m.bias.requires_grad   = True
+            else:
+                for p in mod.parameters():
+                    p.requires_grad = True
+                    detail_params += p.numel()
+                for m in mod.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.train()
+
     # Head: full trainable
     head_params = sum(p.numel() for p in model.decode_head.parameters())
     for p in model.decode_head.parameters():
@@ -356,9 +384,11 @@ def freeze_for_finetune(model, variant='fan_dwsa'):
 
     total_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"  Trainable: {total_train:,} params")
-    print(f"    Head:  {head_params:,}")
-    print(f"    DWSA:  {dwsa_params:,}")
-    print(f"    FAN α: {fan_params:,}")
+    print(f"    Head:          {head_params:,}")
+    print(f"    DWSA:          {dwsa_params:,}")
+    print(f"    FAN α:         {fan_params:,}")
+    if unfreeze_detail:
+        print(f"    Detail branch: {detail_params:,}  ← unfrozen for boundary")
 
 
 # ============================================================
@@ -567,8 +597,8 @@ def main():
     parser.add_argument('--dice_loss_w',     type=float, default=0.3,
                         help='Scalar weight của soft dice loss')
     parser.add_argument('--ohem_thresh',     type=float, default=0.9)
-    parser.add_argument('--class_weights_file', type=str, default=None,
-                        help='Path to .pt file chứa class weights')
+    parser.add_argument('--unfreeze_detail', action='store_true', default=False,
+                        help='Unfreeze detail branch để cải thiện boundary small objects')
     args = parser.parse_args()
 
     device  = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -592,7 +622,8 @@ def main():
     best_miou = float(recorded_miou) if recorded_miou != '?' else 0.0
 
     print("\nFreezing backbone (keep head + DWSA + FAN trainable):")
-    freeze_for_finetune(model, args.model_variant)
+    freeze_for_finetune(model, args.model_variant,
+                        unfreeze_detail=args.unfreeze_detail)
 
     # ---- Class weights ----
     class_weights = None
