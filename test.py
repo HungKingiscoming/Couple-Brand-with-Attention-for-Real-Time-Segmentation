@@ -128,8 +128,9 @@ def build_model(variant: str, ckpt_path: str, device: torch.device,
 
     if deploy:
         model.backbone.switch_to_deploy()
-        fuse_conv_bn(model)
-        print(f"  deploy + fuse_conv_bn applied")
+        print(f"  switch_to_deploy applied (reparam branches fused)")
+
+    model = model.to(device).eval()
 
     model = model.to(device).eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
