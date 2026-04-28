@@ -33,11 +33,11 @@ class CityscapesDataset(Dataset):
         dataset_type: str = 'normal'
     ):
         super().__init__()
-        self.txt_file    = txt_file
-        self.img_size    = img_size
-        self.mean        = mean
-        self.std         = std
-        self.ignore_index = ignore_index
+        self.txt_file      = txt_file
+        self.img_size      = img_size
+        self.mean          = mean
+        self.std           = std
+        self.ignore_index  = ignore_index
         self.label_mapping = label_mapping
         self.dataset_type  = dataset_type
 
@@ -121,16 +121,20 @@ def get_train_transforms(
 ) -> A.Compose:
 
     # ===== GEOMETRIC (CORE) =====
-    # FIX: scale_limit tuple để giới hạn lower bound ở 0.75
-    # Bản gốc scale_limit=0.4 → scale có thể xuống 0.6× → sau PadIfNeeded
-    # phần lớn crop là padding (mask=255) → gradient thưa, OHEM không hiệu quả
+    #
+    # FIX 3: scale_limit lower bound -0.25 → -0.10
+    # Bản gốc: scale xuống 0.75× → small objects (pole, rider, motorcycle)
+    # bị shrink quá mức trước khi vào PadIfNeeded+RandomCrop.
+    # -0.10 giới hạn scale down ở 0.90× — đủ diversity nhưng bảo vệ small objects.
+    # Quan sát từ log: pole=0.476, rider=0.490, motorcycle=0.454 không cải thiện
+    # sau 30 epoch → small object gradient bị mất ở augmentation.
     base_list = [
-        A.RandomScale(scale_limit=(-0.25, 0.5), p=0.9),  # 10% samples giữ nguyên scale
+        A.RandomScale(scale_limit=(-0.10, 0.5), p=0.9),  # FIX 3: -0.25 → -0.10
 
         A.PadIfNeeded(
             min_height=img_size[0],
             min_width=img_size[1],
-            border_mode=cv2.BORDER_CONSTANT,   # FIX: CONSTANT thay REFLECT
+            border_mode=cv2.BORDER_CONSTANT,
             value=0,
             mask_value=255,
             p=1.0
@@ -140,8 +144,6 @@ def get_train_transforms(
 
         A.HorizontalFlip(p=0.5),
 
-        # GridDistortion: tạo biến thể hình học nhẹ
-        # Đặc biệt hiệu quả cho boundary của object nhỏ (rider, motorcycle)
         A.GridDistortion(
             num_steps=5,
             distort_limit=0.1,
@@ -155,9 +157,6 @@ def get_train_transforms(
     # ===== DATASET-SPECIFIC =====
     if dataset_type == 'foggy':
         specific = [
-            # FIX: giảm holes từ 6 xuống 4 và size từ 32 xuống 24
-            # Foggy images đã có nhiều vùng khó (fog-occluded) → dropout quá nhiều
-            # làm giảm useful gradient
             A.CoarseDropout(
                 max_holes=4,
                 max_height=24,
@@ -172,10 +171,39 @@ def get_train_transforms(
                 A.MotionBlur(blur_limit=3, p=1.0),
             ], p=0.15),
 
-            # FIX: thêm CLAHE để augment low-contrast foggy images
-            # CLAHE tăng local contrast → model học được features dù bị fog che
-            # Tăng p 0.2→0.35 và clip_limit range để hiệu quả hơn với foggy
-            A.CLAHE(clip_limit=(1.0, 4.0), tile_grid_size=(8, 8), p=0.35),
+            # FIX 1+2: CLAHE và RandomFog tách thành OneOf để không conflict.
+            #
+            # Bản gốc:
+            #   CLAHE p=0.35  (tăng contrast)
+            #   RandomFog p=0.20  (giảm contrast)
+            #   → 35%×20% = 7% samples nhận cả hai → triệt tiêu nhau
+            #   → chỉ 20% samples có fog augmentation (quá thấp)
+            #
+            # FIX mới (OneOf):
+            #   55% samples nhận MỘT trong hai — không bao giờ cả hai.
+            #   CLAHE: tăng local contrast cho low-visibility samples.
+            #   RandomFog: simulate fog thực với alpha_coef cao hơn (0.08→0.12)
+            #              và fog_coef_upper cao hơn (0.30→0.35) để cover
+            #              Cityscapes Foggy beta=0.02 (heavy fog level).
+            #   p=0.55: từ 20% fog coverage → 55%×(1/2) ≈ 27.5% fog,
+            #           55%×(1/2) ≈ 27.5% CLAHE — balanced và không conflict.
+            #
+            # Lý do tách: trong log val loss không giảm dù train loss giảm đều
+            # (1.31→1.02) — dấu hiệu rõ ràng của train/val distribution gap.
+            # Val set là Foggy Cityscapes thực, train chỉ có 20% fog aug → gap.
+            A.OneOf([
+                A.CLAHE(
+                    clip_limit=(1.0, 3.0),   # giảm upper từ 4.0→3.0 (ít aggressive hơn)
+                    tile_grid_size=(8, 8),
+                    p=1.0
+                ),
+                A.RandomFog(
+                    fog_coef_lower=0.05,
+                    fog_coef_upper=0.35,     # FIX 1: 0.30→0.35 (cover heavy fog)
+                    alpha_coef=0.12,         # FIX 1: 0.08→0.12 (fog dày hơn, realistic hơn)
+                    p=1.0
+                ),
+            ], p=0.55),                      # FIX 1: tổng p tăng từ 0.20→0.55
 
             A.OneOf([
                 A.RandomBrightnessContrast(
@@ -186,25 +214,15 @@ def get_train_transforms(
                 A.RandomGamma(gamma_limit=(90, 110), p=1.0),
             ], p=0.3),
 
-            # FIX: thêm ISONoise — simulates camera noise trong điều kiện sương
-            # Giảm ISONoise: fog + noise cùng lúc confuse model
             A.ISONoise(
                 color_shift=(0.01, 0.02),
                 intensity=(0.02, 0.08),
                 p=0.05
             ),
-
-            # Tăng fog_coef_upper 0.15→0.30: cover fog nặng hơn
-            # Cityscapes Foggy có 3 beta levels, 0.15 chỉ cover beta=0.005
-            A.RandomFog(
-                fog_coef_lower=0.05,
-                fog_coef_upper=0.30,
-                alpha_coef=0.08,
-                p=0.2
-            ),
         ]
 
     else:
+        # Normal Cityscapes — không thay đổi
         specific = [
             A.CoarseDropout(
                 max_holes=8,
@@ -332,14 +350,13 @@ def create_dataloaders(
         drop_last=True,
     )
 
-    # FIX: drop_last=False cho validation — không nên bỏ samples khi tính metrics
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=False,   # FIX: False (bản gốc True làm mất vài samples)
+        drop_last=False,
     )
 
     print(f"\n{'='*60}")
