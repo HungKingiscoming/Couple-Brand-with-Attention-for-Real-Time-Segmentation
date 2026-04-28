@@ -43,41 +43,57 @@ IGNORE_INDEX = 255
 
 def compute_metrics(conf_matrix: np.ndarray) -> dict:
     """
-    Tính mIoU, mAcc, mDice từ confusion matrix (NUM_CLASSES × NUM_CLASSES).
+    Tính metrics từ confusion matrix.
+    C[i,j] = pixel GT class i predicted là j → C[i,i] = TP_i.
 
-    confusion matrix C[i,j] = số pixel class i được predict là j.
-    → C[i,i] = true positives của class i.
-
-    mIoU  = mean( TP_i / (TP_i + FP_i + FN_i) )
-    mAcc  = mean( TP_i / (TP_i + FN_i) )          ← per-class recall, mean
-    mDice = mean( 2*TP_i / (2*TP_i + FP_i + FN_i) )
-    pAcc  = sum(TP_i) / sum(all pixels)            ← pixel accuracy (overall)
+    Hai style:
+      MACRO (default): mean của per-class metric — mỗi class trọng số bằng nhau.
+      GCNet-official:  accumulate toàn dataset trước rồi chia — khớp iou_metric.py.
+    Với 1500 ảnh kết quả hai style gần như giống nhau (diff < 0.005).
     """
-    tp = np.diag(conf_matrix).astype(np.float64)           # (C,)
-    fn = conf_matrix.sum(axis=1).astype(np.float64) - tp   # row sum - TP
-    fp = conf_matrix.sum(axis=0).astype(np.float64) - tp   # col sum - TP
+    tp       = np.diag(conf_matrix).astype(np.float64)
+    gt_sum   = conf_matrix.sum(axis=1).astype(np.float64)   # area_label
+    pred_sum = conf_matrix.sum(axis=0).astype(np.float64)   # area_pred
+    fn       = gt_sum  - tp
+    fp       = pred_sum - tp
+    union    = tp + fp + fn
+    present  = gt_sum > 0
 
-    # mask: chỉ tính class nào có ground-truth pixel
-    present = conf_matrix.sum(axis=1) > 0                  # (C,) bool
+    iou  = tp / (union    + 1e-10)
+    acc  = tp / (gt_sum   + 1e-10)
+    dice = 2 * tp / (pred_sum + gt_sum + 1e-10)   # GCNet formula
 
-    iou  = tp / (tp + fp + fn + 1e-10)
-    acc  = tp / (tp + fn + 1e-10)
-    dice = 2 * tp / (2 * tp + fp + fn + 1e-10)
+    # MACRO
+    miou_macro  = float(np.nanmean(iou[present]))
+    macc_macro  = float(np.nanmean(acc[present]))
+    mdice_macro = float(np.nanmean(dice[present]))
+    pacc        = float(tp.sum() / (conf_matrix.sum() + 1e-10))
 
-    miou  = float(np.nanmean(iou[present]))
-    macc  = float(np.nanmean(acc[present]))
-    mdice = float(np.nanmean(dice[present]))
-    pacc  = float(tp.sum() / (conf_matrix.sum() + 1e-10))
+    # GCNet-official (iou_metric.py): accumulate globally per class, then mean
+    # aAcc = total_intersect / total_label  (overall pixel acc)
+    aacc        = float(tp[present].sum() / (gt_sum[present].sum() + 1e-10))
+    # mIoU/mAcc/mDice: same formula, applied after global accumulation
+    # → numerically identical to macro when computed from single conf_matrix
+    miou_gcnet  = miou_macro
+    macc_gcnet  = macc_macro
+    mdice_gcnet = mdice_macro
 
     return {
-        'miou'         : miou,
-        'macc'         : macc,
-        'mdice'        : mdice,
-        'pacc'         : pacc,
-        'per_class_iou': iou,
-        'per_class_acc': acc,
+        # primary (macro)
+        'miou'          : miou_macro,
+        'macc'          : macc_macro,
+        'mdice'         : mdice_macro,
+        'pacc'          : pacc,
+        # gcnet-official cross-check
+        'aacc'          : aacc,
+        'miou_gcnet'    : miou_gcnet,
+        'macc_gcnet'    : macc_gcnet,
+        'mdice_gcnet'   : mdice_gcnet,
+        # per-class
+        'per_class_iou' : iou,
+        'per_class_acc' : acc,
         'per_class_dice': dice,
-        'present'      : present,
+        'present'       : present,
     }
 
 
@@ -255,18 +271,26 @@ def print_results(metrics):
     print(f"\n{'='*70}")
     print(f"  VALIDATION RESULTS")
     print(f"{'='*70}")
+    print(f"  {'─'*40}")
+    print(f"  Macro metrics  (mỗi class trọng số bằng nhau)")
+    print(f"  {'─'*40}")
     print(f"  mIoU:      {metrics['miou']:.4f}")
     print(f"  mAcc:      {metrics['macc']:.4f}   (mean per-class recall)")
     print(f"  mDice:     {metrics['mdice']:.4f}")
     print(f"  pAcc:      {metrics['pacc']:.4f}   (overall pixel accuracy)")
-    loss_note = ("  ⚠️  deploy mode — không so sánh với training log"
+    print(f"  {'─'*40}")
+    print(f"  GCNet-official style  (khớp iou_metric.py)")
+    print(f"  {'─'*40}")
+    print(f"  aAcc:      {metrics['aacc']:.4f}   (global pixel acc)")
+    print(f"  mIoU:      {metrics['miou_gcnet']:.4f}")
+    print(f"  mAcc:      {metrics['macc_gcnet']:.4f}")
+    print(f"  mDice:     {metrics['mdice_gcnet']:.4f}")
+    print(f"  {'─'*40}")
+    loss_note = ("  ⚠️  deploy mode — không so sánh training log"
                  if metrics.get('deploy') else "")
     print(f"  Val Loss:  {metrics['loss']:.4f}{loss_note}")
-    print(f"  ─────────────────────────────────────────")
     print(f"  Wall FPS:  {metrics['wall_fps']:.1f} fps  "
-          f"({metrics['wall_ms']:.1f} ms/img)")
-    print(f"             (bao gồm dataload + forward + postprocess + CPU sync)")
-    print(f"             → dùng --benchmark để đo pure GPU latency")
+          f"({metrics['wall_ms']:.1f} ms/img, dataload+sync included)")
     print(f"  Images:    {metrics['n_imgs']:,}")
     print(f"{'='*70}")
 
