@@ -259,9 +259,10 @@ class Segmentor(nn.Module):
         return self.decode_head(feat)
 
     def forward_train(self, x):
-        feat   = self.backbone(x)
-        logits = self.decode_head(feat)
-        return logits   # (c4_logit, c6_logit) tuple
+        # Backbone ở training mode trả về (c4_feat, fused)
+        feats  = self.backbone(x)           # (c4_feat, c6_feat) tuple
+        logits = self.decode_head(feats)    # (c4_logit, c6_logit) tuple
+        return logits
 
 
 def build_model(variant, ckpt_path, device):
@@ -451,7 +452,7 @@ def print_val(m, epoch, best_miou, save_dir):
 def train_epoch(model, loader, optimizer, scheduler,
                 ohem_loss, boundary_loss, dice_loss,
                 aux_weight, device, use_amp, scaler,
-                accumulation_steps, epoch):
+                accumulation_steps, epoch, args_epochs):
     model.train()
     # Giữ backbone BN ở eval (đã freeze)
     for m in model.backbone.modules():
@@ -493,7 +494,7 @@ def train_epoch(model, loader, optimizer, scheduler,
             if c4_logit is not None and aux_weight > 0:
                 c4_full = F.interpolate(c4_logit, size=masks.shape[-2:],
                                         mode='bilinear', align_corners=False)
-                aux_decay = aux_weight * (1 - epoch / 15) ** 0.9
+                aux_decay = aux_weight * (1 - epoch / max(args_epochs, 1)) ** 0.9
                 loss = loss + aux_decay * ohem_loss(c4_full, masks)
 
             loss = loss / accumulation_steps
@@ -658,7 +659,7 @@ def main():
         train_ds, batch_size=args.batch_size, shuffle=True,
         num_workers=args.num_workers, pin_memory=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(
-        val_ds, batch_size=args.batch_size * 2, shuffle=False,
+        val_ds, batch_size=args.batch_size, shuffle=False,  # same batch, avoid OOM
         num_workers=args.num_workers, pin_memory=True, drop_last=False)
 
     print(f"\n  Train: {len(train_ds):,} | Val: {len(val_ds):,}")
@@ -672,7 +673,7 @@ def main():
             model, train_loader, optimizer, scheduler,
             ohem_loss, boundary_loss, dice_loss,
             args.aux_weight, device, use_amp, scaler,
-            args.accumulation, epoch)
+            args.accumulation, epoch, args.epochs)
 
         print(f"\n  Train — OHEM: {train_metrics['ohem']:.4f} | "
               f"Boundary: {train_metrics['bnd']:.4f} | "
