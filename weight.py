@@ -5,21 +5,30 @@ Tạo class weights từ Foggy Cityscapes training set thực tế.
 
 Có 2 chế độ:
   1. SCAN MODE  (--scan):   scan toàn bộ label files → weights chính xác nhất
-  2. PRESET MODE (default): dùng weights được tính sẵn từ Foggy Cityscapes
-                            (nhanh, không cần data path)
+                            Tối ưu: vectorized numpy + multiprocessing
+  2. PRESET MODE (default): dùng weights được tính sẵn (không cần data)
 
 Chạy trên Kaggle:
-    # Preset (nhanh):
+    # Preset (nhanh, ~1 giây):
     python make_foggy_weights.py --output /kaggle/working/class_weights_foggy.pt
 
-    # Scan từ data thực (chính xác hơn):
-    python make_foggy_weights.py --scan --train_txt /kaggle/working/train.txt \
-                                 --output /kaggle/working/class_weights_foggy.pt
+    # Scan tối ưu (~1-2 phút cho 8925 files, tự detect CPU cores):
+    python make_foggy_weights.py --scan \
+        --train_txt /kaggle/working/train.txt \
+        --output /kaggle/working/class_weights_foggy.pt
+
+    # Scan với số workers cụ thể:
+    python make_foggy_weights.py --scan --workers 8 \
+        --train_txt /kaggle/working/train.txt \
+        --output /kaggle/working/class_weights_foggy.pt
 """
 import argparse
+import os
+import time
 import torch
 import numpy as np
 from pathlib import Path
+
 
 CLASSES = [
     'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
@@ -27,160 +36,201 @@ CLASSES = [
     'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
 ]
 
+# label_map: orig pixel value → train_id (255 = ignore)
+_ID_TO_TRAINID = {
+    7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
+    21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
+    28: 15, 31: 16, 32: 17, 33: 18,
+}
+_LABEL_MAP = np.full(256, 255, dtype=np.uint8)
+for _k, _v in _ID_TO_TRAINID.items():
+    _LABEL_MAP[_k] = _v
+
+
 # ============================================================
-# PRESET: Foggy-aware weights
+# PRESET
 # ============================================================
-# Dựa trên phân tích từ training log:
-#   - Stuck classes (IoU < 0.50): pole(5), fence(4), rider(12), motorcycle(17)
-#   - Clear classes (IoU > 0.85): road(0), building(2), vegetation(8), sky(10), car(13)
-#
-# Strategy:
-#   1. Boost stuck small-object classes thêm ~15-30% so với official weights
-#   2. Giữ nguyên hoặc giảm nhẹ easy classes để tổng budget không thay đổi
-#   3. Ratio max/min ~ 1.7x (từ 1.38x) — đủ để tạo bias mà không destabilize
-#
-# Index:  road  side  bldg  wall  fence pole  tl    ts    veg   terr
-#         0     1     2     3     4     5     6     7     8     9
-# Index:  sky   pers  rider car   truck bus   train moto  bike
-#         10    11    12    13    14    15    16    17    18
+
 FOGGY_WEIGHTS_PRESET = torch.tensor([
-    0.837,  # 0  road        — easy, giữ nguyên
-    0.918,  # 1  sidewalk    — giữ nguyên
-    0.866,  # 2  building    — easy, giữ nguyên
-    1.050,  # 3  wall        — tăng nhẹ từ 1.035 (IoU 0.547, trung bình)
-    1.150,  # 4  fence       — tăng từ 1.017 (IoU 0.488, stuck)
-    1.250,  # 5  pole        — tăng mạnh từ 0.997 (IoU 0.476, stuck + thin object)
-    0.975,  # 6  traffic_light — giữ nguyên
-    1.049,  # 7  traffic_sign  — giữ nguyên
-    0.879,  # 8  vegetation  — easy, giữ nguyên
-    1.002,  # 9  terrain     — giữ nguyên
-    0.954,  # 10 sky         — easy, giữ nguyên
-    1.100,  # 11 person      — tăng nhẹ từ 0.984 (IoU 0.689, cần cải thiện)
-    1.300,  # 12 rider       — tăng mạnh từ 1.112 (IoU 0.490, stuck + fog-occluded)
-    0.904,  # 13 car         — easy, giữ nguyên
-    1.087,  # 14 truck       — giữ nguyên (IoU dao động 0.57-0.61)
-    1.096,  # 15 bus         — giữ nguyên (IoU ổn 0.74-0.76)
-    1.087,  # 16 train       — giữ nguyên (IoU ổn 0.69-0.70)
-    1.400,  # 17 motorcycle  — boost mạnh nhất từ 1.153 (IoU 0.452, stuck nhất)
-    1.051,  # 18 bicycle     — giữ nguyên (IoU ổn 0.636)
+    0.837,  # 0  road
+    0.918,  # 1  sidewalk
+    0.866,  # 2  building
+    1.050,  # 3  wall
+    1.150,  # 4  fence       — stuck IoU 0.488
+    1.250,  # 5  pole        — stuck IoU 0.476
+    0.975,  # 6  traffic_light
+    1.049,  # 7  traffic_sign
+    0.879,  # 8  vegetation
+    1.002,  # 9  terrain
+    0.954,  # 10 sky
+    1.100,  # 11 person
+    1.300,  # 12 rider       — stuck IoU 0.490
+    0.904,  # 13 car
+    1.087,  # 14 truck
+    1.096,  # 15 bus
+    1.087,  # 16 train
+    1.400,  # 17 motorcycle  — stuck IoU 0.452
+    1.051,  # 18 bicycle
 ], dtype=torch.float32)
 
 
-def normalize_weights(weights: torch.Tensor, n_classes: int = 19) -> torch.Tensor:
-    """Normalize về mean=1.0 (tổng = n_classes)."""
-    return weights / weights.mean()
+# ============================================================
+# FAST SCAN — worker function (module-level để pickle được)
+# ============================================================
 
-
-def compute_weights_from_scan(train_txt: str, method: str = 'median_freq') -> torch.Tensor:
+def _count_one(label_path: str) -> np.ndarray:
     """
-    Scan toàn bộ label files trong train_txt để tính class weights.
+    Đọc một label file và trả về histogram 19 classes.
 
-    Args:
-        train_txt: Path đến file txt chứa 'img_path,label_path' mỗi dòng.
-        method: 'median_freq' hoặc 'inverse_freq'
-
-    Returns:
-        Tensor weights shape (19,), normalized về mean=1.0.
+    Tối ưu so với bản gốc:
+      Bản gốc: for c in range(19): (label==c).sum()  → 19 full-array pass
+      Bản mới: np.bincount(mapped_and_valid)          → 1 pass, ~19x nhanh hơn
     """
     from PIL import Image
+    raw    = np.array(Image.open(label_path), dtype=np.uint8)  # (H, W)
+    mapped = _LABEL_MAP[raw].ravel()                            # vectorized remap
+    valid  = mapped[mapped < 19]                                # loại ignore=255
+    counts = np.bincount(valid, minlength=19)                   # 1-pass histogram
+    return counts.astype(np.int64)
+
+
+def compute_weights_from_scan(
+    train_txt: str,
+    method: str = 'median_freq',
+    workers: int = 0,
+) -> torch.Tensor:
+    """
+    Scan label files song song, tính class weights.
+
+    Speedup so với bản gốc:
+      - Per-file: 19 array passes → 1 bincount pass (~19x)
+      - Tổng hợp: multiprocessing Pool thay vì sequential loop
+      - Expected: ~1-2 phút cho 8925 files (từ ~15-20 phút sequential)
+
+    Args:
+        train_txt: Path txt chứa 'img_path,label_path' mỗi dòng.
+        method:    'median_freq' hoặc 'inverse_freq'.
+        workers:   Số processes. 0 = auto (min(cpu_count, 8)).
+
+    Returns:
+        Tensor weights (19,), normalized mean=1.0.
+    """
+    from multiprocessing import Pool
     from tqdm import tqdm
 
-    ID_TO_TRAINID = {
-        7: 0, 8: 1, 11: 2, 12: 3, 13: 4, 17: 5, 19: 6, 20: 7,
-        21: 8, 22: 9, 23: 10, 24: 11, 25: 12, 26: 13, 27: 14,
-        28: 15, 31: 16, 32: 17, 33: 18,
-    }
-    label_map = np.ones(256, dtype=np.uint8) * 255
-    for orig_id, train_id in ID_TO_TRAINID.items():
-        label_map[orig_id] = train_id
-
-    samples = []
+    # đọc paths
+    label_paths = []
     with open(train_txt, 'r') as f:
         for line in f:
             line = line.strip()
             if line:
-                _, label_path = line.split(',')
-                samples.append(label_path)
+                _, lp = line.split(',')
+                label_paths.append(lp)
 
-    print(f"Scanning {len(samples)} label files...")
-    class_counts = np.zeros(19, dtype=np.int64)
-    total_pixels = 0
+    n = len(label_paths)
+    if workers <= 0:
+        workers = min(os.cpu_count() or 4, 8)
 
-    for label_path in tqdm(samples, desc="Counting pixels"):
-        label = label_map[np.array(Image.open(label_path), dtype=np.uint8)]
-        for c in range(19):
-            class_counts[c] += (label == c).sum()
-        total_pixels += label.size
+    print(f"  Files: {n:,}  |  workers: {workers}  |  method: {method}")
+    t0 = time.time()
 
-    freq = class_counts / max(total_pixels, 1)
-    print(f"\n{'Class':<16} {'Pixels':>15} {'Freq%':>8}")
-    print("-" * 42)
-    for c, (cls, cnt, fr) in enumerate(zip(CLASSES, class_counts, freq)):
-        print(f"  {cls:<14} {cnt:>15,} {fr*100:>7.3f}%")
+    chunksize = max(1, n // (workers * 4))
+    with Pool(processes=workers) as pool:
+        results = list(tqdm(
+            pool.imap(_count_one, label_paths, chunksize=chunksize),
+            total=n,
+            desc="  Scanning",
+            unit="file",
+            ncols=80,
+        ))
 
+    class_counts = np.sum(results, axis=0)   # (19,)
+    total_valid  = class_counts.sum()
+    elapsed      = time.time() - t0
+
+    print(f"  Finished in {elapsed:.1f}s  ({n/elapsed:.0f} files/sec)\n")
+    freq = class_counts / max(total_valid, 1)
+
+    print(f"  {'Class':<16} {'Pixels':>15} {'Freq%':>8}")
+    print(f"  {'-'*42}")
+    for cls, cnt, fr in zip(CLASSES, class_counts, freq):
+        print(f"  {cls:<16} {cnt:>15,} {fr*100:>7.3f}%")
+
+    # compute weights
     if method == 'median_freq':
-        # Median frequency balancing: w_c = median(freq) / freq_c
         median_f = np.median(freq[freq > 0])
-        raw_w = median_f / (freq + 1e-10)
+        raw_w    = median_f / (freq + 1e-10)
     else:
-        # Inverse frequency
         raw_w = 1.0 / (freq + 1e-10)
 
     weights = torch.tensor(raw_w, dtype=torch.float32)
     weights = torch.clamp(weights, min=0.1, max=50.0)
-    weights = normalize_weights(weights)
+    weights = weights / weights.mean()
     return weights
 
 
-def print_weight_table(weights: torch.Tensor, title: str = "Class Weights"):
-    print(f"\n{'='*60}")
-    print(f"  {title}")
-    print(f"{'='*60}")
-    print(f"  {'Class':<16} {'Weight':>8}  {'Bar'}")
-    print(f"  {'-'*50}")
-    for cls, w in zip(CLASSES, weights):
-        bar   = '█' * int(w.item() * 12)
-        mark  = ' ← boosted' if w.item() > 1.15 else ''
-        print(f"  {cls:<16} {w.item():>8.4f}  {bar}{mark}")
-    print(f"\n  min={weights.min():.4f}  max={weights.max():.4f}")
-    print(f"  mean={weights.mean():.4f}  ratio={weights.max()/weights.min():.2f}x")
-    print(f"{'='*60}\n")
+# ============================================================
+# UTILS
+# ============================================================
 
+def normalize_weights(w: torch.Tensor) -> torch.Tensor:
+    return w / w.mean()
+
+
+def print_weight_table(weights: torch.Tensor, title: str = "Class Weights"):
+    print(f"\n  {'='*58}")
+    print(f"  {title}")
+    print(f"  {'='*58}")
+    print(f"  {'Class':<16} {'Weight':>8}  Bar")
+    print(f"  {'-'*56}")
+    for cls, w in zip(CLASSES, weights):
+        bar  = '█' * int(w.item() * 12)
+        mark = ' ← boosted' if w.item() > 1.15 else ''
+        print(f"  {cls:<16} {w.item():>8.4f}  {bar}{mark}")
+    print(f"\n  min={weights.min():.4f}  max={weights.max():.4f}  "
+          f"mean={weights.mean():.4f}  ratio={weights.max()/weights.min():.2f}x")
+    print(f"  {'='*58}\n")
+
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Generate foggy-aware class weights for Cityscapes")
     parser.add_argument('--scan',      action='store_true',
-                        help='Scan actual label files (accurate but slow)')
+                        help='Scan actual label files (~1-2 min, most accurate)')
     parser.add_argument('--train_txt', type=str, default=None,
                         help='Path to train.txt (required if --scan)')
     parser.add_argument('--method',    type=str, default='median_freq',
-                        choices=['median_freq', 'inverse_freq'],
-                        help='Weight computation method when --scan is used')
+                        choices=['median_freq', 'inverse_freq'])
+    parser.add_argument('--workers',   type=int, default=0,
+                        help='Parallel workers for scan (0 = auto-detect)')
     parser.add_argument('--output',    type=str,
                         default='/kaggle/working/class_weights_foggy.pt')
     args = parser.parse_args()
 
-    # --- Compare with official weights ---
     official = torch.tensor([
         0.8373, 0.918,  0.866,  1.0345, 1.0166, 0.9969, 0.9754, 1.0489,
         0.8786, 1.0023, 0.9539, 0.9843, 1.1116, 0.9037, 1.0865, 1.0955,
         1.0865, 1.1529, 1.0507,
     ], dtype=torch.float32)
-    print_weight_table(official, "Official GCNet-S weights (Clear Cityscapes)")
+    print_weight_table(official, "Official GCNet-S (Clear Cityscapes) — reference")
 
     if args.scan:
         if args.train_txt is None:
             raise ValueError("--train_txt is required when using --scan")
-        weights = compute_weights_from_scan(args.train_txt, method=args.method)
-        title = f"Computed from Foggy scan ({args.method})"
+        weights = compute_weights_from_scan(
+            args.train_txt, method=args.method, workers=args.workers)
+        title = f"Scanned from Foggy data ({args.method})"
     else:
         weights = normalize_weights(FOGGY_WEIGHTS_PRESET)
         title = "Foggy-aware preset (boosted stuck classes)"
 
     print_weight_table(weights, title)
 
-    # Delta vs official
-    print("  Delta vs official weights:")
+    print(f"  Delta vs official:")
     print(f"  {'Class':<16} {'Official':>9} {'New':>9} {'Delta':>9}")
     print(f"  {'-'*46}")
     for cls, ow, nw in zip(CLASSES, official, weights):
@@ -191,8 +241,8 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(weights, out_path)
-    print(f"\n✅ Saved → {out_path}")
-    print(f"   Usage: --class_weights_file {out_path}\n")
+    print(f"\n  ✅ Saved → {out_path}")
+    print(f"     Usage: --class_weights_file {out_path}\n")
 
 
 if __name__ == '__main__':
