@@ -597,6 +597,8 @@ def main():
     parser.add_argument('--dice_loss_w',     type=float, default=0.3,
                         help='Scalar weight của soft dice loss')
     parser.add_argument('--ohem_thresh',     type=float, default=0.9)
+    parser.add_argument('--class_weights_file', type=str, default=None,
+                        help='Path to .pt file chứa class weights')
     parser.add_argument('--unfreeze_detail', action='store_true', default=False,
                         help='Unfreeze detail branch để cải thiện boundary small objects')
     args = parser.parse_args()
