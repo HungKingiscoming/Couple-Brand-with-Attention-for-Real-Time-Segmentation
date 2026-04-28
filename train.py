@@ -683,7 +683,18 @@ def check_spp_bn_health(model, epoch: int):
         print(f"\n  ⚠️  SPP BN HEALTH WARNING (epoch {epoch+1}):")
         for iss in issues:
             print(f"    {iss}")
-        print(f"    → Recommend: add --freeze_spp_bn to next run\n")
+        print(f"    → Auto-resetting corrupted BN running stats...")
+        # Reset running stats về giá trị an toàn thay vì để inf lan truyền
+        for name, m in spp.named_modules():
+            if isinstance(m, nn.BatchNorm2d):
+                if (m.running_var is not None and
+                        (torch.isnan(m.running_var).any() or
+                         torch.isinf(m.running_var).any() or
+                         m.running_var.min().item() < 1e-6)):
+                    m.running_mean.zero_()
+                    m.running_var.fill_(1.0)
+                    print(f"    Reset: spp.{name}")
+        print(f"    → Also recommend: add --freeze_spp_bn to next run\n")
     else:
         if epoch % 5 == 0:
             print(f"  ✅ SPP BN health OK (epoch {epoch+1})")
@@ -942,6 +953,13 @@ class Trainer:
             spp = getattr(self.model.backbone, "spp", None)
             if spp is not None:
                 for m in spp.modules():
+                    if isinstance(m, nn.BatchNorm2d):
+                        m.eval()
+        if getattr(self.args, "freeze_stem_conv", False):
+        for stem_name in ["stem_stage2", "stem_stage3"]:
+            module = getattr(self.model.backbone, stem_name, None)
+            if module is not None:
+                for m in module.modules():
                     if isinstance(m, nn.BatchNorm2d):
                         m.eval()
 
@@ -1391,6 +1409,7 @@ def main():
 
     if getattr(args, "freeze_stem_conv", False):
         frozen_stem = 0
+        # stem_conv1/2: chỉ freeze conv weight, giữ FAN trainable
         for stem_name in ["stem_conv1", "stem_conv2"]:
             module = getattr(model.backbone, stem_name, None)
             if module is None: continue
@@ -1398,7 +1417,17 @@ def main():
                 is_fan = any(k in pname for k in ("alpha", "bn.", "in_."))
                 if not is_fan:
                     param.requires_grad = False; frozen_stem += param.numel()
-        print(f"Stem conv frozen: {frozen_stem:,} params (FoggyAwareNorm still trainable)")
+        # stem_stage2/3: freeze toàn bộ (không có FAN)
+        for stem_name in ["stem_stage2", "stem_stage3"]:
+            module = getattr(model.backbone, stem_name, None)
+            if module is None: continue
+            for param in module.parameters():
+                param.requires_grad = False; frozen_stem += param.numel()
+            # Lock BN running stats
+            for m in module.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
+        print(f"Stem frozen: {frozen_stem:,} params (stem_conv1/2/stage2/3, FAN still trainable)")
         optimizer = build_optimizer(model, args)
         scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=trainer.start_epoch)
         trainer.optimizer = optimizer; trainer.scheduler = scheduler
