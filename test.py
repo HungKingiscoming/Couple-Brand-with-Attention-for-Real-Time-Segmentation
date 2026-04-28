@@ -259,10 +259,14 @@ def print_results(metrics):
     print(f"  mAcc:      {metrics['macc']:.4f}   (mean per-class recall)")
     print(f"  mDice:     {metrics['mdice']:.4f}")
     print(f"  pAcc:      {metrics['pacc']:.4f}   (overall pixel accuracy)")
-    print(f"  Val Loss:  {metrics['loss']:.4f}")
+    loss_note = ("  ⚠️  deploy mode — không so sánh với training log"
+                 if metrics.get('deploy') else "")
+    print(f"  Val Loss:  {metrics['loss']:.4f}{loss_note}")
     print(f"  ─────────────────────────────────────────")
     print(f"  Wall FPS:  {metrics['wall_fps']:.1f} fps  "
-          f"({metrics['wall_ms']:.1f} ms/img, includes dataload)")
+          f"({metrics['wall_ms']:.1f} ms/img)")
+    print(f"             (bao gồm dataload + forward + postprocess + CPU sync)")
+    print(f"             → dùng --benchmark để đo pure GPU latency")
     print(f"  Images:    {metrics['n_imgs']:,}")
     print(f"{'='*70}")
 
@@ -418,6 +422,7 @@ def main():
 
     # ---- Validate ----
     metrics = validate(model, val_loader, device, use_amp=use_amp)
+    metrics['deploy'] = args.deploy
     print_results(metrics)
 
     # ---- Sanity check ----
