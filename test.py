@@ -1,314 +1,189 @@
 """
-validate.py
-───────────
-Standalone validation — mIoU / mAcc / mDice + speed benchmarks.
+speed_benchmark.py — Đo FPS inference chuẩn nhất với CUDA Events
+
+Methodology chuẩn cho paper/report:
+  - batch=1, pure forward pass (không tính dataload, upsample, postprocess)
+  - CUDA Events (không phải time.time) — đồng bộ trực tiếp trên GPU timeline
+  - Warmup 50 iters trước khi đo
+  - Trim 10% đầu + 5% outlier cao nhất
+  - Báo cáo: mean, std, min, P95
 
 Chạy:
-    python validate.py \
-        --checkpoint ./checkpoints/best.pth \
-        --val_txt    /kaggle/working/val.txt \
-        --model_variant fan_dwsa
-
-    # + deploy mode + speed:
-    python validate.py \
-        --checkpoint ./checkpoints/best.pth \
-        --val_txt    /kaggle/working/val.txt \
-        --deploy --benchmark
+    python speed_benchmark.py \
+        --ckpt ./checkpoints/best.pth \
+        --model_variant fan_dwsa \
+        --img_h 512 --img_w 1024
 """
 import argparse
-import time
+import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.amp import autocast
-from tqdm import tqdm
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-CLASS_NAMES = [
-    'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
-    'traffic_light', 'traffic_sign', 'vegetation', 'terrain', 'sky',
-    'person', 'rider', 'car', 'truck', 'bus', 'train', 'motorcycle', 'bicycle'
-]
-NUM_CLASSES  = 19
-IGNORE_INDEX = 255
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from model.head.segmentation_head import GCNetHead
 
 
 # ============================================================
-# METRICS từ confusion matrix
+# BUILD MODEL
 # ============================================================
 
-def compute_metrics(conf_matrix: np.ndarray) -> dict:
+class Segmentor(nn.Module):
+    def __init__(self, backbone, head):
+        super().__init__()
+        self.backbone    = backbone
+        self.decode_head = head
+
+    def forward(self, x):
+        return self.decode_head(self.backbone(x))
+
+
+def build_model(variant, ckpt_path, device):
+    C   = 32
+    cfg = dict(
+        in_channels=3, channels=C, ppm_channels=128,
+        num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
+        align_corners=False, deploy=False,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        act_cfg=dict(type='ReLU', inplace=True),
+        dwsa_reduction=8,
+    )
+    if variant == 'fan_dwsa':
+        from model.backbone.model import GCNet
+    elif variant == 'fan_only':
+        from model.backbone.fan import GCNet
+        cfg.pop('dwsa_reduction')
+    else:
+        from model.backbone.dwsa import GCNet
+
+    model = Segmentor(
+        GCNet(**cfg),
+        GCNetHead(
+            in_channels=C*4, channels=64, num_classes=19,
+            align_corners=False, dropout_ratio=0.0,
+            norm_cfg=dict(type='BN', requires_grad=True),
+            act_cfg=dict(type='ReLU', inplace=True),
+        )
+    )
+    ck    = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    state = (ck.get('model') or ck.get('model_state_dict') or
+             ck.get('state_dict') or ck)
+    model.load_state_dict(state, strict=False)
+    print(f"  Loaded | mIoU recorded: {ck.get('best_miou', '?')}")
+
+    # Deploy: fuse reparam branches → single conv
+    model.backbone.switch_to_deploy()
+    model = model.to(device).eval()
+
+    n_conv   = sum(1 for m in model.modules() if isinstance(m, nn.Conv2d))
+    n_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"  Deploy fused | params: {n_params:.2f}M | Conv2d: {n_conv}")
+    return model
+
+
+# ============================================================
+# BENCHMARK CORE — CUDA Events
+# ============================================================
+
+def benchmark(
+    model,
+    img_h: int,
+    img_w: int,
+    device: torch.device,
+    use_amp: bool = True,
+    n_warmup: int = 50,
+    n_runs:   int = 300,
+) -> dict:
     """
-    Tính metrics từ confusion matrix.
-    C[i,j] = pixel GT class i predicted là j → C[i,i] = TP_i.
+    Đo latency bằng CUDA Events — chuẩn nhất cho GPU timing.
 
-    Hai style:
-      MACRO (default): mean của per-class metric — mỗi class trọng số bằng nhau.
-      GCNet-official:  accumulate toàn dataset trước rồi chia — khớp iou_metric.py.
-    Với 1500 ảnh kết quả hai style gần như giống nhau (diff < 0.005).
+    Tại sao CUDA Events tốt hơn time.time():
+      - time.time() đo CPU wall time, không phản ánh GPU execution time
+      - GPU execute async với CPU → time.time() phụ thuộc vào
+        cuda.synchronize() placement và CPU scheduling jitter
+      - CUDA Events được insert vào GPU command stream →
+        elapsed_time() đo chính xác GPU execution time giữa 2 events
+
+    Tại sao batch=1:
+      - Latency đơn ảnh là số liệu chuẩn trong paper segmentation
+      - Throughput (batch>1) có thể báo cáo thêm nhưng không phải primary
+
+    Tại sao trim outliers:
+      - 10% đầu: GPU clock chưa ổn định ngay sau warmup
+      - 5% cuối: thermal throttling spikes, memory transfer outliers
     """
-    tp       = np.diag(conf_matrix).astype(np.float64)
-    gt_sum   = conf_matrix.sum(axis=1).astype(np.float64)   # area_label
-    pred_sum = conf_matrix.sum(axis=0).astype(np.float64)   # area_pred
-    fn       = gt_sum  - tp
-    fp       = pred_sum - tp
-    union    = tp + fp + fn
-    present  = gt_sum > 0
+    torch.backends.cudnn.enabled   = True
+    torch.backends.cudnn.benchmark = True   # cuDNN autotuning — set một lần
 
-    iou  = tp / (union    + 1e-10)
-    acc  = tp / (gt_sum   + 1e-10)
-    dice = 2 * tp / (pred_sum + gt_sum + 1e-10)   # GCNet formula
+    inp = torch.randn(1, 3, img_h, img_w, device=device)
 
-    # MACRO
-    miou_macro  = float(np.nanmean(iou[present]))
-    macc_macro  = float(np.nanmean(acc[present]))
-    mdice_macro = float(np.nanmean(dice[present]))
-    pacc        = float(tp.sum() / (conf_matrix.sum() + 1e-10))
-
-    # GCNet-official (iou_metric.py): accumulate globally per class, then mean
-    # aAcc = total_intersect / total_label  (overall pixel acc)
-    aacc        = float(tp[present].sum() / (gt_sum[present].sum() + 1e-10))
-    # mIoU/mAcc/mDice: same formula, applied after global accumulation
-    # → numerically identical to macro when computed from single conf_matrix
-    miou_gcnet  = miou_macro
-    macc_gcnet  = macc_macro
-    mdice_gcnet = mdice_macro
-
-    return {
-        # primary (macro)
-        'miou'          : miou_macro,
-        'macc'          : macc_macro,
-        'mdice'         : mdice_macro,
-        'pacc'          : pacc,
-        # gcnet-official cross-check
-        'aacc'          : aacc,
-        'miou_gcnet'    : miou_gcnet,
-        'macc_gcnet'    : macc_gcnet,
-        'mdice_gcnet'   : mdice_gcnet,
-        # per-class
-        'per_class_iou' : iou,
-        'per_class_acc' : acc,
-        'per_class_dice': dice,
-        'present'       : present,
-    }
-
-
-# ============================================================
-# SPEED BENCHMARK
-# ============================================================
-
-def benchmark_speed(model, device, img_h, img_w,
-                    batch_size=1, n_warmup=10, n_runs=50,
-                    use_amp=True) -> dict:
-    """
-    Đo FPS và latency (ms/image) bằng CUDA events.
-
-    Dùng batch_size=1 cho latency thực tế (inference đơn ảnh).
-    Dùng batch_size lớn hơn cho throughput (batch inference).
-
-    CUDA events chính xác hơn time.time() vì đồng bộ GPU.
-    """
-    model.eval()
-    dummy = torch.randn(batch_size, 3, img_h, img_w, device=device)
-
-    # Warmup — flush cache, JIT compile nếu có
-    print(f"  Warming up ({n_warmup} runs, batch={batch_size})...")
+    # Warmup — cuDNN autotuning + GPU clock stabilization
+    print(f"  Warmup {n_warmup} iters...")
     with torch.no_grad():
         for _ in range(n_warmup):
-            with autocast(device_type='cuda', enabled=(use_amp and device == 'cuda')):
-                _ = model(dummy)
-    if device == 'cuda':
-        torch.cuda.synchronize()
+            with autocast(device_type='cuda', enabled=use_amp):
+                _ = model(inp)
+    torch.cuda.synchronize()
 
-    # Benchmark
-    print(f"  Benchmarking ({n_runs} runs)...")
-    if device == 'cuda':
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event   = torch.cuda.Event(enable_timing=True)
-        latencies   = []
-        with torch.no_grad():
-            for _ in range(n_runs):
-                start_event.record()
-                with autocast(device_type='cuda', enabled=use_amp):
-                    _ = model(dummy)
-                end_event.record()
-                torch.cuda.synchronize()
-                latencies.append(start_event.elapsed_time(end_event))  # ms per batch
+    # Measure — một Event pair per iteration
+    print(f"  Measuring {n_runs} iters (CUDA Events)...")
+    latencies = []
+    s_evt = torch.cuda.Event(enable_timing=True)
+    e_evt = torch.cuda.Event(enable_timing=True)
 
-        latencies    = np.array(latencies)
-        ms_per_batch = float(np.mean(latencies))
-        ms_std       = float(np.std(latencies))
-        ms_per_img   = ms_per_batch / batch_size
-        fps          = 1000.0 / ms_per_img
+    with torch.no_grad():
+        for _ in range(n_runs):
+            s_evt.record()
+            with autocast(device_type='cuda', enabled=use_amp):
+                _ = model(inp)
+            e_evt.record()
+            torch.cuda.synchronize()          # chờ GPU xong trước khi đọc time
+            latencies.append(s_evt.elapsed_time(e_evt))   # ms
 
-        # Memory
-        mem_alloc    = torch.cuda.memory_allocated(device) / 1024**2    # MB
-        mem_reserved = torch.cuda.memory_reserved(device) / 1024**2     # MB
-    else:
-        # CPU fallback với time.time()
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            for _ in range(n_runs):
-                _ = model(dummy)
-        elapsed      = (time.perf_counter() - t0) * 1000   # ms total
-        ms_per_batch = elapsed / n_runs
-        ms_std       = 0.0
-        ms_per_img   = ms_per_batch / batch_size
-        fps          = 1000.0 / ms_per_img
-        mem_alloc    = 0.0
-        mem_reserved = 0.0
-
-    # Params & FLOPs (params chính xác, FLOPs ước tính)
-    n_params   = sum(p.numel() for p in model.parameters()) / 1e6
-    n_trainable = sum(p.numel() for p in model.parameters()
-                      if p.requires_grad) / 1e6
+    lat = np.array(latencies)
+    # Trim: bỏ 10% đầu + 5% cao nhất
+    lo  = int(n_runs * 0.10)
+    hi  = int(n_runs * 0.95)
+    lat_trim = np.sort(lat)[lo:hi]
 
     return {
-        'fps'         : fps,
-        'ms_per_img'  : ms_per_img,
-        'ms_per_batch': ms_per_batch,
-        'ms_std'      : ms_std,
-        'mem_alloc_mb': mem_alloc,
-        'mem_reserved_mb': mem_reserved,
-        'params_m'    : n_params,
-        'trainable_m' : n_trainable,
-        'batch_size'  : batch_size,
-        'n_runs'      : n_runs,
+        'fps'    : 1000.0 / lat_trim.mean(),
+        'ms_mean': float(lat_trim.mean()),
+        'ms_std' : float(lat_trim.std()),
+        'ms_min' : float(lat.min()),
+        'ms_p50' : float(np.percentile(lat, 50)),
+        'ms_p95' : float(np.percentile(lat, 95)),
+        'ms_p99' : float(np.percentile(lat, 99)),
+        'mem_mb' : torch.cuda.max_memory_allocated(device) / 1024**2,
+        'params_m': sum(p.numel() for p in model.parameters()) / 1e6,
+        'n_runs' : n_runs,
+        'n_trim' : len(lat_trim),
     }
 
 
-def print_speed(speed: dict, deploy: bool):
-    print(f"\n{'='*70}")
-    print(f"  SPEED BENCHMARK  {'[DEPLOY MODE]' if deploy else '[TRAIN MODE]'}")
-    print(f"{'='*70}")
-    print(f"  Batch size used:     {speed['batch_size']}")
-    print(f"  Runs:                {speed['n_runs']}")
-    print(f"  ─────────────────────────────────────────")
-    print(f"  Latency (ms/image):  {speed['ms_per_img']:>8.2f} ms")
-    print(f"  Latency (ms/batch):  {speed['ms_per_batch']:>8.2f} ± {speed['ms_std']:.2f} ms")
-    print(f"  FPS:                 {speed['fps']:>8.1f} fps")
-    print(f"  ─────────────────────────────────────────")
-    print(f"  GPU mem (allocated): {speed['mem_alloc_mb']:>8.1f} MB")
-    print(f"  GPU mem (reserved):  {speed['mem_reserved_mb']:>8.1f} MB")
-    print(f"  ─────────────────────────────────────────")
-    print(f"  Total params:        {speed['params_m']:>8.2f} M")
-    print(f"  Trainable params:    {speed['trainable_m']:>8.2f} M")
-    print(f"{'='*70}\n")
-
-
-# ============================================================
-# VALIDATE
-# ============================================================
-
-@torch.no_grad()
-def validate(model, loader, device, use_amp=True):
-    model.eval()
-
-    total_loss  = 0.0
-    conf_matrix = np.zeros((NUM_CLASSES, NUM_CLASSES), dtype=np.int64)
-    ce_loss_fn  = nn.CrossEntropyLoss(ignore_index=IGNORE_INDEX)
-
-    # Wall-clock time (bao gồm dataload + forward + postprocess)
-    t_start = time.perf_counter()
-    n_imgs  = 0
-
-    pbar = tqdm(loader, desc="Validating", ncols=90)
-    for imgs, masks in pbar:
-        imgs  = imgs.to(device, non_blocking=True)
-        masks = masks.to(device, non_blocking=True).long()
-        if masks.dim() == 4:
-            masks = masks.squeeze(1)
-
-        n_imgs += imgs.shape[0]
-
-        with autocast(device_type='cuda', enabled=use_amp):
-            logits      = model(imgs)
-            logits_full = F.interpolate(
-                logits, size=masks.shape[-2:],
-                mode='bilinear', align_corners=False)
-            loss = ce_loss_fn(logits_full, masks)
-
-        total_loss += loss.item()
-
-        pred   = logits_full.argmax(1).cpu().numpy()
-        target = masks.cpu().numpy()
-
-        # confusion matrix — exact same as train.py
-        valid = (target >= 0) & (target < NUM_CLASSES)
-        label = NUM_CLASSES * target[valid].astype(int) + pred[valid]
-        count = np.bincount(label, minlength=NUM_CLASSES ** 2)
-        conf_matrix += count.reshape(NUM_CLASSES, NUM_CLASSES)
-
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
-    if device == 'cuda':
-        torch.cuda.synchronize()
-    t_total = time.perf_counter() - t_start
-
-    metrics              = compute_metrics(conf_matrix)
-    metrics['loss']      = total_loss / len(loader)
-    metrics['wall_fps']  = n_imgs / t_total   # FPS bao gồm dataload
-    metrics['wall_ms']   = t_total * 1000 / n_imgs
-    metrics['n_imgs']    = n_imgs
-    metrics['conf_matrix'] = conf_matrix
-    return metrics
-
-
-# ============================================================
-# PRINT RESULTS
-# ============================================================
-
-def print_results(metrics):
-    iou_arr  = metrics['per_class_iou']
-    acc_arr  = metrics['per_class_acc']
-    dice_arr = metrics['per_class_dice']
-    present  = metrics['present']
-
-    print(f"\n{'='*70}")
-    print(f"  VALIDATION RESULTS")
-    print(f"{'='*70}")
-    print(f"  {'─'*40}")
-    print(f"  Macro metrics  (mỗi class trọng số bằng nhau)")
-    print(f"  {'─'*40}")
-    print(f"  mIoU:      {metrics['miou']:.4f}")
-    print(f"  mAcc:      {metrics['macc']:.4f}   (mean per-class recall)")
-    print(f"  mDice:     {metrics['mdice']:.4f}")
-    print(f"  pAcc:      {metrics['pacc']:.4f}   (overall pixel accuracy)")
-    print(f"  {'─'*40}")
-    print(f"  GCNet-official style  (khớp iou_metric.py)")
-    print(f"  {'─'*40}")
-    print(f"  aAcc:      {metrics['aacc']:.4f}   (global pixel acc)")
-    print(f"  mIoU:      {metrics['miou_gcnet']:.4f}")
-    print(f"  mAcc:      {metrics['macc_gcnet']:.4f}")
-    print(f"  mDice:     {metrics['mdice_gcnet']:.4f}")
-    print(f"  {'─'*40}")
-    loss_note = ("  ⚠️  deploy mode — không so sánh training log"
-                 if metrics.get('deploy') else "")
-    print(f"  Val Loss:  {metrics['loss']:.4f}{loss_note}")
-    print(f"  Wall FPS:  {metrics['wall_fps']:.1f} fps  "
-          f"({metrics['wall_ms']:.1f} ms/img, dataload+sync included)")
-    print(f"  Images:    {metrics['n_imgs']:,}")
-    print(f"{'='*70}")
-
-    # Per-class table
-    print(f"\n  {'Class':<16} {'IoU':>6}  {'Acc':>6}  {'Dice':>6}  Bar (IoU)")
-    print(f"  {'─'*60}")
-    for cname, iou, acc, dice, pres in zip(
-            CLASS_NAMES, iou_arr, acc_arr, dice_arr, present):
-        bar  = '█' * int(iou * 18)
-        mark = ' ⚠️ ' if iou < 0.40 else (' ★' if iou > 0.75 else '')
-        skip = '' if pres else '  (no GT)'
-        print(f"  {cname:<16} {iou:>6.4f}  {acc:>6.4f}  {dice:>6.4f}  {bar}{mark}{skip}")
-
-    low_cls = [n for n, v, p in zip(CLASS_NAMES, iou_arr, present)
-               if v < 0.40 and p]
-    if low_cls:
-        print(f"\n  ⚠️  LOW IoU (<0.40): {low_cls}")
-    print(f"{'='*70}\n")
+def print_result(r: dict, variant: str, img_h: int, img_w: int,
+                 gpu_name: str, use_amp: bool):
+    print(f"\n{'='*60}")
+    print(f"  INFERENCE SPEED  —  {variant}  (deploy+fuse)")
+    print(f"{'='*60}")
+    print(f"  GPU:           {gpu_name}")
+    print(f"  Input:         1 × 3 × {img_h} × {img_w}")
+    print(f"  AMP:           {use_amp}")
+    print(f"  Runs:          {r['n_runs']}  (trimmed: {r['n_trim']})")
+    print(f"  {'─'*45}")
+    print(f"  FPS:           {r['fps']:>8.1f}")
+    print(f"  Latency mean:  {r['ms_mean']:>8.2f} ms")
+    print(f"  Latency std:   {r['ms_std']:>8.2f} ms")
+    print(f"  Latency min:   {r['ms_min']:>8.2f} ms")
+    print(f"  Latency P50:   {r['ms_p50']:>8.2f} ms")
+    print(f"  Latency P95:   {r['ms_p95']:>8.2f} ms")
+    print(f"  Latency P99:   {r['ms_p99']:>8.2f} ms")
+    print(f"  {'─'*45}")
+    print(f"  GPU mem peak:  {r['mem_mb']:>8.1f} MB")
+    print(f"  Params:        {r['params_m']:>8.2f} M")
+    print(f"{'='*60}\n")
 
 
 # ============================================================
@@ -316,149 +191,40 @@ def print_results(metrics):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="GCNet v3 — Validation + Speed")
-    parser.add_argument('--checkpoint',    type=str, required=True)
-    parser.add_argument('--val_txt',       type=str, required=True)
-    parser.add_argument('--model_variant', type=str, default='fan_dwsa',
+    parser = argparse.ArgumentParser(description="GCNet v3 — Speed Benchmark")
+    parser.add_argument('--ckpt',          required=True)
+    parser.add_argument('--model_variant', default='fan_dwsa',
                         choices=['fan_dwsa', 'fan_only', 'dwsa_only'])
-    parser.add_argument('--img_h',         type=int, default=512)
-    parser.add_argument('--img_w',         type=int, default=1024)
-    parser.add_argument('--batch_size',    type=int, default=22)
-    parser.add_argument('--num_workers',   type=int, default=4)
-    parser.add_argument('--no_amp',        action='store_true')
-    parser.add_argument('--deploy',        action='store_true',
-                        help='Fuse reparam branches → single conv')
-    parser.add_argument('--benchmark',     action='store_true',
-                        help='Run speed benchmark (pure GPU, no dataload)')
-    parser.add_argument('--bench_batch',   type=int, default=1,
-                        help='Batch size for benchmark (default 1 = latency mode)')
-    parser.add_argument('--bench_runs',    type=int, default=100,
-                        help='Number of benchmark runs (default 100)')
+    parser.add_argument('--img_h',    type=int,  default=512)
+    parser.add_argument('--img_w',    type=int,  default=1024)
+    parser.add_argument('--n_warmup', type=int,  default=50)
+    parser.add_argument('--n_runs',   type=int,  default=300)
+    parser.add_argument('--no_amp',   action='store_true',
+                        help='Tắt AMP (default: bật, dùng FP16 compute)')
     args = parser.parse_args()
 
-    device  = 'cuda' if torch.cuda.is_available() else 'cpu'
-    use_amp = not args.no_amp and device == 'cuda'
+    device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
+    use_amp  = not args.no_amp and str(device) == 'cuda'
 
-    print(f"\n{'='*70}")
-    print(f"  GCNet v3 — Validation + Speed")
-    print(f"{'='*70}")
-    print(f"  Checkpoint:   {args.checkpoint}")
-    print(f"  Val txt:      {args.val_txt}")
-    print(f"  Image size:   {args.img_h}×{args.img_w}")
-    print(f"  Batch size:   {args.batch_size}")
-    print(f"  AMP:          {use_amp}")
-    print(f"  Deploy:       {args.deploy}")
-    print(f"  Benchmark:    {args.benchmark}")
-    print(f"  Device:       {device}")
-    print(f"{'='*70}\n")
+    print(f"\n{'='*60}")
+    print(f"  GCNet v3 — Speed Benchmark")
+    print(f"{'='*60}")
+    print(f"  GPU:      {gpu_name}")
+    print(f"  Input:    {args.img_h}×{args.img_w}  batch=1")
+    print(f"  AMP:      {use_amp}")
+    print(f"  Warmup:   {args.n_warmup}  |  Runs: {args.n_runs}")
+    print(f"{'='*60}\n")
 
-    # ---- Model ----
-    if args.model_variant == 'fan_dwsa':
-        from model.backbone.model import GCNet
-    elif args.model_variant == 'fan_only':
-        from model.backbone.fan import GCNet
-    else:
-        from model.backbone.dwsa import GCNet
-    from model.head.segmentation_head import GCNetHead
+    torch.cuda.reset_peak_memory_stats(device)
 
-    C        = 32
-    backbone = GCNet(
-        in_channels=3, channels=C, ppm_channels=128,
-        num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
-        align_corners=False,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU', inplace=True),
-        dwsa_reduction=8, deploy=False,
-    )
-    head = GCNetHead(
-        in_channels=C * 4, channels=64, num_classes=NUM_CLASSES,
-        align_corners=False, dropout_ratio=0.1,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU', inplace=True),
-    )
-
-    class Segmentor(nn.Module):
-        def __init__(self, bb, hd):
-            super().__init__()
-            self.backbone    = bb
-            self.decode_head = hd
-        def forward(self, x):
-            return self.decode_head(self.backbone(x))
-
-    model = Segmentor(backbone, head).to(device)
-
-    # ---- Load checkpoint ----
-    ckpt  = torch.load(args.checkpoint, map_location=device, weights_only=False)
-    state = (ckpt.get('model') or ckpt.get('model_state_dict') or
-             ckpt.get('state_dict') or ckpt)
-    missing, unexpected = model.load_state_dict(state, strict=False)
-
-    skip_markers = ('dwsa', 'alpha', 'in_.', 'foggy', 'loss_', 'fog_')
-    unexpected_missing = [k for k in missing
-                          if not any(s in k for s in skip_markers)]
-    print(f"  Epoch:      {ckpt.get('epoch', '?')}")
-    print(f"  Best mIoU (recorded): {ckpt.get('best_miou', 'N/A')}")
-    if unexpected_missing:
-        print(f"  ⚠️  Missing keys ({len(unexpected_missing)}): "
-              f"{unexpected_missing[:3]}")
-    if unexpected:
-        print(f"  ⚠️  Unexpected keys: {unexpected[:3]}")
-    print()
-
-    # ---- Deploy ----
-    if args.deploy:
-        model.backbone.switch_to_deploy()
-        model.eval()
-        n_conv = sum(1 for m in model.modules() if isinstance(m, nn.Conv2d))
-        print(f"  ✅ Deploy: reparam fused | Conv2d count: {n_conv}")
-        print()
-
-    # ---- Speed benchmark (pure GPU, no dataload overhead) ----
-    if args.benchmark:
-        speed = benchmark_speed(
-            model, device,
-            img_h=args.img_h, img_w=args.img_w,
-            batch_size=args.bench_batch,
-            n_warmup=10, n_runs=args.bench_runs,
-            use_amp=use_amp,
-        )
-        print_speed(speed, deploy=args.deploy)
-
-    # ---- DataLoader ----
-    from data.custom import CityscapesDataset, get_val_transforms
-
-    val_dataset = CityscapesDataset(
-        txt_file=args.val_txt,
-        transforms=get_val_transforms(img_size=(args.img_h, args.img_w)),
-        img_size=(args.img_h, args.img_w),
-        label_mapping='train_id',
-        dataset_type='foggy',
-    )
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device == 'cuda'),
-        drop_last=False,
-    )
-    print(f"  Val samples: {len(val_dataset):,} ({len(val_loader)} batches)\n")
-
-    # ---- Validate ----
-    metrics = validate(model, val_loader, device, use_amp=use_amp)
-    metrics['deploy'] = args.deploy
-    print_results(metrics)
-
-    # ---- Sanity check ----
-    recorded = ckpt.get('best_miou') or (ckpt.get('metrics') or {}).get('miou')
-    if recorded:
-        diff = abs(metrics['miou'] - recorded)
-        status = '✅' if diff < 0.001 else '⚠️ '
-        print(f"  {status} mIoU: got {metrics['miou']:.4f}, "
-              f"recorded {recorded:.4f}  (diff={diff:.4f})")
-        if diff >= 0.001:
-            print(f"     → Kiểm tra --img_h/--img_w và --batch_size")
-        print()
+    model  = build_model(args.model_variant, args.ckpt, device)
+    result = benchmark(model, args.img_h, args.img_w, device,
+                       use_amp=use_amp,
+                       n_warmup=args.n_warmup,
+                       n_runs=args.n_runs)
+    print_result(result, args.model_variant, args.img_h, args.img_w,
+                 gpu_name, use_amp)
 
 
 if __name__ == '__main__':
