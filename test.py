@@ -152,7 +152,7 @@ def main():
     use_amp = not args.no_amp and device == 'cuda'
 
     print(f"\n{'='*70}")
-    print(f"  GCNet v3 — Standalone Validation")
+    print(f"Standalone Validation")
     print(f"{'='*70}")
     print(f"  Checkpoint: {args.checkpoint}")
     print(f"  Val txt:    {args.val_txt}")
