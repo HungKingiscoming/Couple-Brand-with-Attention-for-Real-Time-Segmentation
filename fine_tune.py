@@ -479,7 +479,14 @@ def train_epoch(model, loader, optimizer, scheduler,
 
             l_ohem = ohem_loss(c6_full, masks)
             l_bnd  = boundary_loss(c6_full, masks)
-            l_dice = dice_loss(c6_full, masks)
+
+            # Dice trên c6_logit (1/8 resolution) thay vì full resolution
+            # Tránh OOM: one_hot (B,19,H,W) tốn ~836MB ở 512×1024
+            masks_small = F.interpolate(
+                masks.unsqueeze(1).float(),
+                size=c6_logit.shape[-2:],
+                mode='nearest').squeeze(1).long()
+            l_dice = dice_loss(c6_logit, masks_small)
 
             loss = l_ohem + l_bnd + l_dice
 
