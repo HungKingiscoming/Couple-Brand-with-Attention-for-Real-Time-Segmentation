@@ -98,15 +98,35 @@ class CityscapesDataset(Dataset):
 
         return image, label
 
-    def get_class_distribution(self) -> Dict[int, int]:
-        print("📊 Computing class distribution...")
-        class_counts = {i: 0 for i in range(19)}
-        for idx in tqdm(range(len(self)), desc="Scanning labels"):
-            _, label_path = self.samples[idx]
-            label = self.label_map[np.array(Image.open(label_path), dtype=np.uint8)]
-            for class_id in range(19):
-                class_counts[class_id] += (label == class_id).sum()
-        return class_counts
+    def get_class_distribution(self, num_workers: int = 4) -> Dict[int, int]:
+        import multiprocessing as mp
+    
+        label_map = self.label_map  # copy ref để pickle được
+    
+        def count_single(label_path: str) -> np.ndarray:
+            """Worker function — đếm 1 file label."""
+            label = label_map[np.array(Image.open(label_path), dtype=np.uint8).ravel()]
+            # bincount nhanh hơn 19× so với loop (label == class_id).sum()
+            counts = np.bincount(label, minlength=256)
+            return counts[:19]  # chỉ giữ 19 classes (bỏ ignore=255)
+    
+        label_paths = [p for _, p in self.samples]
+    
+        print(f"📊 Computing class distribution ({len(label_paths)} files, {num_workers} workers)...")
+    
+        # Multiprocessing pool — đọc song song
+        # chunksize=50: mỗi worker nhận 50 file 1 lần → giảm IPC overhead
+        with mp.Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(count_single, label_paths, chunksize=50),
+                total=len(label_paths),
+                desc="Scanning labels"
+            ))
+    
+        # Stack và sum — nhanh hơn loop cộng dồn
+        total_counts = np.stack(results, axis=0).sum(axis=0)
+    
+        return {i: int(total_counts[i]) for i in range(19)}
 
 
 # ============================================
@@ -299,29 +319,50 @@ def create_dataloaders(
 
     class_weights = None
     if compute_class_weights:
-        print(f"\n{'='*60}")
-        print("📊 Computing class weights for balanced training...")
-        print(f"{'='*60}\n")
-
-        class_counts = train_dataset.get_class_distribution()
-        total_pixels = sum(class_counts.values())
-        class_weights = []
-
-        print("\n📈 Class distribution:")
-        print(f"{'Class':<8} {'Pixels':<15} {'Frequency':<12} {'Weight':<10}")
-        print("-" * 50)
-
-        for class_id in range(19):
-            count = class_counts[class_id]
-            freq  = count / total_pixels if total_pixels > 0 else 0
-            weight = 1.0 / (freq + 1e-8)
-            class_weights.append(weight)
-            print(f"{class_id:<8} {count:<15,} {freq*100:>6.2f}%      {weight:>8.4f}")
-
-        class_weights = torch.tensor(class_weights, dtype=torch.float32)
-        class_weights = torch.clamp(class_weights, min=0.1, max=50.0)
-        class_weights = class_weights / class_weights.sum() * 19
-        print(f"\n✅ Class weights normalized (mean=1.0, max clipped to 50x)")
+        import hashlib, pathlib
+    
+        # Cache key dựa trên nội dung train_txt
+        # → cùng dataset thì load cache, khác dataset thì tính lại
+        with open(train_txt, 'rb') as f:
+            txt_hash = hashlib.md5(f.read()).hexdigest()[:8]
+        cache_path = pathlib.Path(train_txt).parent / f"class_weights_cache_{txt_hash}.pt"
+    
+        if cache_path.exists():
+            # Load từ cache — gần như instant
+            class_weights = torch.load(cache_path, map_location='cpu')
+            print(f"✅ Class weights loaded from cache: {cache_path}")
+            print(f"   (min={class_weights.min():.3f}, max={class_weights.max():.3f})")
+        else:
+            print(f"\n{'='*60}")
+            print("📊 Computing class weights (first time, will be cached)...")
+            print(f"{'='*60}\n")
+    
+            # Dùng num_workers từ dataloader config
+            class_counts = train_dataset.get_class_distribution(
+                num_workers=num_workers
+            )
+            total_pixels = sum(class_counts.values())
+    
+            print("\n📈 Class distribution:")
+            print(f"{'Class':<8} {'Pixels':<15} {'Frequency':<12} {'Weight':<10}")
+            print("-" * 50)
+    
+            raw_weights = []
+            for class_id in range(19):
+                count = class_counts[class_id]
+                freq  = count / total_pixels if total_pixels > 0 else 0
+                weight = 1.0 / (freq + 1e-8)
+                raw_weights.append(weight)
+                print(f"{class_id:<8} {count:<15,} {freq*100:>6.2f}%      {weight:>8.4f}")
+    
+            class_weights = torch.tensor(raw_weights, dtype=torch.float32)
+            class_weights = torch.clamp(class_weights, min=0.1, max=50.0)
+            class_weights = class_weights / class_weights.sum() * 19
+    
+            # Lưu cache
+            torch.save(class_weights, cache_path)
+            print(f"\n✅ Class weights computed & cached → {cache_path}")
+            print(f"   (min={class_weights.min():.3f}, max={class_weights.max():.3f})")
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
