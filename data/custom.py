@@ -9,7 +9,18 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
 
+_LABEL_MAP_GLOBAL = None
 
+def _mp_init_worker(label_map: np.ndarray):
+    global _LABEL_MAP_GLOBAL
+    _LABEL_MAP_GLOBAL = label_map
+
+def _mp_count_label_file(label_path: str) -> np.ndarray:
+    label = _LABEL_MAP_GLOBAL[
+        np.array(Image.open(label_path), dtype=np.uint8).ravel()
+    ]
+    counts = np.bincount(label, minlength=256)
+    return counts[:19]
 class CityscapesDataset(Dataset):
     """
     Universal Dataset for Cityscapes (Normal & Foggy versions)
@@ -101,31 +112,21 @@ class CityscapesDataset(Dataset):
     def get_class_distribution(self, num_workers: int = 4) -> Dict[int, int]:
         import multiprocessing as mp
     
-        label_map = self.label_map  # copy ref để pickle được
-    
-        def count_single(label_path: str) -> np.ndarray:
-            """Worker function — đếm 1 file label."""
-            label = label_map[np.array(Image.open(label_path), dtype=np.uint8).ravel()]
-            # bincount nhanh hơn 19× so với loop (label == class_id).sum()
-            counts = np.bincount(label, minlength=256)
-            return counts[:19]  # chỉ giữ 19 classes (bỏ ignore=255)
-    
         label_paths = [p for _, p in self.samples]
-    
         print(f"📊 Computing class distribution ({len(label_paths)} files, {num_workers} workers)...")
     
-        # Multiprocessing pool — đọc song song
-        # chunksize=50: mỗi worker nhận 50 file 1 lần → giảm IPC overhead
-        with mp.Pool(processes=num_workers) as pool:
+        with mp.Pool(
+            processes=num_workers,
+            initializer=_mp_init_worker,
+            initargs=(self.label_map,)
+        ) as pool:
             results = list(tqdm(
-                pool.imap(count_single, label_paths, chunksize=50),
+                pool.imap(_mp_count_label_file, label_paths, chunksize=50),
                 total=len(label_paths),
                 desc="Scanning labels"
             ))
     
-        # Stack và sum — nhanh hơn loop cộng dồn
         total_counts = np.stack(results, axis=0).sum(axis=0)
-    
         return {i: int(total_counts[i]) for i in range(19)}
 
 
