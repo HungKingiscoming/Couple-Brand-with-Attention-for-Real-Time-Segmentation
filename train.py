@@ -990,19 +990,16 @@ def setup_memory_efficient_training():
 
 
 def check_gradients(model, threshold=10.0):
-    max_grad = 0.0; max_name = ""; total_sq = 0.0
-    grad_map = {}
+    # Chỉ track max_grad — bỏ grad_map để tránh iterate 480+ params mỗi step
+    max_grad = 0.0; max_name = ""
     for name, p in model.named_parameters():
         if p.grad is not None:
             g = p.grad.norm().item()
-            total_sq += g ** 2
-            grad_map[name] = g
             if g > max_grad:
                 max_grad = g; max_name = name
-    total_norm = total_sq ** 0.5
     if max_grad > threshold:
         print(f"Large gradient: {max_name[:60]}... = {max_grad:.2f}")
-    return max_grad, total_norm, grad_map
+    return max_grad
 
 
 def debug_inf_gradients(model, batch_idx: int, loss_components: dict):
@@ -1132,7 +1129,6 @@ def log_dwsa_health(model, writer, epoch: int, diag: DiagnosticLogger):
         if module is None:
             continue
         gamma_val = module.gamma.item()
-        writer.add_scalar(f'dwsa/{name}_gamma', gamma_val, epoch)
         diag.log(epoch, f'dwsa/{"gamma4" if "4" in name else "gamma5" if "5" in name else "gamma6"}',
                  gamma_val)
 
@@ -1170,8 +1166,6 @@ def log_fan_health(model, writer, epoch: int, diag: DiagnosticLogger):
         alpha_max  = alpha_sig.max().item()
         fan_info.append((stem_name, alpha_mean, alpha_std, alpha_min, alpha_max))
         tag = '1' if '1' in stem_name else '2'
-        writer.add_scalar(f'fan/alpha{tag}_mean', alpha_mean, epoch)
-        writer.add_scalar(f'fan/alpha{tag}_std',  alpha_std,  epoch)
         diag.log(epoch, f'fan/alpha{tag}_mean', alpha_mean)
 
     if fan_info:
@@ -1218,9 +1212,7 @@ def check_spp_bn_health(model, epoch: int):
                     m.running_mean.zero_()
                     m.running_var.fill_(1.0)
                     print(f"    Reset: spp.{name}")
-    else:
-        if epoch % 5 == 0:
-            print(f"  ✅ SPP BN health OK (epoch {epoch+1})")
+    # Không print OK — chỉ cảnh báo khi có vấn đề
 
 
 def count_trainable_params(model):
@@ -1538,7 +1530,6 @@ class Trainer:
         total_kl   = 0.0
         max_grad_epoch = 0.0
         max_grad       = 0.0
-        last_grad_map  = {}
         hard_ratio_acc = 0.0
         pbar = tqdm(loader,
                     desc=f"Epoch {epoch+1}/{self.args.epochs}")
@@ -1634,21 +1625,8 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                max_grad, _, last_grad_map = check_gradients(
-                    self.model, threshold=10.0)
+                max_grad = check_gradients(self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
-                # Debug chi tiết khi có inf gradient (chỉ 10 batch đầu)
-                if not math.isfinite(max_grad) and batch_idx < 20:
-                    debug_inf_gradients(
-                        self.model,
-                        batch_idx=batch_idx,
-                        loss_components={
-                            'ohem':      total_ohem / max(batch_idx+1, 1),
-                            'dice':      total_dice / max(batch_idx+1, 1),
-                            'kl_distill': total_kl  / max(batch_idx+1, 1),
-                            'loss_raw':  loss.item() * self.args.accumulation_steps,
-                        }
-                    )
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.args.grad_clip)
@@ -1679,30 +1657,9 @@ class Trainer:
                 postfix['kl'] = f'{kl_val:.4f}'
             pbar.set_postfix(postfix)
 
-            if batch_idx % 50 == 0:
-                clear_gpu_memory()
-
-            if batch_idx % self.args.log_interval == 0:
-                self.writer.add_scalar(
-                    'train/loss',
-                    loss.item() * self.args.accumulation_steps,
-                    self.global_step)
-                self.writer.add_scalar(
-                    'train/ohem', ohem_loss.item(), self.global_step)
-                self.writer.add_scalar(
-                    'train/dice', dice_loss.item(), self.global_step)
-                self.writer.add_scalar(
-                    'train/lr',
-                    self.optimizer.param_groups[0]['lr'],
-                    self.global_step)
-                self.writer.add_scalar(
-                    'train/max_grad', max_grad, self.global_step)
-                self.writer.add_scalar(
-                    'train/hard_ratio',
-                    self.ohem.last_hard_ratio, self.global_step)
-                if kl_val > 0:
-                    self.writer.add_scalar(
-                        'train/kl_distill', kl_val, self.global_step)
+            # clear_gpu_memory chỉ gọi mỗi 200 batch thay vì 50
+            if batch_idx % 200 == 0:
+                torch.cuda.empty_cache()
 
         n = len(loader)
         avg_hard_ratio = hard_ratio_acc / n
@@ -1712,14 +1669,8 @@ class Trainer:
         if total_kl > 0:
             print(f"  Avg KL distill loss: {total_kl/n:.4f}")
 
-        if last_grad_map:
-            log_gradient_flow(last_grad_map, self.writer, epoch, top_k=5)
-
-        print(f"  Learning rates:")
-        for g in self.optimizer.param_groups:
-            print(f"    {g.get('name','?'):<16} lr={g['lr']:.2e}")
-            self.writer.add_scalar(
-                f"lr/{g.get('name','group')}", g['lr'], epoch)
+        # Chỉ in LR của group đầu (head) — đủ để monitor scheduler
+        print(f"  LR head={self.optimizer.param_groups[0]['lr']:.2e}")
 
         torch.cuda.empty_cache()
         if self.scheduler and self.args.scheduler != 'onecycle':
@@ -1733,8 +1684,8 @@ class Trainer:
         }
 
         if self.diag:
-            self.diag.log_dict(epoch, result, prefix='train/')
-            self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
+            # Chỉ log val metrics vào CSV — train metrics không cần thiết cho diagnostics
+            pass
 
         return result
 
@@ -1796,9 +1747,7 @@ class Trainer:
         }
 
         if self.diag:
-            self.diag.log(epoch, 'val/miou',     miou)
-            self.diag.log(epoch, 'val/accuracy', acc)
-            self.diag.log(epoch, 'val/loss',     result['loss'])
+            self.diag.log(epoch, 'val/miou', miou)
 
         return result
 
@@ -2343,9 +2292,11 @@ def main():
             print(f"\n  ⚠️  LOW classes (<{low_thresh}): "
                   f"{[n for n,_ in low_cls]}")
 
-        for cname, ciou in zip(CLASS_NAMES, iou_arr):
-            trainer.writer.add_scalar(f'val/iou_{cname}', float(ciou), epoch)
-            diag.log(epoch, f'iou/{cname}', float(ciou))
+        # Bỏ per-class tensorboard (19 write/epoch) — chỉ log best/worst class vào diag
+        best_cls  = max(zip(CLASS_NAMES, iou_arr), key=lambda x: x[1])
+        worst_cls = min(zip(CLASS_NAMES, iou_arr), key=lambda x: x[1])
+        diag.log(epoch, 'iou/best',  best_cls[1])
+        diag.log(epoch, 'iou/worst', worst_cls[1])
 
         # ── Standard logging ─────────────────────────────────────────────
         print(f"\n{SEP}")
@@ -2360,11 +2311,7 @@ def main():
               f"Acc: {val_metrics['accuracy']:.4f}")
         print(f"{SEP}\n")
 
-        trainer.writer.add_scalar('val/loss',     val_metrics['loss'],     epoch)
-        trainer.writer.add_scalar('val/miou',     val_metrics['miou'],     epoch)
-        trainer.writer.add_scalar('val/accuracy', val_metrics['accuracy'], epoch)
-
-        diag.print_epoch_summary(epoch)
+        # Tensorboard val metrics đã bỏ — dùng diagnostics.csv để track
 
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
