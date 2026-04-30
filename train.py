@@ -1427,15 +1427,14 @@ class Trainer:
         if getattr(self.args, "freeze_spp_bn", False):
             spp = getattr(self.model.backbone, "spp", None)
             if spp is not None:
+                # Freeze TẤT CẢ params trong SPP mỗi epoch (conv + BN)
+                # BN eval() đã không đủ — conv weight vẫn nhận inf gradient
+                # khi distillation loss scale lớn ở epoch đầu
+                for p in spp.parameters():
+                    p.requires_grad = False
                 for m in spp.modules():
                     if isinstance(m, nn.BatchNorm2d):
                         m.eval()
-                        # Freeze gradient — m.eval() chỉ tắt running stats update
-                        # nhưng backward vẫn tính gradient cho weight/bias → có thể inf
-                        if m.weight is not None:
-                            m.weight.requires_grad = False
-                        if m.bias is not None:
-                            m.bias.requires_grad = False
         if getattr(self.args, "freeze_stem_conv", False):
             for stem_name in ["stem_stage2", "stem_stage3"]:
                 module = getattr(self.model.backbone, stem_name, None)
@@ -2065,18 +2064,19 @@ def main():
         spp = getattr(model.backbone, "spp", None)
         if spp is not None:
             frozen_spp_params = 0
+            # Freeze TẤT CẢ params trong SPP: conv + BN weight/bias
+            # Chỉ freeze BN không đủ — SPP conv weight vẫn nhận inf gradient
+            # qua distillation loss hoặc khi batch_size nhỏ
+            for p in spp.parameters():
+                if p.requires_grad:
+                    p.requires_grad = False
+                    frozen_spp_params += p.numel()
             for m in spp.modules():
                 if isinstance(m, nn.BatchNorm2d):
                     m.eval()
-                    if m.weight is not None:
-                        m.weight.requires_grad = False
-                        frozen_spp_params += m.weight.numel()
-                    if m.bias is not None:
-                        m.bias.requires_grad = False
-                        frozen_spp_params += m.bias.numel()
-            print(f"SPP BN frozen: {frozen_spp_params} params "
-                  f"(eval mode + grad disabled — prevents inf gradient)")
-            # Rebuild optimizer để loại bỏ SPP BN params khỏi param groups
+            print(f"SPP fully frozen: {frozen_spp_params:,} params "
+                  f"(all conv + BN — prevents inf gradient from distillation)")
+            # Rebuild optimizer để loại bỏ SPP params khỏi param groups
             optimizer = build_optimizer(model, args)
             scheduler = build_scheduler(optimizer, args, train_loader,
                                         start_epoch=trainer.start_epoch)
