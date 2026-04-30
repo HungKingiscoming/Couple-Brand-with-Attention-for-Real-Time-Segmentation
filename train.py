@@ -1886,6 +1886,7 @@ CLASS_NAMES = ['road','sidewalk','building','wall','fence','pole',
 # ============================================
 
 def main():
+    sep = "=" * 70
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
     parser.add_argument("--model_variant",         type=str, default="fan_dwsa",
                         choices=["fan_dwsa", "fan_only", "dwsa_only"])
