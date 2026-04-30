@@ -1002,6 +1002,95 @@ def check_gradients(model, threshold=10.0):
     return max_grad, total_norm, grad_map
 
 
+def debug_inf_gradients(model, batch_idx: int, loss_components: dict):
+    """
+    Debug chi tiết khi phát hiện inf/nan gradient.
+    In ra:
+    - Loss components (task, kl, ewc) tại batch này
+    - Tất cả layers có inf/nan gradient (không chỉ top-1)
+    - Phân loại theo module (spp, detail, semantic, head, dwsa)
+    Gọi ngay sau unscale_, trước clip_grad_norm_.
+    """
+    inf_layers   = []
+    nan_layers   = []
+    large_layers = []  # > 1000 nhưng không phải inf/nan
+
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        g = p.grad.norm().item()
+        if not math.isfinite(g):
+            if math.isnan(g):
+                nan_layers.append(name)
+            else:
+                inf_layers.append((name, g))
+        elif g > 1000:
+            large_layers.append((name, g))
+
+    if not inf_layers and not nan_layers:
+        return  # không có vấn đề, không in gì
+
+    sep = "=" * 70
+    print(f"\n  {sep}")
+    print(f"  🔴 INF/NAN GRADIENT DEBUG — batch {batch_idx}")
+    print(f"  {sep}")
+
+    # Loss components
+    print(f"  Loss components:")
+    for k, v in loss_components.items():
+        v_str = f"{v:.4f}" if math.isfinite(v) else f"⚠️ {v}"
+        print(f"    {k:<20} {v_str}")
+
+    # Phân loại inf layers theo module
+    module_groups = {
+        'spp':          [],
+        'detail_branch': [],
+        'semantic_branch': [],
+        'dwsa':         [],
+        'decode_head':  [],
+        'stem':         [],
+        'other':        [],
+    }
+    for name, g in inf_layers:
+        if 'spp' in name:
+            module_groups['spp'].append(name)
+        elif 'detail_branch' in name:
+            module_groups['detail_branch'].append(name)
+        elif 'semantic_branch' in name:
+            module_groups['semantic_branch'].append(name)
+        elif 'dwsa' in name:
+            module_groups['dwsa'].append(name)
+        elif 'decode_head' in name:
+            module_groups['decode_head'].append(name)
+        elif 'stem' in name:
+            module_groups['stem'].append(name)
+        else:
+            module_groups['other'].append(name)
+
+    print(f"  INF gradient layers ({len(inf_layers)} total):")
+    for group, layers in module_groups.items():
+        if layers:
+            print(f"    [{group}] {len(layers)} layers:")
+            for l in layers[:3]:
+                print(f"      - {l}")
+            if len(layers) > 3:
+                print(f"      ... and {len(layers)-3} more")
+
+    if nan_layers:
+        print(f"  NAN gradient layers ({len(nan_layers)}):")
+        for l in nan_layers[:5]:
+            print(f"    - {l}")
+
+    if large_layers:
+        top3 = sorted(large_layers, key=lambda x: x[1], reverse=True)[:3]
+        print(f"  LARGE (>1000) gradient layers:")
+        for name, g in top3:
+            print(f"    {name[-55:]}: {g:.1f}")
+
+    print(f"  {sep}\n")
+
+
+
 def log_gradient_flow(grad_map: dict, writer, epoch: int, top_k: int = 5):
     if not grad_map:
         return
@@ -1141,7 +1230,7 @@ def count_trainable_params(model):
     hd_total  = sum(p.numel() for p in model.decode_head.parameters())
     hd_train  = sum(p.numel() for p in model.decode_head.parameters()
                     if p.requires_grad)
-    print(f"\n{'='*70}\nPARAMETER STATISTICS\n{'='*70}")
+    print(f"\n{sep}\nPARAMETER STATISTICS\n{sep}")
     print(f"Total:      {total:>15,} | 100%")
     print(f"Trainable:  {trainable:>15,} | {100*trainable/total:.1f}%")
     print(f"Frozen:     {total-trainable:>15,} | "
@@ -1151,7 +1240,7 @@ def count_trainable_params(model):
           f"{100*bb_train/max(bb_total,1):.1f}%")
     print(f"Head:       {hd_train:>15,} / {hd_total:,} | "
           f"{100*hd_train/max(hd_total,1):.1f}%")
-    print(f"{'='*70}\n")
+    print(f"{sep}\n")
     return trainable, total - trainable
 
 
@@ -1240,7 +1329,7 @@ def unfreeze_backbone_progressive(model, stage_names):
 
 
 def print_backbone_structure(model):
-    print(f"\n{'='*70}\n BACKBONE STRUCTURE (GCNet v3)\n{'='*70}")
+    print(f"\n{sep}\n BACKBONE STRUCTURE (GCNet v3)\n{sep}")
     for name, module in model.backbone.named_children():
         n_params = sum(p.numel() for p in module.parameters())
         if isinstance(module, nn.ModuleList):
@@ -1250,7 +1339,7 @@ def print_backbone_structure(model):
                 print(f"    [{i}]: {type(sub).__name__}  ({sp:,} params)")
         else:
             print(f"  {name}: {type(module).__name__}  ({n_params:,} params)")
-    print(f"{'='*70}\n")
+    print(f"{sep}\n")
 
 
 # ============================================
@@ -1401,7 +1490,7 @@ class Trainer:
               f"(CE={self.ce_weight}, Dice={self.dice_weight})")
 
     def _print_config(self, loss_cfg):
-        print(f"\n{'='*70}\nTRAINER CONFIGURATION\n{'='*70}")
+        print(f"\n{sep}\nTRAINER CONFIGURATION\n{sep}")
         print(f"Batch size:             {self.args.batch_size}")
         print(f"Gradient accumulation:  {self.args.accumulation_steps}")
         print(f"Effective batch:        "
@@ -1415,7 +1504,7 @@ class Trainer:
                   f"alpha={self.args.distill_alpha}")
         if getattr(self.args, 'use_ewc', False):
             print(f"EWC: lambda={self.args.ewc_lambda}")
-        print(f"{'='*70}\n")
+        print(f"{sep}\n")
 
     def save_config(self):
         with open(self.save_dir / "config.json", "w") as f:
@@ -1473,9 +1562,16 @@ class Trainer:
                         imgs_teacher = imgs
                     t_out = self.teacher_model(imgs_teacher)
                     if isinstance(t_out, (tuple, list)):
-                        teacher_logits_c6 = t_out[-1].detach()
+                        t_raw = t_out[-1].detach()
                     else:
-                        teacher_logits_c6 = t_out.detach()
+                        t_raw = t_out.detach()
+                    # Resize teacher logit về H/8×W/8 để match c6_logit
+                    # Tránh tính KL trên full resolution (512×1024) → OOM + inf grad
+                    _th = self.args.img_h // 8
+                    _tw = self.args.img_w // 8
+                    teacher_logits_c6 = F.interpolate(
+                        t_raw.float(), size=(_th, _tw),
+                        mode='bilinear', align_corners=False)
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
                 outputs  = self.model.forward_train(imgs)
@@ -1508,11 +1604,14 @@ class Trainer:
                     task_loss  = task_loss + aux_weight * aux_loss
 
                 # K3: Combine với distillation loss
+                # Dùng c6_logit (nhỏ, H/8×W/8) thay vì c6_full (H×W)
+                # c6_full = 512×1024 → log_softmax tốn 836MB → OOM + inf gradient
+                # c6_logit = 64×128 → nhỏ hơn 64x, gradient ổn định hơn
                 kl_val = 0.0
                 if (teacher_logits_c6 is not None and
                         self.distill_loss_fn is not None):
                     loss, kl_val = self.distill_loss_fn(
-                        c6_full, teacher_logits_c6, task_loss)
+                        c6_logit, teacher_logits_c6, task_loss)
                 else:
                     loss = task_loss
 
@@ -1536,6 +1635,18 @@ class Trainer:
                 max_grad, _, last_grad_map = check_gradients(
                     self.model, threshold=10.0)
                 max_grad_epoch = max(max_grad_epoch, max_grad)
+                # Debug chi tiết khi có inf gradient (chỉ 10 batch đầu)
+                if not math.isfinite(max_grad) and batch_idx < 20:
+                    debug_inf_gradients(
+                        self.model,
+                        batch_idx=batch_idx,
+                        loss_components={
+                            'ohem':      total_ohem / max(batch_idx+1, 1),
+                            'dice':      total_dice / max(batch_idx+1, 1),
+                            'kl_distill': total_kl  / max(batch_idx+1, 1),
+                            'loss_raw':  loss.item() * self.args.accumulation_steps,
+                        }
+                    )
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(
                         self.model.parameters(), self.args.grad_clip)
@@ -1901,9 +2012,9 @@ def main():
         args.scheduler = 'cosine'
         print("[INFO] scheduler auto-switched: onecycle → cosine")
 
-    print(f"\n{'='*70}")
+    print(f"\n{sep}")
     print(f"GCNet v3 Training  |  {args.model_variant}")
-    print(f"{'='*70}")
+    print(f"{sep}")
     print(f"Device: {device}  |  Image: {args.img_h}x{args.img_w}")
     print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
     print(f"Grad clip: {args.grad_clip}  |  AMP: {args.use_amp}")
@@ -1917,7 +2028,7 @@ def main():
     if args.use_progressive_res:  kr_features.append("K5:ProgRes")
     if kr_features:
         print(f"Knowledge Retention: {' | '.join(kr_features)}")
-    print(f"{'='*70}\n")
+    print(f"{sep}\n")
 
     variant = getattr(args, 'model_variant', 'fan_dwsa')
     if variant == 'fan_dwsa':
@@ -2131,7 +2242,7 @@ def main():
             use_class_weights=False
         )
 
-    print(f"\n{'='*70}\nSTARTING TRAINING\n{'='*70}\n")
+    print(f"\n{sep}\nSTARTING TRAINING\n{sep}\n")
 
     applied_unfreeze_stages = set()
 
@@ -2235,9 +2346,9 @@ def main():
             diag.log(epoch, f'iou/{cname}', float(ciou))
 
         # ── Standard logging ─────────────────────────────────────────────
-        print(f"\n{'='*70}")
+        print(f"\n{sep}")
         print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"{'='*70}")
+        print(f"{sep}")
         print(f"Train — Loss: {train_metrics['loss']:.4f} | "
               f"OHEM: {train_metrics['ohem']:.4f} | "
               f"Dice: {train_metrics['dice']:.4f} | "
@@ -2245,7 +2356,7 @@ def main():
         print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
               f"mIoU: {val_metrics['miou']:.4f}  | "
               f"Acc: {val_metrics['accuracy']:.4f}")
-        print(f"{'='*70}\n")
+        print(f"{sep}\n")
 
         trainer.writer.add_scalar('val/loss',     val_metrics['loss'],     epoch)
         trainer.writer.add_scalar('val/miou',     val_metrics['miou'],     epoch)
@@ -2263,11 +2374,11 @@ def main():
     diag.close()
     trainer.writer.close()
 
-    print(f"\n{'='*70}")
+    print(f"\n{sep}")
     print(f"TRAINING COMPLETED!")
     print(f"Best mIoU: {trainer.best_miou:.4f}")
     print(f"Checkpoints: {args.save_dir}")
-    print(f"{'='*70}\n")
+    print(f"{sep}\n")
 
 
 if __name__ == "__main__":
