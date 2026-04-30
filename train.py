@@ -733,7 +733,7 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
     if truly_unmatched:
         print(f"Backbone unmatched:    {len(truly_unmatched)}  ← cần kiểm tra")
         for k in truly_unmatched[:5]: print(f"    {k}")
-    print(sep + "\n")
+    print(SEP + "\n")
 
     missing_bb, _ = model.backbone.load_state_dict(compatible, strict=False)
     missing_hd, _ = model.decode_head.load_state_dict(head_loaded, strict=False)
