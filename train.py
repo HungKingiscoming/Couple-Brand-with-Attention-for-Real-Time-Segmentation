@@ -1632,38 +1632,7 @@ class Trainer:
                 continue
 
             self.scaler.scale(loss).backward()
-            # ── DEBUG GRADIENT (batch 0, epoch 0 only) ──────────
-            if batch_idx == 0 and epoch == 0:
-                self.scaler.unscale_(self.optimizer)
-                print(f"\n{'='*60}")
-                print(f"  GRADIENT DEBUG")
-                print(f"{'='*60}")
-                print(f"  {'Label':<40} {'grad_norm':>10}  {'requires_grad':>13}")
-                print(f"  {'─'*40}  {'─'*10}  {'─'*13}")
-                targets = [
-                    ('backbone.dwsa_stage4.gamma',                              'DWSA4 gamma'),
-                    ('backbone.dwsa_stage5.gamma',                              'DWSA5 gamma'),
-                    ('backbone.dwsa_stage6.gamma',                              'DWSA6 gamma'),
-                    ('backbone.dwsa_stage4.query.weight',                       'DWSA4 query'),
-                    ('backbone.dwsa_stage4.out_proj.weight',                    'DWSA4 out_proj'),
-                    ('backbone.stem_conv1.1.alpha',                             'FAN1 alpha'),
-                    ('backbone.stem_conv2.1.alpha',                             'FAN2 alpha'),
-                    ('backbone.stem_conv1.0.weight',                            'stem_conv1[0] (frozen?)'),
-                    ('backbone.stem_stage2.0.path_3x3_1.conv1.conv.weight',    'stem_stage2 (frozen?)'),
-                    ('backbone.semantic_branch_layers.0.0.path_3x3_1.conv1.conv.weight', 'semantic[0][0]'),
-                    ('backbone.spp.processes.0.conv.weight',                    'spp.processes[0]'),
-                    ('decode_head.cls_seg.weight',                              'head cls_seg'),
-                ]
-                param_dict = dict(self.model.named_parameters())
-                for pname, label in targets:
-                    p = param_dict.get(pname)
-                    if p is None:
-                        print(f"  {label:<40} {'NOT FOUND':>10}")
-                        continue
-                    g = p.grad.norm().item() if p.grad is not None else 0.0
-                    rg = str(p.requires_grad)
-                    print(f"  {label:<40} {g:>10.6f}  {rg:>13}")
-                print(f"{'='*60}\n")
+    
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
                 max_grad = check_gradients(self.model, threshold=10.0)
