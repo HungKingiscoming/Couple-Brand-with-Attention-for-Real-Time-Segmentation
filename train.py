@@ -1519,9 +1519,19 @@ class Trainer:
                     if isinstance(m, nn.BatchNorm2d):
                         m.eval()
         if getattr(self.args, "freeze_stem_conv", False):
+            # Re-lock stem mỗi epoch sau model.train() — train() không restore requires_grad
+            for stem_name in ["stem_conv1", "stem_conv2"]:
+                module = getattr(self.model.backbone, stem_name, None)
+                if module is None: continue
+                for pname, param in module.named_parameters():
+                    is_fan = any(k in pname for k in ("alpha", "bn.", "in_."))
+                    if not is_fan:
+                        param.requires_grad = False
             for stem_name in ["stem_stage2", "stem_stage3"]:
                 module = getattr(self.model.backbone, stem_name, None)
                 if module is not None:
+                    for param in module.parameters():
+                        param.requires_grad = False
                     for m in module.modules():
                         if isinstance(m, nn.BatchNorm2d):
                             m.eval()
@@ -1684,8 +1694,8 @@ class Trainer:
         }
 
         if self.diag:
-            # Chỉ log val metrics vào CSV — train metrics không cần thiết cho diagnostics
-            pass
+            self.diag.log_dict(epoch, result, prefix='train/')
+            self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
 
         return result
 
