@@ -75,6 +75,10 @@ import gc
 import warnings
 warnings.filterwarnings('ignore')
 
+# Module-level separator constant used across all print functions
+SEP = "=" * 70
+
+
 from model.head.segmentation_head import GCNetHead
 from data.custom import create_dataloaders
 from model.model_utils import replace_bn_with_gn, init_weights, check_model_health
@@ -716,8 +720,7 @@ def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dws
     truly_unmatched = [k for k in skipped
                        if not any(s in k for s in expected_skip_markers)]
 
-    sep = '=' * 70
-    print(f"\n{sep}\nWEIGHT LOADING SUMMARY\n{sep}")
+    print(f"\n{SEP}\nWEIGHT LOADING SUMMARY\n{SEP}")
     print(f"Backbone:  {loaded_bb:>5} / {total_bb}  ({100*loaded_bb/max(total_bb,1):.1f}%)")
     print(f"Head:      {loaded_hd:>5} / {total_hd}  ({100*loaded_hd/max(total_hd,1):.1f}%)")
     print(f"BN dropped (expected): {len(bn_dropped):>3}")
@@ -1030,10 +1033,9 @@ def debug_inf_gradients(model, batch_idx: int, loss_components: dict):
     if not inf_layers and not nan_layers:
         return  # không có vấn đề, không in gì
 
-    sep = "=" * 70
-    print(f"\n  {sep}")
+    print(f"\n  {SEP}")
     print(f"  🔴 INF/NAN GRADIENT DEBUG — batch {batch_idx}")
-    print(f"  {sep}")
+    print(f"  {SEP}")
 
     # Loss components
     print(f"  Loss components:")
@@ -1087,7 +1089,7 @@ def debug_inf_gradients(model, batch_idx: int, loss_components: dict):
         for name, g in top3:
             print(f"    {name[-55:]}: {g:.1f}")
 
-    print(f"  {sep}\n")
+    print(f"  {SEP}\n")
 
 
 
@@ -1230,7 +1232,7 @@ def count_trainable_params(model):
     hd_total  = sum(p.numel() for p in model.decode_head.parameters())
     hd_train  = sum(p.numel() for p in model.decode_head.parameters()
                     if p.requires_grad)
-    print(f"\n{sep}\nPARAMETER STATISTICS\n{sep}")
+    print(f"\n{SEP}\nPARAMETER STATISTICS\n{SEP}")
     print(f"Total:      {total:>15,} | 100%")
     print(f"Trainable:  {trainable:>15,} | {100*trainable/total:.1f}%")
     print(f"Frozen:     {total-trainable:>15,} | "
@@ -1240,7 +1242,7 @@ def count_trainable_params(model):
           f"{100*bb_train/max(bb_total,1):.1f}%")
     print(f"Head:       {hd_train:>15,} / {hd_total:,} | "
           f"{100*hd_train/max(hd_total,1):.1f}%")
-    print(f"{sep}\n")
+    print(f"{SEP}\n")
     return trainable, total - trainable
 
 
@@ -1329,7 +1331,7 @@ def unfreeze_backbone_progressive(model, stage_names):
 
 
 def print_backbone_structure(model):
-    print(f"\n{sep}\n BACKBONE STRUCTURE (GCNet v3)\n{sep}")
+    print(f"\n{SEP}\n BACKBONE STRUCTURE (GCNet v3)\n{SEP}")
     for name, module in model.backbone.named_children():
         n_params = sum(p.numel() for p in module.parameters())
         if isinstance(module, nn.ModuleList):
@@ -1339,7 +1341,7 @@ def print_backbone_structure(model):
                 print(f"    [{i}]: {type(sub).__name__}  ({sp:,} params)")
         else:
             print(f"  {name}: {type(module).__name__}  ({n_params:,} params)")
-    print(f"{sep}\n")
+    print(f"{SEP}\n")
 
 
 # ============================================
@@ -1490,7 +1492,7 @@ class Trainer:
               f"(CE={self.ce_weight}, Dice={self.dice_weight})")
 
     def _print_config(self, loss_cfg):
-        print(f"\n{sep}\nTRAINER CONFIGURATION\n{sep}")
+        print(f"\n{SEP}\nTRAINER CONFIGURATION\n{SEP}")
         print(f"Batch size:             {self.args.batch_size}")
         print(f"Gradient accumulation:  {self.args.accumulation_steps}")
         print(f"Effective batch:        "
@@ -1504,7 +1506,7 @@ class Trainer:
                   f"alpha={self.args.distill_alpha}")
         if getattr(self.args, 'use_ewc', False):
             print(f"EWC: lambda={self.args.ewc_lambda}")
-        print(f"{sep}\n")
+        print(f"{SEP}\n")
 
     def save_config(self):
         with open(self.save_dir / "config.json", "w") as f:
@@ -1886,7 +1888,6 @@ CLASS_NAMES = ['road','sidewalk','building','wall','fence','pole',
 # ============================================
 
 def main():
-    sep = "=" * 70
     parser = argparse.ArgumentParser(description="GCNet v3 Training")
     parser.add_argument("--model_variant",         type=str, default="fan_dwsa",
                         choices=["fan_dwsa", "fan_only", "dwsa_only"])
@@ -2013,9 +2014,9 @@ def main():
         args.scheduler = 'cosine'
         print("[INFO] scheduler auto-switched: onecycle → cosine")
 
-    print(f"\n{sep}")
+    print(f"\n{SEP}")
     print(f"GCNet v3 Training  |  {args.model_variant}")
-    print(f"{sep}")
+    print(f"{SEP}")
     print(f"Device: {device}  |  Image: {args.img_h}x{args.img_w}")
     print(f"Epochs: {args.epochs}  |  Scheduler: {args.scheduler}")
     print(f"Grad clip: {args.grad_clip}  |  AMP: {args.use_amp}")
@@ -2029,7 +2030,7 @@ def main():
     if args.use_progressive_res:  kr_features.append("K5:ProgRes")
     if kr_features:
         print(f"Knowledge Retention: {' | '.join(kr_features)}")
-    print(f"{sep}\n")
+    print(f"{SEP}\n")
 
     variant = getattr(args, 'model_variant', 'fan_dwsa')
     if variant == 'fan_dwsa':
@@ -2243,7 +2244,7 @@ def main():
             use_class_weights=False
         )
 
-    print(f"\n{sep}\nSTARTING TRAINING\n{sep}\n")
+    print(f"\n{SEP}\nSTARTING TRAINING\n{SEP}\n")
 
     applied_unfreeze_stages = set()
 
@@ -2347,9 +2348,9 @@ def main():
             diag.log(epoch, f'iou/{cname}', float(ciou))
 
         # ── Standard logging ─────────────────────────────────────────────
-        print(f"\n{sep}")
+        print(f"\n{SEP}")
         print(f"Epoch {epoch+1}/{args.epochs}")
-        print(f"{sep}")
+        print(f"{SEP}")
         print(f"Train — Loss: {train_metrics['loss']:.4f} | "
               f"OHEM: {train_metrics['ohem']:.4f} | "
               f"Dice: {train_metrics['dice']:.4f} | "
@@ -2357,7 +2358,7 @@ def main():
         print(f"Val   — Loss: {val_metrics['loss']:.4f}  | "
               f"mIoU: {val_metrics['miou']:.4f}  | "
               f"Acc: {val_metrics['accuracy']:.4f}")
-        print(f"{sep}\n")
+        print(f"{SEP}\n")
 
         trainer.writer.add_scalar('val/loss',     val_metrics['loss'],     epoch)
         trainer.writer.add_scalar('val/miou',     val_metrics['miou'],     epoch)
@@ -2375,11 +2376,11 @@ def main():
     diag.close()
     trainer.writer.close()
 
-    print(f"\n{sep}")
+    print(f"\n{SEP}")
     print(f"TRAINING COMPLETED!")
     print(f"Best mIoU: {trainer.best_miou:.4f}")
     print(f"Checkpoints: {args.save_dir}")
-    print(f"{sep}\n")
+    print(f"{SEP}\n")
 
 
 if __name__ == "__main__":
