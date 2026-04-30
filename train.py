@@ -1430,6 +1430,12 @@ class Trainer:
                 for m in spp.modules():
                     if isinstance(m, nn.BatchNorm2d):
                         m.eval()
+                        # Freeze gradient — m.eval() chỉ tắt running stats update
+                        # nhưng backward vẫn tính gradient cho weight/bias → có thể inf
+                        if m.weight is not None:
+                            m.weight.requires_grad = False
+                        if m.bias is not None:
+                            m.bias.requires_grad = False
         if getattr(self.args, "freeze_stem_conv", False):
             for stem_name in ["stem_stage2", "stem_stage3"]:
                 module = getattr(self.model.backbone, stem_name, None)
@@ -2053,6 +2059,29 @@ def main():
                                     start_epoch=trainer.start_epoch)
         trainer.optimizer = optimizer
         trainer.scheduler = scheduler
+
+    # ── Freeze SPP BN — disable cả gradient để tránh inf backward ────────
+    if getattr(args, "freeze_spp_bn", False):
+        spp = getattr(model.backbone, "spp", None)
+        if spp is not None:
+            frozen_spp_params = 0
+            for m in spp.modules():
+                if isinstance(m, nn.BatchNorm2d):
+                    m.eval()
+                    if m.weight is not None:
+                        m.weight.requires_grad = False
+                        frozen_spp_params += m.weight.numel()
+                    if m.bias is not None:
+                        m.bias.requires_grad = False
+                        frozen_spp_params += m.bias.numel()
+            print(f"SPP BN frozen: {frozen_spp_params} params "
+                  f"(eval mode + grad disabled — prevents inf gradient)")
+            # Rebuild optimizer để loại bỏ SPP BN params khỏi param groups
+            optimizer = build_optimizer(model, args)
+            scheduler = build_scheduler(optimizer, args, train_loader,
+                                        start_epoch=trainer.start_epoch)
+            trainer.optimizer = optimizer
+            trainer.scheduler = scheduler
 
     # ── K3: Load teacher model ─────────────────────────────────────────────
     if args.use_distillation and args.teacher_ckpt:
