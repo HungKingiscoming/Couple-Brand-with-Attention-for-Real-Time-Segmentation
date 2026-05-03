@@ -19,16 +19,10 @@ from components.components import (
 
 
 # =============================================================================
-# DWSA — Dynamic Weight Self-Attention (giữ nguyên từ model.py)
+# DWSA — Dynamic Weight Self-Attention
 # =============================================================================
 
 class DWSA(nn.Module):
-    """Dynamic Weight Self-Attention.
-
-    Áp lên semantic branch (global context) thay vì detail branch (local).
-    Không có FoggyAwareNorm — stem dùng BN thuần.
-    """
-
     def __init__(self,
                  in_channels: int,
                  reduction: int = 8,
@@ -90,26 +84,8 @@ class DWSA(nn.Module):
         return x + self.gamma * out
 
 
-# =============================================================================
-# GCNet backbone — DWSA only, NO FoggyAwareNorm
-# Stem dùng BN thuần (giống pretrained GCNet-S checkpoint)
-# → Load pretrained weights 100% backbone (không có key mismatch ở stem)
-# =============================================================================
 
 class GCNet(BaseModule):
-    """GCNet backbone với DWSA, không có FoggyAwareNorm.
-
-    So với model.py (FAN + DWSA):
-      - Bỏ FoggyAwareNorm ở stem_conv1/2 → dùng BN thuần
-      - Giữ nguyên DWSA trên semantic branch (stage 4/5/6)
-      - Stem weights load 100% từ GCNet-S checkpoint (không có FAN mismatch)
-      - Phù hợp để so sánh: DWSA-only vs FAN+DWSA vs FAN-only
-
-    Khi nào dùng:
-      - Domain không quá foggy (clear Cityscapes hoặc nhẹ)
-      - Muốn tận dụng pretrained weights hoàn toàn
-      - Cần deploy nhanh (không có InstanceNorm overhead)
-    """
 
     def __init__(self,
                  in_channels: int = 3,
@@ -134,9 +110,7 @@ class GCNet(BaseModule):
         self.act_cfg              = act_cfg
         self.deploy               = deploy
 
-        # ── Stage 1: Stem với BN thuần ────────────────────────────────────────
-        # Khác với model.py (dùng FoggyAwareNorm)
-        # → Weights load trực tiếp từ GCNet-S checkpoint không cần remapping
+        # ── Stage 1: ────────────────────────────────────────
         self.stem_conv1 = nn.Sequential(
             nn.Conv2d(in_channels, channels,
                       kernel_size=3, stride=2, padding=1, bias=False),
@@ -270,11 +244,11 @@ class GCNet(BaseModule):
 
         out_size = (math.ceil(x.shape[-2] / 8), math.ceil(x.shape[-1] / 8))
 
-        # Stage 1-3 (BN thuần, không FAN)
+        # Stage 1-3
         x = self.stem_conv1(x)
         x = self.stem_conv2(x)
         x = self.stem_stage2(x)
-        x = self.stem_stage3(x)      # 1/8, channels*2
+        x = self.stem_stage3(x)      
 
         # Stage 4
         x_s = self.semantic_branch_layers[0](x)
@@ -334,7 +308,7 @@ class GCNet(BaseModule):
 
 
 # =============================================================================
-# Block1x1, Block3x3, GCBlock — copy từ model.py với bugfixes
+# Block1x1, Block3x3, GCBlock
 # =============================================================================
 
 class Block1x1(BaseModule):
