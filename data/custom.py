@@ -62,11 +62,11 @@ class CityscapesDataset(Dataset):
                     img_path, label_path = line.split(',')
                     self.samples.append((img_path, label_path))
 
-        print(f"📁 Loaded {len(self.samples)} samples from {txt_file}")
-        print(f"🏷️  Dataset type: {self.dataset_type.upper()}")
-        print(f"🎯 Label mapping mode: {self.label_mapping}")
-        print(f"✅ Valid training classes: 19 (0-18)")
-        print(f"🚫 Ignore index: {self.ignore_index}")
+        print(f"Loaded {len(self.samples)} samples from {txt_file}")
+        print(f"Dataset type: {self.dataset_type.upper()}")
+        print(f"Label mapping mode: {self.label_mapping}")
+        print(f"Valid training classes: 19 (0-18)")
+        print(f"Ignore index: {self.ignore_index}")
 
         if transforms is None:
             self.transforms = self.get_default_transforms()
@@ -113,7 +113,7 @@ class CityscapesDataset(Dataset):
         import multiprocessing as mp
     
         label_paths = [p for _, p in self.samples]
-        print(f"📊 Computing class distribution ({len(label_paths)} files, {num_workers} workers)...")
+        print(f"Computing class distribution ({len(label_paths)} files, {num_workers} workers)...")
     
         with mp.Pool(
             processes=num_workers,
@@ -141,10 +141,6 @@ def get_train_transforms(
     dataset_type: str = 'normal'
 ) -> A.Compose:
 
-    # ===== GEOMETRIC (CORE) =====
-    # FIX: scale_limit tuple để giới hạn lower bound ở 0.75
-    # Bản gốc scale_limit=0.4 → scale có thể xuống 0.6× → sau PadIfNeeded
-    # phần lớn crop là padding (mask=255) → gradient thưa, OHEM không hiệu quả
     base_list = [
         A.RandomScale(scale_limit=(-0.25, 0.5), p=0.9),  # 10% samples giữ nguyên scale
 
@@ -161,8 +157,6 @@ def get_train_transforms(
 
         A.HorizontalFlip(p=0.5),
 
-        # GridDistortion: tạo biến thể hình học nhẹ
-        # Đặc biệt hiệu quả cho boundary của object nhỏ (rider, motorcycle)
         A.GridDistortion(
             num_steps=5,
             distort_limit=0.1,
@@ -176,9 +170,6 @@ def get_train_transforms(
     # ===== DATASET-SPECIFIC =====
     if dataset_type == 'foggy':
         specific = [
-            # FIX: giảm holes từ 6 xuống 4 và size từ 32 xuống 24
-            # Foggy images đã có nhiều vùng khó (fog-occluded) → dropout quá nhiều
-            # làm giảm useful gradient
             A.CoarseDropout(
                 max_holes=4,
                 max_height=24,
@@ -192,10 +183,6 @@ def get_train_transforms(
                 A.GaussianBlur(blur_limit=3, p=1.0),
                 A.MotionBlur(blur_limit=3, p=1.0),
             ], p=0.15),
-
-            # FIX: thêm CLAHE để augment low-contrast foggy images
-            # CLAHE tăng local contrast → model học được features dù bị fog che
-            # Tăng p 0.2→0.35 và clip_limit range để hiệu quả hơn với foggy
             A.CLAHE(clip_limit=(1.0, 4.0), tile_grid_size=(8, 8), p=0.35),
 
             A.OneOf([
@@ -206,17 +193,11 @@ def get_train_transforms(
                 ),
                 A.RandomGamma(gamma_limit=(90, 110), p=1.0),
             ], p=0.3),
-
-            # FIX: thêm ISONoise — simulates camera noise trong điều kiện sương
-            # Giảm ISONoise: fog + noise cùng lúc confuse model
             A.ISONoise(
                 color_shift=(0.01, 0.02),
                 intensity=(0.02, 0.08),
                 p=0.05
             ),
-
-            # Tăng fog_coef_upper 0.15→0.30: cover fog nặng hơn
-            # Cityscapes Foggy có 3 beta levels, 0.15 chỉ cover beta=0.005
             A.RandomFog(
                 fog_coef_lower=0.05,
                 fog_coef_upper=0.30,
@@ -322,8 +303,6 @@ def create_dataloaders(
     if compute_class_weights:
         import hashlib, pathlib
     
-        # Cache key dựa trên nội dung train_txt
-        # → cùng dataset thì load cache, khác dataset thì tính lại
         with open(train_txt, 'rb') as f:
             txt_hash = hashlib.md5(f.read()).hexdigest()[:8]
         cache_path = pathlib.Path(train_txt).parent / f"class_weights_cache_{txt_hash}.pt"
@@ -331,20 +310,19 @@ def create_dataloaders(
         if cache_path.exists():
             # Load từ cache — gần như instant
             class_weights = torch.load(cache_path, map_location='cpu')
-            print(f"✅ Class weights loaded from cache: {cache_path}")
+            print(f"Class weights loaded from cache: {cache_path}")
             print(f"   (min={class_weights.min():.3f}, max={class_weights.max():.3f})")
         else:
             print(f"\n{'='*60}")
-            print("📊 Computing class weights (first time, will be cached)...")
+            print("Computing class weights (first time, will be cached)...")
             print(f"{'='*60}\n")
     
-            # Dùng num_workers từ dataloader config
             class_counts = train_dataset.get_class_distribution(
                 num_workers=num_workers
             )
             total_pixels = sum(class_counts.values())
     
-            print("\n📈 Class distribution:")
+            print("\nClass distribution:")
             print(f"{'Class':<8} {'Pixels':<15} {'Frequency':<12} {'Weight':<10}")
             print("-" * 50)
     
@@ -362,7 +340,7 @@ def create_dataloaders(
     
             # Lưu cache
             torch.save(class_weights, cache_path)
-            print(f"\n✅ Class weights computed & cached → {cache_path}")
+            print(f"\nClass weights computed & cached → {cache_path}")
             print(f"   (min={class_weights.min():.3f}, max={class_weights.max():.3f})")
 
     train_loader = torch.utils.data.DataLoader(
@@ -385,13 +363,13 @@ def create_dataloaders(
     )
 
     print(f"\n{'='*60}")
-    print("✅ DataLoaders Created Successfully")
+    print("DataLoaders Created Successfully")
     print(f"{'='*60}")
-    print(f"📦 Train samples: {len(train_dataset):,} ({len(train_loader)} batches)")
-    print(f"📦 Val samples:   {len(val_dataset):,} ({len(val_loader)} batches)")
-    print(f"🔢 Batch size:    {batch_size}")
-    print(f"👷 Workers:       {num_workers}")
-    print(f"📐 Image size:    {img_size[0]}x{img_size[1]}")
+    print(f"Train samples: {len(train_dataset):,} ({len(train_loader)} batches)")
+    print(f"Val samples:   {len(val_dataset):,} ({len(val_loader)} batches)")
+    print(f"Batch size:    {batch_size}")
+    print(f"Workers:       {num_workers}")
+    print(f"Image size:    {img_size[0]}x{img_size[1]}")
     print(f"{'='*60}\n")
 
     return train_loader, val_loader, class_weights
