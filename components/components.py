@@ -1,11 +1,4 @@
-"""
-components/components.py — fixed version
 
-Thay đổi duy nhất so với bản gốc:
-    ConvModule.__init__: norm_channels xác định theo vị trí 'norm' trong order.
-    Khi order=('norm','act','conv'): norm nhận in_channels (không phải out_channels).
-    Khi order=('conv','norm','act'): norm nhận out_channels (giống bản gốc).
-"""
 import numpy as np
 import torch
 import torch.nn as nn
@@ -133,33 +126,10 @@ def build_activation_layer(cfg: Union[Dict, str, None]) -> Optional[nn.Module]:
 
 
 # ============================================================================
-# CONVOLUTION MODULE  —  BUG FIX: norm_channels theo vị trí trong order
+# CONVOLUTION MODULE
 # ============================================================================
 
 class ConvModule(nn.Module):
-    """Conv + Norm + Activation với thứ tự tuỳ chỉnh qua `order`.
-
-    FIX so với bản gốc:
-        norm_channels phụ thuộc vào vị trí của 'norm' trong order:
-        - 'norm' đứng TRƯỚC 'conv' → norm nhận in_channels
-          (DAPPM dùng order=(norm,act,conv) cần điều này)
-        - 'norm' đứng SAU  'conv' → norm nhận out_channels (default đúng)
-
-    Args:
-        in_channels:  Input channels.
-        out_channels: Output channels.
-        kernel_size:  Kernel size.
-        stride:       Default 1.
-        padding:      Default 0.
-        dilation:     Default 1.
-        groups:       Default 1.
-        bias:         'auto' | True | False.
-        conv_cfg:     Unused, giữ để tương thích API.
-        norm_cfg:     Norm config dict hoặc None.
-        act_cfg:      Activation config dict hoặc None.
-        order:        Tuple thứ tự ('conv','norm','act'). Default: ('conv','norm','act').
-    """
-
     def __init__(
         self,
         in_channels: int,
@@ -187,7 +157,6 @@ class ConvModule(nn.Module):
 
         # ---- bias ---- #
         if bias == 'auto':
-            # Tắt bias khi norm đứng SAU conv (norm hấp thụ bias)
             bias = not (self.with_norm and
                         'norm' in order and 'conv' in order and
                         order.index('norm') > order.index('conv'))
@@ -201,7 +170,6 @@ class ConvModule(nn.Module):
 
         # ---- Norm ---- #
         if self.with_norm:
-            # KEY FIX: xác định norm_channels theo vị trí trong order
             if 'norm' in order and 'conv' in order:
                 norm_before_conv = order.index('norm') < order.index('conv')
             else:
@@ -209,9 +177,7 @@ class ConvModule(nn.Module):
             norm_channels = in_channels if norm_before_conv else out_channels
 
             norm_name, norm_layer = build_norm_layer(norm_cfg, norm_channels)
-            # Giữ tên gốc (bn/gn/...) để state_dict key khớp checkpoint
             self.add_module(norm_name, norm_layer)
-            # Lưu tên vào biến KHÔNG trùng với property nào
             object.__setattr__(self, '_norm_key', norm_name)
 
         # ---- Activation ---- #
