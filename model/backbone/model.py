@@ -51,22 +51,6 @@ class FoggyAwareNorm(nn.Module):
 
 class DWSA(nn.Module):
     """Dynamic Weight Self-Attention.
-
-    Áp lên semantic branch (global context) thay vì detail branch (local).
-
-    FIX so với bản gốc:
-      1. Attention computation: bản gốc dùng bmm(v_pool, attn.T) — sai semantic.
-         Standard attention là attended[i] = sum_j attn[i,j] * v[j].
-         Sửa: v_t = v_pool.T → attended = bmm(attn, v_t).T
-
-      2. dw_gen gate: bản gốc gate từ x gốc, không interact với attended.
-         Sửa: gate từ attended (global-average-pooled) để channel weighting
-         phụ thuộc vào attention output — hai nhánh có interaction thực sự.
-
-      3. Bỏ self.norm (BN) sau out_proj:
-         - Deploy mode: BN trong DWSA không fuse được vào reparam conv
-         - gamma=0.1 + residual connection đã đủ kiểm soát magnitude
-         - Tránh vấn đề BN với small batch size
     """
 
     def __init__(self,
@@ -81,7 +65,6 @@ class DWSA(nn.Module):
         self.key     = nn.Conv2d(in_channels, mid_channels, kernel_size=1, bias=False)
         self.value   = nn.Conv2d(in_channels, in_channels,  kernel_size=1, bias=False)
 
-        # FIX 2: dw_gen nhận attended (sau attention) thay vì x gốc
         # Input là global-average-pooled attended feature → (B, C)
         self.dw_gen = nn.Sequential(
             nn.Linear(in_channels, mid_channels),
@@ -91,9 +74,7 @@ class DWSA(nn.Module):
         )
 
         self.out_proj = nn.Conv2d(in_channels, in_channels, kernel_size=1, bias=False)
-        # FIX 3: bỏ self.norm — deploy-safe, gamma=0.1 đủ kiểm soát magnitude
 
-        # gamma=0.1 → DWSA active ngay từ epoch đầu, không cần warm-up
         self.gamma = nn.Parameter(torch.ones(1) * 0.1)
 
         self._init_weights()
@@ -115,7 +96,6 @@ class DWSA(nn.Module):
         k = self.key(x)     # (B, mid_ch, H, W)
         v = self.value(x)   # (B, C,      H, W)
 
-        # Pool xuống spatial nhỏ hơn để tính attention hiệu quả
         ph, pw = H // 4 + 1, W // 4 + 1
         q_pool = F.adaptive_avg_pool2d(q, (ph, pw)).flatten(2)  # (B, mid_ch, N)
         k_pool = F.adaptive_avg_pool2d(k, (ph, pw)).flatten(2)  # (B, mid_ch, N)
@@ -129,7 +109,6 @@ class DWSA(nn.Module):
             dim=-1
         )   # (B, N, N), attn[b, i, j] = weight của query i với key j
 
-        # FIX 1: standard attention — attended[i] = sum_j attn[i,j] * v[j]
         # attn: (B, N, N)  ×  v_pool.T: (B, N, C)  →  (B, N, C)
         v_t      = v_pool.transpose(1, 2)            # (B, N, C)
         attended = torch.bmm(attn, v_t)              # (B, N, C)
@@ -138,12 +117,9 @@ class DWSA(nn.Module):
         attended = F.interpolate(attended, size=(H, W),
                                  mode='bilinear', align_corners=False)
 
-        # FIX 2: dw_gen gate từ attended (global avg pool), không phải x gốc
-        # → channel weighting có interaction với attention output
         attended_gap = attended.mean(dim=[-2, -1])   # (B, C)
         dw  = self.dw_gen(attended_gap).view(B, C, 1, 1)
 
-        # FIX 3: bỏ self.norm — out_proj đã đủ, gamma kiểm soát scale
         out = self.out_proj(attended * dw)
 
         return x + self.gamma * out
@@ -154,22 +130,6 @@ class DWSA(nn.Module):
 # =============================================================================
 
 class GCNet(BaseModule):
-    """GCNet backbone với DWSA trên semantic branch và FoggyAwareNorm ở stem.
-
-    Thay đổi so với bản gốc:
-      1. Stem dùng FoggyAwareNorm thay BN ở 2 conv đầu.
-      2. DWSA áp lên SEMANTIC branch (không phải detail branch):
-         - stage4: x_s sau bilateral fusion (channels*4, 1/16)
-         - stage5: x_s sau bilateral fusion (channels*8, 1/32)
-         - stage6: x_spp (DAPPM output) trước khi fuse với x_d (channels*4)
-      3. gamma khởi tạo 0.1 — DWSA có ảnh hưởng ngay từ epoch đầu.
-
-    FIX so với bản trước:
-      4. forward() nhận return_aux param — không còn fragile khi gọi ở eval mode.
-      5. c4_feat luôn được tạo trong forward, không dùng conditional assignment
-         → tránh UnboundLocalError nếu control flow thay đổi.
-    """
-
     def __init__(self,
                  in_channels: int = 3,
                  channels: int = 32,
@@ -344,12 +304,6 @@ class GCNet(BaseModule):
             return_aux: Nếu True → trả về (c4_feat, fused).
                         Nếu False → trả về fused.
                         Nếu None (default) → dùng self.training.
-
-        FIX: dùng return_aux thay vì chỉ dựa vào self.training.
-        Bản gốc: c4_feat chỉ được gán trong `if self.training` block →
-        nếu ai gọi backbone ở training mode nhưng cần fused only (e.g.
-        distillation teacher), hoặc gọi ở eval mode mà unpack tuple →
-        UnboundLocalError hoặc type error ngầm.
         """
         use_aux = self.training if return_aux is None else return_aux
 
@@ -373,8 +327,6 @@ class GCNet(BaseModule):
 
         x_s = self.dwsa_stage4(x_s)
 
-        # FIX: c4_feat luôn được tạo (dùng no-op clone khi không cần)
-        # Tránh UnboundLocalError nếu return_aux và self.training không đồng bộ
         c4_feat = x_d.clone() if use_aux else None
 
         # ---- Stage 5 ---------------------------------------------------- #
