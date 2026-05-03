@@ -19,19 +19,10 @@ from components.components import (
 
 
 # =============================================================================
-# Foggy-aware Normalization  (giữ nguyên)
+# Foggy-aware Normalization
 # =============================================================================
 
 class FoggyAwareNorm(nn.Module):
-    """Foggy-aware Normalization.
-
-    Kết hợp Instance Normalization và Batch Normalization qua learnable gate alpha.
-    Khi alpha → 1: thiên về IN (foggy / unseen domain).
-    Khi alpha → 0: thiên về BN (clear images / in-domain).
-
-    FIX: clamp alpha ∈ [0.05, 0.95] để tránh gradient explosion khi sigmoid saturate.
-    """
-
     def __init__(self,
                  num_channels: int,
                  requires_grad: bool = True,
@@ -49,27 +40,15 @@ class FoggyAwareNorm(nn.Module):
                 p.requires_grad_(False)
 
     def forward(self, x: Tensor) -> Tensor:
-        # Bỏ clamp: sigmoid đã đủ stable (output trong (0,1))
-        # Clamp (0.05, 0.95) giới hạn model không học full IN hoặc full BN
-        # Thêm eps nhỏ để tránh numerical issue ở boundary
         alpha = torch.sigmoid(self.alpha)
         return alpha * self.in_(x) + (1 - alpha) * self.bn(x)
 
 
 # =============================================================================
-# GCNet backbone — FoggyAwareNorm only, không có DWSA
+# GCNet backbone
 # =============================================================================
 
 class GCNet(BaseModule):
-    """GCNet backbone chỉ dùng FoggyAwareNorm ở stem, không có DWSA.
-
-    So với bản đầy đủ (FAN + DWSA):
-      - Loại bỏ hoàn toàn DWSA (dwsa_stage4/5/6)
-      - Không có dwsa_reduction param
-      - Forward đơn giản hơn, ít params hơn (~246K params DWSA)
-      - Phù hợp để so sánh baseline: FAN-only vs FAN+DWSA
-    """
-
     def __init__(self,
                  in_channels: int = 3,
                  channels: int = 32,
@@ -92,7 +71,7 @@ class GCNet(BaseModule):
         self.deploy               = deploy
 
         # ------------------------------------------------------------------ #
-        # Stage 1 — FoggyAwareNorm ở 2 conv đầu                              #
+        # Stage 1
         # ------------------------------------------------------------------ #
         self.stem_conv1 = nn.Sequential(
             nn.Conv2d(in_channels, channels,
