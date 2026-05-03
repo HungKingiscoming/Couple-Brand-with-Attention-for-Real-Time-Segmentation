@@ -1,24 +1,4 @@
-"""
-speed_benchmark.py — Đo FPS inference + Validate (GCNet-official style)
 
-Chạy benchmark:
-    python speed_benchmark.py \
-        --ckpt ./checkpoints/best.pth \
-        --model_variant fan_dwsa \
-        --img_h 512 --img_w 1024
-
-Chạy validate:
-    python speed_benchmark.py \
-        --ckpt ./checkpoints/best.pth \
-        --val_txt /kaggle/working/val.txt \
-        --validate
-
-Chạy cả hai:
-    python speed_benchmark.py \
-        --ckpt ./checkpoints/best.pth \
-        --val_txt /kaggle/working/val.txt \
-        --validate --benchmark
-"""
 import argparse
 import os
 import sys
@@ -140,18 +120,10 @@ def build_model(variant: str, ckpt_path: str, device: torch.device,
 
 
 # ============================================================
-# VALIDATE — GCNet official methodology (khớp iou_metric.py)
+# VALIDATE
 # ============================================================
 
 def _update_accum(pred, target, ti, tu, tp, tl):
-    """
-    Cập nhật 4 accumulators cho một batch.
-    Khớp với intersect_and_union() của GCNet iou_metric.py:
-      area_intersect = histc(pred[pred==label])
-      area_pred      = histc(pred)
-      area_label     = histc(label)
-      area_union     = area_pred + area_label - area_intersect
-    """
     mask = (target != IGNORE_INDEX) & (target >= 0) & (target < NUM_CLASSES)
     p    = pred[mask].astype(np.int64)
     t    = target[mask].astype(np.int64)
@@ -163,7 +135,6 @@ def _update_accum(pred, target, ti, tu, tp, tl):
 
 
 def _compute_metrics(ti, tu, tp, tl):
-    """Tính metrics từ accumulated totals — khớp total_area_to_metrics()."""
     present = tl > 0
     iou     = ti / (tu + 1e-10)
     acc     = ti / (tl + 1e-10)
