@@ -1,8 +1,3 @@
-"""
-Label mapping utilities for Cityscapes dataset
-Reference: https://github.com/mcordts/cityscapesScripts
-"""
-
 import numpy as np
 from PIL import Image
 import matplotlib.pyplot as plt
