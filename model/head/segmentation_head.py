@@ -55,29 +55,6 @@ class CrossEntropyLoss(nn.Module):
 # =============================================================================
 
 class OHEMCrossEntropyLoss(nn.Module):
-    """Online Hard Example Mining Cross-Entropy Loss.
-
-    FIX: thresh mặc định đổi từ 0.7 → 1.5.
-
-    Lý do: với 19 classes, random prediction cho loss ≈ ln(19) ≈ 2.94.
-    Threshold 0.7 quá thấp → gần như mọi pixel đều vượt ngưỡng ở early
-    training → OHEM hoạt động giống CE thường, không có tác dụng filtering.
-
-    thresh=1.5 ≈ 51% của loss random → chỉ giữ pixel mà model đang sai
-    đáng kể, buộc focus vào các vùng bị fog che phủ nặng.
-
-    Guideline chọn thresh:
-      - thresh ≈ ln(C) * 0.5  (C = num_classes) là điểm khởi đầu tốt
-      - Tăng thresh → strict hơn, gradient thưa hơn
-      - Giảm thresh → tiệm cận CE thường
-      - min_kept đảm bảo gradient không quá thưa khi fog nhẹ
-
-    Args:
-        ignore_index (int): Label value to ignore. Default: 255.
-        loss_weight (float): Scalar weight. Default: 1.0.
-        thresh (float): Loss threshold. Default: 1.5 (FIX từ 0.7).
-        min_kept (int): Số pixel tối thiểu giữ lại. Default: 100_000.
-    """
 
     def __init__(self,
                  ignore_index: int = 255,
@@ -117,33 +94,6 @@ class OHEMCrossEntropyLoss(nn.Module):
 # =============================================================================
 
 class FogConsistencyLoss(nn.Module):
-    """Fog Consistency Loss — KL divergence giữa predictions của cùng scene
-    ở hai mức fog khác nhau.
-
-    FIX: làm rõ KL direction — light fog là TEACHER (target P), heavy fog
-    là STUDENT (distribution Q được tối ưu).
-
-    Lý do chọn chiều này:
-      - Light fog ít degraded hơn → prediction ổn định, distribution sắc nét
-        hơn → làm target tốt hơn
-      - Heavy fog prediction noisy → nếu dùng làm target thì KL loss dạy
-        student học noise
-      - KL(P=light || Q=heavy) → heavy fog model học phân phối của light fog
-
-    Gọi đúng cách:
-        fog_loss = loss_fog(logit_light.detach(), logit_heavy)
-        # logit_light là teacher → detach
-        # logit_heavy là student → được update
-
-    Không nên:
-        fog_loss = loss_fog(logit_light, logit_heavy.detach())
-        # heavy fog làm target → dạy model học noise
-
-    Args:
-        temperature (float): Softmax temperature. Default: 4.0.
-        loss_weight (float): Scalar weight. Default: 0.1.
-    """
-
     def __init__(self,
                  temperature: float = 4.0,
                  loss_weight: float = 0.1):
@@ -154,16 +104,6 @@ class FogConsistencyLoss(nn.Module):
     def forward(self,
                 logit_light: Tensor,
                 logit_heavy: Tensor) -> Tensor:
-        """
-        Args:
-            logit_light (Tensor): Logits của ảnh foggy NHẸ, shape (B, C, H, W).
-                Nên .detach() trước khi truyền vào (light fog = teacher).
-            logit_heavy (Tensor): Logits của ảnh foggy NẶNG, shape (B, C, H, W).
-                Đây là student → KHÔNG detach, để gradient chạy qua.
-
-        Returns:
-            Tensor: Scalar KL divergence loss (heavy fog học từ light fog).
-        """
         assert logit_light.shape == logit_heavy.shape, (
             f"FogConsistencyLoss: shape mismatch "
             f"{logit_light.shape} vs {logit_heavy.shape}"
@@ -185,19 +125,6 @@ class FogConsistencyLoss(nn.Module):
 # =============================================================================
 
 class GCNetHead(BaseModule):
-    """Decode head for GCNet.
-
-    FIX so với bản gốc:
-      1. ohem_thresh default: 0.7 → 1.5 (phù hợp với 19-class Cityscapes)
-      2. seg_label shape: dùng shape[-2:] thay vì shape[1:] — an toàn với
-         (B, 1, H, W) input
-      3. forward() thêm assertion khi training mode để debug type error sớm
-      4. FogConsistencyLoss API: đổi tên param logit_a/b → logit_light/heavy
-         để tường minh hơn, đồng thời sửa KL direction
-      5. _make_base_head: giữ nguyên pre-activation (BN→ReLU→ConvModule)
-         để khớp với checkpoint structure — model_loader.py xử lý key remap
-    """
-
     def __init__(self,
                  in_channels: int,
                  channels: int,
@@ -241,7 +168,6 @@ class GCNetHead(BaseModule):
         self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
                                          loss_weight=loss_weight_aux)
 
-        # FIX: thresh=1.5 (default đã sửa ở param)
         self.loss_c6 = OHEMCrossEntropyLoss(
             ignore_index=ignore_index,
             loss_weight=1.0,
@@ -281,15 +207,6 @@ class GCNetHead(BaseModule):
     def forward(self,
                 inputs: Union[Tensor, Tuple[Tensor, Tensor]]
                 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
-        """Forward pass.
-
-        Training  : inputs = (c4_feat, c6_feat) → returns (c4_logit, c6_logit)
-        Inference : inputs = c6_feat            → returns c6_logit
-
-        FIX: thêm assertion để bắt type error sớm.
-        Bản gốc: nếu training mode nhưng nhận Tensor đơn → unpack error
-        không rõ ràng. Assert giúp debug nhanh hơn.
-        """
         if self.training:
             assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, (
                 f"GCNetHead training mode expects (c4_feat, c6_feat) tuple, "
@@ -320,21 +237,6 @@ class GCNetHead(BaseModule):
     def loss(self,
              seg_logits: Tuple[Tensor, Tensor],
              seg_label: Tensor) -> Dict[str, Tensor]:
-        """Tính loss từ logits và ground-truth label.
-
-        FIX: dùng seg_label.shape[-2:] thay vì shape[1:].
-        Bản gốc: shape[1:] đúng khi seg_label là (B, H, W), nhưng nếu
-        caller truyền vào (B, 1, H, W) thì target_size = (1, H, W) →
-        resize tạo ra logit sai shape, lỗi ngầm không bắt được.
-        shape[-2:] luôn lấy đúng (H, W) bất kể có dim=1 hay không.
-
-        Args:
-            seg_logits: (c4_logit, c6_logit) từ forward() khi training.
-            seg_label: Ground-truth shape (B, H, W) hoặc (B, 1, H, W).
-
-        Returns:
-            dict: 'loss_c4', 'loss_c6', 'acc_seg'.
-        """
         c4_logit, c6_logit = seg_logits
 
         # FIX: normalize seg_label shape → luôn (B, H, W)
@@ -360,26 +262,6 @@ class GCNetHead(BaseModule):
     def compute_fog_consistency(self,
                                  logit_light: Tensor,
                                  logit_heavy: Tensor) -> Optional[Tensor]:
-        """Tính FogConsistencyLoss giữa logits của cùng scene ở 2 mức fog.
-
-        FIX: đổi tên param logit_a/b → logit_light/heavy để tường minh.
-        API mới buộc caller phải nghĩ về chiều KL đúng:
-          logit_light = teacher (detach trước khi truyền vào)
-          logit_heavy = student (không detach)
-
-        Gọi đúng:
-            fog_loss = head.compute_fog_consistency(
-                logit_light.detach(),   # light fog = teacher, frozen
-                logit_heavy             # heavy fog = student, trainable
-            )
-
-        Args:
-            logit_light: Logits ảnh foggy nhẹ (B, C, H, W). Nên .detach().
-            logit_heavy: Logits ảnh foggy nặng (B, C, H, W). Không detach.
-
-        Returns:
-            Tensor hoặc None nếu fog_consistency_weight=0.
-        """
         if self.loss_fog is None:
             return None
         return self.loss_fog(logit_light, logit_heavy)
@@ -389,22 +271,6 @@ class GCNetHead(BaseModule):
     # ---------------------------------------------------------------------- #
 
     def _make_base_head(self, in_channels: int, channels: int) -> nn.Sequential:
-        """Pre-activation: BN → ReLU → ConvModule(Conv→BN→ReLU).
-
-        Giữ nguyên pre-activation để khớp với checkpoint structure:
-          head.0.*       = BN standalone  (in_channels)
-          head.1         = ReLU
-          head.2.conv.*  = Conv 3×3
-          head.2.bn.*    = BN trong ConvModule
-
-        model_loader.py xử lý việc remap:
-          head.2.conv.* → head.0.conv.*  (trong ConvModule)
-          head.2.bn.*   → head.0.bn.*    (trong ConvModule)
-          head.0.*      → dropped        (BN standalone pre-act không có trong post-act)
-
-        Nếu muốn đổi sang post-activation trong tương lai, phải train lại
-        từ đầu hoặc không dùng pretrained checkpoint cũ.
-        """
         return nn.Sequential(
             build_norm_layer(self.norm_cfg, in_channels)[1],   # [0] BN standalone
             build_activation_layer(self.act_cfg),              # [1] ReLU
@@ -426,15 +292,6 @@ class GCNetHead(BaseModule):
     def predict(self,
                 inputs: Union[Tensor, Tuple[Tensor, Tensor]],
                 img_size: Optional[Tuple[int, int]] = None) -> Tensor:
-        """Inference: forward + upsample về img_size nếu cần.
-
-        Args:
-            inputs: c6_feat hoặc (c4_feat, c6_feat).
-            img_size: (H, W) của ảnh gốc. Nếu None, không upsample.
-
-        Returns:
-            Tensor: Segmentation map (B, num_classes, H, W).
-        """
         self.eval()
         with torch.no_grad():
             logit = self.forward(inputs)
