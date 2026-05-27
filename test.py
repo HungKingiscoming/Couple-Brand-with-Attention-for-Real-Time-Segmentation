@@ -117,6 +117,12 @@ def build_model(variant: str, ckpt_path: str, device: torch.device,
     if deploy:
         model.backbone.switch_to_deploy()
         print(f"  switch_to_deploy applied (reparam branches fused)")
+        n_bn_before = sum(1 for m in model.modules()
+                          if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)))
+        fuse_conv_bn(model)
+        n_bn_after  = sum(1 for m in model.modules()
+                          if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm)))
+        print(f"  fuse_conv_bn applied (BN layers: {n_bn_before} → {n_bn_after})")
 
     model = model.to(device).eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -406,26 +412,14 @@ def infer_video(model, video_path: str, output_path: str,
                 save_mask_video: bool = False):
     """
     Chạy segmentation trên từng frame của video và lưu kết quả.
-
-    Args:
-        model          : mô hình đã load + eval
-        video_path     : đường dẫn video đầu vào (mp4, avi, mkv …)
-        output_path    : đường dẫn video đầu ra (blend)
-        img_h / img_w  : kích thước resize trước khi đưa vào model
-        device         : cuda / cpu
-        use_amp        : bật mixed-precision
-        alpha          : tỉ lệ blend màu (0 = ảnh gốc, 1 = mask thuần)
-        show_legend    : vẽ legend class ở góc trên trái
-        frame_skip     : chỉ xử lý 1/N frame (giúp tăng tốc preview)
-        save_mask_video: nếu True, lưu thêm video mask thuần màu bên cạnh
+    Toàn bộ xử lý ở img_h×img_w — KHÔNG upscale về resolution gốc.
     """
     import cv2
     import albumentations as A
     from albumentations.pytorch import ToTensorV2
 
-    # ── Transforms (chuẩn hoá như lúc validate) ─────────────────────────
-    transform = A.Compose([
-        A.Resize(img_h, img_w),
+    # ── Normalize tensor (albumentations chỉ dùng để normalize) ─────────
+    normalize = A.Compose([
         A.Normalize(mean=(0.485, 0.456, 0.406),
                     std=(0.229, 0.224, 0.225)),
         ToTensorV2(),
@@ -442,27 +436,31 @@ def infer_video(model, video_path: str, output_path: str,
     src_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     out_fps      = src_fps / max(frame_skip, 1)
 
+    # Output resolution = model resolution (img_w × img_h)
+    out_w, out_h = img_w, img_h
+
     print(f"\n{'='*65}")
     print(f"  VIDEO INFERENCE")
     print(f"{'='*65}")
     print(f"  Input : {video_path}")
     print(f"  Output: {output_path}")
     print(f"  Source: {src_w}×{src_h}  {src_fps:.1f} FPS  {total_frames} frames")
-    print(f"  Model : {img_w}×{img_h}  |  AMP: {use_amp}")
+    print(f"  Model : {out_w}×{out_h}  |  AMP: {use_amp}")
     print(f"  Alpha : {alpha}  |  frame_skip: {frame_skip}  |  legend: {show_legend}")
+    print(f"  Note  : output ở {out_w}×{out_h} (model res, no 4K upscale)")
     print(f"{'='*65}\n")
 
-    # ── Writer ────────────────────────────────────────────────────────────
+    # ── Writer — ghi ở model resolution ──────────────────────────────────
     fourcc  = cv2.VideoWriter_fourcc(*'mp4v')
-    writer  = cv2.VideoWriter(output_path, fourcc, out_fps, (src_w, src_h))
+    writer  = cv2.VideoWriter(output_path, fourcc, out_fps, (out_w, out_h))
     assert writer.isOpened(), f"Không thể tạo video: {output_path}"
 
     mask_writer = None
     if save_mask_video:
         mask_path   = str(Path(output_path).with_suffix('')) + '_mask.mp4'
-        mask_writer = cv2.VideoWriter(mask_path, fourcc, out_fps, (src_w, src_h))
+        mask_writer = cv2.VideoWriter(mask_path, fourcc, out_fps, (out_w, out_h))
 
-    # ── Thống kê per-class (tuỳ chọn) ───────────────────────────────────
+    # ── Thống kê per-class ───────────────────────────────────────────────
     class_pixel_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
 
     model.eval()
@@ -482,26 +480,29 @@ def infer_video(model, video_path: str, output_path: str,
             frame_idx += 1
             continue
 
+        # ── Resize frame về model resolution ngay từ đầu ────────────────
+        frame_bgr = cv2.resize(frame_bgr, (out_w, out_h),
+                               interpolation=cv2.INTER_LINEAR)
         frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
 
-        # ── Preprocess ──────────────────────────────────────────────────
-        inp = transform(image=frame_rgb)['image'].unsqueeze(0).to(device)
+        # ── Normalize + to tensor ────────────────────────────────────────
+        inp = normalize(image=frame_rgb)['image'].unsqueeze(0).to(device)
 
-        # ── Forward ─────────────────────────────────────────────────────
+        # ── Forward — logits ở model resolution, KHÔNG interpolate lên 4K
         with autocast(device_type='cuda', enabled=use_amp):
             logits = model(inp)
-            logits = F.interpolate(logits, size=(src_h, src_w),
-                                   mode='bilinear', align_corners=False)
+            if logits.shape[-2:] != (out_h, out_w):
+                logits = F.interpolate(logits, size=(out_h, out_w),
+                                       mode='bilinear', align_corners=False)
 
         pred = logits.argmax(1).squeeze(0).cpu().numpy().astype(np.uint8)
 
-        # ── Thống kê ────────────────────────────────────────────────────
-        for cls_id in range(NUM_CLASSES):
-            class_pixel_counts[cls_id] += int((pred == cls_id).sum())
+        # ── Thống kê (vectorized) ────────────────────────────────────────
+        np.add.at(class_pixel_counts, pred.ravel(), 1)
 
         # ── Colorize + Blend ─────────────────────────────────────────────
-        mask_rgb   = _colorize_mask(pred)
-        blended    = _blend(frame_rgb, mask_rgb, alpha)
+        mask_rgb = _colorize_mask(pred)
+        blended  = _blend(frame_rgb, mask_rgb, alpha)
 
         # ── Legend ──────────────────────────────────────────────────────
         if show_legend:
@@ -512,7 +513,7 @@ def infer_video(model, video_path: str, output_path: str,
         # ── Write ────────────────────────────────────────────────────────
         writer.write(cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
         if mask_writer is not None:
-            writer.write(cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
+            mask_writer.write(cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
 
         written    += 1
         frame_idx  += 1
