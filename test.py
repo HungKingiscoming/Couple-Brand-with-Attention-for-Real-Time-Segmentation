@@ -698,10 +698,17 @@ def main():
     if args.infer_video and not args.video_input:
         parser.error("--infer_video yêu cầu --video_input")
 
-    # Auto output path
+    # Auto output path — redirect ra thư mục writable nếu input nằm trong read-only mount
     if args.infer_video and args.video_output is None:
-        p = Path(args.video_input)
-        args.video_output = str(p.with_stem(p.stem + '_seg').with_suffix('.mp4'))
+        p        = Path(args.video_input)
+        out_name = p.stem + '_seg.mp4'
+        # /kaggle/input là read-only → ghi vào /kaggle/working thay thế
+        if str(p).startswith('/kaggle/input'):
+            out_dir = Path('/kaggle/working')
+        else:
+            out_dir = p.parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        args.video_output = str(out_dir / out_name)
 
     device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
