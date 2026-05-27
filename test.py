@@ -22,6 +22,15 @@ CLASS_NAMES = [
 NUM_CLASSES  = 19
 IGNORE_INDEX = 255
 
+# Cityscapes 19-class colour palette (RGB)
+PALETTE = np.array([
+    [128,  64, 128], [244,  35, 232], [ 70,  70,  70], [102, 102, 156],
+    [190, 153, 153], [153, 153, 153], [250, 170,  30], [220, 220,   0],
+    [107, 142,  35], [152, 251, 152], [ 70, 130, 180], [220,  20,  60],
+    [255,   0,   0], [  0,   0, 142], [  0,   0,  70], [  0,  60, 100],
+    [  0,  80, 100], [  0,   0, 230], [119,  11,  32],
+], dtype=np.uint8)
+
 
 # ============================================================
 # FUSE CONV + BN
@@ -304,21 +313,17 @@ def validate_driving(model, data_root, img_h, img_w, batch_size,
     pbar = tqdm(pairs, desc="Validating Driving", ncols=90)
 
     for img_path, gt_path, _ in pbar:
-        # Load image
         img_bgr = cv2.imread(img_path)
         if img_bgr is None:
             continue
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
 
-        # Load GT — labelTrainIds đã là trainId (0–18), ignore=255
         gt = cv2.imread(gt_path, cv2.IMREAD_GRAYSCALE)
         if gt is None:
             continue
 
-        # Preprocess image
         t   = transform(image=img_rgb)['image'].unsqueeze(0).to(device)
 
-        # Preprocess GT — resize về img_h × img_w bằng nearest để giữ label
         gt_resized = cv2.resize(gt, (img_w, img_h),
                                 interpolation=cv2.INTER_NEAREST)
         mask = torch.from_numpy(gt_resized).long().unsqueeze(0).to(device)
@@ -341,6 +346,209 @@ def validate_driving(model, data_root, img_h, img_w, batch_size,
     m['loss'] = total_loss / len(pairs)
     _print_metrics(m, recorded, title="FOGGY DRIVING — Validation Results")
     return m
+
+
+# ============================================================
+# INFERENCE ON VIDEO  (NEW)
+# ============================================================
+
+def _colorize_mask(pred: np.ndarray) -> np.ndarray:
+    """Map class-index HxW → RGB HxW×3 using Cityscapes palette."""
+    h, w   = pred.shape
+    colour = np.zeros((h, w, 3), dtype=np.uint8)
+    for cls_id in range(NUM_CLASSES):
+        colour[pred == cls_id] = PALETTE[cls_id]
+    return colour
+
+
+def _blend(frame_rgb: np.ndarray, mask_rgb: np.ndarray, alpha: float) -> np.ndarray:
+    """Alpha-blend segmentation colour over the original frame."""
+    return (alpha * mask_rgb + (1 - alpha) * frame_rgb).astype(np.uint8)
+
+
+def _draw_legend(canvas: np.ndarray, present_ids: list[int],
+                 cell_h: int = 18, cell_w: int = 130) -> np.ndarray:
+    """Paste a small legend box into the top-left corner."""
+    import cv2
+    cols   = 2
+    rows   = (len(present_ids) + cols - 1) // cols
+    pad    = 4
+    box_h  = rows * cell_h + 2 * pad
+    box_w  = cols * cell_w + 2 * pad
+    box_h  = min(box_h, canvas.shape[0])
+
+    overlay = canvas[:box_h, :box_w].copy()
+    cv2.rectangle(overlay, (0, 0), (box_w, box_h), (0, 0, 0), -1)
+    canvas[:box_h, :box_w] = cv2.addWeighted(
+        canvas[:box_h, :box_w], 0.35, overlay, 0.65, 0)
+
+    for idx, cls_id in enumerate(present_ids):
+        col   = idx % cols
+        row   = idx // cols
+        x0    = pad + col * cell_w
+        y0    = pad + row * cell_h
+        color = tuple(int(c) for c in PALETTE[cls_id][::-1])   # RGB→BGR
+        cv2.rectangle(canvas, (x0, y0), (x0 + 12, y0 + 12), color, -1)
+        cv2.putText(canvas, CLASS_NAMES[cls_id],
+                    (x0 + 16, y0 + 11),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1,
+                    cv2.LINE_AA)
+    return canvas
+
+
+@torch.no_grad()
+def infer_video(model, video_path: str, output_path: str,
+                img_h: int, img_w: int,
+                device: torch.device, use_amp: bool,
+                alpha: float = 0.55,
+                show_legend: bool = True,
+                frame_skip: int = 1,
+                save_mask_video: bool = False):
+    """
+    Chạy segmentation trên từng frame của video và lưu kết quả.
+
+    Args:
+        model          : mô hình đã load + eval
+        video_path     : đường dẫn video đầu vào (mp4, avi, mkv …)
+        output_path    : đường dẫn video đầu ra (blend)
+        img_h / img_w  : kích thước resize trước khi đưa vào model
+        device         : cuda / cpu
+        use_amp        : bật mixed-precision
+        alpha          : tỉ lệ blend màu (0 = ảnh gốc, 1 = mask thuần)
+        show_legend    : vẽ legend class ở góc trên trái
+        frame_skip     : chỉ xử lý 1/N frame (giúp tăng tốc preview)
+        save_mask_video: nếu True, lưu thêm video mask thuần màu bên cạnh
+    """
+    import cv2
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
+    # ── Transforms (chuẩn hoá như lúc validate) ─────────────────────────
+    transform = A.Compose([
+        A.Resize(img_h, img_w),
+        A.Normalize(mean=(0.485, 0.456, 0.406),
+                    std=(0.229, 0.224, 0.225)),
+        ToTensorV2(),
+    ])
+
+    # ── Mở video ─────────────────────────────────────────────────────────
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Không thể mở video: {video_path}")
+
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    src_fps      = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    src_w        = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    src_h        = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out_fps      = src_fps / max(frame_skip, 1)
+
+    print(f"\n{'='*65}")
+    print(f"  VIDEO INFERENCE")
+    print(f"{'='*65}")
+    print(f"  Input : {video_path}")
+    print(f"  Output: {output_path}")
+    print(f"  Source: {src_w}×{src_h}  {src_fps:.1f} FPS  {total_frames} frames")
+    print(f"  Model : {img_w}×{img_h}  |  AMP: {use_amp}")
+    print(f"  Alpha : {alpha}  |  frame_skip: {frame_skip}  |  legend: {show_legend}")
+    print(f"{'='*65}\n")
+
+    # ── Writer ────────────────────────────────────────────────────────────
+    fourcc  = cv2.VideoWriter_fourcc(*'mp4v')
+    writer  = cv2.VideoWriter(output_path, fourcc, out_fps, (src_w, src_h))
+    assert writer.isOpened(), f"Không thể tạo video: {output_path}"
+
+    mask_writer = None
+    if save_mask_video:
+        mask_path   = str(Path(output_path).with_suffix('')) + '_mask.mp4'
+        mask_writer = cv2.VideoWriter(mask_path, fourcc, out_fps, (src_w, src_h))
+
+    # ── Thống kê per-class (tuỳ chọn) ───────────────────────────────────
+    class_pixel_counts = np.zeros(NUM_CLASSES, dtype=np.int64)
+
+    model.eval()
+    pbar        = tqdm(total=total_frames, desc="Video inference", ncols=90, unit="fr")
+    frame_idx   = 0
+    written     = 0
+    t_start     = time.perf_counter()
+
+    while True:
+        ret, frame_bgr = cap.read()
+        if not ret:
+            break
+
+        pbar.update(1)
+
+        if frame_idx % frame_skip != 0:
+            frame_idx += 1
+            continue
+
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+
+        # ── Preprocess ──────────────────────────────────────────────────
+        inp = transform(image=frame_rgb)['image'].unsqueeze(0).to(device)
+
+        # ── Forward ─────────────────────────────────────────────────────
+        with autocast(device_type='cuda', enabled=use_amp):
+            logits = model(inp)
+            logits = F.interpolate(logits, size=(src_h, src_w),
+                                   mode='bilinear', align_corners=False)
+
+        pred = logits.argmax(1).squeeze(0).cpu().numpy().astype(np.uint8)
+
+        # ── Thống kê ────────────────────────────────────────────────────
+        for cls_id in range(NUM_CLASSES):
+            class_pixel_counts[cls_id] += int((pred == cls_id).sum())
+
+        # ── Colorize + Blend ─────────────────────────────────────────────
+        mask_rgb   = _colorize_mask(pred)
+        blended    = _blend(frame_rgb, mask_rgb, alpha)
+
+        # ── Legend ──────────────────────────────────────────────────────
+        if show_legend:
+            present_ids = [i for i in range(NUM_CLASSES)
+                           if class_pixel_counts[i] > 0]
+            blended = _draw_legend(blended, present_ids)
+
+        # ── Write ────────────────────────────────────────────────────────
+        writer.write(cv2.cvtColor(blended, cv2.COLOR_RGB2BGR))
+        if mask_writer is not None:
+            writer.write(cv2.cvtColor(mask_rgb, cv2.COLOR_RGB2BGR))
+
+        written    += 1
+        frame_idx  += 1
+        elapsed     = time.perf_counter() - t_start
+        pbar.set_postfix({'fps': f'{written/elapsed:.1f}', 'fr': written})
+
+    pbar.close()
+    cap.release()
+    writer.release()
+    if mask_writer is not None:
+        mask_writer.release()
+
+    elapsed = time.perf_counter() - t_start
+    print(f"\n{'='*65}")
+    print(f"  VIDEO INFERENCE COMPLETE")
+    print(f"{'='*65}")
+    print(f"  Frames processed : {written}")
+    print(f"  Time elapsed     : {elapsed:.1f}s  ({written/elapsed:.1f} fps)")
+    print(f"  Saved to         : {output_path}")
+    if save_mask_video:
+        print(f"  Mask video       : {mask_path}")
+
+    # ── Per-class pixel distribution ─────────────────────────────────────
+    total_px = class_pixel_counts.sum()
+    if total_px > 0:
+        print(f"\n  {'Class':<16} {'Pixels':>12}  {'%':>6}  Bar")
+        print(f"  {'─'*55}")
+        order = np.argsort(class_pixel_counts)[::-1]
+        for cls_id in order:
+            cnt  = class_pixel_counts[cls_id]
+            pct  = cnt / total_px * 100
+            if cnt == 0:
+                continue
+            bar  = '█' * int(pct / 2)
+            print(f"  {CLASS_NAMES[cls_id]:<16} {cnt:>12,}  {pct:>5.1f}%  {bar}")
+    print(f"{'='*65}\n")
 
 
 # ============================================================
@@ -437,7 +645,7 @@ def print_benchmark(r, variant, img_h, img_w, gpu_name):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="GCNet v3 — Benchmark + Validate")
+    parser = argparse.ArgumentParser(description="GCNet v3 — Benchmark + Validate + Video Inference")
     parser.add_argument('--ckpt',          required=True)
     parser.add_argument('--model_variant', default='fan_dwsa',
                         choices=['fan_dwsa', 'fan_only', 'dwsa_only'])
@@ -456,6 +664,22 @@ def main():
     parser.add_argument('--driving_root',  type=str,   default=None,
                         help='Root của Foggy Driving dataset, '
                              'e.g. /kaggle/input/.../Foggy_Driving')
+    # ── Video inference (NEW) ────────────────────────────────────────────
+    parser.add_argument('--infer_video',   action='store_true',
+                        help='Chạy segmentation trên video')
+    parser.add_argument('--video_input',   type=str,   default=None,
+                        help='Đường dẫn video đầu vào (mp4/avi/mkv/…)')
+    parser.add_argument('--video_output',  type=str,   default=None,
+                        help='Đường dẫn video đầu ra (mặc định: <input>_seg.mp4)')
+    parser.add_argument('--video_alpha',   type=float, default=0.55,
+                        help='Blend ratio: 0=ảnh gốc, 1=mask thuần (default: 0.55)')
+    parser.add_argument('--video_no_legend', action='store_true',
+                        help='Tắt legend class ở góc trên trái')
+    parser.add_argument('--video_frame_skip', type=int, default=1,
+                        help='Chỉ xử lý 1/N frame — tăng tốc preview (default: 1)')
+    parser.add_argument('--video_save_mask',  action='store_true',
+                        help='Lưu thêm video mask thuần màu (_mask.mp4)')
+    # ────────────────────────────────────────────────────────────────────
     # Shared
     parser.add_argument('--batch_size',    type=int,   default=22)
     parser.add_argument('--num_workers',   type=int,   default=4)
@@ -463,22 +687,31 @@ def main():
     args = parser.parse_args()
 
     # Default: chạy benchmark nếu không có flag nào
-    if not args.validate and not args.validate_driving and not args.benchmark:
+    if not args.validate and not args.validate_driving \
+            and not args.benchmark and not args.infer_video:
         args.benchmark = True
 
     if args.validate and not args.val_txt:
         parser.error("--validate yêu cầu --val_txt")
     if args.validate_driving and not args.driving_root:
         parser.error("--validate_driving yêu cầu --driving_root")
+    if args.infer_video and not args.video_input:
+        parser.error("--infer_video yêu cầu --video_input")
+
+    # Auto output path
+    if args.infer_video and args.video_output is None:
+        p = Path(args.video_input)
+        args.video_output = str(p.with_stem(p.stem + '_seg').with_suffix('.mp4'))
 
     device   = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'
     use_amp  = not args.no_amp and device.type == 'cuda'
 
     modes = []
-    if args.benchmark:        modes.append('Benchmark')
-    if args.validate:         modes.append('Cityscapes')
+    if args.benchmark:    modes.append('Benchmark')
+    if args.validate:     modes.append('Cityscapes')
     if args.validate_driving: modes.append('Driving')
+    if args.infer_video:  modes.append('VideoInfer')
 
     print(f"\n{'='*55}")
     print(f"  GCNet v3  —  {' + '.join(modes)}")
@@ -497,6 +730,21 @@ def main():
     if args.validate_driving:
         validate_driving(model, args.driving_root, args.img_h, args.img_w,
                          args.batch_size, args.num_workers, device, use_amp, recorded)
+
+    if args.infer_video:
+        infer_video(
+            model=model,
+            video_path=args.video_input,
+            output_path=args.video_output,
+            img_h=args.img_h,
+            img_w=args.img_w,
+            device=device,
+            use_amp=use_amp,
+            alpha=args.video_alpha,
+            show_legend=not args.video_no_legend,
+            frame_skip=args.video_frame_skip,
+            save_mask_video=args.video_save_mask,
+        )
 
     if args.benchmark:
         print(f"\nRunning benchmark...")
