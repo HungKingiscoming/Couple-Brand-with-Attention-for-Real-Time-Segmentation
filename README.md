@@ -118,23 +118,6 @@ DWSA(x) = x + Conv₁ₓ₁(A · DW(A))
 
 *Training (top) and Inference/Reference (bottom). Red blocks indicate our modifications: STEM+FAN at Stage 1 and DWSA at Stages 4, 5, 6 in the semantic branch.*
 
----
-
-### FoggyAwareNorm (FAN)
-
-<img src="assets/fan.png" width="400"/>
-
-*FAN replaces BatchNorm at stem_conv1 and stem_conv2. Input features are processed in parallel by BN and IN, then interpolated by learnable per-channel weight σ(α).*
-
----
-
-### Dynamic Weight Self-Attention (DWSA)
-
-<img src="assets/dwsa.png" width="450"/>
-
-*Q, K, V are projected and pooled to H/4×W/4 (16× spatial reduction). Scaled dot-product attention computes attended features A, which are reweighted by an SE channel gate computed from A itself.*
-
----
 
 ### Qualitative Results — Cityscapes-Foggy
 
