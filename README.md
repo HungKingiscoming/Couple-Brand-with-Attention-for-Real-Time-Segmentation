@@ -110,6 +110,48 @@ DWSA(x) = x + Conv₁ₓ₁(A · DW(A))
 
 ---
 
+## Diagrams
+
+### Overall Architecture
+
+![Overall Architecture](assets/architecture.png)
+
+*Training (top) and Inference/Reference (bottom). Red blocks indicate our modifications: STEM+FAN at Stage 1 and DWSA at Stages 4, 5, 6 in the semantic branch.*
+
+---
+
+### FoggyAwareNorm (FAN)
+
+![FAN Module](assets/fan.png)
+
+*FAN replaces BatchNorm at stem_conv1 and stem_conv2. Input features are processed in parallel by BN and IN, then interpolated by learnable per-channel weight σ(α).*
+
+---
+
+### Dynamic Weight Self-Attention (DWSA)
+
+![DWSA Module](assets/dwsa.png)
+
+*Q, K, V are projected and pooled to H/4×W/4 (16× spatial reduction). Scaled dot-product attention computes attended features A, which are reweighted by an SE channel gate computed from A itself.*
+
+---
+
+### Qualitative Results — Cityscapes-Foggy
+
+![Qualitative Results](assets/qualitative_cityscapes.png)
+
+*From top to bottom: input foggy image, ground truth, our prediction. Columns show increasing fog density β = 0.005 → 0.01 → 0.02.*
+
+---
+
+### Qualitative Results — Driving-Foggy
+
+![Qualitative Results Driving](assets/qualitative_driving.png)
+
+*Out-of-distribution evaluation on 101 real-world foggy images never seen during training.*
+
+---
+
 ## Installation
 
 ```bash
