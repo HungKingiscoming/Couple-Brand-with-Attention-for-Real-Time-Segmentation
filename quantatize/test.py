@@ -208,7 +208,7 @@ class InferenceRunner:
 def build_baseline_backend(model, device, img_h, img_w, **kwargs):
     """PyTorch eager mode thuần — baseline để so sánh mọi backend khác."""
     def forward_fn(x):
-        with torch.no_grad():
+        with torch.inference_mode():
             return model(x)
     return InferenceRunner('baseline', forward_fn, model=model)
 
@@ -223,10 +223,14 @@ def build_fp16_backend(model, device, img_h, img_w, **kwargs):
     if device.type != 'cuda':
         print("  [!] FP16 backend chạy trên CPU thường KHÔNG có lợi về tốc độ "
               "(thiếu kernel FP16 tối ưu) — khuyến nghị test FP16 trên GPU/Jetson thật.")
-    model_fp16 = model.half()
+    with torch.autocast(
+        device_type="cuda",
+        dtype=torch.float16
+    ):
+        out = model(x)
 
     def forward_fn(x):
-        with torch.no_grad():
+        with torch.inference_mode():
             return model_fp16(x.half())
     return InferenceRunner('fp16', forward_fn, model=model_fp16)
 
@@ -240,7 +244,7 @@ def build_compile_backend(model, device, img_h, img_w, **kwargs):
     compiled = torch.compile(model)
 
     def forward_fn(x):
-        with torch.no_grad():
+        with torch.inference_mode():
             return compiled(x)
     return InferenceRunner('compile', forward_fn, model=model)
 
@@ -257,7 +261,7 @@ def build_compile_fp16_backend(model, device, img_h, img_w, **kwargs):
     compiled = torch.compile(model_fp16)
 
     def forward_fn(x):
-        with torch.no_grad():
+        with torch.inference_mode():
             return compiled(x.half())
     return InferenceRunner('compile_fp16', forward_fn, model=model_fp16)
 
@@ -269,12 +273,16 @@ def build_torchscript_backend(model, device, img_h, img_w, **kwargs):
     Embedded Linux / production serving.
     """
     example = torch.randn(1, 3, img_h, img_w, device=device)
-    with torch.no_grad():
-        traced = torch.jit.trace(model, example)
+    with torch.inference_mode():
+        torch.jit.trace(
+            model,
+            example,
+            strict=False
+        )
     traced = torch.jit.freeze(traced) if not traced.training else traced
 
     def forward_fn(x):
-        with torch.no_grad():
+        with torch.inference_mode():
             return traced(x)
     return InferenceRunner('torchscript', forward_fn, model=model)
 
@@ -359,7 +367,7 @@ def _compute_metrics(ti, tu, tp, tl):
     }
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def validate(model, val_txt, img_h, img_w, batch_size,
              num_workers, device, use_amp, recorded):
     from data.custom import CityscapesDataset, get_val_transforms
@@ -393,7 +401,7 @@ def validate(model, val_txt, img_h, img_w, batch_size,
         if masks.dim() == 4:
             masks = masks.squeeze(1)
         with autocast(device_type='cuda', enabled=use_amp):
-            logits = model(imgs)
+            logits = runner(imgs)
             logits = F.interpolate(logits, size=masks.shape[-2:],
                                    mode='bilinear', align_corners=False)
             loss   = ce_fn(logits, masks)
