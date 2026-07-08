@@ -264,6 +264,49 @@ Row 2: Ground truth
 Row 3: Our predictions
 ```
 
+
+---
+
+## Edge AI Deployment Benchmark
+
+To evaluate the practical deployment capability of our model, we benchmarked inference performance on a real consumer laptop instead of cloud GPUs (e.g., Kaggle or Google Colab). This provides a more realistic estimate of latency and throughput for Edge AI applications such as autonomous driving, intelligent transportation systems, and embedded vision.
+
+### Benchmark Hardware
+
+| Component | Specification |
+| :--- | :--- |
+| **GPU** | NVIDIA GeForce RTX 2050 Laptop GPU (4 GB) |
+| **CPU** | Intel Core i5 (Laptop) |
+| **Framework** | PyTorch 2.2 |
+| **Input Resolution** | 512 × 1024 |
+| **Model** | FAN + DWSA (9.45M parameters) |
+
+> 💡 The same trained checkpoint was exported and evaluated using multiple deployment backends, including native PyTorch, ONNX Runtime, OpenVINO, and TensorRT. All benchmarks were performed with `batch_size = 1` after applying the deployment re-parameterization via `switch_to_deploy()`.
+
+### Performance Comparison
+
+*Table 1. Benchmark Results on Real Hardware*
+
+| Backend | Precision | FPS ↑ | Latency (ms) ↓ | GPU Memory |
+| :--- | :---: | :---: | :---: | :---: |
+| PyTorch (Baseline) | FP32 | 60.8 | 16.45 | 114.3 MB |
+| ONNX Runtime (CUDA) | FP32 | 55.7 | 17.94 | 42.7 MB |
+| OpenVINO (GPU) | FP16 | 29.8 | 33.58 | 42.1 MB |
+| TensorRT | FP32 | 100.9 | 9.92 | 42.7 MB |
+| **TensorRT** | **FP16** | **203.4** | **4.92** | **45.4 MB** |
+
+### Discussion
+
+* **TensorRT FP16 Optimization**: Achieves the absolute best performance, reaching **203.4 FPS** with only **4.92 ms** latency. This represents an acceleration of approximately:
+  * **3.35×** faster than native PyTorch
+  * **3.65×** faster than ONNX Runtime
+  * **6.82×** faster than OpenVINO GPU
+* **Backend Analysis**: Although OpenVINO supports GPU execution, its performance on NVIDIA hardware is significantly lower than TensorRT because OpenVINO is primarily optimized for Intel hardware (Intel CPUs, Intel Arc GPUs, and Intel NPUs).
+* **Memory Efficiency**: ONNX Runtime substantially reduces GPU memory consumption (**42.7 MB** vs. **114.3 MB**) while maintaining performance close to PyTorch, making it a highly convenient cross-platform deployment option when TensorRT is unavailable.
+
+These results explicitly demonstrate that our proposed lightweight architecture is exceptionally well-suited for real-time Edge AI deployment, especially when combined with TensorRT FP16 inference.
+
+---
 ---
 
 ## Citation
