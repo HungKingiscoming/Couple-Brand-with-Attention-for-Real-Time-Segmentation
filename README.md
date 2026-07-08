@@ -263,8 +263,6 @@ Row 1: Input foggy images
 Row 2: Ground truth
 Row 3: Our predictions
 ```
-
-
 ---
 
 ## Edge AI Deployment Benchmark
@@ -306,7 +304,6 @@ To evaluate the practical deployment capability of our model, we benchmarked inf
 
 These results explicitly demonstrate that our proposed lightweight architecture is exceptionally well-suited for real-time Edge AI deployment, especially when combined with TensorRT FP16 inference.
 
----
 ---
 
 ## Citation
