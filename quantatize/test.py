@@ -55,6 +55,7 @@ tiết backend đang chạy là gì.
 benchmark()/main() — toàn bộ phần đo latency/FPS/memory dùng chung.
 """
 import argparse
+import copy
 import os
 import sys
 import time
@@ -208,7 +209,7 @@ class InferenceRunner:
 def build_baseline_backend(model, device, img_h, img_w, **kwargs):
     """PyTorch eager mode thuần — baseline để so sánh mọi backend khác."""
     def forward_fn(x):
-        with torch.inference_mode():
+        with torch.no_grad():
             return model(x)
     return InferenceRunner('baseline', forward_fn, model=model)
 
@@ -225,8 +226,18 @@ def build_fp16_backend(model, device, img_h, img_w, **kwargs):
               "(thiếu kernel FP16 tối ưu) — khuyến nghị test FP16 trên GPU/Jetson thật.")
     model_fp16 = model.half()
 
+    # FIX: sau .half(), BatchNorm cũng bị chuyển FP16 — running_mean/running_var
+    # tích luỹ qua nhiều batch dễ mất precision ở FP16 (giá trị nhỏ bị underflow/
+    # rounding), làm giảm accuracy so với FP32 gốc. Best-practice chuẩn (giống
+    # torch.cuda.amp): giữ riêng BatchNorm ở FP32, chỉ Conv/Linear chạy FP16.
+    # PyTorch tự động upcast/downcast qua lại giữa 2 dtype ở input/output của
+    # BN layer nên không cần sửa gì thêm trong forward.
+    for m in model_fp16.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm, nn.InstanceNorm2d)):
+            m.float()
+
     def forward_fn(x):
-        with torch.inference_mode():
+        with torch.no_grad():
             return model_fp16(x.half())
     return InferenceRunner('fp16', forward_fn, model=model_fp16)
 
@@ -236,11 +247,19 @@ def build_compile_backend(model, device, img_h, img_w, **kwargs):
     """torch.compile (TorchInductor) — tự động fuse kernel, giảm overhead
     Python dispatch. Cần PyTorch >= 2.0. Lần gọi đầu tiên sẽ có compile
     overhead (không tính vào latency vì đã warmup trước khi đo).
+
+    mode='reduce-overhead' dùng CUDA Graphs — giảm mạnh Python/launch overhead
+    cho inference lặp lại nhiều lần (đúng kịch bản benchmark ở đây), nhưng
+    CHỈ có ý nghĩa trên CUDA (CPU không có CUDA Graphs) và yêu cầu input shape
+    cố định qua các lần gọi — khớp với chiến lược fixed-shape của cả pipeline.
     """
-    compiled = torch.compile(model)
+    compile_mode = 'reduce-overhead' if device.type == 'cuda' else None
+    print(f"  torch.compile mode={compile_mode!r}"
+          + ("" if compile_mode else " (CPU — reduce-overhead chỉ hỗ trợ CUDA)"))
+    compiled = torch.compile(model, mode=compile_mode)
 
     def forward_fn(x):
-        with torch.inference_mode():
+        with torch.no_grad():
             return compiled(x)
     return InferenceRunner('compile', forward_fn, model=model)
 
@@ -254,10 +273,14 @@ def build_compile_fp16_backend(model, device, img_h, img_w, **kwargs):
         print("  [!] compile_fp16 trên CPU có thể không ổn định/không có lợi — "
               "khuyến nghị chạy trên GPU/Jetson thật.")
     model_fp16 = model.half()
-    compiled = torch.compile(model_fp16)
+    for m in model_fp16.modules():
+        if isinstance(m, (nn.BatchNorm2d, nn.SyncBatchNorm, nn.InstanceNorm2d)):
+            m.float()
+    compile_mode = 'reduce-overhead' if device.type == 'cuda' else None
+    compiled = torch.compile(model_fp16, mode=compile_mode)
 
     def forward_fn(x):
-        with torch.inference_mode():
+        with torch.no_grad():
             return compiled(x.half())
     return InferenceRunner('compile_fp16', forward_fn, model=model_fp16)
 
@@ -269,14 +292,415 @@ def build_torchscript_backend(model, device, img_h, img_w, **kwargs):
     Embedded Linux / production serving.
     """
     example = torch.randn(1, 3, img_h, img_w, device=device)
-    with torch.inference_mode():
-        traced = torch.jit.trace(model, example, strict=False)
+    with torch.no_grad():
+        traced = torch.jit.trace(model, example)
     traced = torch.jit.freeze(traced) if not traced.training else traced
 
     def forward_fn(x):
-        with torch.inference_mode():
+        with torch.no_grad():
             return traced(x)
     return InferenceRunner('torchscript', forward_fn, model=model)
+
+
+def _export_onnx(model, onnx_path, img_h, img_w, opset=17, half=False):
+    """Export model (đã deploy=True, reparam fused) sang ONNX — dùng chung
+    cho cả 3 backend onnxruntime/tensorrt/openvino để tránh lặp code.
+    Luôn export trên CPU cho ổn định, sau đó trả model về đúng device gốc.
+
+    half=True: export ONNX với toàn bộ tensor ở FP16 — CẦN THIẾT cho TensorRT
+    >= 11.x khi muốn build engine FP16, vì BuilderFlag.FP16 đã bị xoá (network
+    giờ "strongly typed", precision lấy trực tiếp từ dtype của chính ONNX graph
+    thay vì set qua builder config).
+    """
+    orig_device = next(model.parameters()).device
+    os.makedirs(os.path.dirname(onnx_path) or '.', exist_ok=True)
+    print(f"  Exporting ONNX -> {onnx_path} (opset={opset}, half={half})...")
+
+    if half:
+        # deepcopy để không làm hỏng model gốc (vẫn cần dùng FP32 cho các
+        # backend khác trong cùng 1 lần chạy nếu có)
+        model_export = copy.deepcopy(model).to('cpu').eval().half()
+        dummy = torch.randn(1, 3, img_h, img_w).half()
+    else:
+        model_export = model.to('cpu').eval()
+        dummy = torch.randn(1, 3, img_h, img_w)
+
+    torch.onnx.export(
+        model_export, dummy, onnx_path,
+        input_names=['input'], output_names=['output'],
+        opset_version=opset, do_constant_folding=True,
+        dynamo=False,  # TorchScript-based exporter — ổn định, không cần onnxscript
+    )
+    model.to(orig_device)
+    print(f"  ✅ Exported: {onnx_path} ({os.path.getsize(onnx_path)/1024**2:.2f} MB)")
+
+
+def _get_or_export_onnx(model, img_h, img_w, onnx_path=None, force_rebuild=False,
+                         half=False, **_):
+    if onnx_path is None:
+        suffix = '_fp16' if half else ''
+        onnx_path = f'checkpoints/gcnet_{img_h}x{img_w}{suffix}.onnx'
+    if force_rebuild or not os.path.exists(onnx_path):
+        _export_onnx(model, onnx_path, img_h, img_w, half=half)
+    else:
+        print(f"  Dùng ONNX có sẵn: {onnx_path} (thêm --force_rebuild để export lại)")
+    return onnx_path
+
+
+class _RandomOrDirCalibrationReader:
+    """Calibration data reader cho quantize_static — đọc ảnh thật từ calib_dir
+    nếu có, nếu không thì fallback random tensor (CHỈ để demo/test pipeline,
+    KHÔNG dùng random data cho INT8 production — accuracy sẽ sai lệch nhiều
+    vì range hoạt động không phản ánh đúng phân phối dữ liệu thật).
+    """
+    def __init__(self, input_name, img_h, img_w, calib_dir=None, n_samples=100):
+        self.input_name = input_name
+        self.idx = 0
+        if calib_dir and os.path.isdir(calib_dir):
+            import glob
+            import cv2
+            paths = sorted(glob.glob(os.path.join(calib_dir, '*')))[:n_samples]
+            self.samples = []
+            for pth in paths:
+                img = cv2.imread(pth)
+                if img is None:
+                    continue
+                img = cv2.resize(img, (img_w, img_h))
+                img = img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+                self.samples.append(img[None])
+            print(f"  Đọc {len(self.samples)} ảnh calibration từ {calib_dir}")
+        else:
+            print(f"  [!] Không có --calib_dir hợp lệ -> dùng {n_samples} random "
+                  f"tensor để calibrate (CHỈ DEMO — INT8 build từ random data "
+                  f"KHÔNG phản ánh đúng phân phối dữ liệu thật, đừng dùng số liệu "
+                  f"accuracy này cho production).")
+            self.samples = [np.random.rand(1, 3, img_h, img_w).astype(np.float32)
+                             for _ in range(n_samples)]
+
+    def get_next(self):
+        if self.idx >= len(self.samples):
+            return None
+        item = {self.input_name: self.samples[self.idx]}
+        self.idx += 1
+        return item
+
+    def rewind(self):
+        self.idx = 0
+
+
+def _get_or_build_qdq_onnx(fp32_onnx_path, img_h, img_w, calib_dir=None,
+                            force_rebuild=False):
+    """Tạo (hoặc dùng cache) ONNX dạng QDQ (QuantizeLinear/DequantizeLinear) từ
+    ONNX FP32 — ĐÂY LÀ FORMAT TensorRT >= 11.x CẦN để build engine INT8 thật
+    (network strongly-typed lấy precision trực tiếp từ node Q/DQ trong graph,
+    không còn implicit calibrator qua BuilderFlag.INT8 nữa).
+    """
+    from onnxruntime.quantization import quantize_static, QuantFormat, QuantType, CalibrationMethod
+    import onnxruntime as ort
+
+    qdq_path = fp32_onnx_path.replace('.onnx', '_qdq.onnx')
+    if not force_rebuild and os.path.exists(qdq_path):
+        print(f"  Dùng ONNX QDQ có sẵn: {qdq_path} (thêm --force_rebuild để tạo lại)")
+        return qdq_path
+
+    sess = ort.InferenceSession(fp32_onnx_path, providers=['CPUExecutionProvider'])
+    input_name = sess.get_inputs()[0].name
+    reader = _RandomOrDirCalibrationReader(input_name, img_h, img_w, calib_dir)
+
+    print(f"  Đang tạo ONNX QDQ (static quantization) -> {qdq_path} ...")
+    quantize_static(
+        model_input=fp32_onnx_path,
+        model_output=qdq_path,
+        calibration_data_reader=reader,
+        quant_format=QuantFormat.QDQ,   # BẮT BUỘC: QDQ format để TensorRT parse đúng
+        calibrate_method=CalibrationMethod.MinMax,
+        weight_type=QuantType.QInt8,
+        activation_type=QuantType.QInt8,
+        extra_options={
+            # FIX: mặc định onnxruntime quantize bias thành Int32 kèm node
+            # DequantizeLinear riêng — TensorRT KHÔNG chấp nhận DequantizeLinear
+            # trên input Int32 (chỉ nhận INT8/FP8/FP4/INT4), gây lỗi parse
+            # ("ITensor::getDimensions ... must have type FP8, FP4, Int4, or Int8").
+            # Giữ bias ở FP32 (không quantize) — TensorRT vẫn cộng bias bình
+            # thường sau Conv INT8, gần như không ảnh hưởng tốc độ vì bias-add
+            # chỉ là 1 phép cộng nhỏ so với toàn bộ phép nhân ma trận Conv.
+            'QuantizeBias': False,
+        },
+    )
+    print(f"  ✅ ONNX QDQ saved: {qdq_path}")
+    return qdq_path
+
+
+@register_backend('onnxruntime')
+def build_onnxruntime_backend(model, device, img_h, img_w,
+                               onnx_path=None, force_rebuild=False, **kwargs):
+    """ONNX Runtime — tự chọn CUDAExecutionProvider nếu có GPU, fallback CPU.
+
+    Trên máy bạn (RTX 2050, ONNX Runtime 1.27 build có CUDA): sẽ tự dùng
+    CUDAExecutionProvider + IOBinding (zero-copy GPU->ORT->GPU, không phải
+    đi vòng qua CPU numpy như cách gọi sess.run() thông thường).
+    """
+    import onnxruntime as ort
+
+    onnx_path = _get_or_export_onnx(model, img_h, img_w, onnx_path, force_rebuild)
+
+    available = ort.get_available_providers()
+    use_cuda = (device.type == 'cuda' and 'CUDAExecutionProvider' in available)
+    providers = (['CUDAExecutionProvider', 'CPUExecutionProvider'] if use_cuda
+                 else ['CPUExecutionProvider'])
+    print(f"  ONNX Runtime available providers: {available}")
+    print(f"  ONNX Runtime dùng providers: {providers}")
+
+    sess = ort.InferenceSession(onnx_path, providers=providers)
+    input_name = sess.get_inputs()[0].name
+    output_name = sess.get_outputs()[0].name
+
+    if use_cuda:
+        # --- IOBinding: input/output ở thẳng trên GPU, không copy qua CPU ---
+        import torch.utils.dlpack as dlpack
+        io_binding = sess.io_binding()
+        print("  Dùng IOBinding (zero-copy GPU input/output)")
+
+        def forward_fn(x):
+            x = x.to(device='cuda', dtype=torch.float32).contiguous()
+            io_binding.bind_input(
+                name=input_name, device_type='cuda', device_id=0,
+                element_type=np.float32, shape=tuple(x.shape),
+                buffer_ptr=x.data_ptr(),
+            )
+            io_binding.bind_output(output_name, device_type='cuda', device_id=0)
+            sess.run_with_iobinding(io_binding)
+            ort_out = io_binding.get_outputs()[0]
+            # Chuyển OrtValue -> torch tensor qua DLPack, KHÔNG copy dữ liệu,
+            # kết quả vẫn nằm trên GPU (đúng ý #1 trong review: tránh .cpu()
+            # thừa làm sai lệch số liệu latency thuần).
+            return dlpack.from_dlpack(ort_out.to_dlpack())
+    else:
+        # CPU: numpy path bình thường, không cần IOBinding (không có copy
+        # GPU<->CPU để tối ưu vì bản thân đã chạy trên CPU).
+        def forward_fn(x):
+            x_np = x.detach().cpu().numpy()
+            out_np = sess.run(None, {input_name: x_np})[0]
+            return torch.from_numpy(out_np)
+
+    return InferenceRunner('onnxruntime', forward_fn, model=model)
+
+
+@register_backend('openvino')
+def build_openvino_backend(model, device, img_h, img_w,
+                            onnx_path=None, force_rebuild=False,
+                            ov_device='AUTO', ov_precision='FP16', **kwargs):
+    """OpenVINO — dùng cho Intel CPU/iGPU/NPU/Core Ultra.
+
+    ov_device: 'CPU' / 'GPU' (iGPU Intel) / 'NPU' / 'AUTO'
+    ov_precision: 'FP16' (khuyến nghị, giảm ~50% size) hoặc 'FP32'
+    """
+    import openvino as ov
+
+    onnx_path = _get_or_export_onnx(model, img_h, img_w, onnx_path, force_rebuild)
+
+    core = ov.Core()
+    print(f"  OpenVINO devices khả dụng: {core.available_devices}")
+    ov_model = ov.convert_model(onnx_path)
+
+    ir_path = onnx_path.replace('.onnx', f'_{ov_precision.lower()}.xml')
+    ov.save_model(ov_model, ir_path, compress_to_fp16=(ov_precision.upper() == 'FP16'))
+    print(f"  ✅ OpenVINO IR saved: {ir_path}")
+
+    compiled = core.compile_model(ov_model, ov_device)
+    infer_request = compiled.create_infer_request()
+
+    def forward_fn(x):
+        x_np = x.detach().cpu().numpy()
+        result = infer_request.infer({0: x_np})
+        out = result[compiled.output(0)]
+        return torch.from_numpy(out)
+
+    return InferenceRunner(f'openvino[{ov_device}/{ov_precision}]', forward_fn, model=model)
+
+
+# --- TensorRT: dùng API "bindingless" (execute_async_v3 + set_tensor_address) ---
+# đúng chuẩn TensorRT >= 8.5, khớp với TensorRT 11.1 trên máy bạn. KHÔNG tương
+# thích với code TensorRT 8.x kiểu cũ (execute_async_v2 + bindings list).
+
+_TRT_DTYPE_TO_TORCH = None  # lazy-init trong hàm vì cần import tensorrt trước
+
+
+def _build_tensorrt_engine(onnx_path, engine_path, precision='fp16', workspace_gb=4):
+    import tensorrt as trt
+
+    trt_major = int(trt.__version__.split('.')[0])
+    print(f"  TensorRT version: {trt.__version__} (major={trt_major})")
+
+    logger = trt.Logger(trt.Logger.WARNING)
+    builder = trt.Builder(logger)
+    network = builder.create_network()
+    parser = trt.OnnxParser(network, logger)
+
+    print(f"  Parsing ONNX -> TensorRT network: {onnx_path}")
+    with open(onnx_path, 'rb') as f:
+        if not parser.parse(f.read()):
+            for i in range(parser.num_errors):
+                print(f"  [TRT parse error] {parser.get_error(i)}")
+            raise RuntimeError("Parse ONNX sang TensorRT network that bai")
+
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gb * (1 << 30))
+
+    if trt_major >= 11:
+        # TensorRT >= 11.0: TOAN BO BuilderFlag.FP16/INT8/BF16/FP8/INT4 (weak
+        # typing) da bi XOA (xem NVIDIA "Migrating from TensorRT 10.x to 11.x").
+        # Network gio luon "strongly typed" - precision cua tung tensor lay
+        # TRUC TIEP tu dtype khai bao trong chinh do thi ONNX, khong con set
+        # qua builder config nua. Do do:
+        #   - fp16: ONNX dua vao PHAI LA ONNX FP16 that (xem _export_onnx(half=True)
+        #     o build_tensorrt_backend) - khong set flag gi them o day.
+        #   - int8: ONNX phai co san node QuantizeLinear/DequantizeLinear (explicit
+        #     quantization/QDQ graph). IInt8Calibrator kieu implicit cu DA BI XOA.
+        #     Dung scripts/04_quantize_ptq.py (--mode static) de tao ONNX QDQ roi
+        #     truyen vao qua --onnx_path, KHONG dung calibrator o day nua.
+        if precision == 'fp16':
+            print("  [TensorRT >=11] Strongly-typed network: engine se FP16 neu (va "
+                  "chi neu) ONNX input da la FP16 - khong dung BuilderFlag.FP16 nua.")
+        elif precision == 'int8':
+            print("  [TensorRT >=11] INT8: ONNX truyền vào đã ở dạng QDQ "
+                  "(QuantizeLinear/DequantizeLinear, tự động tạo ở build_tensorrt_backend) "
+                  "-> engine sẽ dùng kernel INT8 thật cho các layer đã quantize.")
+        # fp32: khong can lam gi them, ONNX FP32 -> engine FP32 mac dinh.
+    else:
+        # TensorRT <= 10.x: API cu, van con BuilderFlag
+        if precision == 'fp16':
+            if builder.platform_has_fast_fp16:
+                config.set_flag(trt.BuilderFlag.FP16)
+                print("  FP16 mode: bat (GPU ho tro FP16 toc do cao)")
+            else:
+                print("  [!] GPU khong bao ho tro FP16 nhanh - van build FP32.")
+        elif precision == 'int8':
+            config.set_flag(trt.BuilderFlag.INT8)
+            print("  [!] INT8 build KHONG co calibrator rieng o day (dung default) - "
+                  "CHI de demo toc do, PHAI calibrate bang du lieu that truoc khi dung "
+                  "production (xem scripts/04_quantize_ptq.py de tham khao cach calibrate).")
+
+    print("  Building TensorRT engine (co the mat vai phut)...")
+    serialized_engine = builder.build_serialized_network(network, config)
+    if serialized_engine is None:
+        raise RuntimeError("Build TensorRT engine that bai (build_serialized_network tra None)")
+
+    os.makedirs(os.path.dirname(engine_path) or '.', exist_ok=True)
+    with open(engine_path, 'wb') as f:
+        f.write(serialized_engine)
+    print(f"  Da luu TensorRT engine: {engine_path} "
+          f"({os.path.getsize(engine_path)/1024**2:.2f} MB)")
+
+
+@register_backend('tensorrt')
+def build_tensorrt_backend(model, device, img_h, img_w,
+                            onnx_path=None, trt_engine_path=None,
+                            trt_precision='fp16', trt_workspace_gb=4,
+                            force_rebuild=False, calib_dir=None, **kwargs):
+    """TensorRT native API — nhanh nhất trên NVIDIA GPU/Jetson, bắt buộc CUDA.
+
+    Input size PHẢI CỐ ĐỊNH khi build engine (không dùng dynamic_axes) để đạt
+    tốc độ tối ưu nhất — đây cũng là khuyến nghị chuẩn cho deploy Edge AI.
+    """
+    if device.type != 'cuda':
+        raise RuntimeError(
+            "Backend 'tensorrt' yêu cầu CUDA device (GPU) — không chạy được trên CPU. "
+            "Chạy lại với máy có GPU (vd: RTX 2050) hoặc trên Jetson.")
+
+    try:
+        import tensorrt as trt
+    except ImportError as e:
+        raise ImportError(
+            "Chưa cài package `tensorrt`. Trên máy có RTX/GPU thường: cài qua "
+            "NVIDIA pip index đúng bản CUDA (vd: `pip install tensorrt` sau khi "
+            "đã cài CUDA Toolkit + cuDNN khớp version), hoặc trên Jetson TensorRT "
+            "đã có sẵn trong JetPack (dùng python3 hệ thống, không phải venv riêng "
+            "trừ khi symlink lại site-packages tensorrt)."
+        ) from e
+
+    trt_major = int(trt.__version__.split('.')[0])
+
+    # FIX: TensorRT >= 11.x đã xoá BuilderFlag.FP16 — muốn engine FP16 phải
+    # đưa vào 1 ONNX FP16 thật (strongly-typed network lấy precision từ dtype
+    # của chính đồ thị ONNX). Với TensorRT <= 10.x, vẫn export ONNX FP32 bình
+    # thường và set flag như cũ.
+    need_fp16_onnx = (trt_major >= 11 and trt_precision == 'fp16')
+    if need_fp16_onnx:
+        print(f"  TensorRT {trt.__version__} (>=11): export ONNX dạng FP16 để build "
+              f"engine FP16 (BuilderFlag.FP16 đã bị xoá khỏi TensorRT 11.x).")
+
+    onnx_path = _get_or_export_onnx(model, img_h, img_w, onnx_path, force_rebuild,
+                                     half=need_fp16_onnx)
+
+    # FIX: TensorRT >= 11.x cần ONNX dạng QDQ (QuantizeLinear/DequantizeLinear)
+    # để build engine INT8 THẬT — implicit BuilderFlag.INT8 + calibrator kiểu cũ
+    # đã bị xoá. Trước đây code chỉ IN CẢNH BÁO rồi build thẳng từ ONNX FP32
+    # thường -> engine build "thành công" nhưng KHÔNG có kernel INT8 nào cả
+    # (chạy full-precision, tên file gây hiểu lầm là INT8). Giờ tự động tạo
+    # ONNX QDQ (static quantization) trước khi build, giống hệt cách
+    # scripts/04_quantize_ptq.py --mode static làm, nhưng tích hợp thẳng vào
+    # đây để chạy 1 lệnh duy nhất là đủ.
+    build_onnx_path = onnx_path
+    if trt_precision == 'int8' and trt_major >= 11:
+        build_onnx_path = _get_or_build_qdq_onnx(
+            onnx_path, img_h, img_w, calib_dir=calib_dir, force_rebuild=force_rebuild)
+
+    engine_path = trt_engine_path or onnx_path.replace('.onnx', f'_{trt_precision}.engine')
+
+    if force_rebuild or not os.path.exists(engine_path):
+        _build_tensorrt_engine(build_onnx_path, engine_path, trt_precision, trt_workspace_gb)
+    else:
+        print(f"  Dùng TensorRT engine có sẵn: {engine_path} "
+              f"(thêm --force_rebuild để build lại)")
+
+    trt_logger = trt.Logger(trt.Logger.WARNING)
+    runtime = trt.Runtime(trt_logger)
+    with open(engine_path, 'rb') as f:
+        engine = runtime.deserialize_cuda_engine(f.read())
+    context = engine.create_execution_context()
+
+    # Xác định tên input/output tensor theo IO mode (không giả định thứ tự cố định)
+    input_name, output_name = None, None
+    for i in range(engine.num_io_tensors):
+        name = engine.get_tensor_name(i)
+        if engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+            input_name = name
+        else:
+            output_name = name
+    assert input_name and output_name, "Không tìm thấy input/output tensor trong engine"
+
+    dtype_map = {
+        trt.DataType.FLOAT: torch.float32,
+        trt.DataType.HALF: torch.float16,
+        trt.DataType.INT8: torch.int8,
+        trt.DataType.INT32: torch.int32,
+        trt.DataType.BOOL: torch.bool,
+    }
+    in_dtype = dtype_map[engine.get_tensor_dtype(input_name)]
+    out_dtype = dtype_map[engine.get_tensor_dtype(output_name)]
+
+    stream = torch.cuda.Stream()
+
+    def forward_fn(x):
+        x = x.to(device='cuda', dtype=in_dtype).contiguous()
+        context.set_input_shape(input_name, tuple(x.shape))
+        out_shape = tuple(context.get_tensor_shape(output_name))
+        out = torch.empty(out_shape, dtype=out_dtype, device='cuda')
+
+        context.set_tensor_address(input_name, x.data_ptr())
+        context.set_tensor_address(output_name, out.data_ptr())
+        with torch.cuda.stream(stream):
+            context.execute_async_v3(stream.cuda_stream)
+        stream.synchronize()
+        # KHÔNG copy về CPU ở đây — .cpu() sẽ cộng thêm PCIe transfer time vào
+        # số liệu benchmark, làm sai lệch latency "pure inference". Giữ output
+        # trên GPU; benchmark() chỉ cần torch.cuda.synchronize() là đủ để đo
+        # đúng thời gian tính toán. Nếu cần accuracy-check (so sánh với PyTorch/
+        # ONNX Runtime), gọi runner(x).cpu().numpy() ở nơi gọi, không phải ở đây.
+        return out
+
+    return InferenceRunner(f'tensorrt[{trt_precision}]', forward_fn, model=model)
 
 
 def _not_implemented_backend(name, hint):
@@ -289,32 +713,17 @@ def _not_implemented_backend(name, hint):
     return _stub
 
 
-# Placeholder có chủ đích: giữ đúng tên trong choices để người dùng thấy rõ
-# lộ trình mở rộng, đồng thời trỏ sang các script chuyên biệt đã có sẵn
-# trong bộ pipeline (xem scripts/02_bench_onnxruntime.py, 03_convert_openvino.py).
-_not_implemented_backend(
-    'onnxruntime',
-    "Dùng scripts/02_bench_onnxruntime.py (đã hỗ trợ CPU/CUDA/TensorRT/OpenVINO "
-    "Execution Provider) — hoặc implement build_onnxruntime_backend() theo mẫu "
-    "trong docstring đầu file.")
-_not_implemented_backend(
-    'tensorrt',
-    "Build TensorRT engine từ ONNX (trtexec/polygraphy) rồi implement "
-    "build_tensorrt_backend() dùng pycuda/torch2trt để load engine — theo đúng "
-    "mẫu InferenceRunner ở trên.")
-_not_implemented_backend(
-    'openvino',
-    "Dùng scripts/03_convert_openvino.py để convert + benchmark riêng, hoặc "
-    "implement build_openvino_backend() bọc openvino.CompiledModel theo mẫu "
-    "InferenceRunner ở trên.")
+# Đã implement đầy đủ ONNX Runtime / TensorRT / OpenVINO ở trên (không còn là
+# placeholder). Giữ lại register_backend cho backend chưa hỗ trợ khác nếu cần
+# mở rộng thêm sau này (vd: 'ncnn', 'tflite'...).
 
 
 def build_runner(backend: str, model: nn.Module, device: torch.device,
-                  img_h: int, img_w: int) -> InferenceRunner:
+                  img_h: int, img_w: int, **kwargs) -> InferenceRunner:
     if backend not in BACKEND_REGISTRY:
         raise ValueError(f"Backend '{backend}' không tồn tại. "
                           f"Các backend khả dụng: {list(BACKEND_REGISTRY.keys())}")
-    return BACKEND_REGISTRY[backend](model, device, img_h, img_w)
+    return BACKEND_REGISTRY[backend](model, device, img_h, img_w, **kwargs)
 
 
 # ============================================================
@@ -359,7 +768,7 @@ def _compute_metrics(ti, tu, tp, tl):
     }
 
 
-@torch.inference_mode()
+@torch.no_grad()
 def validate(model, val_txt, img_h, img_w, batch_size,
              num_workers, device, use_amp, recorded):
     from data.custom import CityscapesDataset, get_val_transforms
@@ -563,8 +972,24 @@ def main():
     parser.add_argument('--backend',     default='baseline',
                         choices=list(BACKEND_REGISTRY.keys()),
                         help="Backend inference: baseline/fp16/compile/"
-                             "compile_fp16/torchscript (onnxruntime/tensorrt/"
-                             "openvino: xem docstring đầu file để tích hợp)")
+                             "compile_fp16/torchscript/onnxruntime/tensorrt/openvino")
+    # --- Tham số cho onnxruntime / tensorrt / openvino (đều có default an toàn,
+    #     KHÔNG ảnh hưởng CLI cũ nếu không dùng các backend này) ---
+    parser.add_argument('--onnx_path', default=None,
+                        help='Đường dẫn .onnx (mặc định: checkpoints/gcnet_{h}x{w}.onnx)')
+    parser.add_argument('--force_rebuild', action='store_true',
+                        help='Ép export lại ONNX / build lại TensorRT engine dù đã có cache')
+    parser.add_argument('--trt_engine_path', default=None,
+                        help='Đường dẫn .engine (mặc định: tự đặt tên theo onnx_path + precision)')
+    parser.add_argument('--trt_precision', choices=['fp32', 'fp16', 'int8'], default='fp16')
+    parser.add_argument('--trt_workspace_gb', type=float, default=4)
+    parser.add_argument('--calib_dir', default=None,
+                        help='Thư mục ảnh calibration cho TensorRT INT8 (QDQ static '
+                             'quantization). Không có -> dùng random data, CHỈ demo tốc độ, '
+                             'KHÔNG dùng cho production.')
+    parser.add_argument('--ov_device', default='AUTO',
+                        help='CPU / GPU (iGPU Intel) / NPU / AUTO')
+    parser.add_argument('--ov_precision', choices=['FP32', 'FP16'], default='FP16')
     # Benchmark
     parser.add_argument('--benchmark',   action='store_true',
                         help='Chạy speed benchmark (default: True nếu không có --validate)')
@@ -610,7 +1035,18 @@ def main():
 
     if args.benchmark:
         print(f"\nBuilding backend '{args.backend}'...")
-        runner = build_runner(args.backend, model, device, args.img_h, args.img_w)
+        backend_kwargs = dict(
+            onnx_path=args.onnx_path,
+            force_rebuild=args.force_rebuild,
+            trt_engine_path=args.trt_engine_path,
+            trt_precision=args.trt_precision,
+            trt_workspace_gb=args.trt_workspace_gb,
+            calib_dir=args.calib_dir,
+            ov_device=args.ov_device,
+            ov_precision=args.ov_precision,
+        )
+        runner = build_runner(args.backend, model, device, args.img_h, args.img_w,
+                               **backend_kwargs)
 
         print(f"Running benchmark...")
         result = benchmark(runner, args.img_h, args.img_w, device,
