@@ -223,11 +223,7 @@ def build_fp16_backend(model, device, img_h, img_w, **kwargs):
     if device.type != 'cuda':
         print("  [!] FP16 backend chạy trên CPU thường KHÔNG có lợi về tốc độ "
               "(thiếu kernel FP16 tối ưu) — khuyến nghị test FP16 trên GPU/Jetson thật.")
-    with torch.autocast(
-        device_type="cuda",
-        dtype=torch.float16
-    ):
-        out = model(x)
+    model_fp16 = model.half()
 
     def forward_fn(x):
         with torch.inference_mode():
@@ -274,11 +270,7 @@ def build_torchscript_backend(model, device, img_h, img_w, **kwargs):
     """
     example = torch.randn(1, 3, img_h, img_w, device=device)
     with torch.inference_mode():
-        torch.jit.trace(
-            model,
-            example,
-            strict=False
-        )
+        traced = torch.jit.trace(model, example, strict=False)
     traced = torch.jit.freeze(traced) if not traced.training else traced
 
     def forward_fn(x):
@@ -401,7 +393,7 @@ def validate(model, val_txt, img_h, img_w, batch_size,
         if masks.dim() == 4:
             masks = masks.squeeze(1)
         with autocast(device_type='cuda', enabled=use_amp):
-            logits = runner(imgs)
+            logits = model(imgs)
             logits = F.interpolate(logits, size=masks.shape[-2:],
                                    mode='bilinear', align_corners=False)
             loss   = ce_fn(logits, masks)
