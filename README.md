@@ -252,18 +252,6 @@ python train.py \
 - Hardware: NVIDIA Tesla P100 16GB (Kaggle)
 - Transfer learning: Progressive unfreezing from GCNet-S pretrained on Cityscapes
 
----
-
-## Qualitative Results
-
-Results on Cityscapes-Foggy at three fog densities (β = 0.005, 0.01, 0.02):
-
-```
-Row 1: Input foggy images
-Row 2: Ground truth
-Row 3: Our predictions
-```
----
 
 ## Edge AI Deployment Benchmark
 
