@@ -267,7 +267,26 @@ def make_fitness_function(base_cfg,
                 # Shape mismatches from the changed stage-4/5/6 depths &
                 # ppm_channels are skipped automatically by this function's
                 # own shape check -- see train.py's load_pretrained_gcnet.
-                load_pretrained_gcnet(model, pretrained_weights_path)
+                load_pct = load_pretrained_gcnet(model, pretrained_weights_path)
+                if load_pct < 1.0:
+                    # stem_conv1/conv2/stage2/stage3 are never touched by
+                    # the search, so a working load should ALWAYS match at
+                    # least that much regardless of what stage-4/5/6 depths
+                    # this candidate uses -- a near-0% match means the
+                    # checkpoint didn't load at all (e.g. an unrecognized
+                    # top-level key), which would silently turn every
+                    # candidate's "proxy fine-tuning" into training from
+                    # random init instead, making the whole search's cost
+                    # signal meaningless. Fail loudly instead of burning
+                    # GPU time on a broken proxy.
+                    raise RuntimeError(
+                        f"load_pretrained_gcnet matched only {load_pct:.2f}% of "
+                        f"parameters from {pretrained_weights_path!r} -- this looks "
+                        "like the checkpoint failed to load rather than a normal "
+                        "architecture mismatch. Check the checkpoint's top-level "
+                        "key (must be 'model', 'model_state_dict', 'state_dict', "
+                        "or a flat state_dict) before continuing the search."
+                    )
 
                 proxy_args = _build_proxy_args(
                     loss_config=base_cfg["loss"], proxy_epochs=proxy_epochs,

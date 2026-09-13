@@ -171,7 +171,14 @@ def _remap_stem_key(key, N2=4):
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dwsa"):
     print(f"Loading pretrained weights from: {ckpt_path}")
     ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-    state = ckpt.get('state_dict', ckpt)
+    # FIX: Trainer.save_checkpoint() saves the model state dict under the
+    # 'model' key (see save_checkpoint below), not 'state_dict' -- the old
+    # `ckpt.get('state_dict', ckpt)` silently fell back to treating the
+    # WHOLE checkpoint dict (with keys like 'epoch', 'model', 'optimizer')
+    # as if it were the state dict itself whenever loading one of this
+    # project's own checkpoints, matching 0% of parameters with no error.
+    # Same fallback chain as Trainer.load_checkpoint() below.
+    state = ckpt.get('model') or ckpt.get('model_state_dict') or ckpt.get('state_dict') or ckpt
 
     # Head key remap
     HEAD_MAP = {}
