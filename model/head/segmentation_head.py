@@ -1,11 +1,8 @@
-import math
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from torch import Tensor
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 from components.components import (
     BaseModule,
@@ -14,114 +11,29 @@ from components.components import (
     build_activation_layer,
     resize,
     OptConfigType,
-    SampleList,
 )
 
 
 # =============================================================================
-# Accuracy helper
-# =============================================================================
-
-def accuracy(pred: Tensor,
-             target: Tensor,
-             ignore_index: int = 255) -> Tensor:
-    """Tính pixel accuracy, bỏ qua các pixel có nhãn = ignore_index."""
-    pred_label = pred.argmax(dim=1)
-    mask       = target != ignore_index
-    correct    = (pred_label[mask] == target[mask]).sum().float()
-    total      = mask.sum().float().clamp(min=1)
-    return correct / total * 100.0
-
-
-# =============================================================================
-# Cross-entropy loss wrapper
-# =============================================================================
-
-class CrossEntropyLoss(nn.Module):
-    def __init__(self,
-                 ignore_index: int = 255,
-                 loss_weight: float = 1.0):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.loss_weight  = loss_weight
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        return self.loss_weight * F.cross_entropy(
-            pred, target, ignore_index=self.ignore_index)
-
-
-# =============================================================================
-# OHEM Cross-entropy loss
-# =============================================================================
-
-class OHEMCrossEntropyLoss(nn.Module):
-
-    def __init__(self,
-                 ignore_index: int = 255,
-                 loss_weight: float = 1.0,
-                 thresh: float = 1.5,
-                 min_kept: int = 100_000):
-        super().__init__()
-        self.ignore_index = ignore_index
-        self.loss_weight  = loss_weight
-        self.thresh       = thresh
-        self.min_kept     = min_kept
-
-    def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        losses = F.cross_entropy(
-            pred, target,
-            ignore_index=self.ignore_index,
-            reduction='none'
-        ).view(-1)
-
-        valid_mask = target.view(-1) != self.ignore_index
-        losses     = losses[valid_mask]
-
-        if losses.numel() == 0:
-            return pred.sum() * 0.0
-
-        losses_sorted, _ = losses.sort(descending=True)
-
-        n_above_thresh = (losses_sorted > self.thresh).sum().item()
-        n_keep         = int(max(n_above_thresh, self.min_kept))
-        n_keep         = min(n_keep, losses_sorted.numel())
-
-        return self.loss_weight * losses_sorted[:n_keep].mean()
-
-
-# =============================================================================
-# Fog Consistency Loss
-# =============================================================================
-
-class FogConsistencyLoss(nn.Module):
-    def __init__(self,
-                 temperature: float = 4.0,
-                 loss_weight: float = 0.1):
-        super().__init__()
-        self.T           = temperature
-        self.loss_weight = loss_weight
-
-    def forward(self,
-                logit_light: Tensor,
-                logit_heavy: Tensor) -> Tensor:
-        assert logit_light.shape == logit_heavy.shape, (
-            f"FogConsistencyLoss: shape mismatch "
-            f"{logit_light.shape} vs {logit_heavy.shape}"
-        )
-
-        # Q = heavy fog distribution (student, được tối ưu)
-        # P = light fog distribution (teacher, target)
-        # Minimize KL(P || Q) = sum P * log(P/Q)
-        log_q = F.log_softmax(logit_heavy / self.T, dim=1)   # log Q (student)
-        p     = F.softmax(logit_light  / self.T, dim=1)       # P     (teacher)
-
-        kl = F.kl_div(log_q, p, reduction='batchmean') * (self.T ** 2)
-
-        return self.loss_weight * kl
-
-
-# =============================================================================
 # GCNetHead
+#
+# NOTE (cleanup): Các thành phần sau đã bị loại bỏ khỏi bản gốc vì không được
+# gọi ở bất kỳ đâu trong training loop thực tế (Trainer trong train.py tự định
+# nghĩa và dùng OHEMLoss/DiceLoss riêng, không đi qua GCNetHead.loss()):
+#   - accuracy()                     (chỉ được gọi trong loss(), nay đã xóa)
+#   - CrossEntropyLoss               (chỉ dùng cho self.loss_c4, dead)
+#   - OHEMCrossEntropyLoss           (chỉ dùng cho self.loss_c6, dead — khác với
+#                                      OHEMLoss trong train.py, cái đó MỚI là cái
+#                                      thực sự chạy khi train)
+#   - FogConsistencyLoss             (được khai báo nhưng chưa từng gọi forward())
+#   - GCNetHead.loss()                (method không được Trainer sử dụng)
+#   - GCNetHead.compute_fog_consistency() (không được gọi ở đâu)
+# Theo đó, các tham số constructor chỉ tồn tại để phục vụ các thành phần trên
+# (ignore_index, loss_weight_aux, ohem_thresh, ohem_min_kept,
+#  fog_consistency_weight, fog_temperature) cũng đã được loại bỏ.
+# Nếu sau này cần tính loss ngay trong head (thay vì trong Trainer), hãy viết
+# lại loss() dựa trên chính OHEMLoss/DiceLoss của train.py để tránh 2 bản loss
+# OHEM khác nhau tồn tại song song như trước.
 # =============================================================================
 
 class GCNetHead(BaseModule):
@@ -132,14 +44,7 @@ class GCNetHead(BaseModule):
                  norm_cfg: OptConfigType = dict(type='BN', requires_grad=True),
                  act_cfg: OptConfigType = dict(type='ReLU', inplace=True),
                  align_corners: bool = False,
-                 ignore_index: int = 255,
-                 loss_weight_aux: float = 0.4,
                  dropout_ratio: float = 0.1,
-                 # FIX: thresh default 1.5 (từ 0.7) — xem OHEMCrossEntropyLoss
-                 ohem_thresh: float = 1.5,
-                 ohem_min_kept: int = 100_000,
-                 fog_consistency_weight: float = 0.1,
-                 fog_temperature: float = 4.0,
                  init_cfg: OptConfigType = None):
         super().__init__(init_cfg)
 
@@ -149,8 +54,6 @@ class GCNetHead(BaseModule):
         self.norm_cfg            = norm_cfg
         self.act_cfg             = act_cfg
         self.align_corners       = align_corners
-        self.ignore_index        = ignore_index
-        self.loss_weight_aux     = loss_weight_aux
 
         # ---- Main head (c6) ---------------------------------------------- #
         self.head = self._make_base_head(in_channels, channels)
@@ -163,26 +66,6 @@ class GCNetHead(BaseModule):
         # ---- Final classifiers ------------------------------------------- #
         self.dropout = nn.Dropout2d(dropout_ratio) if dropout_ratio > 0 else nn.Identity()
         self.cls_seg  = nn.Conv2d(channels, num_classes, kernel_size=1)
-
-        # ---- Loss functions ---------------------------------------------- #
-        self.loss_c4 = CrossEntropyLoss(ignore_index=ignore_index,
-                                         loss_weight=loss_weight_aux)
-
-        self.loss_c6 = OHEMCrossEntropyLoss(
-            ignore_index=ignore_index,
-            loss_weight=1.0,
-            thresh=ohem_thresh,
-            min_kept=ohem_min_kept,
-        )
-
-        self.fog_consistency_weight = fog_consistency_weight
-        if fog_consistency_weight > 0.0:
-            self.loss_fog = FogConsistencyLoss(
-                temperature=fog_temperature,
-                loss_weight=fog_consistency_weight,
-            )
-        else:
-            self.loss_fog = None
 
         self.init_weights()
 
@@ -229,42 +112,6 @@ class GCNetHead(BaseModule):
             else:
                 c6_feat = inputs
             return self.cls_seg(self.dropout(self.head(c6_feat)))
-
-    # ---------------------------------------------------------------------- #
-    # Loss                                                                     #
-    # ---------------------------------------------------------------------- #
-
-    def loss(self,
-             seg_logits: Tuple[Tensor, Tensor],
-             seg_label: Tensor) -> Dict[str, Tensor]:
-        c4_logit, c6_logit = seg_logits
-
-        # FIX: normalize seg_label shape → luôn (B, H, W)
-        if seg_label.dim() == 4:
-            seg_label = seg_label.squeeze(1)
-
-        # FIX: dùng shape[-2:] thay vì shape[1:]
-        target_size = seg_label.shape[-2:]
-
-        c4_logit = resize(c4_logit, size=target_size,
-                          mode='bilinear', align_corners=self.align_corners)
-        c6_logit = resize(c6_logit, size=target_size,
-                          mode='bilinear', align_corners=self.align_corners)
-
-        losses = {
-            'loss_c4': self.loss_c4(c4_logit, seg_label),
-            'loss_c6': self.loss_c6(c6_logit, seg_label),
-            'acc_seg': accuracy(c6_logit, seg_label,
-                                ignore_index=self.ignore_index),
-        }
-        return losses
-
-    def compute_fog_consistency(self,
-                                 logit_light: Tensor,
-                                 logit_heavy: Tensor) -> Optional[Tensor]:
-        if self.loss_fog is None:
-            return None
-        return self.loss_fog(logit_light, logit_heavy)
 
     # ---------------------------------------------------------------------- #
     # Helper                                                                   #
