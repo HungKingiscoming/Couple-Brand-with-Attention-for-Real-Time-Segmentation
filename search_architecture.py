@@ -60,6 +60,12 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     # Output
     p.add_argument("--out_json", default="best_gcnet_arch.json")
+    p.add_argument("--log_path", default="search_log.jsonl",
+                    help="Every candidate's result is appended here as one JSON "
+                         "line the moment it finishes, so progress survives even "
+                         "if the process is killed before the search completes "
+                         "(Kaggle session limit, disconnect, etc). tail -f this "
+                         "file to watch the search live. Pass '' to disable.")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -82,6 +88,7 @@ def main():
         img_size=(args.img_h, args.img_w),
         dataset_type=args.dataset_type,
         device=args.device,
+        log_path=(args.log_path or None),
     )
 
     opt = OBLAdaptiveRaindropOptimizer(
@@ -89,8 +96,13 @@ def main():
         pop_size=args.pop_size, max_iter=args.max_iter, seed=args.seed,
     )
 
+    n_candidates = args.pop_size * (args.max_iter + 2)
     print(f"Starting search: pop_size={args.pop_size}, max_iter={args.max_iter}, "
           f"proxy_epochs={args.proxy_epochs}, proxy_data_fraction={args.proxy_data_fraction}")
+    print(f"Total candidates to evaluate: ~{n_candidates}")
+    if args.log_path:
+        print(f"Live progress (safe even if this process gets killed): "
+              f"tail -f {args.log_path}")
     best_x, best_cost = opt.optimize(verbose=True)
 
     best_config = decode_candidate(best_x)

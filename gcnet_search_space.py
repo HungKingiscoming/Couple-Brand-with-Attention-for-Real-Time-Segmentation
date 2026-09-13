@@ -25,7 +25,9 @@ module itself (and using decode_candidate/build_model_config) never
 requires torch or a GPU.
 """
 
+import json
 import os
+import time
 
 import numpy as np
 
@@ -221,7 +223,8 @@ def make_fitness_function(base_cfg,
                            lr=5e-4,
                            img_size=(512, 1024),
                            dataset_type="foggy",
-                           device="cuda"):
+                           device="cuda",
+                           log_path=None):
     """
     Returns a `fitness(X)` function compatible with RaindropOptimizer /
     ADERaindropOptimizer's `obj_func` signature: takes an (N, d) array of
@@ -235,6 +238,14 @@ def make_fitness_function(base_cfg,
     this function, so importing gcnet_search_space.py itself never
     requires torch (decode_candidate/build_model_config stay usable, and
     testable, without a GPU or even torch installed).
+
+    If `log_path` is given, every candidate's result is appended to it as
+    one JSON line (JSONL) the moment that candidate finishes evaluating --
+    a proxy search can run for many hours across `pop_size * (max_iter+2)`
+    candidates with nothing else saved until the very end, so if the
+    process is killed partway (Kaggle session limit, disconnect, etc.)
+    this log is the only way to recover which architectures were already
+    tried and how they did. Safe to `tail -f` while the search is running.
 
     NOTE: this function trains N models per call (once per candidate row).
     Candidates within a call cannot share one GPU training run because
@@ -259,6 +270,7 @@ def make_fitness_function(base_cfg,
         costs = np.zeros(X.shape[0])
         for i, x in enumerate(X):
             cfg = build_model_config(x, base_cfg)
+            cfg_candidate_for_log = decode_candidate(x)
             tmp_dir = tempfile.mkdtemp(prefix="ade_rd_proxy_")
             try:
                 train_txt_sub = os.path.join(tmp_dir, "train_subset.txt")
@@ -312,6 +324,16 @@ def make_fitness_function(base_cfg,
                     trainer.train_epoch(train_loader, epoch)
                 val_metrics = trainer.validate(val_loader, proxy_epochs - 1)
                 costs[i] = 1.0 - val_metrics["miou"]
+
+                if log_path is not None:
+                    with open(log_path, "a") as f:
+                        f.write(json.dumps({
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "config": cfg_candidate_for_log,
+                            "miou": val_metrics["miou"],
+                            "cost": float(costs[i]),
+                            "backbone_load_pct": load_pct,
+                        }) + "\n")
 
                 del model, trainer, optimizer, train_loader, val_loader
             finally:
