@@ -160,6 +160,18 @@ def _make_subset_txt(src_txt, fraction, out_path, seed):
     import random
     with open(src_txt, "r") as f:
         lines = [line for line in f if line.strip()]
+    if not lines:
+        # Fail here, immediately and clearly -- otherwise this silently
+        # writes an empty subset file, and the real error only surfaces
+        # much later as a cryptic "num_samples should be a positive
+        # integer" from deep inside torch's DataLoader/RandomSampler,
+        # nowhere near the actual cause (an empty/wrong --train_txt or
+        # --val_txt path).
+        raise ValueError(
+            f"{src_txt!r} has no valid (non-blank) lines -- double-check "
+            "that this path points to the correct train/val list file on "
+            "Kaggle and that the file isn't empty."
+        )
     rng = random.Random(seed)
     rng.shuffle(lines)
     n = max(1, int(round(len(lines) * fraction)))
