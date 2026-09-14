@@ -274,7 +274,9 @@ def create_dataloaders(
     img_size: Tuple[int, int] = (512, 1024),
     pin_memory: bool = True,
     compute_class_weights: bool = False,
-    dataset_type: str = 'normal'
+    dataset_type: str = 'normal',
+    persistent_workers: bool = False,
+    prefetch_factor: int = 2,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.Tensor]]:
 
     print(f"\n{'='*60}")
@@ -343,13 +345,23 @@ def create_dataloaders(
             print(f"\nClass weights computed & cached → {cache_path}")
             print(f"   (min={class_weights.min():.3f}, max={class_weights.max():.3f})")
 
+    worker_kwargs = {}
+    if num_workers > 0:
+        worker_kwargs = {
+            'persistent_workers': persistent_workers,
+            'prefetch_factor': prefetch_factor,
+        }
+
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        # A very small proxy subset may contain fewer items than one batch;
+        # keep that batch instead of silently producing a zero-length loader.
+        drop_last=len(train_dataset) >= batch_size,
+        **worker_kwargs,
     )
 
     # FIX: drop_last=False cho validation — không nên bỏ samples khi tính metrics
@@ -360,6 +372,7 @@ def create_dataloaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         drop_last=False,   # FIX: False (bản gốc True làm mất vài samples)
+        **worker_kwargs,
     )
 
     print(f"\n{'='*60}")

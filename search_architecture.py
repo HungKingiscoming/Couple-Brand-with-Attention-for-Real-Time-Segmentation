@@ -11,7 +11,7 @@ Usage (on Kaggle, with a GPU):
         --pop_size 8 --max_iter 20 \
         --proxy_epochs 4 --proxy_data_fraction 0.2
 
-Each candidate is trained for `proxy_epochs` epochs on a random
+Each candidate is trained for `proxy_epochs` epochs on a fixed random
 `proxy_data_fraction` subset of train/val (see
 gcnet_search_space.make_fitness_function) -- this is a cheap PROXY signal
 to rank candidates against each other, not a final accuracy number. After
@@ -25,6 +25,10 @@ pop_size candidates per iteration after that, so the total number of
 proxy-trained models is roughly `pop_size * (max_iter + 2)`. Sanity-check
 your GPU time budget with a single candidate first, e.g. by temporarily
 setting --pop_size 1 --max_iter 1.
+
+For a cheap first-stage screen, add `--fast_proxy`, use a smaller image
+size/data fraction, then re-evaluate the finalists without `--fast_proxy`.
+Compatible completed candidates in --log_path are reused on restart.
 """
 
 import argparse
@@ -51,6 +55,7 @@ def parse_args():
     p.add_argument("--proxy_epochs", type=int, default=4)
     p.add_argument("--proxy_data_fraction", type=float, default=0.2)
     p.add_argument("--batch_size", type=int, default=4)
+    p.add_argument("--proxy_num_workers", type=int, default=2)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--img_h", type=int, default=512)
     p.add_argument("--img_w", type=int, default=1024)
@@ -67,11 +72,22 @@ def parse_args():
                          "(Kaggle session limit, disconnect, etc). tail -f this "
                          "file to watch the search live. Pass '' to disable.")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--fast_proxy", action="store_true",
+                   help="Screen candidates faster by disabling Dice and the auxiliary loss. "
+                        "Re-evaluate finalists without this flag before full training.")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # train.py enables these inside its main(), which is not executed when
+    # architecture search imports Trainer. Enable the same fast paths here.
+    import torch
+    if str(args.device).startswith("cuda"):
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     base_cfg = ModelConfig.get_config(variant=args.model_variant)
 
@@ -89,6 +105,9 @@ def main():
         dataset_type=args.dataset_type,
         device=args.device,
         log_path=(args.log_path or None),
+        proxy_num_workers=args.proxy_num_workers,
+        proxy_seed=args.seed,
+        fast_proxy=args.fast_proxy,
     )
 
     opt = OBLAdaptiveRaindropOptimizer(
@@ -99,6 +118,8 @@ def main():
     n_candidates = args.pop_size * (args.max_iter + 2)
     print(f"Starting search: pop_size={args.pop_size}, max_iter={args.max_iter}, "
           f"proxy_epochs={args.proxy_epochs}, proxy_data_fraction={args.proxy_data_fraction}")
+    print(f"Proxy mode: {'FAST screening' if args.fast_proxy else 'full proxy loss'}; "
+          f"workers={args.proxy_num_workers}")
     print(f"Total candidates to evaluate: ~{n_candidates}")
     if args.log_path:
         print(f"Live progress (safe even if this process gets killed): "

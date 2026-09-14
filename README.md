@@ -263,12 +263,39 @@ The model is initialized from GCNet weights pretrained on clean Cityscapes and f
 python train.py \
   --train_txt /path/to/train.txt \
   --val_txt /path/to/val.txt \
-  --pretrained /path/to/gcnet_cityscapes.pth \
+  --pretrained_weights /path/to/gcnet_cityscapes.pth \
   --img_h 512 --img_w 1024 \
   --batch_size 4 \
   --epochs 100 \
   --lr 5e-4
 ```
+
+For higher input-pipeline throughput, add `--persistent_workers` and tune
+`--num_workers` for the available CPU. Gradient diagnostics now run every
+100 optimizer steps by default (`--gradient_check_interval 0` disables them),
+and CUDA allocator cache flushing is disabled unless explicitly requested.
+
+### Faster architecture search
+
+The search reuses one fixed proxy subset, persistent DataLoaders, and one
+in-memory pretrained checkpoint across candidates. Completed evaluations are
+also recovered from `search_log.jsonl` when all proxy settings match.
+
+Use a cheap screening pass first:
+
+```bash
+python search_architecture.py \
+  --pretrained_weights /path/to/our_miou_0.6783.pth \
+  --train_txt /path/to/train.txt --val_txt /path/to/val.txt \
+  --batch_size 16 --img_h 384 --img_w 768 \
+  --proxy_data_fraction 0.05 --proxy_epochs 1 \
+  --pop_size 6 --max_iter 5 --proxy_num_workers 4 \
+  --fast_proxy
+```
+
+`--fast_proxy` disables Dice and auxiliary loss only for screening. Re-run
+the best candidates without that flag at full proxy resolution before the
+final full-data training run.
 
 ### Training Configuration
 

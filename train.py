@@ -44,6 +44,15 @@ class _DummyWriter:
     def close(self): self._f.close()
 
 
+class _NullWriter:
+    """No-op writer for short proxy runs where per-candidate I/O is wasteful."""
+    def add_scalar(self, tag, value, step):
+        pass
+
+    def close(self):
+        pass
+
+
 def _make_writer(log_dir):
     if _TB:
         try: return SummaryWriter(log_dir=str(log_dir))
@@ -169,8 +178,18 @@ def _remap_stem_key(key, N2=4):
 
 
 def load_pretrained_gcnet(model, ckpt_path, strict_match=False, variant="fan_dwsa"):
-    print(f"Loading pretrained weights from: {ckpt_path}")
-    ckpt  = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    """Load compatible GCNet weights from a path or an in-memory checkpoint.
+
+    Architecture search builds many models from the same checkpoint. Accepting
+    the already-loaded object avoids repeatedly reading and deserializing the
+    same file for every candidate while preserving the original path API.
+    """
+    if isinstance(ckpt_path, (str, os.PathLike)):
+        print(f"Loading pretrained weights from: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    else:
+        print("Loading pretrained weights from cached checkpoint")
+        ckpt = ckpt_path
     # FIX: Trainer.save_checkpoint() saves the model state dict under the
     # 'model' key (see save_checkpoint below), not 'state_dict' -- the old
     # `ckpt.get('state_dict', ckpt)` silently fell back to treating the
@@ -346,7 +365,9 @@ class OHEMLoss(nn.Module):
             n_keep = min(max(int(self.keep_ratio * n), min(self.min_kept, n)), n)
             self.last_hard_ratio = n_keep / n
             if n_keep < n:
-                thr     = torch.sort(loss_px, descending=True)[0][n_keep-1].detach()
+                # kthvalue is linear-time and preserves the old threshold/tie
+                # semantics without fully sorting every valid pixel.
+                thr = torch.kthvalue(loss_px, n - n_keep + 1).values.detach()
                 loss_px = loss_px[loss_px >= thr]
         return loss_px.mean()
 
@@ -569,8 +590,9 @@ class Segmentor(nn.Module):
     def forward(self, x):
         return self.decode_head(self.backbone(x))
 
-    def forward_train(self, x):
-        return {"main": self.decode_head(self.backbone(x))}
+    def forward_train(self, x, return_aux=True):
+        features = self.backbone(x, return_aux=return_aux)
+        return {"main": self.decode_head(features)}
 
 
 # ============================================================
@@ -602,11 +624,11 @@ class Trainer:
             keep_ratio=getattr(args,'ohem_keep_ratio',0.3),
             min_kept=getattr(args,'ohem_min_kept',100000),
             thresh=getattr(args,'ohem_thresh',None),
-            class_weights=class_weights)
+            class_weights=cw)
 
         self.dice = DiceLoss(smooth=lcfg['dice_smooth'],
                              ignore_index=args.ignore_index,
-                             class_weights=class_weights)
+                             class_weights=cw)
         _ls = getattr(args, 'label_smoothing', 0.0)
         self.ce = nn.CrossEntropyLoss(weight=cw, ignore_index=args.ignore_index,
                                       label_smoothing=_ls)
@@ -614,7 +636,9 @@ class Trainer:
         self.scaler   = GradScaler(enabled=args.use_amp)
         self.save_dir = Path(args.save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
-        self.writer   = _make_writer(self.save_dir / "tensorboard")
+        self.writer = (_make_writer(self.save_dir / "tensorboard")
+                       if getattr(args, "enable_tensorboard", True)
+                       else _NullWriter())
         self._save_config()
         self._print_config()
 
@@ -668,8 +692,14 @@ class Trainer:
                 for m in mod.modules():
                     if isinstance(m, nn.BatchNorm2d): m.eval()
 
-        total_loss = total_ohem = total_dice = 0.0
+        total_loss = torch.zeros((), device=self.device)
+        total_ohem = torch.zeros((), device=self.device)
+        total_dice = torch.zeros((), device=self.device)
         max_grad_epoch = hard_ratio_acc = 0.0
+        mg = 0.0
+        grad_check_interval = getattr(self.args, "gradient_check_interval", 100)
+        progress_interval = max(1, getattr(self.args, "progress_interval", 20))
+        empty_cache_interval = getattr(self.args, "empty_cache_interval", 0)
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{self.args.epochs}")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
@@ -678,10 +708,13 @@ class Trainer:
             if masks.dim() == 4: masks = masks.squeeze(1)
 
             with autocast(device_type='cuda', enabled=self.args.use_amp):
-                c4_logit, c6_logit = self.model.forward_train(imgs)["main"]
+                use_aux = self.args.aux_weight > 0
+                outputs = self.model.forward_train(imgs, return_aux=use_aux)["main"]
+                if use_aux:
+                    c4_logit, c6_logit = outputs
+                else:
+                    c4_logit, c6_logit = None, outputs
                 target_size = masks.shape[-2:]
-                c4_full = F.interpolate(c4_logit, size=target_size,
-                                        mode='bilinear', align_corners=False)
                 c6_full = F.interpolate(c6_logit, size=target_size,
                                         mode='bilinear', align_corners=False)
 
@@ -698,7 +731,9 @@ class Trainer:
 
                 task_loss = self.ce_weight * ohem_loss + self.dice_weight * dice_loss
 
-                if self.args.aux_weight > 0:
+                if use_aux:
+                    c4_full = F.interpolate(c4_logit, size=target_size,
+                                            mode='bilinear', align_corners=False)
                     aux_decay = getattr(self.args, 'aux_decay_exp', 0.9)
                     aux_w     = self.args.aux_weight * (1 - epoch / self.args.epochs) ** aux_decay
                     task_loss = task_loss + aux_w * self.ohem(c4_full, masks)
@@ -713,8 +748,10 @@ class Trainer:
 
             if (batch_idx + 1) % self.args.accumulation_steps == 0:
                 self.scaler.unscale_(self.optimizer)
-                mg = check_gradients(self.model, threshold=10.0)
-                max_grad_epoch = max(max_grad_epoch, mg)
+                if (grad_check_interval > 0 and
+                        (self.global_step + 1) % grad_check_interval == 0):
+                    mg = check_gradients(self.model, threshold=10.0)
+                    max_grad_epoch = max(max_grad_epoch, mg)
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
                 self.scaler.step(self.optimizer)
@@ -724,32 +761,33 @@ class Trainer:
                 if self.scheduler and self.args.scheduler == 'onecycle':
                     self.scheduler.step()
 
-            total_loss  += loss.item() * self.args.accumulation_steps
-            total_ohem  += ohem_loss.item()
-            total_dice  += dice_loss.item()
+            total_loss += loss.detach() * self.args.accumulation_steps
+            total_ohem += ohem_loss.detach()
+            total_dice += dice_loss.detach()
             hard_ratio_acc += self.ohem.last_hard_ratio
 
-            pbar.set_postfix({
-                'loss': f'{loss.item()*self.args.accumulation_steps:.4f}',
-                'ohem': f'{ohem_loss.item():.4f}',
-                'dice': f'{dice_loss.item():.4f}',
-                'lr':   f'{self.optimizer.param_groups[0]["lr"]:.2e}',
-                'hard%':f'{self.ohem.last_hard_ratio:.2f}',
-                'mg':   f'{mg:.2f}',
-            })
-            if batch_idx % 200 == 0: torch.cuda.empty_cache()
+            if batch_idx % progress_interval == 0 or batch_idx + 1 == len(loader):
+                pbar.set_postfix({
+                    'loss': f'{loss.detach().item()*self.args.accumulation_steps:.4f}',
+                    'ohem': f'{ohem_loss.detach().item():.4f}',
+                    'dice': f'{dice_loss.detach().item():.4f}',
+                    'lr':   f'{self.optimizer.param_groups[0]["lr"]:.2e}',
+                    'hard%':f'{self.ohem.last_hard_ratio:.2f}',
+                    'mg':   f'{mg:.2f}',
+                })
+            if empty_cache_interval > 0 and (batch_idx + 1) % empty_cache_interval == 0:
+                torch.cuda.empty_cache()
 
         n = len(loader)
         avg_hr = hard_ratio_acc / n
         print(f"\nEpoch {epoch+1} — Max grad: {max_grad_epoch:.2f}  |  Hard%: {avg_hr:.3f}")
         print(f"  LR head={self.optimizer.param_groups[0]['lr']:.2e}")
 
-        torch.cuda.empty_cache()
         if self.scheduler and self.args.scheduler != 'onecycle':
             self.scheduler.step()
 
-        result = {'loss': total_loss/n, 'ohem': total_ohem/n,
-                  'dice': total_dice/n, 'hard_ratio': avg_hr}
+        result = {'loss': total_loss.item()/n, 'ohem': total_ohem.item()/n,
+                  'dice': total_dice.item()/n, 'hard_ratio': avg_hr}
         if self.diag:
             self.diag.log_dict(epoch, result, prefix='train/')
             self.diag.log(epoch, 'train/max_grad', max_grad_epoch)
@@ -758,9 +796,10 @@ class Trainer:
     @torch.no_grad()
     def validate(self, loader, epoch):
         self.model.eval()
-        total_loss = 0.0
+        total_loss = torch.zeros((), device=self.device)
         C  = self.args.num_classes
-        cm = np.zeros((C, C), dtype=np.int64)
+        cm = torch.zeros((C, C), dtype=torch.int64, device=self.device)
+        progress_interval = max(1, getattr(self.args, "progress_interval", 20))
         pbar = tqdm(loader, desc="Validation")
 
         for batch_idx, (imgs, masks) in enumerate(pbar):
@@ -775,22 +814,21 @@ class Trainer:
                                        mode='bilinear', align_corners=False)
                 loss   = self.ce(logits, masks)
 
-            total_loss += loss.item()
-            pred   = logits.argmax(1).cpu().numpy()
-            target = masks.cpu().numpy()
+            total_loss += loss.detach()
+            pred = logits.argmax(1)
+            target = masks
             valid  = (target >= 0) & (target < C)
-            lbl    = C * target[valid].astype(int) + pred[valid]
-            cm    += np.bincount(lbl, minlength=C * C).reshape(C, C)
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-            if batch_idx % 20 == 0:
-                gc.collect()
-                torch.cuda.empty_cache()
+            lbl = C * target[valid].long() + pred[valid].long()
+            cm += torch.bincount(lbl, minlength=C * C).reshape(C, C)
+            if batch_idx % progress_interval == 0 or batch_idx + 1 == len(loader):
+                pbar.set_postfix({'loss': f'{loss.detach().item():.4f}'})
 
+        cm = cm.cpu().numpy()
         inter = np.diag(cm)
         union = cm.sum(1) + cm.sum(0) - inter
         iou   = inter / (union + 1e-10)
         result = {
-            'loss'         : total_loss / len(loader),
+            'loss'         : total_loss.item() / len(loader),
             'miou'         : float(np.nanmean(iou)),
             'accuracy'     : float(inter.sum() / (cm.sum() + 1e-10)),
             'per_class_iou': iou,
@@ -918,6 +956,9 @@ def main():
     # Misc
     parser.add_argument("--use_amp",            action="store_true", default=True)
     parser.add_argument("--num_workers",        type=int,   default=4)
+    parser.add_argument("--persistent_workers", action="store_true",
+                        help="Keep DataLoader workers alive between epochs")
+    parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--save_dir",           default="./checkpoints")
     parser.add_argument("--resume",             type=str,   default=None)
     parser.add_argument("--resume_mode",        type=str,   default="transfer",
@@ -926,6 +967,12 @@ def main():
     parser.add_argument("--save_interval",      type=int,   default=10)
     parser.add_argument("--reset_best_metric",  action="store_true")
     parser.add_argument("--diag_interval",      type=int,   default=1)
+    parser.add_argument("--gradient_check_interval", type=int, default=100,
+                        help="Check all parameter gradients every N optimizer steps; 0 disables")
+    parser.add_argument("--progress_interval", type=int, default=20,
+                        help="Refresh tqdm batch metrics every N batches")
+    parser.add_argument("--empty_cache_interval", type=int, default=0,
+                        help="Call CUDA empty_cache every N batches; 0 keeps the allocator warm")
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
     args = parser.parse_args()
 
@@ -971,7 +1018,9 @@ def main():
         batch_size=args.batch_size, num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w), pin_memory=True,
         compute_class_weights=args.use_class_weights,
-        dataset_type=args.dataset_type)
+        dataset_type=args.dataset_type,
+        persistent_workers=args.persistent_workers,
+        prefetch_factor=args.prefetch_factor)
 
     if getattr(args, "class_weights_file", None):
         cw_path = Path(args.class_weights_file)

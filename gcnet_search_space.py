@@ -18,7 +18,7 @@ depths at stage 4/5/6), as agreed:
 
 This file defines the *decoding*, a *config merge*, and a working
 *fitness function* (`make_fitness_function`) that trains each candidate
-via train.py's Segmentor/Trainer/load_pretrained_gcnet on a random subset
+via train.py's Segmentor/Trainer/load_pretrained_gcnet on a fixed random subset
 of the given train/val split. `torch`/`train.py` imports are deferred to
 inside `make_fitness_function`'s inner `fitness()`, so importing this
 module itself (and using decode_candidate/build_model_config) never
@@ -154,10 +154,10 @@ def _make_subset_txt(src_txt, fraction, out_path, seed):
     """
     Write a random `fraction` of the lines of `src_txt` to `out_path`, so
     proxy training/validation runs on a cheap subset instead of the full
-    Cityscapes split. Sampled fresh (with `seed`) per candidate rather than
-    reusing one fixed subset for the whole search, so the search doesn't
-    quietly overfit its architecture choices to one particular slice of
-    the data.
+    Cityscapes split. The caller creates this once and reuses it for every
+    candidate, which makes comparisons fair and avoids repeatedly starting
+    DataLoader workers. Re-evaluate finalists with another seed/full proxy
+    to guard against overfitting this screening subset.
     """
     import random
     with open(src_txt, "r") as f:
@@ -182,7 +182,8 @@ def _make_subset_txt(src_txt, fraction, out_path, seed):
 
 
 def _build_proxy_args(loss_config, proxy_epochs, save_dir,
-                       num_classes, ignore_index, batch_size, lr):
+                       num_classes, ignore_index, batch_size, lr,
+                       fast_proxy=False):
     """
     Minimal args namespace covering every attribute Trainer/build_optimizer
     in train.py actually read (checked directly against train.py's source:
@@ -193,7 +194,9 @@ def _build_proxy_args(loss_config, proxy_epochs, save_dir,
     """
     import types
     args = types.SimpleNamespace()
-    args.loss_config = loss_config
+    args.loss_config = dict(loss_config)
+    if fast_proxy:
+        args.loss_config["dice_weight"] = 0.0
     args.ignore_index = ignore_index
     args.num_classes = num_classes
     args.use_amp = True
@@ -202,13 +205,19 @@ def _build_proxy_args(loss_config, proxy_epochs, save_dir,
     args.accumulation_steps = 1
     args.grad_clip = 5.0
     args.epochs = proxy_epochs
-    args.aux_weight = 0.4
+    args.aux_weight = 0.0 if fast_proxy else 0.4
     args.save_interval = proxy_epochs + 1  # never trigger train.py's periodic checkpoint
     args.lr = lr
     args.weight_decay = 1e-4
     args.backbone_lr_factor = 0.1
     args.dwsa_lr_factor = 0.5
     args.alpha_lr_factor = 0.1
+    # Proxy runs prioritize throughput and do not need per-batch diagnostic
+    # synchronization or one TensorBoard writer per candidate.
+    args.gradient_check_interval = 0
+    args.progress_interval = 50
+    args.empty_cache_interval = 0
+    args.enable_tensorboard = False
     return args
 
 
@@ -224,14 +233,17 @@ def make_fitness_function(base_cfg,
                            img_size=(512, 1024),
                            dataset_type="foggy",
                            device="cuda",
-                           log_path=None):
+                           log_path=None,
+                           proxy_num_workers=2,
+                           proxy_seed=42,
+                           fast_proxy=False):
     """
     Returns a `fitness(X)` function compatible with RaindropOptimizer /
     ADERaindropOptimizer's `obj_func` signature: takes an (N, d) array of
     candidates, returns an (N,) array of COSTS to MINIMIZE (so we return
     1 - mIoU, since RD/ADE-RD minimize by convention).
 
-    Each candidate is trained for `proxy_epochs` epochs on a fresh random
+    Each candidate is trained for `proxy_epochs` epochs on one fixed random
     `proxy_data_fraction` subset of train_txt/val_txt, using the same
     Segmentor/Trainer/load_pretrained_gcnet building blocks as a full
     train.py run. `torch`/`train.py`/model imports are deferred to inside
@@ -254,9 +266,84 @@ def make_fitness_function(base_cfg,
     avoid this, which was intentionally scoped out for this project.
     """
 
+    if not 0 < proxy_data_fraction <= 1:
+        raise ValueError("proxy_data_fraction must be in (0, 1]")
+    if proxy_epochs < 1:
+        raise ValueError("proxy_epochs must be at least 1")
+    if batch_size < 1 or proxy_num_workers < 0:
+        raise ValueError("batch_size must be positive and proxy_num_workers non-negative")
+
+    def _file_identity(path):
+        absolute = os.path.abspath(os.fspath(path))
+        try:
+            stat = os.stat(absolute)
+            return {"path": absolute, "size": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns}
+        except OSError:
+            return {"path": absolute}
+
+    proxy_signature = {
+        "proxy_epochs": proxy_epochs,
+        "proxy_data_fraction": proxy_data_fraction,
+        "batch_size": batch_size,
+        "lr": lr,
+        "img_size": list(img_size),
+        "dataset_type": dataset_type,
+        "num_classes": num_classes,
+        "fast_proxy": fast_proxy,
+        "seed": proxy_seed,
+        "checkpoint": _file_identity(pretrained_weights_path),
+        "train_list": _file_identity(train_txt),
+        "val_list": _file_identity(val_txt),
+    }
+    signature_json = json.dumps(proxy_signature, sort_keys=True)
+    result_cache = {}
+    shared = {}
+
+    # Recover compatible completed evaluations when resuming a killed run.
+    if log_path and os.path.isfile(log_path):
+        with open(log_path, "r") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                    if json.dumps(row.get("proxy", {}), sort_keys=True) != signature_json:
+                        continue
+                    key = json.dumps(row["config"], sort_keys=True)
+                    result_cache[key] = float(row["cost"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+
+    def _ensure_shared_resources(torch, create_dataloaders):
+        if shared:
+            return
+
+        import atexit
+        import shutil
+        import tempfile
+
+        tmp_dir = tempfile.mkdtemp(prefix="ade_rd_proxy_shared_")
+        atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
+        train_txt_sub = os.path.join(tmp_dir, "train_subset.txt")
+        val_txt_sub = os.path.join(tmp_dir, "val_subset.txt")
+        _make_subset_txt(train_txt, proxy_data_fraction, train_txt_sub, seed=proxy_seed)
+        _make_subset_txt(val_txt, proxy_data_fraction, val_txt_sub, seed=proxy_seed)
+
+        train_loader, val_loader, _ = create_dataloaders(
+            train_txt=train_txt_sub, val_txt=val_txt_sub,
+            batch_size=batch_size, num_workers=proxy_num_workers,
+            img_size=img_size, pin_memory=True,
+            compute_class_weights=False, dataset_type=dataset_type,
+            persistent_workers=proxy_num_workers > 0,
+            prefetch_factor=2)
+
+        # This file is identical for every candidate; deserialize it once.
+        checkpoint = torch.load(pretrained_weights_path, map_location="cpu",
+                                weights_only=False)
+        shared.update(tmp_dir=tmp_dir, train_loader=train_loader,
+                      val_loader=val_loader, checkpoint=checkpoint)
+
     def fitness(X):
         import gc
-        import shutil
         import tempfile
 
         import torch
@@ -267,23 +354,25 @@ def make_fitness_function(base_cfg,
                             build_optimizer)
         from data.custom import create_dataloaders
 
+        _ensure_shared_resources(torch, create_dataloaders)
         costs = np.zeros(X.shape[0])
         for i, x in enumerate(X):
             cfg = build_model_config(x, base_cfg)
             cfg_candidate_for_log = decode_candidate(x)
+            cache_key = json.dumps(cfg_candidate_for_log, sort_keys=True)
+            if cache_key in result_cache:
+                costs[i] = result_cache[cache_key]
+                print(f"Reusing cached candidate: mIoU={1.0-costs[i]:.4f}  "
+                      f"config={cfg_candidate_for_log}")
+                continue
+
             tmp_dir = tempfile.mkdtemp(prefix="ade_rd_proxy_")
             try:
-                train_txt_sub = os.path.join(tmp_dir, "train_subset.txt")
-                val_txt_sub = os.path.join(tmp_dir, "val_subset.txt")
-                _make_subset_txt(train_txt, proxy_data_fraction, train_txt_sub, seed=i)
-                _make_subset_txt(val_txt, proxy_data_fraction, val_txt_sub, seed=i)
-
-                train_loader, val_loader, _ = create_dataloaders(
-                    train_txt=train_txt_sub, val_txt=val_txt_sub,
-                    batch_size=batch_size, num_workers=2,
-                    img_size=img_size, pin_memory=True,
-                    compute_class_weights=False, dataset_type=dataset_type)
-
+                # Use the same initialization seed and data subset so fitness
+                # differences primarily reflect architecture, not sampling noise.
+                torch.manual_seed(proxy_seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(proxy_seed)
                 model = Segmentor(
                     GCNet(**cfg["backbone"]),
                     GCNetHead(**cfg["head"], num_classes=num_classes)
@@ -291,7 +380,7 @@ def make_fitness_function(base_cfg,
                 # Shape mismatches from the changed stage-4/5/6 depths &
                 # ppm_channels are skipped automatically by this function's
                 # own shape check -- see train.py's load_pretrained_gcnet.
-                load_pct = load_pretrained_gcnet(model, pretrained_weights_path)
+                load_pct = load_pretrained_gcnet(model, shared["checkpoint"])
                 if load_pct < 1.0:
                     # stem_conv1/conv2/stage2/stage3 are never touched by
                     # the search, so a working load should ALWAYS match at
@@ -315,15 +404,17 @@ def make_fitness_function(base_cfg,
                 proxy_args = _build_proxy_args(
                     loss_config=base_cfg["loss"], proxy_epochs=proxy_epochs,
                     save_dir=tmp_dir, num_classes=num_classes,
-                    ignore_index=255, batch_size=batch_size, lr=lr)
+                    ignore_index=255, batch_size=batch_size, lr=lr,
+                    fast_proxy=fast_proxy)
                 optimizer = build_optimizer(model, proxy_args)
                 trainer = Trainer(model=model, optimizer=optimizer, scheduler=None,
                                    device=device, args=proxy_args)
 
                 for epoch in range(proxy_epochs):
-                    trainer.train_epoch(train_loader, epoch)
-                val_metrics = trainer.validate(val_loader, proxy_epochs - 1)
+                    trainer.train_epoch(shared["train_loader"], epoch)
+                val_metrics = trainer.validate(shared["val_loader"], proxy_epochs - 1)
                 costs[i] = 1.0 - val_metrics["miou"]
+                result_cache[cache_key] = float(costs[i])
 
                 if log_path is not None:
                     with open(log_path, "a") as f:
@@ -333,13 +424,16 @@ def make_fitness_function(base_cfg,
                             "miou": val_metrics["miou"],
                             "cost": float(costs[i]),
                             "backbone_load_pct": load_pct,
+                            "proxy": proxy_signature,
                         }) + "\n")
 
-                del model, trainer, optimizer, train_loader, val_loader
+                trainer.writer.close()
+                del model, trainer, optimizer
             finally:
+                import shutil
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 gc.collect()
-                if device == "cuda":
+                if str(device).startswith("cuda"):
                     torch.cuda.empty_cache()
 
         return costs

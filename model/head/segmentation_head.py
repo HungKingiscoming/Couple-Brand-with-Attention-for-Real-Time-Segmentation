@@ -91,17 +91,16 @@ class GCNetHead(BaseModule):
                 inputs: Union[Tensor, Tuple[Tensor, Tensor]]
                 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         if self.training:
-            assert isinstance(inputs, (tuple, list)) and len(inputs) == 2, (
-                f"GCNetHead training mode expects (c4_feat, c6_feat) tuple, "
-                f"got {type(inputs)}. "
-                f"Kiểm tra backbone.forward() có return_aux=True không."
-            )
-            c4_feat, c6_feat = inputs
+            if isinstance(inputs, (tuple, list)):
+                assert len(inputs) == 2
+                c4_feat, c6_feat = inputs
+                c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
+                c6_logit = self.cls_seg(self.dropout(self.head(c6_feat)))
+                return c4_logit, c6_logit
 
-            c4_logit = self.aux_cls_seg_c4(self.aux_head_c4(c4_feat))
-            c6_logit = self.cls_seg(self.dropout(self.head(c6_feat)))
-
-            return c4_logit, c6_logit
+            # Fast proxy mode explicitly asks the backbone for only the
+            # fused feature, avoiding the auxiliary head entirely.
+            return self.cls_seg(self.dropout(self.head(inputs)))
 
         else:
             # Inference: inputs có thể là tuple (nếu backbone.return_aux=True)
