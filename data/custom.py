@@ -8,6 +8,8 @@ from typing import Callable, Optional, Tuple, List, Dict
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 import cv2
+from alb_compat import (pad_kwargs, grid_kwargs, dropout_kwargs, fog_kwargs,
+                        compose_seed_kwargs)
 
 _LABEL_MAP_GLOBAL = None
 
@@ -138,7 +140,8 @@ def get_train_transforms(
     img_size: Tuple[int, int] = (512, 1024),
     mean: List[float] = [0.485, 0.456, 0.406],
     std: List[float] = [0.229, 0.224, 0.225],
-    dataset_type: str = 'normal'
+    dataset_type: str = 'normal',
+    seed: Optional[int] = None,
 ) -> A.Compose:
 
     base_list = [
@@ -148,8 +151,7 @@ def get_train_transforms(
             min_height=img_size[0],
             min_width=img_size[1],
             border_mode=cv2.BORDER_CONSTANT,   # FIX: CONSTANT thay REFLECT
-            value=0,
-            mask_value=255,
+            **pad_kwargs(A.PadIfNeeded),
             p=1.0
         ),
 
@@ -159,10 +161,8 @@ def get_train_transforms(
 
         A.GridDistortion(
             num_steps=5,
-            distort_limit=0.1,
             border_mode=cv2.BORDER_CONSTANT,
-            value=0,
-            mask_value=255,
+            **grid_kwargs(A.GridDistortion),
             p=0.2
         ),
     ]
@@ -171,11 +171,7 @@ def get_train_transforms(
     if dataset_type == 'foggy':
         specific = [
             A.CoarseDropout(
-                max_holes=4,
-                max_height=24,
-                max_width=24,
-                fill_value=0,
-                mask_fill_value=255,
+                **dropout_kwargs(A.CoarseDropout),
                 p=0.25
             ),
 
@@ -199,8 +195,7 @@ def get_train_transforms(
                 p=0.05
             ),
             A.RandomFog(
-                fog_coef_lower=0.05,
-                fog_coef_upper=0.30,
+                **fog_kwargs(A.RandomFog),
                 alpha_coef=0.08,
                 p=0.2
             ),
@@ -245,7 +240,8 @@ def get_train_transforms(
         + [
             A.Normalize(mean=mean, std=std),
             ToTensorV2()
-        ]
+        ],
+        **compose_seed_kwargs(A.Compose, seed),
     )
 
 
@@ -277,6 +273,7 @@ def create_dataloaders(
     dataset_type: str = 'normal',
     persistent_workers: bool = False,
     prefetch_factor: int = 2,
+    seed: Optional[int] = None,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.Tensor]]:
 
     print(f"\n{'='*60}")
@@ -285,7 +282,8 @@ def create_dataloaders(
 
     train_dataset = CityscapesDataset(
         txt_file=train_txt,
-        transforms=get_train_transforms(img_size=img_size, dataset_type=dataset_type),
+        transforms=get_train_transforms(img_size=img_size, dataset_type=dataset_type,
+                                        seed=seed),
         img_size=img_size,
         label_mapping='train_id',
         dataset_type=dataset_type
@@ -352,6 +350,8 @@ def create_dataloaders(
             'prefetch_factor': prefetch_factor,
         }
 
+    train_generator = (torch.Generator().manual_seed(seed)
+                       if seed is not None else None)
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -361,6 +361,7 @@ def create_dataloaders(
         # A very small proxy subset may contain fewer items than one batch;
         # keep that batch instead of silently producing a zero-length loader.
         drop_last=len(train_dataset) >= batch_size,
+        generator=train_generator,
         **worker_kwargs,
     )
 

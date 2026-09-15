@@ -5,7 +5,7 @@ import torch.optim as optim
 from torch.amp import autocast, GradScaler
 import torch.nn.functional as F
 from collections import defaultdict
-import math, gc, json, warnings
+import math, gc, json, time, warnings
 import numpy as np
 from tqdm import tqdm
 import argparse
@@ -972,6 +972,10 @@ def main():
                         help="Keep DataLoader workers alive between epochs")
     parser.add_argument("--prefetch_factor", type=int, default=2)
     parser.add_argument("--save_dir",           default="./checkpoints")
+    parser.add_argument("--target_miou", type=float, default=None,
+                        help="Stop after the first full-validation mIoU strictly above this value")
+    parser.add_argument("--hpo_summary_json", type=str, default=None,
+                        help="Write time-to-target and best mIoU for HPO orchestration")
     parser.add_argument("--resume",             type=str,   default=None)
     parser.add_argument("--resume_mode",        type=str,   default="transfer",
                         choices=["transfer","continue"])
@@ -987,6 +991,12 @@ def main():
                         help="Call CUDA empty_cache every N batches; 0 keeps the allocator warm")
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
     args = parser.parse_args()
+
+    if args.target_miou is not None and (not math.isfinite(args.target_miou)
+                                         or not 0 <= args.target_miou < 1):
+        raise ValueError("--target_miou must be finite and in [0, 1)")
+    if args.target_miou is not None and not args.pretrained_weights:
+        raise ValueError("Time-to-target HPO requires --pretrained_weights")
 
     # Validate unfreeze schedule
     unfreeze_list = []
@@ -1048,7 +1058,8 @@ def main():
         compute_class_weights=args.use_class_weights,
         dataset_type=args.dataset_type,
         persistent_workers=args.persistent_workers,
-        prefetch_factor=args.prefetch_factor)
+        prefetch_factor=args.prefetch_factor,
+        seed=args.seed if args.target_miou is not None else None)
 
     if getattr(args, "class_weights_file", None):
         cw_path = Path(args.class_weights_file)
@@ -1073,6 +1084,10 @@ def main():
         if loaded_pct < 20.0:
             raise RuntimeError(f"Only {loaded_pct:.2f}% pretrained weights matched. "
                                "Check --pretrained_weights before training.")
+        if args.target_miou is not None and loaded_pct < 99.0:
+            raise RuntimeError(
+                f"HPO needs the same starting model in every trial, but only "
+                f"{loaded_pct:.2f}% of checkpoint weights matched")
     if args.freeze_backbone:
         freeze_backbone(model, variant=args.model_variant)
 
@@ -1140,6 +1155,12 @@ def main():
 
     print(f"\n{SEP}\nSTARTING TRAINING\n{SEP}\n")
     applied_unfreeze = set()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    train_started = time.perf_counter()
+    epochs_completed = 0
+    target_epoch = None
+    time_to_target_sec = None
 
     for epoch in range(trainer.start_epoch, args.epochs):
 
@@ -1168,6 +1189,13 @@ def main():
 
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics   = trainer.validate(val_loader, epoch)
+        epochs_completed += 1
+        if (args.target_miou is not None
+                and val_metrics['miou'] > args.target_miou):
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            target_epoch = epoch + 1
+            time_to_target_sec = time.perf_counter() - train_started
 
         if epoch % args.diag_interval == 0:
             log_dwsa_health(model, epoch, diag)
@@ -1204,6 +1232,25 @@ def main():
             trainer.best_miou = val_metrics['miou']
             print(f"  ★ NEW BEST mIoU: {trainer.best_miou:.4f}")
         trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
+        if target_epoch is not None:
+            print(f"Target mIoU > {args.target_miou:.6f} reached at epoch "
+                  f"{target_epoch} in {time_to_target_sec/60:.1f} min")
+            break
+
+    if args.hpo_summary_json:
+        summary_path = Path(args.hpo_summary_json)
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        summary = {
+            'target_miou': args.target_miou,
+            'target_reached': target_epoch is not None,
+            'target_epoch': target_epoch,
+            'time_to_target_sec': time_to_target_sec,
+            'epochs_completed': epochs_completed,
+            'best_miou': float(trainer.best_miou),
+            'best_checkpoint': str(Path(args.save_dir) / 'best.pth'),
+        }
+        with open(summary_path, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, indent=2)
 
     diag.print_full_history()
     diag.close()

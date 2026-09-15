@@ -3,3 +3,6 @@ __pycache__/
 efficient_search_runs/
 efficient_search_runs*/
 best_efficient_arch.json
+hpo_time_to_miou_runs/
+hpo_time_to_miou_runs*/
+best_hpo_time_to_miou.json
