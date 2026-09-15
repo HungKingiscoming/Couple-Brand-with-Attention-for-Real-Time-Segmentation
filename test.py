@@ -32,6 +32,8 @@ from tqdm import tqdm
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from model.head.segmentation_head import GCNetHead
+from arch_config import apply_arch_config, load_arch_json
+from train import ModelConfig
 
 CLASS_NAMES = [
     'road', 'sidewalk', 'building', 'wall', 'fence', 'pole',
@@ -92,45 +94,47 @@ class Segmentor(nn.Module):
 
 
 def build_model(variant: str, ckpt_path: str, device: torch.device,
-                deploy: bool = True) -> Segmentor:
-    C   = 32
-    cfg = dict(
-        in_channels=3, channels=C, ppm_channels=128,
-        num_blocks_per_stage=[4, 4, [5, 4], [5, 4], [2, 2]],
-        align_corners=False, deploy=False,
-        norm_cfg=dict(type='BN', requires_grad=True),
-        act_cfg=dict(type='ReLU', inplace=True),
-    )
+                deploy: bool = True, arch_json: str = None) -> Segmentor:
+    ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    cfg = ModelConfig.get_config(variant=variant)
+    if arch_json:
+        cfg = apply_arch_config(cfg, load_arch_json(arch_json))
+        if ck.get('model_config') is not None and ck['model_config'] != cfg:
+            raise ValueError("--arch_json differs from the architecture stored "
+                             "in the checkpoint")
+    elif ck.get('model_config') is not None:
+        cfg = ck['model_config']
+        recorded_variant = ck.get('model_variant')
+        if recorded_variant and recorded_variant != variant:
+            raise ValueError(f"Checkpoint uses {recorded_variant!r}; pass "
+                             f"--model_variant {recorded_variant}")
+
     if variant == 'fan_dwsa':
         from model.backbone.model import GCNet
-        cfg['dwsa_reduction'] = 8
     elif variant == 'fan_only':
         from model.backbone.fan import GCNet
     else:
         from model.backbone.dwsa import GCNet
-        cfg['dwsa_reduction'] = 8
 
     model = Segmentor(
-        GCNet(**cfg),
-        GCNetHead(
-            in_channels=C*4, channels=64, num_classes=NUM_CLASSES,
-            align_corners=False, dropout_ratio=0.0, ignore_index=IGNORE_INDEX,
-            norm_cfg=dict(type='BN', requires_grad=True),
-            act_cfg=dict(type='ReLU', inplace=True),
-        )
+        GCNet(**cfg['backbone']),
+        GCNetHead(**cfg['head'], num_classes=NUM_CLASSES)
     )
-    ck    = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     state = (ck.get('model') or ck.get('model_state_dict') or
              ck.get('state_dict') or ck)
-    model.load_state_dict(state, strict=False)
+    result = model.load_state_dict(state, strict=False)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError("Checkpoint does not match the requested model "
+                           f"architecture: {len(result.missing_keys)} missing and "
+                           f"{len(result.unexpected_keys)} unexpected keys. "
+                           "Use the checkpoint's matching --arch_json.")
     recorded = ck.get('best_miou', '?')
-    print(f"  Loaded {variant} | recorded mIoU: {recorded}")
+    print(f"  Loaded {variant} | recorded mIoU: {recorded} | "
+          f"architecture: {cfg['backbone']['num_blocks_per_stage']}")
 
     if deploy:
         model.backbone.switch_to_deploy()
         print(f"  switch_to_deploy applied (reparam branches fused)")
-
-    model = model.to(device).eval()
 
     model = model.to(device).eval()
     n_params = sum(p.numel() for p in model.parameters()) / 1e6
@@ -172,6 +176,7 @@ def _compute_metrics(ti, tu, tp, tl):
     return {
         'aacc'          : aacc,
         'miou'          : float(np.nanmean(iou[present])),
+        'miou_all_19'   : float(np.nanmean(iou)),
         'macc'          : float(np.nanmean(acc[present])),
         'mdice'         : float(np.nanmean(dice[present])),
         'per_class_iou' : iou,
@@ -233,6 +238,7 @@ def validate(model, val_txt, img_h, img_w, batch_size,
     print(f"{'='*65}")
     print(f"  aAcc:   {m['aacc']:.4f}   (overall pixel accuracy)")
     print(f"  mIoU:   {m['miou']:.4f}")
+    print(f"  mIoU (all 19 classes, search-style): {m['miou_all_19']:.4f}")
     print(f"  mAcc:   {m['macc']:.4f}   (mean per-class recall)")
     print(f"  mDice:  {m['mdice']:.4f}")
     print(f"  Loss:   {m['loss']:.4f}   (deploy: không so với training log)")
@@ -256,9 +262,12 @@ def validate(model, val_txt, img_h, img_w, batch_size,
     print(f"{'='*65}")
 
     if recorded and recorded != '?':
-        diff = abs(m['miou'] - float(recorded))
+        # Trainer.validate records the all-19-class mean, not the
+        # present-class mean printed as the primary GCNet-style metric.
+        diff = abs(m['miou_all_19'] - float(recorded))
         ok   = '✅' if diff < 0.001 else '⚠️ '
-        print(f"\n  {ok} mIoU: {m['miou']:.4f} vs recorded {float(recorded):.4f}"
+        print(f"\n  {ok} all-19 mIoU: {m['miou_all_19']:.4f} "
+              f"vs recorded {float(recorded):.4f}"
               f"  (diff={diff:.4f})")
     print()
     return m
@@ -363,6 +372,10 @@ def main():
     parser.add_argument('--ckpt',          required=True)
     parser.add_argument('--model_variant', default='fan_dwsa',
                         choices=['fan_dwsa', 'fan_only', 'dwsa_only'])
+    parser.add_argument('--arch_json', type=str, default=None,
+                        help='Architecture JSON for an older checkpoint without '
+                             'embedded model_config; new train.py checkpoints '
+                             'load their architecture automatically')
     parser.add_argument('--img_h',       type=int,   default=512)
     parser.add_argument('--img_w',       type=int,   default=1024)
     # Benchmark
@@ -401,7 +414,8 @@ def main():
     print(f"{'='*55}\n")
 
     model, recorded = build_model(
-        args.model_variant, args.ckpt, device, deploy=True)
+        args.model_variant, args.ckpt, device, deploy=True,
+        arch_json=args.arch_json)
 
     if args.validate:
         validate(model, args.val_txt, args.img_h, args.img_w,

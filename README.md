@@ -297,6 +297,44 @@ python search_architecture.py \
 the best candidates without that flag at full proxy resolution before the
 final full-data training run.
 
+### Train and evaluate the selected architecture
+
+`train.py --arch_json` accepts the full `best_gcnet_arch.json` produced by
+search, or a JSON file containing just `best_config`. It applies the selected
+stage depths, PPM channels, DWSA reduction, and dropout before model creation.
+Pretrained weights are loaded with shape matching; the resulting training
+checkpoints embed the resolved architecture so evaluation and resume cannot
+silently use the default model instead.
+
+```bash
+python train.py \
+  --arch_json /path/to/best_gcnet_arch.json \
+  --pretrained_weights /path/to/our_miou_0.6783.pth \
+  --train_txt /path/to/train.txt --val_txt /path/to/val.txt \
+  --model_variant fan_dwsa --dataset_type foggy \
+  --img_h 512 --img_w 1024 --batch_size 16 \
+  --epochs 40 --num_workers 4 --persistent_workers \
+  --save_dir /path/to/checkpoints_selected
+```
+
+To continue from `last.pth` in another session, use `--resume
+/path/to/last.pth --resume_mode continue` with the same training settings.
+`--arch_json` is optional for continuation because the architecture is saved
+inside the checkpoint. Save the checkpoints outside an ephemeral Kaggle
+session before it ends.
+
+```bash
+python test.py \
+  --ckpt /path/to/checkpoints_selected/best.pth \
+  --val_txt /path/to/val.txt --validate \
+  --img_h 512 --img_w 1024 --batch_size 16
+```
+
+`test.py` automatically reads the architecture embedded in new checkpoints.
+For older checkpoints without metadata, pass matching `--arch_json` when
+needed. Validation prints both present-class mIoU and all-19-class mIoU (the
+latter matches the architecture search's class averaging convention).
+
 ### Training Configuration
 
 | Setting | Value |

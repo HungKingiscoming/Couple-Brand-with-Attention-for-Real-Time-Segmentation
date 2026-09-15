@@ -30,6 +30,7 @@ import os
 import time
 
 import numpy as np
+from arch_config import apply_arch_config
 
 
 # --------------------------------------------------------------------- #
@@ -121,29 +122,7 @@ def build_model_config(x, base_cfg):
     `channels` or the stem block counts (kept fixed to stay compatible
     with the pretrained backbone).
     """
-    cand = decode_candidate(x)
-    cfg = {
-        "backbone": dict(base_cfg["backbone"]),
-        "head":     dict(base_cfg["head"]),
-        "loss":     dict(base_cfg["loss"]),
-    }
-    cfg["backbone"]["ppm_channels"]   = cand["ppm_channels"]
-    cfg["backbone"]["dwsa_reduction"] = cand["dwsa_reduction"]
-
-    # num_blocks_per_stage = [stem2, stem3, [sem_s4, det_s4], [sem_s5, det_s5], [sem_s6, det_s6]]
-    # Only indices 2, 3, 4 (stage 4/5/6, the newly-added branches) are
-    # touched; stem depths (indices 0, 1) are left exactly as in base_cfg.
-    orig = base_cfg["backbone"]["num_blocks_per_stage"]
-    cfg["backbone"]["num_blocks_per_stage"] = [
-        orig[0],
-        orig[1],
-        [cand["sem_blocks_s4"], cand["det_blocks_s4"]],
-        [cand["sem_blocks_s5"], cand["det_blocks_s5"]],
-        [cand["sem_blocks_s6"], cand["det_blocks_s6"]],
-    ]
-
-    cfg["head"]["dropout_ratio"] = cand["dropout_ratio"]
-    return cfg
+    return apply_arch_config(base_cfg, decode_candidate(x))
 
 
 # --------------------------------------------------------------------- #
@@ -381,7 +360,7 @@ def make_fitness_function(base_cfg,
                 # ppm_channels are skipped automatically by this function's
                 # own shape check -- see train.py's load_pretrained_gcnet.
                 load_pct = load_pretrained_gcnet(model, shared["checkpoint"])
-                if load_pct < 1.0:
+                if load_pct < 20.0:
                     # stem_conv1/conv2/stage2/stage3 are never touched by
                     # the search, so a working load should ALWAYS match at
                     # least that much regardless of what stage-4/5/6 depths

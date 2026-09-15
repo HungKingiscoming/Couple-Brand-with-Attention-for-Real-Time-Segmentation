@@ -24,6 +24,7 @@ SEP = "=" * 70
 from model.head.segmentation_head import GCNetHead
 from data.custom import create_dataloaders
 from model.model_utils import init_weights, check_model_health
+from arch_config import apply_arch_config, load_arch_json
 
 
 # ============================================================
@@ -847,6 +848,8 @@ class Trainer:
             'scaler': self.scaler.state_dict(),
             'best_miou': self.best_miou, 'metrics': metrics,
             'global_step': self.global_step,
+            'model_config': getattr(self.args, 'model_config', None),
+            'model_variant': getattr(self.args, 'model_variant', None),
         }
         torch.save(ckpt, self.save_dir / "last.pth")
         if is_best:
@@ -857,6 +860,11 @@ class Trainer:
 
     def load_checkpoint(self, path, reset_epoch=True, load_optimizer=True, reset_best_metric=False):
         ckpt  = torch.load(path, map_location=self.device, weights_only=False)
+        if not reset_epoch and ckpt.get('model_config') is not None:
+            if ckpt['model_config'] != getattr(self.args, 'model_config', None):
+                raise ValueError("Resume checkpoint architecture differs from the current "
+                                 "model. Pass the same --arch_json used for the original "
+                                 "run, or use --resume_mode transfer intentionally.")
         state = ckpt.get('model') or ckpt.get('model_state_dict') or ckpt.get('state_dict') or ckpt
         self.model.load_state_dict(state, strict=False)
         if load_optimizer and not reset_epoch:
@@ -906,6 +914,10 @@ def main():
     parser.add_argument("--model_variant",      type=str, default="fan_dwsa",
                         choices=["fan_dwsa","fan_only","dwsa_only"])
     parser.add_argument("--pretrained_weights", type=str, default=None)
+    parser.add_argument("--arch_json", type=str, default=None,
+                        help="Search output JSON containing best_config, or a bare "
+                             "architecture JSON. Applies the selected architecture "
+                             "before building the model.")
     # Backbone freeze/unfreeze
     parser.add_argument("--freeze_backbone",    action="store_true")
     parser.add_argument("--unfreeze_schedule",  type=str, default="")
@@ -1010,6 +1022,22 @@ def main():
         from model.backbone.dwsa import GCNet
 
     cfg = ModelConfig.get_config(variant=args.model_variant)
+    if args.arch_json:
+        arch = load_arch_json(args.arch_json)
+        cfg = apply_arch_config(cfg, arch)
+        print(f"Selected architecture from {args.arch_json}: {arch}")
+    elif args.resume and args.resume_mode == "continue":
+        # A new Kaggle session can continue a selected architecture without
+        # needing the original search JSON, because it is embedded in ckpt.
+        resume_meta = torch.load(args.resume, map_location="cpu", weights_only=False)
+        if resume_meta.get("model_config") is not None:
+            saved_variant = resume_meta.get("model_variant")
+            if saved_variant and saved_variant != args.model_variant:
+                raise ValueError(f"Resume checkpoint uses {saved_variant!r}; pass "
+                                 f"--model_variant {saved_variant}")
+            cfg = resume_meta["model_config"]
+            print(f"Restored architecture from resume checkpoint: {args.resume}")
+    args.model_config = cfg
     args.loss_config = cfg["loss"]
 
     # DataLoaders
@@ -1038,7 +1066,13 @@ def main():
     check_model_health(model)
 
     if args.pretrained_weights:
-        load_pretrained_gcnet(model, args.pretrained_weights, variant=args.model_variant)
+        loaded_pct = load_pretrained_gcnet(
+            model, args.pretrained_weights, variant=args.model_variant)
+        # The 26 head keys alone are about 1% of a full model; require a
+        # meaningful backbone match rather than accepting a head-only load.
+        if loaded_pct < 20.0:
+            raise RuntimeError(f"Only {loaded_pct:.2f}% pretrained weights matched. "
+                               "Check --pretrained_weights before training.")
     if args.freeze_backbone:
         freeze_backbone(model, variant=args.model_variant)
 
