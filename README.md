@@ -314,6 +314,17 @@ python efficient_search.py \
   --work_dir efficient_search_runs --out_json best_efficient_arch.json
 ```
 
+For Kaggle **T4x2**, add `--gpu_ids 0,1 --proxy_num_workers 2` to that command.
+The latency gate runs on GPU 0 only, so all candidates are compared against
+one T4 baseline. Proxy training then runs two independent candidates at a time
+in two spawned processes, one process per GPU; each process reuses its own
+checkpoint and DataLoaders. Kaggle T4x2 provides four CPU cores, so two
+DataLoader workers per GPU avoid the eight-worker CPU oversubscription of
+`--proxy_num_workers 4`. The code also clamps larger worker requests to two
+per GPU in T4x2 mode. This parallelizes **architecture evaluations**, not a
+single model's training. `train.py` remains single-GPU; use the resulting
+architecture JSON/weights to train the selected model afterward.
+
 This search includes the **original checkpoint as a proxy baseline** in both
 stages. It first rejects candidates larger than the original training model or
 not at least 3% faster in a short deploy-architecture T4 latency benchmark.

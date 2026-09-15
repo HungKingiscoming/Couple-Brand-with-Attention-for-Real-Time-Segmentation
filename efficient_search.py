@@ -10,8 +10,10 @@ import copy
 import gc
 import hashlib
 import json
+import multiprocessing
 import random
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 from arch_config import apply_arch_config, validate_arch_config
@@ -80,6 +82,16 @@ def select_for_promotion(rows, baseline_miou, count, tolerance):
     return (feasible + fallback)[:count]
 
 
+def parse_gpu_ids(value):
+    try:
+        gpu_ids = [int(part) for part in value.split(",")]
+    except ValueError as exc:
+        raise ValueError("--gpu_ids must look like 0 or 0,1") from exc
+    if not 1 <= len(gpu_ids) <= 2 or len(set(gpu_ids)) != len(gpu_ids):
+        raise ValueError("Use one or two distinct GPU IDs")
+    return gpu_ids
+
+
 def _append_log(path, row):
     with open(path, "a", encoding="utf-8") as f:
         f.write(json.dumps(row, sort_keys=True) + "\n")
@@ -102,6 +114,7 @@ def _manifest(args):
         "train_txt": _file_identity(args.train_txt),
         "val_txt": _file_identity(args.val_txt),
         "variant": args.model_variant, "dataset_type": args.dataset_type,
+        "gpu_ids": args.gpu_ids,
         "num_classes": args.num_classes, "img_size": [args.img_h, args.img_w],
         "batch_size": args.batch_size, "proxy_num_workers": args.proxy_num_workers,
         "lr": args.lr, "seed": args.seed,
@@ -198,6 +211,113 @@ def _proxy_run(arch, base_cfg, checkpoint, loader, val_loader, args,
         torch.cuda.empty_cache()
 
 
+_WORKER_STATE = {}
+
+
+def _init_gpu_worker(gpu_id, args, base_cfg, subset_paths):
+    """One long-lived process owns one T4 and its two proxy DataLoaders."""
+    import torch
+    from data.custom import create_dataloaders
+
+    torch.cuda.set_device(gpu_id)
+    torch.set_num_threads(1)
+    worker_args = copy.copy(args)
+    worker_args.device = f"cuda:{gpu_id}"
+    checkpoint = torch.load(args.pretrained_weights, map_location="cpu",
+                            weights_only=False)
+    loaders = {}
+    for stage, (train_sub, val_sub) in subset_paths.items():
+        train_loader, val_loader, _ = create_dataloaders(
+            train_txt=train_sub, val_txt=val_sub,
+            batch_size=args.batch_size, num_workers=args.proxy_num_workers,
+            img_size=(args.img_h, args.img_w), pin_memory=True,
+            compute_class_weights=False, dataset_type=args.dataset_type,
+            persistent_workers=False, prefetch_factor=2)
+        loaders[stage] = (train_loader, val_loader)
+    _WORKER_STATE.update(args=worker_args, base_cfg=base_cfg,
+                         checkpoint=checkpoint, loaders=loaders,
+                         gpu_id=gpu_id)
+
+
+def _gpu_proxy_task(stage, row, prior, root):
+    """Process-pool entry point; the caller writes result metadata/logs."""
+    state = _WORKER_STATE
+    candidate_dir = Path(root) / f"candidate_{row['id']}"
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    save_path = candidate_dir / f"stage{stage}.pth"
+    args = state["args"]
+    epochs = args.stage1_epochs if stage == 1 else args.stage2_extra_epochs
+    metrics = _proxy_run(row["arch"], state["base_cfg"], state["checkpoint"],
+                         *state["loaders"][stage], args, epochs, prior,
+                         save_path, candidate_dir)
+    return dict(row, stage=f"proxy{stage}", gpu_id=state["gpu_id"], **metrics,
+                checkpoint=str(save_path))
+
+
+def parallel_proxy_batch(stage, rows, priors, pools, root, log_path,
+                         started, max_hours, task=_gpu_proxy_task):
+    """Run at most one candidate per T4, preserving input/result ordering."""
+    if len(rows) != len(priors) or len(pools) != 2:
+        raise ValueError("Need matching rows/priors and exactly two GPU pools")
+    root = Path(root)
+    results = [None] * len(rows)
+    active = {}
+    busy = set()
+    cursor = 0
+    budget_reached = False
+    while cursor < len(rows) or active:
+        for gpu_slot in range(2):
+            if gpu_slot in busy or budget_reached:
+                continue
+            while cursor < len(rows):
+                index = cursor
+                row = rows[index]
+                cursor += 1
+                candidate_dir = root / f"candidate_{row['id']}"
+                result_path = candidate_dir / f"stage{stage}.json"
+                checkpoint_path = candidate_dir / f"stage{stage}.pth"
+                if result_path.exists() and checkpoint_path.exists():
+                    with open(result_path, encoding="utf-8") as f:
+                        previous = json.load(f)
+                    if previous["arch"] == row["arch"]:
+                        print(f"Reusing candidate {row['id']} stage {stage}: "
+                              f"mIoU={previous['miou']:.4f}")
+                        results[index] = dict(
+                            previous, latency_ms=row["latency_ms"],
+                            train_params=row["train_params"])
+                        continue
+                if time.perf_counter() - started >= max_hours * 3600:
+                    cursor -= 1
+                    budget_reached = True
+                    break
+                future = pools[gpu_slot].submit(
+                    task, stage, row, priors[index], str(root))
+                active[future] = (index, gpu_slot)
+                busy.add(gpu_slot)
+                break
+        if active:
+            future = next(as_completed(active))
+            index, gpu_slot = active.pop(future)
+            busy.remove(gpu_slot)
+            result = future.result()
+            results[index] = result
+            print(f"Candidate {result['id']} stage {stage} on GPU "
+                  f"{result.get('gpu_id', gpu_slot)}: "
+                  f"proxy mIoU={result['miou']:.4f}")
+            candidate_dir = root / f"candidate_{result['id']}"
+            with open(candidate_dir / f"stage{stage}.json", "w",
+                      encoding="utf-8") as f:
+                json.dump(result, f, indent=2)
+            _append_log(log_path, result)
+        elif budget_reached:
+            raise TimeoutError("Time budget reached; completed T4x2 stages "
+                               "are saved and will be reused on rerun")
+    if budget_reached:
+        raise TimeoutError("Time budget reached; completed T4x2 stages "
+                           "are saved and will be reused on rerun")
+    return results
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Budget-aware two-rung GCNet search")
     p.add_argument("--pretrained_weights", required=True)
@@ -213,6 +333,8 @@ def parse_args():
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--gpu_ids", default="0",
+                   help="Comma-separated CUDA GPU IDs; use 0,1 for Kaggle T4x2")
     p.add_argument("--n_candidates", type=int, default=12)
     p.add_argument("--n_promote", type=int, default=3)
     p.add_argument("--stage1_fraction", type=float, default=0.10)
@@ -233,6 +355,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    gpu_ids = parse_gpu_ids(args.gpu_ids)
+    if args.device not in ("cuda", f"cuda:{gpu_ids[0]}"):
+        raise ValueError("--device must match the first --gpu_ids entry")
+    args.device = f"cuda:{gpu_ids[0]}"
     if args.num_classes != 19:
         raise ValueError("Latency screening currently supports the 19-class foggy task")
     if not args.device.startswith("cuda"):
@@ -254,6 +380,12 @@ def main():
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is unavailable; run the search on a GPU notebook")
+    if any(gpu_id < 0 or gpu_id >= torch.cuda.device_count() for gpu_id in gpu_ids):
+        raise ValueError(f"Requested {gpu_ids}, but only "
+                         f"{torch.cuda.device_count()} CUDA GPU(s) are visible")
+    if len(gpu_ids) == 2 and args.proxy_num_workers > 2:
+        print("T4x2 has 4 CPU cores: reducing DataLoader workers to 2 per GPU")
+        args.proxy_num_workers = 2
 
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -284,8 +416,8 @@ def main():
                                    args.latency_warmup, args.latency_repeat)
     print(f"Baseline: {baseline_params/1e6:.2f}M train params, "
           f"{baseline_latency:.2f} ms deploy latency")
-    checkpoint = torch.load(args.pretrained_weights, map_location="cpu",
-                            weights_only=False)
+    checkpoint = (torch.load(args.pretrained_weights, map_location="cpu",
+                             weights_only=False) if len(gpu_ids) == 1 else None)
 
     screened = []
     for i, arch in enumerate(candidates):
@@ -314,21 +446,24 @@ def main():
         return 2
 
     loaders = {}
+    subset_paths = {}
     for stage, fraction in ((1, args.stage1_fraction), (2, args.stage2_fraction)):
         train_sub = root / f"train_stage{stage}.txt"
         val_sub = root / f"val_stage{stage}.txt"
         _make_subset_txt(args.train_txt, fraction, train_sub, args.seed)
         _make_subset_txt(args.val_txt, fraction, val_sub, args.seed)
-        train_loader, val_loader, _ = create_dataloaders(
-            train_txt=str(train_sub), val_txt=str(val_sub),
-            batch_size=args.batch_size, num_workers=args.proxy_num_workers,
-            img_size=(args.img_h, args.img_w), pin_memory=True,
-            compute_class_weights=False, dataset_type=args.dataset_type,
-            # Fresh worker seeds per candidate keep stochastic augmentations
-            # comparable; persistent worker RNG drifts across candidates.
-            persistent_workers=False,
-            prefetch_factor=2)
-        loaders[stage] = (train_loader, val_loader)
+        subset_paths[stage] = (str(train_sub), str(val_sub))
+        if len(gpu_ids) == 1:
+            train_loader, val_loader, _ = create_dataloaders(
+                train_txt=str(train_sub), val_txt=str(val_sub),
+                batch_size=args.batch_size, num_workers=args.proxy_num_workers,
+                img_size=(args.img_h, args.img_w), pin_memory=True,
+                compute_class_weights=False, dataset_type=args.dataset_type,
+                # Fresh worker seeds per candidate keep stochastic augmentations
+                # comparable; persistent worker RNG drifts across candidates.
+                persistent_workers=False,
+                prefetch_factor=2)
+            loaders[stage] = (train_loader, val_loader)
 
     def run(stage, row, prior=None):
         candidate_dir = root / f"candidate_{row['id']}"
@@ -359,16 +494,44 @@ def main():
     baseline_row = {"id": "baseline", "arch": baseline,
                     "train_params": baseline_params,
                     "latency_ms": baseline_latency}
-    try:
-        baseline_stage1 = run(1, baseline_row)
-        first = [run(1, row) for row in screened]
-        promoted = select_for_promotion(first, baseline_stage1["miou"],
-                                         args.n_promote, args.proxy_tolerance)
-        baseline_stage2 = run(2, baseline_row, baseline_stage1["checkpoint"])
-        final = [run(2, row, row["checkpoint"]) for row in promoted]
-    except TimeoutError as exc:
-        print(exc)
-        return 3
+    if len(gpu_ids) == 1:
+        try:
+            baseline_stage1 = run(1, baseline_row)
+            first = [run(1, row) for row in screened]
+            promoted = select_for_promotion(first, baseline_stage1["miou"],
+                                             args.n_promote, args.proxy_tolerance)
+            baseline_stage2 = run(2, baseline_row, baseline_stage1["checkpoint"])
+            final = [run(2, row, row["checkpoint"]) for row in promoted]
+        except TimeoutError as exc:
+            print(exc)
+            return 3
+    else:
+        context = multiprocessing.get_context("spawn")
+        pools = [ProcessPoolExecutor(
+            max_workers=1, mp_context=context,
+            initializer=_init_gpu_worker,
+            initargs=(gpu_id, args, base_cfg, subset_paths)) for gpu_id in gpu_ids]
+
+        try:
+            first_stage = parallel_proxy_batch(
+                1, [baseline_row, *screened], [None] * (len(screened) + 1),
+                pools, root, log_path, started, args.max_hours)
+            baseline_stage1, first = first_stage[0], first_stage[1:]
+            promoted = select_for_promotion(first, baseline_stage1["miou"],
+                                             args.n_promote, args.proxy_tolerance)
+            second_rows = [baseline_row, *promoted]
+            second_priors = [baseline_stage1["checkpoint"],
+                             *[row["checkpoint"] for row in promoted]]
+            second_stage = parallel_proxy_batch(
+                2, second_rows, second_priors, pools, root, log_path,
+                started, args.max_hours)
+            baseline_stage2, final = second_stage[0], second_stage[1:]
+        except TimeoutError as exc:
+            print(exc)
+            return 3
+        finally:
+            for pool in pools:
+                pool.shutdown(wait=True, cancel_futures=True)
     viable = [r for r in final if r["miou"] >= baseline_stage2["miou"]
               - args.proxy_tolerance]
     if not viable:
