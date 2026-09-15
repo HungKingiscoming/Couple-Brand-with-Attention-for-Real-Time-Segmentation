@@ -297,6 +297,53 @@ python search_architecture.py \
 the best candidates without that flag at full proxy resolution before the
 final full-data training run.
 
+For the **lightweight/faster-than-baseline** objective on a 12-hour Kaggle
+budget, use `efficient_search.py` instead of the unconstrained optimizer:
+
+```bash
+python efficient_search.py \
+  --pretrained_weights /path/to/our_miou_0.6783.pth \
+  --train_txt /path/to/train.txt --val_txt /path/to/val.txt \
+  --model_variant fan_dwsa --dataset_type foggy \
+  --img_h 512 --img_w 1024 --batch_size 16 \
+  --n_candidates 12 --n_promote 3 \
+  --stage1_fraction 0.10 --stage1_epochs 1 \
+  --stage2_fraction 0.20 --stage2_extra_epochs 2 \
+  --proxy_num_workers 4 --seed 42 \
+  --max_hours 10 \
+  --work_dir efficient_search_runs --out_json best_efficient_arch.json
+```
+
+This search includes the **original checkpoint as a proxy baseline** in both
+stages. It first rejects candidates larger than the original training model or
+not at least 3% faster in a short deploy-architecture T4 latency benchmark.
+It then trains baseline and surviving candidates on identical 10%/1-epoch
+subsets, promotes up to three candidates, and continues their saved weights
+for two additional epochs on 20% subsets. Stage-2 selection allows at most
+0.02 proxy mIoU below the stage-2 baseline and chooses the lowest latency
+among candidates meeting that floor. Stage 6 and dropout remain at the
+baseline values; stage-4/5 blocks and PPM width are reduced, never expanded.
+The process saves per-candidate checkpoints/results under `--work_dir`, and a
+re-run with identical inputs/settings reuses completed proxy stages. Use a new
+work directory when changing settings. It does **not** prove unchanged full-val
+mIoU: the final selected architecture must be fully trained and validated on
+all 1,500 images, then benchmarked with `test.py` on the same GPU.
+The new search restarts DataLoader workers with matched seeds for each
+candidate instead of reusing drifting augmentation RNG state. Its short
+latency gate uses randomly initialized deploy-mode models to measure the
+architecture, not the final trained model; always re-benchmark the finalist.
+`--max_hours` leaves a two-hour buffer in a 12-hour session by not starting
+further candidates after ten hours; a candidate already training can still
+finish later. Lower `--n_candidates` if early runs reveal a high per-candidate
+cost.
+
+The JSON contains `candidate_proxy_checkpoint`, which can be used as
+`train.py --pretrained_weights` together with `--arch_json` to continue from
+the selected candidate's proxy weights (the optimizer is reinitialized).
+If the screening latency is noisy or no candidate passes, reduce
+`--min_speedup` and use a **new** `--work_dir`; 3% is a cheap gate, not a claim
+that the final model meets a 130-FPS target.
+
 ### Train and evaluate the selected architecture
 
 `train.py --arch_json` accepts the full `best_gcnet_arch.json` produced by

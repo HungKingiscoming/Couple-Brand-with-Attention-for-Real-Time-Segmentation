@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+efficient_search_runs/
+efficient_search_runs*/
+best_efficient_arch.json
