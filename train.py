@@ -672,6 +672,13 @@ class Trainer:
     def train_epoch(self, loader, epoch):
         self.model.train()
 
+        # .train() recursively reactivates BN even after a backbone was frozen.
+        # Eval mode fixes running_mean/var while affine parameters may still train.
+        if getattr(self.args, "lock_bn_stats", False):
+            for module in self.model.modules():
+                if isinstance(module, nn.BatchNorm2d):
+                    module.eval()
+
         # Re-apply freezes each epoch (model.train() doesn't restore requires_grad)
         if getattr(self.args, "freeze_spp_bn", False):
             spp = getattr(self.model.backbone, "spp", None)
@@ -920,6 +927,10 @@ def main():
                              "before building the model.")
     # Backbone freeze/unfreeze
     parser.add_argument("--freeze_backbone",    action="store_true")
+    parser.add_argument("--freeze_all_backbone", action="store_true",
+                        help="Head-only fine-tuning: freeze every backbone parameter")
+    parser.add_argument("--lock_bn_stats", action="store_true",
+                        help="Keep BatchNorm running stats fixed during every train epoch")
     parser.add_argument("--unfreeze_schedule",  type=str, default="")
     parser.add_argument("--freeze_stem_conv",   action="store_true")
     parser.add_argument("--freeze_spp_bn",      action="store_true")
@@ -997,6 +1008,12 @@ def main():
         raise ValueError("--target_miou must be finite and in [0, 1)")
     if args.target_miou is not None and not args.pretrained_weights:
         raise ValueError("Time-to-target HPO requires --pretrained_weights")
+    if args.freeze_all_backbone and args.freeze_backbone:
+        raise ValueError("Use only one backbone-freezing mode")
+    if args.freeze_all_backbone and args.unfreeze_schedule:
+        raise ValueError("Head-only fine-tuning does not support unfreeze_schedule")
+    if args.lock_bn_stats and args.reset_bn_stats:
+        raise ValueError("Cannot reset and lock BatchNorm running stats together")
 
     # Validate unfreeze schedule
     unfreeze_list = []
@@ -1088,7 +1105,11 @@ def main():
             raise RuntimeError(
                 f"HPO needs the same starting model in every trial, but only "
                 f"{loaded_pct:.2f}% of checkpoint weights matched")
-    if args.freeze_backbone:
+    if args.freeze_all_backbone:
+        for p in model.backbone.parameters():
+            p.requires_grad = False
+        print("Backbone fully frozen; training decode head only")
+    elif args.freeze_backbone:
         freeze_backbone(model, variant=args.model_variant)
 
     count_trainable_params(model)

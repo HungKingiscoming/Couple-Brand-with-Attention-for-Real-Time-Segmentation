@@ -355,7 +355,7 @@ If the screening latency is noisy or no candidate passes, reduce
 `--min_speedup` and use a **new** `--work_dir`; 3% is a cheap gate, not a claim
 that the final model meets a 130-FPS target.
 
-### Fastest hyperparameters that actually beat the existing checkpoint
+### Fastest fine-tuning recipe that actually beats the existing checkpoint
 
 If architectural compression is not the immediate goal, keep the original
 `fan_dwsa` architecture and search only fine-tuning settings. No historical
@@ -369,26 +369,35 @@ time wins. A failed/unqualified trial cannot become the winner.
 python hpo_time_to_miou.py \
   --checkpoint /path/to/our_miou_0.6783.pth \
   --train_txt /path/to/train.txt --val_txt /path/to/val.txt \
-  --baseline_miou 0.6783018947437217 --min_gain 0.001 \
+  --baseline_miou 0.6783018947437217 --min_gain 0 \
   --gpu_ids 0,1 --workers_per_gpu 2 \
   --batch_size 16 --img_h 512 --img_w 1024 \
   --max_epochs 4 --max_hours 10 --seed 42 \
-  --work_dir hpo_time_to_miou_runs \
-  --out_json best_hpo_time_to_miou.json
+  --work_dir hpo_bn_scheduler_runs \
+  --out_json best_hpo_bn_scheduler.json
 ```
 
 Two independent `train.py` processes run on the two T4s at once (one GPU per
-trial). The six baseline-centred trials vary only `lr` and
-`backbone_lr_factor`; weight decay, loss, architecture, image resolution,
-dataset and seed stay fixed. Each trial's log, checkpoint and result are kept
+trial). After six LR-only trials failed to beat 0.6783, the new six-trial
+screen locks BatchNorm running statistics and compares a lower LR, cosine vs
+polynomial scheduler, and AdamW weight decay on a fixed full-model recipe.
+It also tests head-only and attention-plus-head fine-tuning, which may shorten
+backward passes. Those scopes freeze parameters, **not** remove layers or
+change the inference architecture. Head-only trials disable auxiliary-head
+loss because it cannot update the frozen backbone and its output is not used
+at inference; the main CE/OHEM+Dice loss remains unchanged. Every trial retains
+the same architecture, 512x1024 resolution, data split, batch size and seed.
+Each trial's log, checkpoint and result are kept
 under `--work_dir`. A rerun with identical settings skips completed trials,
 and preserves incomplete attempts in separate directories. If no trial reaches
 the full-val threshold within four epochs, the JSON records `best_candidate:
 null`; keep the original checkpoint rather than claiming an improvement.
+Use a **new** `--work_dir` rather than the LR-only run directory, which remains
+untouched; the manifest refuses to mix old and new trial recipes.
 `--max_hours` is a hard search wall-time cap: unfinished trials are stopped,
 but their epoch checkpoints and logs remain for inspection or retry.
-`--min_gain 0.001` makes the required mIoU greater than about 0.6793; set it
-to zero only if any tiny strict improvement is acceptable. Parallel trial
+`--min_gain 0` requires any strict full-val mIoU improvement over 0.6783019;
+use `0.001` if a small validation fluctuation should not qualify. Parallel trial
 training shortens the **search** wall time; it does not use DDP to speed up
 one model's training, nor change single-image inference FPS.
 

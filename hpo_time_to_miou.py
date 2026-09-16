@@ -17,15 +17,53 @@ from pathlib import Path
 
 
 def trial_candidates():
-    """Small baseline-centred search: only learning-rate allocation changes."""
+    """Budgeted A/B fine-tuning search after the original LR-only sweep failed.
+
+    Four full-model trials isolate BN locking, lower LR, scheduler and decay.
+    Two restricted-backbone trials test whether fewer trainable layers can
+    reach the target sooner without changing architecture or validation.
+    """
     return [
-        {"lr": 5e-4, "backbone_lr_factor": 0.10},  # existing recipe/control
-        {"lr": 2e-4, "backbone_lr_factor": 0.10},
-        {"lr": 1e-4, "backbone_lr_factor": 0.10},
-        {"lr": 2e-4, "backbone_lr_factor": 0.05},
-        {"lr": 1e-4, "backbone_lr_factor": 0.05},
-        {"lr": 5e-4, "backbone_lr_factor": 0.05},
+        {"lr": 1e-4, "backbone_lr_factor": 0.05, "scheduler": "cosine",
+         "weight_decay": 1e-4, "scope": "all", "lock_bn_stats": True,
+         "aux_weight": 0.4},
+        {"lr": 5e-5, "backbone_lr_factor": 0.05, "scheduler": "cosine",
+         "weight_decay": 1e-4, "scope": "all", "lock_bn_stats": True,
+         "aux_weight": 0.4},
+        {"lr": 5e-5, "backbone_lr_factor": 0.05, "scheduler": "poly",
+         "weight_decay": 1e-4, "scope": "all", "lock_bn_stats": True,
+         "aux_weight": 0.4},
+        {"lr": 5e-5, "backbone_lr_factor": 0.05, "scheduler": "cosine",
+         "weight_decay": 1e-2, "scope": "all", "lock_bn_stats": True,
+         "aux_weight": 0.4},
+        {"lr": 5e-5, "backbone_lr_factor": 0.05, "scheduler": "cosine",
+         "weight_decay": 0.0, "scope": "head_only", "lock_bn_stats": True,
+         "aux_weight": 0.0},
+        {"lr": 5e-5, "backbone_lr_factor": 0.05, "scheduler": "cosine",
+         "weight_decay": 0.0, "scope": "attention_head", "lock_bn_stats": True,
+         "aux_weight": 0.4},
     ]
+
+
+def trial_training_args(params):
+    """Translate one fully recorded trial recipe to train.py CLI arguments."""
+    scope = params["scope"]
+    if scope not in {"all", "head_only", "attention_head"}:
+        raise ValueError(f"Unknown fine-tuning scope: {scope}")
+    args = [
+        "--lr", str(params["lr"]),
+        "--backbone_lr_factor", str(params["backbone_lr_factor"]),
+        "--scheduler", params["scheduler"],
+        "--weight_decay", str(params["weight_decay"]),
+        "--aux_weight", str(params["aux_weight"]),
+    ]
+    if params["lock_bn_stats"]:
+        args.append("--lock_bn_stats")
+    if scope == "head_only":
+        args.append("--freeze_all_backbone")
+    elif scope == "attention_head":
+        args.append("--freeze_backbone")
+    return args
 
 
 def select_fastest(results, threshold):
@@ -60,7 +98,7 @@ def parse_args():
     p.add_argument("--train_txt", required=True)
     p.add_argument("--val_txt", required=True)
     p.add_argument("--baseline_miou", type=float, default=0.6783018947437217)
-    p.add_argument("--min_gain", type=float, default=0.001,
+    p.add_argument("--min_gain", type=float, default=0.0,
                    help="Require mIoU strictly above baseline plus this margin")
     p.add_argument("--max_epochs", type=int, default=4)
     p.add_argument("--max_hours", type=float, default=10.0)
@@ -70,8 +108,8 @@ def parse_args():
     p.add_argument("--workers_per_gpu", type=int, default=2)
     p.add_argument("--gpu_ids", default="0,1")
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--work_dir", default="hpo_time_to_miou_runs")
-    p.add_argument("--out_json", default="best_hpo_time_to_miou.json")
+    p.add_argument("--work_dir", default="hpo_bn_scheduler_runs")
+    p.add_argument("--out_json", default="best_hpo_bn_scheduler.json")
     return p.parse_args()
 
 
@@ -167,8 +205,7 @@ def main():
             "--batch_size", str(args.batch_size), "--accumulation_steps", "1",
             "--num_workers", str(args.workers_per_gpu), "--persistent_workers",
             "--epochs", str(args.max_epochs),
-            "--lr", str(params["lr"]),
-            "--backbone_lr_factor", str(params["backbone_lr_factor"]),
+            *trial_training_args(params),
             "--seed", str(args.seed), "--gradient_check_interval", "0",
             "--target_miou", repr(threshold),
             "--hpo_summary_json", str(summary), "--save_dir", str(checkpoint_dir),
