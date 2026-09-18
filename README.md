@@ -410,6 +410,48 @@ Seeded HPO additionally requires Albumentations `Compose(seed=...)` support;
 the launcher seeds both that pipeline and the training DataLoader generator
 so the same sample order and augmentation streams are used across trials.
 
+### Raindrop optimizer for training hyperparameters (fixed GCNet)
+
+`raindrop_hpo.py` uses the repository's actual OBL-ADE-RD optimizer. Each
+continuous raindrop is decoded to `lr`, AdamW weight decay, cosine/poly
+scheduler, and head-only/attention-plus-head fine-tuning. The architecture,
+checkpoint, train/val lists, 512x1024 resolution, loss family and seed stay
+fixed. Raindrop **proposes** recipes; `train.py` trains them and returns the
+measured full-validation mIoU. This is different from the earlier fixed six
+HPO trials and from `search_architecture.py`'s architecture search.
+
+For the Kaggle T4x2 / 12-hour budget, default OBL initialization and two
+iterations request about 16 one-epoch proxy evaluations. Each proxy uses all
+8,925 train images and all 1,500 validation images but skips model checkpoint
+writes. The scheduler still has a four-epoch horizon. The two best proxy
+recipes restart from the original checkpoint for up to four full epochs,
+stopping early if mIoU exceeds 0.6783019. A candidate is accepted only if
+its final deploy/fused checkpoint also exceeds that baseline on the full
+validation set. Failed trials are penalized by their *distance below* the
+mIoU threshold, so the search still has a signal even when none succeeds.
+
+```bash
+python raindrop_hpo.py \
+  --checkpoint /kaggle/input/datasets/giangtunhng/our-miou-6783/our_miou_0.6783.pth \
+  --train_txt /kaggle/working/train.txt --val_txt /kaggle/working/val.txt \
+  --baseline_miou 0.6783018947437217 --min_gain 0 \
+  --gpu_ids 0,1 --workers_per_gpu 2 --batch_size 16 \
+  --img_h 512 --img_w 1024 --pop_size 4 --max_iter 2 \
+  --proxy_epochs 1 --full_epochs 4 --finalists 2 \
+  --proxy_hours 6 --max_hours 10 --seed 42 \
+  --work_dir /kaggle/working/raindrop_hpo_runs \
+  --out_json /kaggle/working/best_raindrop_hpo.json
+```
+
+Two independent trials use the two T4s concurrently; this is not DDP.
+One-epoch proxy ranking can miss recipes that improve late. The optimizer
+cannot guarantee a qualifying model in this budget. If `best_candidate` is
+`null`, retain the original checkpoint. The work directory has a manifest
+and per-candidate results/logs so the exact same command can reuse completed
+evaluations after interruption; keep it separate from prior HPO directories.
+The 10-hour limit caps training trials; the final deploy validation may take
+a few more minutes.
+
 ### Train and evaluate the selected architecture
 
 `train.py --arch_json` accepts the full `best_gcnet_arch.json` produced by

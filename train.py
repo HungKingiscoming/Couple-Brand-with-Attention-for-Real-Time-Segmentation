@@ -987,6 +987,10 @@ def main():
                         help="Stop after the first full-validation mIoU strictly above this value")
     parser.add_argument("--hpo_summary_json", type=str, default=None,
                         help="Write time-to-target and best mIoU for HPO orchestration")
+    parser.add_argument("--max_trial_epochs", type=int, default=None,
+                        help="Limit this trial's epochs without changing the scheduler horizon")
+    parser.add_argument("--skip_checkpoint", action="store_true",
+                        help="Do not save model weights for disposable proxy trials")
     parser.add_argument("--resume",             type=str,   default=None)
     parser.add_argument("--resume_mode",        type=str,   default="transfer",
                         choices=["transfer","continue"])
@@ -1008,6 +1012,10 @@ def main():
         raise ValueError("--target_miou must be finite and in [0, 1)")
     if args.target_miou is not None and not args.pretrained_weights:
         raise ValueError("Time-to-target HPO requires --pretrained_weights")
+    if args.max_trial_epochs is not None and not 1 <= args.max_trial_epochs <= args.epochs:
+        raise ValueError("--max_trial_epochs must be between 1 and --epochs")
+    if args.skip_checkpoint and not args.hpo_summary_json:
+        raise ValueError("--skip_checkpoint requires --hpo_summary_json")
     if args.freeze_all_backbone and args.freeze_backbone:
         raise ValueError("Use only one backbone-freezing mode")
     if args.freeze_all_backbone and args.unfreeze_schedule:
@@ -1183,7 +1191,9 @@ def main():
     target_epoch = None
     time_to_target_sec = None
 
-    for epoch in range(trainer.start_epoch, args.epochs):
+    trial_end_epoch = (min(args.epochs, args.max_trial_epochs)
+                       if args.max_trial_epochs is not None else args.epochs)
+    for epoch in range(trainer.start_epoch, trial_end_epoch):
 
         # K1: Restore BN momentum after warmup
         if args.reset_bn_stats and epoch == trainer.start_epoch + args.bn_warmup_epochs:
@@ -1252,7 +1262,8 @@ def main():
         if is_best:
             trainer.best_miou = val_metrics['miou']
             print(f"  ★ NEW BEST mIoU: {trainer.best_miou:.4f}")
-        trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
+        if not args.skip_checkpoint:
+            trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
         if target_epoch is not None:
             print(f"Target mIoU > {args.target_miou:.6f} reached at epoch "
                   f"{target_epoch} in {time_to_target_sec/60:.1f} min")
@@ -1268,7 +1279,8 @@ def main():
             'time_to_target_sec': time_to_target_sec,
             'epochs_completed': epochs_completed,
             'best_miou': float(trainer.best_miou),
-            'best_checkpoint': str(Path(args.save_dir) / 'best.pth'),
+            'best_checkpoint': (None if args.skip_checkpoint else
+                                str(Path(args.save_dir) / 'best.pth')),
         }
         with open(summary_path, 'w', encoding='utf-8') as f:
             json.dump(summary, f, indent=2)

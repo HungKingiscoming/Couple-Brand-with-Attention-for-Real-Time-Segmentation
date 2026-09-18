@@ -9,3 +9,6 @@ best_hpo_time_to_miou.json
 hpo_bn_scheduler_runs/
 hpo_bn_scheduler_runs*/
 best_hpo_bn_scheduler.json
+raindrop_hpo_runs/
+raindrop_hpo_runs*/
+best_raindrop_hpo.json
