@@ -12,3 +12,5 @@ best_hpo_bn_scheduler.json
 raindrop_hpo_runs/
 raindrop_hpo_runs*/
 best_raindrop_hpo.json
+raindrop_weight_escape_runs/
+raindrop_weight_escape_runs*/

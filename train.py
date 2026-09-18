@@ -1084,7 +1084,7 @@ def main():
         dataset_type=args.dataset_type,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
-        seed=args.seed if args.target_miou is not None else None)
+        seed=args.seed if (args.target_miou is not None or args.hpo_summary_json) else None)
 
     if getattr(args, "class_weights_file", None):
         cw_path = Path(args.class_weights_file)
@@ -1109,7 +1109,7 @@ def main():
         if loaded_pct < 20.0:
             raise RuntimeError(f"Only {loaded_pct:.2f}% pretrained weights matched. "
                                "Check --pretrained_weights before training.")
-        if args.target_miou is not None and loaded_pct < 99.0:
+        if (args.target_miou is not None or args.hpo_summary_json) and loaded_pct < 99.0:
             raise RuntimeError(
                 f"HPO needs the same starting model in every trial, but only "
                 f"{loaded_pct:.2f}% of checkpoint weights matched")

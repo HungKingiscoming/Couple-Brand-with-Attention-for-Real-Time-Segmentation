@@ -452,6 +452,53 @@ evaluations after interruption; keep it separate from prior HPO directories.
 The 10-hour limit caps training trials; the final deploy validation may take
 a few more minutes.
 
+### Raindrop-guided weight escape (gradient + Raindrop + gradient)
+
+`raindrop_weight_escape.py` tests a different, paper-inspired hypothesis:
+whether a bounded weight-space move can help an already-trained checkpoint
+fine-tune better. This is **not** the hyperparameter search above, nor a claim
+that the 0.6783 checkpoint is trapped in a local minimum. Five existing
+tensors are targeted: the final classifier weight/bias and the output
+projections of DWSA stages 4–6. Two fixed random directions per tensor give
+Raindrop only ten coefficients to search. For target tensor `W_j`, a candidate
+uses `W'_j = W_j + s * RMS(W_j) * (a_j0 D_j0 + a_j1 D_j1)`, with
+`a_ji` in `[-1, 1]`; all other weights remain unchanged.
+
+Candidate fitness is computed without gradients on 256 deterministic training
+images with validation-style transforms. The 1,500-image validation split is
+never used inside Raindrop. A candidate must improve proxy mIoU without
+raising proxy cross-entropy by more than 5%; otherwise the run stops and the
+original checkpoint is retained. If one passes, it and the original checkpoint
+receive the **same** two-epoch AdamW fine-tune on separate T4 GPUs with the
+same seed and data order. Both use frozen BN statistics and train only the
+head, DWSA and FAN parameters. Final deploy/fused mIoU must beat **both** the
+original checkpoint and the matched ordinary fine-tune. Deploy parameter
+count must match, and median FPS must be at least the original model's
+median FPS when benchmarked in the same session. This strict default is
+sensitive to measurement noise; set `--fps_tolerance 0.02` only if a 2%
+measurement tolerance is acceptable.
+
+Use a new work directory for each run. The original checkpoint is never
+overwritten. A `null` `best_candidate` means there was no verified gain.
+
+```bash
+python raindrop_weight_escape.py \
+  --checkpoint /kaggle/input/datasets/giangtunhng/our-miou-6783/our_miou_0.6783.pth \
+  --train_txt /kaggle/working/train.txt \
+  --val_txt /kaggle/working/val.txt \
+  --baseline_miou 0.6783018947437217 \
+  --gpu_ids 0,1 --img_h 512 --img_w 1024 \
+  --proxy_samples 256 --pop_size 4 --max_iter 1 \
+  --epochs 2 --batch_size 16 --workers_per_gpu 2 \
+  --max_hours 10 --seed 42 \
+  --work_dir /kaggle/working/raindrop_weight_escape_runs
+```
+
+The result is in `work_dir/result.json`, with the ordinary and Raindrop logs
+beside it. This pilot does not guarantee mIoU improvement or establish a
+publication-worthy contribution by itself; repeated seeds and an independent
+test split are needed before making that claim.
+
 ### Train and evaluate the selected architecture
 
 `train.py --arch_json` accepts the full `best_gcnet_arch.json` produced by
