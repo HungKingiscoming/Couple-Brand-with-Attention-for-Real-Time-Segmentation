@@ -495,7 +495,10 @@ python raindrop_weight_escape.py \
 ```
 
 The result is in `work_dir/result.json`, with the ordinary and Raindrop logs
-beside it. This pilot does not guarantee mIoU improvement or establish a
+beside it. Proxy evaluations now show progress bars, while the ordinary and
+Raindrop training subprocesses stream throttled progress and epoch metrics
+to Kaggle stdout while keeping the complete raw output in their `train.log`
+files. This pilot does not guarantee mIoU improvement or establish a
 publication-worthy contribution by itself; repeated seeds and an independent
 test split are needed before making that claim.
 

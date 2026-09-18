@@ -6,12 +6,15 @@ validation split is untouched until the two matched fine-tunes finish.
 """
 
 import argparse
+import codecs
 import json
 import math
 import os
 from pathlib import Path
+import signal
 import subprocess
 import sys
+import threading
 import time
 
 import numpy as np
@@ -27,6 +30,7 @@ TARGETS = (
     "backbone.dwsa_stage5.out_proj.weight",
     "backbone.dwsa_stage6.out_proj.weight",
 )
+_CONSOLE_LOCK = threading.Lock()
 
 
 def eligible(miou, baseline, control, params_equal, fps, baseline_fps,
@@ -83,16 +87,19 @@ class BoundedDirections:
                 param.copy_(base)
 
 
-def proxy_metrics(model, loader, device, num_classes=19):
+def proxy_metrics(model, loader, device, num_classes=19, progress=None):
     import torch
     import torch.nn.functional as F
+    from tqdm.auto import tqdm
 
     model.eval()
     confusion = torch.zeros((num_classes, num_classes), dtype=torch.int64,
                             device=device)
     loss_sum = 0.0
     with torch.inference_mode():
-        for images, labels in loader:
+        batches = (tqdm(loader, desc=progress, mininterval=1, leave=False)
+                   if progress else loader)
+        for images, labels in batches:
             images = images.to(device, non_blocking=True)
             labels = labels.to(device, non_blocking=True).long()
             if labels.ndim == 4:
@@ -116,7 +123,9 @@ def proxy_metrics(model, loader, device, num_classes=19):
 
 def search_perturbation(model, loader, device, args):
     basis = BoundedDirections(model, args.seed, args.relative_scale)
-    baseline_miou, baseline_ce = proxy_metrics(model, loader, device)
+    print("Measuring original checkpoint on the training proxy...", flush=True)
+    baseline_miou, baseline_ce = proxy_metrics(
+        model, loader, device, progress="Proxy original")
     observations = {}
 
     def fitness(population):
@@ -126,13 +135,17 @@ def search_perturbation(model, loader, device, args):
             if key not in observations:
                 try:
                     basis.apply(vector)
-                    miou, ce = proxy_metrics(model, loader, device)
+                    number = len(observations) + 1
+                    miou, ce = proxy_metrics(model, loader, device,
+                                             progress=f"Proxy candidate {number}")
                     # mIoU is primary; CE and perturbation size discourage
                     # large changes that only fit the small proxy split.
                     cost = -miou + 0.01 * max(0.0, ce - baseline_ce)
                     cost += 1e-4 * float(np.square(vector).mean())
                     observations[key] = {"proxy_miou": miou, "proxy_ce": ce,
                                          "cost": cost}
+                    print(f"Proxy candidate {number}: mIoU={miou:.6f}, "
+                          f"CE={ce:.4f}, cost={cost:.6f}", flush=True)
                 finally:
                     basis.restore()
             scores.append(observations[key]["cost"])
@@ -154,6 +167,76 @@ def search_perturbation(model, loader, device, args):
             "accepted_proxy": bool(accepted),
             "evaluations": len(observations),
             "history_best_cost": [float(v) for v in optimizer.history_best]}
+
+
+def _stream_process(cmd, env, cwd, log, deadline, label):
+    """Tee stdout/stderr to disk and show throttled tqdm updates live."""
+    if time.monotonic() >= deadline:
+        return None
+    process = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, bufsize=0,
+                               start_new_session=(os.name != "nt"))
+
+    def kill_on_deadline():
+        if process.poll() is None:
+            if os.name == "nt":
+                process.kill()
+            else:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    timer = threading.Timer(max(1, deadline - time.monotonic()), kill_on_deadline)
+    timer.daemon = True
+    timer.start()
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
+    saw_cr = False
+    last_progress = 0.0
+
+    def emit(message):
+        if message.strip():
+            with _CONSOLE_LOCK:
+                print(f"[{label}] {message.strip()}", flush=True)
+
+    def consume(chunk):
+        nonlocal pending, saw_cr, last_progress
+        for char in chunk:
+            if saw_cr:
+                saw_cr = False
+                if char == "\n":
+                    emit(pending)
+                    pending = ""
+                    continue
+                if pending.strip() and time.monotonic() - last_progress >= 3:
+                    emit(pending)
+                    last_progress = time.monotonic()
+                pending = ""
+            if char == "\n":
+                emit(pending)
+                pending = ""
+            elif char == "\r":
+                saw_cr = True
+            else:
+                pending += char
+
+    try:
+        with log.open("w", encoding="utf-8") as output:
+            while True:
+                block = os.read(process.stdout.fileno(), 4096)
+                if not block:
+                    break
+                decoded = decoder.decode(block)
+                output.write(decoded)
+                output.flush()
+                consume(decoded)
+            consume(decoder.decode(b"", final=True))
+            emit(pending)
+        return process.wait()
+    finally:
+        timer.cancel()
+        process.stdout.close()
 
 
 def _train(checkpoint, gpu, args, out_dir, deadline):
@@ -178,15 +261,11 @@ def _train(checkpoint, gpu, args, out_dir, deadline):
     env = os.environ.copy()
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     started = time.monotonic()
-    with log.open("w", encoding="utf-8") as stream:
-        process = subprocess.Popen(cmd, cwd=Path(__file__).resolve().parent,
-                                   env=env, stdout=stream, stderr=subprocess.STDOUT)
-        try:
-            process.wait(timeout=max(1, deadline - time.monotonic()))
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-    row = {"exit_code": process.returncode, "log": str(log),
+    print(f"Starting {out_dir.name} on GPU {gpu}; live output and {log}",
+          flush=True)
+    exit_code = _stream_process(cmd, env, Path(__file__).resolve().parent,
+                                log, deadline, f"{out_dir.name} GPU{gpu}")
+    row = {"exit_code": exit_code, "log": str(log),
            "elapsed_wall_sec": time.monotonic() - started,
            "checkpoint": str(out_dir / "checkpoints" / "best.pth")}
     if summary.is_file():

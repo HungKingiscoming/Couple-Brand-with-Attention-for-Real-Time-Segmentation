@@ -2,10 +2,15 @@
 
 import os
 import sys
+import tempfile
+import time
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from raindrop_weight_escape import TARGETS, eligible
+from raindrop_weight_escape import TARGETS, _stream_process, eligible
 
 
 class RaindropWeightEscapeTests(unittest.TestCase):
@@ -26,6 +31,21 @@ class RaindropWeightEscapeTests(unittest.TestCase):
                                   119.7, 0.02))
         self.assertFalse(eligible(0.681, 0.6783, 0.679, True, 115,
                                   119.7, 0.02))
+
+    def test_train_output_is_visible_and_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            log = Path(directory) / "train.log"
+            captured = StringIO()
+            command = [sys.executable, "-u", "-c",
+                       "import sys; print('epoch 1', end='\\r', flush=True); "
+                       "print('epoch complete', flush=True)"]
+            with redirect_stdout(captured):
+                code = _stream_process(command, os.environ.copy(), Path(directory),
+                                       log, time.monotonic() + 20, "unit")
+            self.assertEqual(code, 0)
+            self.assertIn("epoch complete", captured.getvalue(),
+                          repr(log.read_text(encoding="utf-8")))
+            self.assertIn("epoch complete", log.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
