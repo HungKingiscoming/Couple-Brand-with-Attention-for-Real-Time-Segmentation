@@ -10,7 +10,8 @@ from io import StringIO
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from raindrop_weight_escape import TARGETS, _stream_process, eligible
+from raindrop_weight_escape import (TARGETS, _stream_process, eligible,
+                                    make_proxy_split)
 
 
 class RaindropWeightEscapeTests(unittest.TestCase):
@@ -31,6 +32,15 @@ class RaindropWeightEscapeTests(unittest.TestCase):
                                   119.7, 0.02))
         self.assertFalse(eligible(0.681, 0.6783, 0.679, True, 115,
                                   119.7, 0.02))
+
+    def test_proxy_search_and_gate_are_deterministic_and_disjoint(self):
+        search, gate = make_proxy_split(1000, 512, 0.25, 42)
+        repeated = make_proxy_split(1000, 512, 0.25, 42)
+        self.assertEqual(len(search), 384)
+        self.assertEqual(len(gate), 128)
+        self.assertEqual(set(search).intersection(gate), set())
+        self.assertEqual(search.tolist(), repeated[0].tolist())
+        self.assertEqual(gate.tolist(), repeated[1].tolist())
 
     def test_train_output_is_visible_and_preserved(self):
         with tempfile.TemporaryDirectory() as directory:

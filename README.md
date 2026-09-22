@@ -459,17 +459,20 @@ whether a bounded weight-space move can help an already-trained checkpoint
 fine-tune better. This is **not** the hyperparameter search above, nor a claim
 that the 0.6783 checkpoint is trapped in a local minimum. Five existing
 tensors are targeted: the final classifier weight/bias and the output
-projections of DWSA stages 4–6. Two fixed random directions per tensor give
-Raindrop only ten coefficients to search. For target tensor `W_j`, a candidate
+projections of DWSA stages 4–6. Each tensor uses one direction measured from
+the negative proxy gradient and one random direction made orthogonal to it,
+giving Raindrop only ten coefficients to search. For target tensor `W_j`, a
+candidate
 uses `W'_j = W_j + s * RMS(W_j) * (a_j0 D_j0 + a_j1 D_j1)`, with
 `a_ji` in `[-1, 1]`; all other weights remain unchanged.
 
-Candidate fitness is computed without gradients on 256 deterministic training
-images with validation-style transforms. The 1,500-image validation split is
-never used inside Raindrop. A candidate must improve proxy mIoU without
-raising proxy cross-entropy by more than 5%; otherwise the run stops and the
-original checkpoint is retained. If one passes, it and the original checkpoint
-receive the **same** two-epoch AdamW fine-tune on separate T4 GPUs with the
+The default 512 deterministic training images are split into 384 search images
+and a disjoint 128-image acceptance gate, all with validation-style transforms.
+Gradients and candidate fitness use only the search part. A candidate must
+improve mIoU and pass the cross-entropy bound on **both** parts; this filters out
+the proxy-only gain seen in the first pilot. The 1,500-image validation split is
+never used inside Raindrop. If a candidate passes, it and the original checkpoint
+receive the **same** one-epoch AdamW fine-tune on separate T4 GPUs with the
 same seed and data order. Both use frozen BN statistics and train only the
 head, DWSA and FAN parameters. Final deploy/fused mIoU must beat **both** the
 original checkpoint and the matched ordinary fine-tune. Deploy parameter
@@ -488,10 +491,12 @@ python raindrop_weight_escape.py \
   --val_txt /kaggle/working/val.txt \
   --baseline_miou 0.6783018947437217 \
   --gpu_ids 0,1 --img_h 512 --img_w 1024 \
-  --proxy_samples 256 --pop_size 4 --max_iter 1 \
-  --epochs 2 --batch_size 16 --workers_per_gpu 2 \
+  --proxy_samples 512 --proxy_gate_fraction 0.25 --gradient_batches 8 \
+  --pop_size 4 --max_iter 1 --relative_scale 0.01 \
+  --epochs 1 --lr 1e-5 --weight_decay 0 \
+  --batch_size 16 --proxy_batch_size 4 --workers_per_gpu 2 \
   --max_hours 10 --seed 42 \
-  --work_dir /kaggle/working/raindrop_weight_escape_runs
+  --work_dir /kaggle/working/raindrop_hybrid_v1
 ```
 
 The result is in `work_dir/result.json`, with the ordinary and Raindrop logs

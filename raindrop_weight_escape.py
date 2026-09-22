@@ -1,8 +1,9 @@
 """Gradient -> bounded Raindrop weight escape -> gradient, with a matched control.
 
 Raindrop searches ten coefficients, not every GCNet weight. Its fitness is
-measured on a fixed, unaugmented subset of *training* images; the full
-validation split is untouched until the two matched fine-tunes finish.
+measured on a fixed, unaugmented subset of *training* images and accepted on
+a disjoint training holdout. The full validation split is untouched until the
+two matched fine-tunes finish.
 """
 
 import argparse
@@ -41,10 +42,81 @@ def eligible(miou, baseline, control, params_equal, fps, baseline_fps,
             and fps >= baseline_fps * (1 - fps_tolerance))
 
 
-class BoundedDirections:
-    """Fixed two-direction basis per tensor; all candidate edits are reversible."""
+def make_proxy_split(dataset_size, proxy_samples, gate_fraction, seed):
+    """Return deterministic, disjoint search/gate indices from training data."""
+    if not 0 < gate_fraction < 0.5:
+        raise ValueError("proxy_gate_fraction must be in (0, 0.5)")
+    if proxy_samples < 64 or proxy_samples > dataset_size:
+        raise ValueError("proxy_samples must be between 64 and dataset size")
+    all_indices = np.random.default_rng(seed).choice(
+        dataset_size, size=proxy_samples, replace=False)
+    gate_size = max(1, int(round(proxy_samples * gate_fraction)))
+    gate = np.sort(all_indices[:gate_size])
+    search = np.sort(all_indices[gate_size:])
+    return search, gate
 
-    def __init__(self, model, seed, relative_scale):
+
+def gradient_directions(model, loader, device, max_batches):
+    """Measure the local descent direction for only the searched tensors."""
+    import torch
+    import torch.nn.functional as F
+    from tqdm.auto import tqdm
+
+    named = dict(model.named_parameters())
+    missing = [name for name in TARGETS if name not in named]
+    if missing:
+        raise ValueError(f"Checkpoint model lacks target tensors: {missing}")
+    original_requires_grad = {name: param.requires_grad
+                              for name, param in model.named_parameters()}
+    for param in model.parameters():
+        param.requires_grad_(False)
+        param.grad = None
+    for name in TARGETS:
+        named[name].requires_grad_(True)
+
+    model.eval()
+    used = 0
+    try:
+        for images, labels in tqdm(loader, desc="Proxy gradients", mininterval=1,
+                                   leave=False):
+            if used >= max_batches:
+                break
+            images = images.to(device, non_blocking=True)
+            labels = labels.to(device, non_blocking=True).long()
+            if labels.ndim == 4:
+                labels = labels.squeeze(1)
+            with torch.autocast(device_type="cuda", enabled=device.type == "cuda"):
+                logits = model(images)
+                logits = F.interpolate(logits, size=labels.shape[-2:],
+                                       mode="bilinear", align_corners=False)
+                loss = F.cross_entropy(logits, labels, ignore_index=255)
+            loss.backward()
+            used += 1
+        if used == 0:
+            raise ValueError("The proxy gradient loader is empty")
+        directions = {}
+        gradient_rms = {}
+        for name in TARGETS:
+            gradient = named[name].grad
+            if gradient is None or not torch.isfinite(gradient).all():
+                raise RuntimeError(f"No finite proxy gradient for {name}")
+            gradient = -gradient.detach().float() / used
+            rms = float(gradient.square().mean().sqrt())
+            if rms <= 1e-12:
+                raise RuntimeError(f"Zero proxy gradient for {name}")
+            directions[name] = gradient / rms
+            gradient_rms[name] = rms
+        return directions, gradient_rms
+    finally:
+        for name, param in model.named_parameters():
+            param.grad = None
+            param.requires_grad_(original_requires_grad[name])
+
+
+class BoundedDirections:
+    """Gradient plus orthogonal random direction; edits are reversible."""
+
+    def __init__(self, model, primary_directions, seed, relative_scale):
         import torch
 
         if not 0 < relative_scale <= 0.1:
@@ -60,12 +132,16 @@ class BoundedDirections:
             param = named[name]
             base = param.detach().clone()
             rms = max(float(base.float().square().mean().sqrt()), 1e-3)
-            directions = []
-            for _ in range(2):
-                direction = torch.randn(param.shape, generator=rng)
-                direction /= direction.square().mean().sqrt().clamp_min(1e-8)
-                directions.append(direction.to(param.device, dtype=param.dtype)
-                                  * (relative_scale * rms))
+            primary = primary_directions[name].to(param.device, dtype=torch.float32)
+            primary /= primary.square().mean().sqrt().clamp_min(1e-8)
+            random = torch.randn(param.shape, generator=rng).to(param.device)
+            projection = ((random * primary).sum()
+                          / primary.square().sum().clamp_min(1e-8))
+            random = random - projection * primary
+            random /= random.square().mean().sqrt().clamp_min(1e-8)
+            scale = relative_scale * rms
+            directions = [(primary * scale).to(dtype=param.dtype),
+                          (random * scale).to(dtype=param.dtype)]
             self.groups.append((param, base, directions))
 
     def apply(self, x):
@@ -121,11 +197,17 @@ def proxy_metrics(model, loader, device, num_classes=19, progress=None):
     return miou, loss_sum / len(loader)
 
 
-def search_perturbation(model, loader, device, args):
-    basis = BoundedDirections(model, args.seed, args.relative_scale)
-    print("Measuring original checkpoint on the training proxy...", flush=True)
+def search_perturbation(model, search_loader, gate_loader, device, args):
+    print("Measuring gradient-informed Raindrop directions...", flush=True)
+    primary, gradient_rms = gradient_directions(
+        model, search_loader, device, args.gradient_batches)
+    basis = BoundedDirections(model, primary, args.seed, args.relative_scale)
+    print("Measuring original checkpoint on proxy search and gate splits...",
+          flush=True)
     baseline_miou, baseline_ce = proxy_metrics(
-        model, loader, device, progress="Proxy original")
+        model, search_loader, device, progress="Proxy search original")
+    gate_baseline_miou, gate_baseline_ce = proxy_metrics(
+        model, gate_loader, device, progress="Proxy gate original")
     observations = {}
 
     def fitness(population):
@@ -136,7 +218,7 @@ def search_perturbation(model, loader, device, args):
                 try:
                     basis.apply(vector)
                     number = len(observations) + 1
-                    miou, ce = proxy_metrics(model, loader, device,
+                    miou, ce = proxy_metrics(model, search_loader, device,
                                              progress=f"Proxy candidate {number}")
                     # mIoU is primary; CE and perturbation size discourage
                     # large changes that only fit the small proxy split.
@@ -157,13 +239,26 @@ def search_perturbation(model, loader, device, args):
         pop_size=args.pop_size, max_iter=args.max_iter, seed=args.seed)
     best_x, _ = optimizer.optimize(verbose=True)
     best = observations[tuple(np.asarray(best_x).round(8))]
+    basis.apply(best_x)
+    try:
+        gate_miou, gate_ce = proxy_metrics(
+            model, gate_loader, device, progress="Proxy gate candidate")
+    finally:
+        basis.restore()
     accepted = (best["proxy_miou"] > baseline_miou + args.proxy_min_gain
-                and best["proxy_ce"] <= baseline_ce * (1 + args.max_ce_increase))
+                and best["proxy_ce"] <= baseline_ce * (1 + args.max_ce_increase)
+                and gate_miou > gate_baseline_miou + args.proxy_gate_min_gain
+                and gate_ce <= gate_baseline_ce * (1 + args.max_ce_increase))
     if accepted:
         basis.apply(best_x)
     return {"baseline_proxy_miou": baseline_miou,
             "baseline_proxy_ce": baseline_ce,
+            "baseline_gate_miou": gate_baseline_miou,
+            "baseline_gate_ce": gate_baseline_ce,
             "best_proxy": best, "coefficients": np.asarray(best_x).tolist(),
+            "candidate_gate_miou": gate_miou,
+            "candidate_gate_ce": gate_ce,
+            "gradient_rms": gradient_rms,
             "accepted_proxy": bool(accepted),
             "evaluations": len(observations),
             "history_best_cost": [float(v) for v in optimizer.history_best]}
@@ -274,7 +369,8 @@ def _train(checkpoint, gpu, args, out_dir, deadline):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Bounded Raindrop weight escape + matched SGD control")
+    parser = argparse.ArgumentParser(
+        description="Gradient-informed Raindrop escape + matched AdamW control")
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--train_txt", required=True)
     parser.add_argument("--val_txt", required=True)
@@ -284,13 +380,16 @@ def parse_args():
     parser.add_argument("--img_w", type=int, default=1024)
     parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--proxy_batch_size", type=int, default=4)
-    parser.add_argument("--proxy_samples", type=int, default=256)
+    parser.add_argument("--proxy_samples", type=int, default=512)
+    parser.add_argument("--proxy_gate_fraction", type=float, default=0.25)
+    parser.add_argument("--gradient_batches", type=int, default=8)
     parser.add_argument("--workers_per_gpu", type=int, default=2)
-    parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--epochs", type=int, default=1)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight_decay", type=float, default=0.0)
-    parser.add_argument("--relative_scale", type=float, default=0.02)
+    parser.add_argument("--relative_scale", type=float, default=0.01)
     parser.add_argument("--proxy_min_gain", type=float, default=0.0)
+    parser.add_argument("--proxy_gate_min_gain", type=float, default=0.0)
     parser.add_argument("--max_ce_increase", type=float, default=0.05)
     parser.add_argument("--pop_size", type=int, default=4)
     parser.add_argument("--max_iter", type=int, default=1)
@@ -315,11 +414,14 @@ def main():
             or any(x < 0 or x >= torch.cuda.device_count() for x in gpu_ids)):
         raise ValueError("Two distinct visible CUDA GPUs are required")
     if (args.pop_size < 4 or args.max_iter < 1 or args.epochs < 1
-            or min(args.proxy_samples, args.proxy_batch_size, args.batch_size,
+            or min(args.proxy_batch_size, args.batch_size,
                    args.img_h, args.img_w, args.workers_per_gpu) < 1
+            or args.proxy_samples < 64 or args.gradient_batches < 1
+            or not 0 < args.proxy_gate_fraction < 0.5
             or not 0 < args.relative_scale <= 0.1
             or not 0 <= args.fps_tolerance <= 0.1
             or not 0 <= args.proxy_min_gain < 1
+            or not 0 <= args.proxy_gate_min_gain < 1
             or not 0 <= args.max_ce_increase <= 1
             or not 0 < args.baseline_miou < 1 or args.max_hours <= 0):
         raise ValueError("Invalid budget, search, or acceptance settings")
@@ -350,17 +452,23 @@ def main():
         transforms=get_val_transforms(img_size=(args.img_h, args.img_w)),
         img_size=(args.img_h, args.img_w), label_mapping="train_id",
         dataset_type="foggy")
-    if len(dataset) < args.proxy_samples:
-        raise ValueError("proxy_samples exceeds training set size")
-    indices = np.sort(np.random.default_rng(args.seed).choice(
-        len(dataset), size=args.proxy_samples, replace=False))
-    (root / "proxy_indices.json").write_text(json.dumps(indices.tolist()), encoding="utf-8")
-    loader = DataLoader(Subset(dataset, indices.tolist()),
-                        batch_size=args.proxy_batch_size, shuffle=False,
-                        num_workers=args.workers_per_gpu, pin_memory=True)
-    proxy = search_perturbation(model, loader, device, args)
-    print(f"Proxy: {proxy['baseline_proxy_miou']:.6f} -> "
-          f"{proxy['best_proxy']['proxy_miou']:.6f}; "
+    search_indices, gate_indices = make_proxy_split(
+        len(dataset), args.proxy_samples, args.proxy_gate_fraction, args.seed)
+    (root / "proxy_search_indices.json").write_text(
+        json.dumps(search_indices.tolist()), encoding="utf-8")
+    (root / "proxy_gate_indices.json").write_text(
+        json.dumps(gate_indices.tolist()), encoding="utf-8")
+    loader_options = {"batch_size": args.proxy_batch_size, "shuffle": False,
+                      "num_workers": args.workers_per_gpu, "pin_memory": True}
+    search_loader = DataLoader(Subset(dataset, search_indices.tolist()),
+                               **loader_options)
+    gate_loader = DataLoader(Subset(dataset, gate_indices.tolist()),
+                             **loader_options)
+    proxy = search_perturbation(model, search_loader, gate_loader, device, args)
+    print(f"Proxy search: {proxy['baseline_proxy_miou']:.6f} -> "
+          f"{proxy['best_proxy']['proxy_miou']:.6f}; gate: "
+          f"{proxy['baseline_gate_miou']:.6f} -> "
+          f"{proxy['candidate_gate_miou']:.6f}; "
           f"accepted={proxy['accepted_proxy']}", flush=True)
     if not proxy["accepted_proxy"]:
         output = {"best_candidate": None, "reason": "No safe proxy improvement",
@@ -373,7 +481,7 @@ def main():
                 "model_config": original_cfg,
                 "model_variant": "fan_dwsa", "best_miou": args.baseline_miou,
                 "raindrop_escape": proxy}, candidate_path)
-    del model, loader, dataset
+    del model, search_loader, gate_loader, dataset
     torch.cuda.empty_cache()
 
     from concurrent.futures import ThreadPoolExecutor
