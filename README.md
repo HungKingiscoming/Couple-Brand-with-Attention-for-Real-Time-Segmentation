@@ -507,6 +507,45 @@ files. This pilot does not guarantee mIoU improvement or establish a
 publication-worthy contribution by itself; repeated seeds and an independent
 test split are needed before making that claim.
 
+### Raindrop-guided AdamW training
+
+`run_raindrop_guided.py` uses Raindrop during training instead of applying a
+single checkpoint perturbation. Before each epoch, gradients from a fixed
+training-only calibration split define the next virtual AdamW update. Raindrop
+then searches one bounded multiplier per optimizer group (`head`, `stem`,
+`dwsa`, and `alpha`) and scores each reversible virtual step on a disjoint
+training-only gate using cross-entropy. A winner must beat the ordinary AdamW
+step by `--min_ce_gain`; otherwise all multipliers remain exactly `1.0`.
+Selected multipliers control every real AdamW update in that epoch without
+changing scheduler state, architecture, deploy parameters, or inference.
+
+The launcher uses both T4 GPUs concurrently: GPU 0 runs Raindrop-guided AdamW
+and GPU 1 runs a matched ordinary AdamW control. Full validation is used only
+after training. A result qualifies only if it beats the original checkpoint
+and the matched control while preserving deploy parameters and FPS.
+
+```bash
+python -u run_raindrop_guided.py \
+  --checkpoint /kaggle/input/datasets/giangtunhng/our-miou-6783/our_miou_0.6783.pth \
+  --train_txt /kaggle/working/train.txt \
+  --val_txt /kaggle/working/val.txt \
+  --baseline_miou 0.6783018947437217 \
+  --gpu_ids 0,1 --img_h 512 --img_w 1024 \
+  --guide_samples 192 --guide_gate_fraction 0.3333333333 \
+  --guide_batch_size 4 --gradient_batches 4 \
+  --pop_size 4 --max_iter 1 --factor_min 0.5 --factor_max 1.5 \
+  --min_ce_gain 0.0001 \
+  --epochs 1 --lr 1e-5 --weight_decay 0 \
+  --batch_size 16 --workers_per_gpu 2 \
+  --max_hours 10 --seed 42 \
+  --work_dir /kaggle/working/raindrop_guided_adamw_v1
+```
+
+Per-epoch Raindrop decisions are saved to
+`raindrop_guided/checkpoints/raindrop_guidance.jsonl`; the matched final result
+is `work_dir/result.json`. This is a low-dimensional, gradient-informed outer
+optimizer, not an infeasible derivative-free search over all 20.94M weights.
+
 ### Train and evaluate the selected architecture
 
 `train.py --arch_json` accepts the full `best_gcnet_arch.json` produced by

@@ -612,6 +612,7 @@ class Trainer:
         self.start_epoch = 0
         self.global_step = 0
         self.diag        = diag
+        self.raindrop_multipliers = {}
 
         lcfg = args.loss_config
         self.ce_weight    = lcfg['ce_weight']
@@ -668,6 +669,10 @@ class Trainer:
         self.dice_weight = 0.0 if phase == 'ce_only' else self.base_loss_cfg['dice_weight']
         self.loss_phase  = phase
         print(f"Loss phase → {phase}  (CE={self.ce_weight}, Dice={self.dice_weight})")
+
+    def set_raindrop_multipliers(self, multipliers):
+        """Set per-group LR multipliers without changing scheduler state."""
+        self.raindrop_multipliers = dict(multipliers or {})
 
     def train_epoch(self, loader, epoch):
         self.model.train()
@@ -762,7 +767,15 @@ class Trainer:
                     max_grad_epoch = max(max_grad_epoch, mg)
                 if self.args.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.grad_clip)
-                self.scaler.step(self.optimizer)
+                base_lrs = [group["lr"] for group in self.optimizer.param_groups]
+                for group, base_lr in zip(self.optimizer.param_groups, base_lrs):
+                    factor = self.raindrop_multipliers.get(group.get("name"), 1.0)
+                    group["lr"] = base_lr * factor
+                try:
+                    self.scaler.step(self.optimizer)
+                finally:
+                    for group, base_lr in zip(self.optimizer.param_groups, base_lrs):
+                        group["lr"] = base_lr
                 self.scaler.update()
                 self.optimizer.zero_grad(set_to_none=True)
                 self.global_step += 1
@@ -1005,6 +1018,17 @@ def main():
     parser.add_argument("--empty_cache_interval", type=int, default=0,
                         help="Call CUDA empty_cache every N batches; 0 keeps the allocator warm")
     parser.add_argument("--ce_only_epochs_after_unfreeze", type=int, default=3)
+    # Training-only outer loop that selects AdamW group step multipliers.
+    parser.add_argument("--raindrop_guided", action="store_true")
+    parser.add_argument("--raindrop_guide_samples", type=int, default=192)
+    parser.add_argument("--raindrop_guide_gate_fraction", type=float, default=1/3)
+    parser.add_argument("--raindrop_gradient_batches", type=int, default=4)
+    parser.add_argument("--raindrop_proxy_batch_size", type=int, default=4)
+    parser.add_argument("--raindrop_pop_size", type=int, default=4)
+    parser.add_argument("--raindrop_max_iter", type=int, default=1)
+    parser.add_argument("--raindrop_factor_min", type=float, default=0.5)
+    parser.add_argument("--raindrop_factor_max", type=float, default=1.5)
+    parser.add_argument("--raindrop_min_ce_gain", type=float, default=1e-4)
     args = parser.parse_args()
 
     if args.target_miou is not None and (not math.isfinite(args.target_miou)
@@ -1022,6 +1046,10 @@ def main():
         raise ValueError("Head-only fine-tuning does not support unfreeze_schedule")
     if args.lock_bn_stats and args.reset_bn_stats:
         raise ValueError("Cannot reset and lock BatchNorm running stats together")
+    if args.raindrop_guided and args.optimizer != "adamw":
+        raise ValueError("--raindrop_guided currently requires --optimizer adamw")
+    if args.raindrop_guided and args.unfreeze_schedule:
+        raise ValueError("Raindrop-guided mode does not support optimizer rebuilds")
 
     # Validate unfreeze schedule
     unfreeze_list = []
@@ -1182,6 +1210,49 @@ def main():
             scheduler = build_scheduler(optimizer, args, train_loader, start_epoch=trainer.start_epoch)
             trainer.optimizer = optimizer; trainer.scheduler = scheduler
 
+    raindrop_guide = None
+    if args.raindrop_guided:
+        from torch.utils.data import DataLoader, Subset
+        from data.custom import CityscapesDataset, get_val_transforms
+        from raindrop_guided import RaindropAdamWGuide, split_guide_indices
+
+        guide_dataset = CityscapesDataset(
+            txt_file=args.train_txt,
+            transforms=get_val_transforms(img_size=(args.img_h, args.img_w)),
+            img_size=(args.img_h, args.img_w), label_mapping="train_id",
+            dataset_type=args.dataset_type)
+        gradient_indices, gate_indices = split_guide_indices(
+            len(guide_dataset), args.raindrop_guide_samples,
+            args.raindrop_guide_gate_fraction, args.seed + 10000)
+        guide_loader_options = {
+            "batch_size": args.raindrop_proxy_batch_size,
+            "shuffle": False,
+            "num_workers": args.num_workers,
+            "pin_memory": True,
+        }
+        gradient_loader = DataLoader(
+            Subset(guide_dataset, gradient_indices.tolist()),
+            **guide_loader_options)
+        guide_gate_loader = DataLoader(
+            Subset(guide_dataset, gate_indices.tolist()),
+            **guide_loader_options)
+        save_path.joinpath("raindrop_guide_indices.json").write_text(
+            json.dumps({"gradient": gradient_indices.tolist(),
+                        "gate": gate_indices.tolist()}, indent=2),
+            encoding="utf-8")
+        raindrop_guide = RaindropAdamWGuide(
+            model, trainer.optimizer, gradient_loader, guide_gate_loader,
+            torch.device(device), pop_size=args.raindrop_pop_size,
+            max_iter=args.raindrop_max_iter,
+            factor_min=args.raindrop_factor_min,
+            factor_max=args.raindrop_factor_max,
+            gradient_batches=args.raindrop_gradient_batches,
+            min_ce_gain=args.raindrop_min_ce_gain, seed=args.seed,
+            log_path=save_path / "raindrop_guidance.jsonl")
+        print(f"Raindrop-guided AdamW enabled: groups={raindrop_guide.group_names}, "
+              f"gradient_samples={len(gradient_indices)}, "
+              f"gate_samples={len(gate_indices)}")
+
     print(f"\n{SEP}\nSTARTING TRAINING\n{SEP}\n")
     applied_unfreeze = set()
     if torch.cuda.is_available():
@@ -1217,6 +1288,10 @@ def main():
                 trainer.set_loss_phase('full')
 
         check_spp_bn_health(model, epoch)
+
+        if raindrop_guide is not None:
+            multipliers, _ = raindrop_guide.select(epoch)
+            trainer.set_raindrop_multipliers(multipliers)
 
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics   = trainer.validate(val_loader, epoch)
