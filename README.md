@@ -546,6 +546,40 @@ Per-epoch Raindrop decisions are saved to
 is `work_dir/result.json`. This is a low-dimensional, gradient-informed outer
 optimizer, not an infeasible derivative-free search over all 20.94M weights.
 
+### Recommended: Raindrop class-aware loss search
+
+`raindrop_loss_search.py` is the recommended metaheuristic experiment. It does
+not compete with gradients over millions of weights. Raindrop searches eight
+non-differentiable training-policy variables: five normalized semantic class-
+group weights, OHEM keep ratio, Dice weight, and auxiliary-loss weight. Each
+candidate performs a short fine-tune on a deterministic subset of `train.txt`
+and is scored on a disjoint gate also drawn from `train.txt`; `val.txt` is not
+used by the search. The fitness protects overall mIoU while rewarding the weak
+wall/fence/pole/traffic-light/rider/motorcycle classes.
+
+After proxy search, the selected policy and the exact default-loss control are
+restarted from the same checkpoint for one full-data epoch on separate T4s.
+Only then are both evaluated on the original validation split with deploy-mode
+parameter and FPS gates.
+
+```bash
+python -u raindrop_loss_search.py \
+  --checkpoint /kaggle/input/datasets/giangtunhng/our-miou-6783/our_miou_0.6783.pth \
+  --train_txt /kaggle/working/train.txt \
+  --val_txt /kaggle/working/val.txt \
+  --baseline_miou 0.6783018947437217 \
+  --gpu_ids 0,1 --img_h 512 --img_w 1024 \
+  --proxy_train_samples 1024 --proxy_gate_samples 256 \
+  --pop_size 4 --max_iter 1 \
+  --batch_size 16 --workers_per_gpu 2 --lr 1e-5 \
+  --fps_tolerance 0.01 --max_hours 10 --seed 42 \
+  --work_dir /kaggle/working/raindrop_loss_search_v1
+```
+
+The default budget evaluates roughly twelve proxy policies. The complete
+policy, every trial, final matched control, deploy validation, and winner gate
+are stored in `work_dir/result.json`.
+
 ### Train and evaluate the selected architecture
 
 `train.py --arch_json` accepts the full `best_gcnet_arch.json` produced by

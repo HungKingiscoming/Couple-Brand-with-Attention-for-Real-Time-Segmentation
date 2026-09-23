@@ -1108,7 +1108,8 @@ def main():
         train_txt=args.train_txt, val_txt=args.val_txt,
         batch_size=args.batch_size, num_workers=args.num_workers,
         img_size=(args.img_h, args.img_w), pin_memory=True,
-        compute_class_weights=args.use_class_weights,
+        compute_class_weights=(args.use_class_weights and
+                               not args.class_weights_file),
         dataset_type=args.dataset_type,
         persistent_workers=args.persistent_workers,
         prefetch_factor=args.prefetch_factor,
@@ -1117,7 +1118,14 @@ def main():
     if getattr(args, "class_weights_file", None):
         cw_path = Path(args.class_weights_file)
         if cw_path.exists():
-            class_weights = torch.load(cw_path, map_location="cpu")
+            if cw_path.suffix.lower() == ".json":
+                class_weights = torch.tensor(
+                    json.loads(cw_path.read_text(encoding="utf-8")),
+                    dtype=torch.float32)
+            else:
+                class_weights = torch.load(cw_path, map_location="cpu")
+            if class_weights.numel() != args.num_classes:
+                raise ValueError("class_weights_file must contain one weight per class")
             print(f"Class weights: {cw_path}  "
                   f"(min={class_weights.min():.3f}, max={class_weights.max():.3f})")
         else:
@@ -1158,7 +1166,7 @@ def main():
     diag    = DiagnosticLogger(save_dir=save_path, class_names=CLASS_NAMES)
     trainer = Trainer(model=model, optimizer=optimizer, scheduler=scheduler,
                       device=device, args=args,
-                      class_weights=class_weights if args.use_class_weights else None,
+                      class_weights=class_weights,
                       diag=diag)
 
     if args.dice_weight is not None:
@@ -1261,6 +1269,7 @@ def main():
     epochs_completed = 0
     target_epoch = None
     time_to_target_sec = None
+    best_per_class_iou = None
 
     trial_end_epoch = (min(args.epochs, args.max_trial_epochs)
                        if args.max_trial_epochs is not None else args.epochs)
@@ -1336,6 +1345,7 @@ def main():
         is_best = val_metrics['miou'] > trainer.best_miou
         if is_best:
             trainer.best_miou = val_metrics['miou']
+            best_per_class_iou = val_metrics['per_class_iou'].tolist()
             print(f"  ★ NEW BEST mIoU: {trainer.best_miou:.4f}")
         if not args.skip_checkpoint:
             trainer.save_checkpoint(epoch, val_metrics, is_best=is_best)
@@ -1354,6 +1364,7 @@ def main():
             'time_to_target_sec': time_to_target_sec,
             'epochs_completed': epochs_completed,
             'best_miou': float(trainer.best_miou),
+            'best_per_class_iou': best_per_class_iou,
             'best_checkpoint': (None if args.skip_checkpoint else
                                 str(Path(args.save_dir) / 'best.pth')),
         }
